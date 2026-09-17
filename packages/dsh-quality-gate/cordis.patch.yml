@@ -1,0 +1,15 @@
+# dsh-quality-gate bundle patch.
+#
+# `insert` is pure-append and the loader rejects duplicate entry ids: a profile
+# adds this plugin through `dsh.profile.bundles` only, then overrides the
+# commands with a top-level `- id: quality-gate` + `config:` block.
+#
+# The command list is the gate's whole point: it must name the project's real
+# verification commands, because a gate nobody configured verifies nothing.
+- insert:
+    - id: quality-gate
+      name: 'dsh-quality-gate'
+      config:
+        enabled: true
+        logFile: '~/.dsh/quality-gate.log'
+        commands: []

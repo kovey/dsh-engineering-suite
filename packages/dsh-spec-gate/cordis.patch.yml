@@ -1,0 +1,12 @@
+# dsh-spec-gate bundle patch.
+#
+# `insert` is pure-append and the loader rejects duplicate entry ids: a profile
+# adds this plugin through `dsh.profile.bundles` only, and overrides parameters
+# with a top-level `- id: spec-gate` + `config:` block.
+- insert:
+    - id: spec-gate
+      name: 'dsh-spec-gate'
+      config:
+        enabled: true
+        logFile: '~/.dsh/spec-gate.log'
+        enforce: true

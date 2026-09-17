@@ -1,0 +1,13 @@
+# dsh-audit-trail bundle patch.
+#
+# `insert` is pure-append and the loader rejects duplicate entry ids: a profile
+# adds this plugin through `dsh.profile.bundles` only, and overrides parameters
+# with a top-level `- id: audit-trail` + `config:` block.
+- insert:
+    - id: audit-trail
+      name: 'dsh-audit-trail'
+      config:
+        enabled: true
+        logFile: '~/.dsh/audit-trail.log'
+        snapshot:
+          enabled: true

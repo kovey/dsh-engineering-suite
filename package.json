@@ -1,0 +1,18 @@
+{
+  "name": "dsh-engineering-suite",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Engineering suite for DeepSeek Harness: seven plugins covering roles, specifications, test design, quality gates, evidence, audit trail and pipeline orchestration (see docs.md)",
+  "type": "module",
+  "engines": {
+    "node": "^22.19 || >=24"
+  },
+  "scripts": {
+    "link-deps": "bash scripts/link-deps.sh",
+    "build": "bash scripts/build-all.sh",
+    "typecheck": "bash scripts/typecheck-all.sh",
+    "test": "bash scripts/test-all.sh",
+    "verify": "bash scripts/verify.sh"
+  },
+  "license": "Apache-2.0"
+}

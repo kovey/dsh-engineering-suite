@@ -1,0 +1,14 @@
+# dsh-evidence-gate bundle patch.
+#
+# `insert` is pure-append and the loader rejects duplicate entry ids: a profile
+# adds this plugin through `dsh.profile.bundles` only, and overrides parameters
+# with a top-level `- id: evidence-gate` + `config:` block.
+- insert:
+    - id: evidence-gate
+      name: 'dsh-evidence-gate'
+      config:
+        enabled: true
+        logFile: '~/.dsh/evidence-gate.log'
+        requireGate: true
+        gateSource: 'dsh-quality-gate'
+        requiredEvidenceKinds: ['command', 'test']

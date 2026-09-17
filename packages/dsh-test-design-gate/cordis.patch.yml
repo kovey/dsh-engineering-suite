@@ -1,0 +1,13 @@
+# dsh-test-design-gate bundle patch.
+#
+# `insert` is pure-append and the loader rejects duplicate entry ids: a profile
+# adds this plugin through `dsh.profile.bundles` only, and overrides parameters
+# with a top-level `- id: test-design-gate` + `config:` block.
+- insert:
+    - id: test-design-gate
+      name: 'dsh-test-design-gate'
+      config:
+        enabled: true
+        logFile: '~/.dsh/test-design-gate.log'
+        strict: false
+        allowDanglingCase: false
