@@ -16,7 +16,9 @@ targets=()
 if [ "$#" -gt 0 ]; then
   for name in "$@"; do targets+=("$ROOT/packages/$name"); done
 else
-  for dir in "$ROOT"/packages/*/; do targets+=("$dir"); done
+  # Dependency order: the plugins compile against dsh-eng-core's built `dist/`,
+  # which a fresh clone (and CI) does not have yet.
+  while IFS= read -r dir; do targets+=("$dir"); done < <(python3 "$ROOT/scripts/package-order.py" "$ROOT")
 fi
 
 failed=0
