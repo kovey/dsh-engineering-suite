@@ -47,15 +47,23 @@ mission add-health-20260917-101010 · rev 2 · 摘要 abcdef123456
 （提示词含两目录两文件与内容摘要；打回记录轮次+清空审批+问询通道被调用+模型拿到回路指引；第二次送审标注"第 2 次"；
 无问答通道时仍能打回），并把 2 条旧断言更新为新契约（打回不再是 `isError`）。
 
-## 二、nvim-tui 侧：**不需要改 TUI**（改用它的公开扩展 API）
+## 二、nvim-tui 侧：**不需要改 TUI**（用它公开的扩展 API）
+
+> **真机踩坑记录（第一版为什么不能用）**：最初的实现把 `ui.card` 当主通道，结果
+> ①卡片按设计渲染进**会话 feed（聊天区）**——不是弹窗，看起来就像"内容被写进了聊天"；
+> ②`feed.ts: extCardLines()` 只渲染**前 4 个动作**（`actions.slice(0, 4)`），而当时给了 6 个，
+> 「通过并放行」「打回重写」**根本没显示**，用户"没法按提示选择"。
+> 结论：**裁决必须放在浮窗里（`ui.picker`），卡片只当记录且动作永远 ≤4 个。**
 
 初版方案是给 TUI 打补丁（多行渲染 + 打开文件的键）。后来发现 nvim-tui 已经 `ctx.provide('nvim-tui', …)`
 了一套稳定的扩展 API（`src/ext-api/index.ts`，契约见 `src/kernel/ext-types.ts`），**审批评审完全可以建在它上面**：
 
 | 需求 | 用到的公开 API |
 |---|---|
-| 弹出审批窗、列出两个目录与两份工件 | `ui.card({ plugin, title, body, actions })` —— 直接渲染进会话 feed |
-| 打开需求文档 / 测试用例 | 卡片动作（光标在卡片上按 `1-9`）→ `nvim.call('fnameescape', [path])` + `nvim.ex('tabedit …')` |
+| **弹出的审批窗（决策）** | `ui.picker({ title, items })` —— TUI 自己的浮窗选择器，`<CR>` 确认 / `jk` 移动 / `Esc` 取消；选"查看…"后菜单再弹一次 |
+| 聊天区里的记录（含条目摘要） | `ui.card({ plugin, title, body, actions })` —— 渲染进会话 feed，动作 **≤4 个且全是"查看"**（TUI 只渲染前 4 个） |
+| **只读预览（首选）** | `nvim.lua('return require("dsh_tui").show_lines_float(...)', [title, lines, path])` —— TUI 自己的只读浮窗（设置/工作流查看器同款）：原生滚动、**`q`/`Esc` 关闭回到原窗口**、`i`/`o` 打开文件编辑。评审菜单**等它关闭后再弹**（两个浮窗叠在一起会挡住文档），收尾时自动关闭 |
+| 打开需求文档 / 测试用例（末位退路，不在菜单里单列） | 三条路由依次尝试：①`nvim.lua('return require("dsh_tui").open_file_tab(...)', [path])`（**TUI 自己的公开入口，`gF` 走的就是它，在 nvim 内部执行**）→ ②`nvim.call('fnameescape')` + `nvim.ex('tabedit …')` → ③本地转义 + `nvim.ex`；每条 4s 超时，成功/失败都用 `ui.notice` 明确告知 |
 | "进去之后可以打开文档" | `ui.picker({ title, items })` 列目录（Node 侧 `fs.readdir`），选中即在新标签页打开；子目录可继续下钻（≤3 层） |
 | 不合格打回重写 | 卡片动作 `{ kind: 'input', inputPrompt: '打回原因（要改什么）：' }` —— **TUI 走输入框**，输入的文字就是人工意见 |
 | 通过 | 卡片动作 `{ kind: 'confirm' }` |

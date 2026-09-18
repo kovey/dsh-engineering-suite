@@ -751,18 +751,74 @@ function fakeTui(cwd: string) {
         dismissed: boolean
     }[] = []
     const pickers: { title: string; items: { label: string; value: string }[] }[] = []
-    let pickAnswer: string | null = null
+    const panels: { slot: string; title: string; lines: string[]; released: number }[] = []
+    const floats: { title: string; lines: string[] }[] = []
+    const closedFloats: string[] = []
+    const viewers: { title: string; lines: string[]; editPath: string; closed: boolean }[] = []
+    let holdViewer = false
+    let currentTab = 1
+    const answers: (string | null | ((picker: { title: string; items: { label: string; value: string }[] }) => string | null))[] = []
+    const inserted: string[] = []
     const api = {
         version: '0.1.0',
         capabilities: () => ({ card: true, float: true, picker: true }),
         nvim: {
+            // The TUI's own public entries: the read-only viewer, its liveness
+            // probe, its close, and `open_file_tab` (the tab route).
+            lua: async (code: string, args?: unknown[]) => {
+                if (code.includes('show_lines_float')) {
+                    viewers.push({ title: String(args?.[0] ?? ''), lines: (args?.[1] as string[]) ?? [], editPath: String(args?.[2] ?? ''), closed: false })
+                    return { buf: viewers.length, win: 100 + viewers.length }
+                }
+                if (code.includes('nvim_get_current_tabpage')) {
+                    return currentTab
+                }
+                if (code.includes('nvim_buf_is_valid')) {
+                    const buf = Number(args?.[0] ?? 0)
+                    const entry = viewers[buf - 1]
+                    if (entry === undefined) return false
+                    // By default the reviewer reads and closes right away; tests
+                    // that need to hold it open call `holdViewer()`.
+                    if (!holdViewer && !entry.closed) entry.closed = true
+                    return !entry.closed
+                }
+                if (code.includes('close_lines_float')) {
+                    for (const entry of viewers) entry.closed = true
+                    return undefined
+                }
+                if (code.includes('open_file_tab')) {
+                    ex.push(`lua:open_file_tab ${String(args?.[0] ?? '')}`)
+                    return true
+                }
+                throw new Error(`unexpected lua: ${code}`)
+            },
             ex: async (cmd: string) => {
                 ex.push(cmd)
             },
-            // nvim's own escaping, like the real layer.
-            call: async (fn: string) => (fn === 'fnameescape' ? 'escaped-by-nvim' : undefined),
+            // nvim's own escaping; the fake echoes the path so an assertion can
+            // name the file that was opened.
+            call: async (fn: string, args?: unknown[]) => (fn === 'fnameescape' ? String(args?.[0] ?? '') : undefined),
         },
         ui: {
+            panel: async (opts: { slot?: string; title?: string; lines?: string[] }) => {
+                const record = { slot: opts.slot ?? '', title: opts.title ?? '', lines: opts.lines ?? [], released: 0 }
+                panels.push(record)
+                return {
+                    win: 1,
+                    buf: 2,
+                    slot: record.slot,
+                    release: async () => {
+                        record.released += 1
+                    },
+                }
+            },
+            float: async (opts: { lines: string[]; title?: string }) => {
+                floats.push({ title: opts.title ?? '', lines: opts.lines })
+                return { id: `float-${floats.length}`, win: 3, buf: 4 }
+            },
+            floatClose: async (id: string) => {
+                closedFloats.push(id)
+            },
             card: (opts: {
                 title: string
                 body: string
@@ -781,106 +837,181 @@ function fakeTui(cwd: string) {
             },
             picker: async (opts: { title: string; items: { label: string; value: string }[] }) => {
                 pickers.push(opts)
-                return pickAnswer
+                const next = answers.length === 0 ? null : answers.shift()
+                return typeof next === 'function' ? next(opts) : ((next ?? null) as string | null)
             },
             notice: (text: unknown) => notices.push(String(text)),
         },
     }
-    return { api, ex, cards, pickers, notices, setPick: (value: string | null) => { pickAnswer = value }, cwd }
+    const api2 = { ...api, insertInput: (text: string) => inserted.push(text) }
+    return {
+        api: api2,
+        ex,
+        cards,
+        pickers,
+        notices,
+        panels,
+        floats,
+        closedFloats,
+        viewers,
+        /** Simulate the human pressing `q` in the viewer. */
+        closeViewer: () => {
+            for (const entry of viewers) entry.closed = true
+        },
+        /** Keep the viewer open until `closeViewer()` (default: closes at once). */
+        holdViewer: () => {
+            holdViewer = true
+        },
+        /** Simulate `i`/`o` inside the viewer: the file opens in another tab. */
+        jumpToFileTab: () => {
+            currentTab = 2
+        },
+        /** Simulate the human returning to the review tab. */
+        backToReviewTab: () => {
+            currentTab = 1
+        },
+        inserted,
+        /** Queue the picker answers, in order (a function may inspect the picker). */
+        queue: (...values: (string | null | ((picker: { title: string; items: { label: string; value: string }[] }) => string | null))[]) =>
+            answers.push(...values),
+        cwd,
+    }
 }
 
-test('the TUI review card opens both artifacts and takes the verdict (regression)', async () => {
+test('the review POPUP lists both artifacts and drives the verdict (regression)', async () => {
     const cwd = tempWorkspace('spec-gate-tui-')
     const tui = fakeTui(cwd)
     const fake = createFakeHost({ cwd, approvalOutcome: 'rejected', services: { 'nvim-tui': tui.api } })
     apply(fake.ctx as never, { logFile: path.join(cwd, 'spec-gate.log'), approval: 'seam' })
     await fake.runTool('spec_create', DRAFT)
 
-    // The card is rendered and the tool waits for a verdict.
-    const pending = fake.runTool('spec_approve', {})
-    await new Promise((resolve) => setTimeout(resolve, 10))
+    // Read first, then approve: the popup stays in charge between the two.
+    tui.queue('spec:open-spec', 'spec:open-design', 'spec:approve')
+    const result = runText(await fake.runTool('spec_approve', {}))
+
+    // The card is only a RECORD in the feed — and nvim-tui renders at most four
+    // actions, so a verdict must never be hidden behind a fifth.
     assert.equal(tui.cards.length, 1)
     const card = tui.cards[0]!
-    assert.match(card.title, /规格审批（第 1 次送审）/)
     assert.match(card.body, /需求文档: \.dsh\/specs\//)
     assert.match(card.body, /测试用例: \.dsh\/missions\//)
+    assert.equal(card.actions?.length, 4)
     assert.deepEqual(
         card.actions?.map((action) => action.value),
-        ['spec:open-spec', 'spec:open-design', 'spec:list-specs', 'spec:list-design', 'spec:approve', 'spec:reject'],
+        ['spec:open-spec', 'spec:open-design', 'spec:list-specs', 'spec:list-design'],
     )
-    assert.equal(card.actions?.find((action) => action.value === 'spec:reject')?.kind, 'input')
+    assert.equal(
+        card.actions?.some((action) => action.value === 'spec:approve' || action.value === 'spec:reject'),
+        false,
+        'the verdict lives in the popup, not on a card whose actions get truncated',
+    )
 
-    // Opening the spec does NOT decide anything: it opens a tab and keeps waiting.
-    card.onAction?.('spec:open-spec')
-    await new Promise((resolve) => setTimeout(resolve, 10))
-    assert.equal(tui.ex.length, 1)
-    assert.equal(tui.ex[0], 'tabedit escaped-by-nvim', 'nvim escapes the path, we do not guess')
-    assert.equal(card.updated.length, 0, 'still pending')
+    // The POPUP is the decision channel: it names both files and both folders.
+    assert.ok(tui.pickers.length >= 3, 'one picker per decision round')
+    const menu = tui.pickers[0]!
+    const labels = menu.items.map((item) => item.label).join('\n')
+    assert.match(menu.title, /规格审批（第 1 次送审）/)
+    for (const needle of ['查看需求文档', '查看测试用例', '浏览需求文档目录', '浏览测试用例目录', '通过并放行', '打回重写', '取消']) {
+        assert.match(labels, new RegExp(needle), `menu must offer ${needle}`)
+    }
+    assert.match(labels, /\.dsh\/specs\//)
+    assert.match(labels, /test-design-review\.md/)
+    assert.doesNotMatch(labels, /新标签页/, 'the tab route is gone from the menu')
 
-    // The test-design artifact is openable too.
-    card.onAction?.('spec:open-design')
-    await new Promise((resolve) => setTimeout(resolve, 10))
-    assert.equal(tui.ex[1], 'tabedit escaped-by-nvim')
+    // The two review choices opened the artifacts.
+    // The preview went into the TUI's OWN read-only viewer float (scrollable,
+    // `q` closes it and returns) — not into a tab the TUI would immediately hide
+    // behind its own window.
+    assert.equal(tui.viewers.length, 2)
+    assert.match(tui.viewers[0]?.title ?? '', /需求文档/)
+    assert.match(tui.viewers[1]?.title ?? '', /测试用例/)
+    assert.match(tui.viewers[0]?.editPath ?? '', /\.dsh\/specs\/.*\.md$/, 'the viewer can hand off to real editing')
+    assert.ok((tui.viewers[0]?.lines.length ?? 0) > 0, 'the viewer shows the document content')
+    assert.equal(tui.ex.length, 0, 'no tab was needed')
+    assert.ok(
+        tui.notices.some((notice) => notice.startsWith('已打开只读预览')),
+        `notices: ${tui.notices.join(' | ')}`,
+    )
+    // The viewer is closed once the verdict is in.
+    assert.equal(tui.viewers.every((entry) => entry.closed), true)
 
-    // Approving resolves the tool call and records the approval.
-    card.onAction?.('spec:approve')
-    const result = runText(await pending)
     assert.match(result, /规格已审批/)
-    const mission = new MissionStoreRegistry().for(cwd).active('session-1')
-    assert.ok((mission?.spec?.approvedAt ?? 0) > 0)
+    assert.ok((new MissionStoreRegistry().for(cwd).active('session-1')?.spec?.approvedAt ?? 0) > 0)
 })
 
-test('the review card rejects with the note typed in the input box (regression)', async () => {
+test('a rejection takes its reason from the popup and loops (regression)', async () => {
     const cwd = tempWorkspace('spec-gate-tui-reject-')
     const tui = fakeTui(cwd)
     const fake = createFakeHost({ cwd, services: { 'nvim-tui': tui.api } })
     apply(fake.ctx as never, { logFile: path.join(cwd, 'spec-gate.log'), approval: 'seam' })
     await fake.runTool('spec_create', DRAFT)
-    const pending = fake.runTool('spec_approve', {})
-    await new Promise((resolve) => setTimeout(resolve, 10))
 
-    // An `input` action delivers the TYPED text — that is the rejection note.
-    tui.cards[0]?.onAction?.('验收标准少了 503 分支，用例也要补边界')
-    const text = runText(await pending)
+    tui.queue('spec:reject', 'reject:验收标准不全或不准确')
+    const text = runText(await fake.runTool('spec_approve', {}))
+
     const mission = new MissionStoreRegistry().for(cwd).active('session-1')
     assert.equal(mission?.approval?.state, 'rejected')
-    assert.match(mission?.approval?.note ?? '', /验收标准少了 503 分支/)
-    assert.equal(mission?.spec?.approvedAt, undefined)
-    assert.match(text, /人工意见：验收标准少了 503 分支，用例也要补边界/)
+    assert.equal(mission?.approval?.round, 1)
+    assert.equal(mission?.approval?.note, '验收标准不全或不准确')
+    assert.equal(mission?.spec?.approvedAt, undefined, 'the approval it reviewed is void')
+    assert.match(text, /人工意见：验收标准不全或不准确/)
+    assert.match(text, /spec_create/)
     assert.match(text, /第 2 次/)
-    // The card says what happened to it.
+    // The second popup asked WHY, and the canned answers were offered.
+    assert.equal(tui.pickers.length, 2)
+    assert.match(tui.pickers[1]?.title ?? '', /打回原因/)
+    assert.ok((tui.pickers[1]?.items.length ?? 0) >= 4)
     assert.match(tui.cards[0]?.updated.join(' ') ?? '', /已打回/)
-    // …and no generic approval prompt was raised on top of it.
-    assert.equal(fake.approvalRequests.length, 0)
+    assert.equal(fake.approvalRequests.length, 0, 'no generic approval prompt on top of the popup')
 })
 
-test('the card can list a directory and open the chosen file (regression)', async () => {
+test('"其它" hands the rejection reason back to the chat input (regression)', async () => {
+    const cwd = tempWorkspace('spec-gate-tui-other-')
+    const tui = fakeTui(cwd)
+    const fake = createFakeHost({ cwd, services: { 'nvim-tui': tui.api } })
+    apply(fake.ctx as never, { logFile: path.join(cwd, 'spec-gate.log'), approval: 'seam' })
+    await fake.runTool('spec_create', DRAFT)
+    tui.queue('spec:reject', 'reject:other')
+    const text = runText(await fake.runTool('spec_approve', {}))
+    const mission = new MissionStoreRegistry().for(cwd).active('session-1')
+    assert.equal(mission?.approval?.state, 'rejected')
+    assert.equal(mission?.approval?.note, undefined)
+    // The input box is prefilled so typing the details is one step away.
+    assert.deepEqual(tui.inserted, ['打回原因：'])
+    assert.match(text, /打回/)
+})
+
+test('browsing a directory from the popup opens the chosen file (regression)', async () => {
     const cwd = tempWorkspace('spec-gate-tui-browse-')
     const tui = fakeTui(cwd)
     const fake = createFakeHost({ cwd, services: { 'nvim-tui': tui.api } })
     apply(fake.ctx as never, { logFile: path.join(cwd, 'spec-gate.log'), approval: 'seam' })
     await fake.runTool('spec_create', DRAFT)
-    const pending = fake.runTool('spec_approve', {})
-    await new Promise((resolve) => setTimeout(resolve, 10))
 
-    tui.setPick(null) // cancel the picker: nothing opens, the review stays pending
-    tui.cards[0]?.onAction?.('spec:list-specs')
-    await new Promise((resolve) => setTimeout(resolve, 10))
-    assert.equal(tui.pickers.length, 1)
-    assert.match(tui.pickers[0]?.title ?? '', /需求文档目录/)
-    assert.equal(tui.ex.length, 0)
+    // A cancelled sub-picker must not decide anything, and must not close the
+    // review: the menu comes back and the verdict is still ours to make.
+    tui.queue('spec:list-specs', null, 'spec:approve')
+    assert.match(runText(await fake.runTool('spec_approve', {})), /规格已审批/)
+    assert.equal(tui.ex.length, 0, 'a cancelled browse opens nothing')
 
-    // Choosing the file from the picker opens it.
-    const specFile = tui.pickers[0]!.items.find((item) => item.value.endsWith('.md'))
-    assert.ok(specFile !== undefined, `picker items: ${JSON.stringify(tui.pickers[0]?.items)}`)
-    tui.setPick(specFile!.value)
-    tui.cards[0]?.onAction?.('spec:list-specs')
-    await new Promise((resolve) => setTimeout(resolve, 10))
-    assert.equal(tui.ex.length, 1)
-    assert.equal(tui.ex[0], 'tabedit escaped-by-nvim')
-
-    tui.cards[0]?.onAction?.('spec:approve')
-    assert.match(runText(await pending), /规格已审批/)
+    // Choosing a file in the browse picker opens THAT file, then shows the menu.
+    const other = tempWorkspace('spec-gate-tui-browse2-')
+    const tui2 = fakeTui(other)
+    const fake2 = createFakeHost({ cwd: other, services: { 'nvim-tui': tui2.api } })
+    apply(fake2.ctx as never, { logFile: path.join(other, 'spec-gate.log'), approval: 'seam' })
+    await fake2.runTool('spec_create', DRAFT)
+    tui2.queue(
+        'spec:list-specs',
+        (picker) => picker.items.find((item) => item.value.endsWith('.md'))?.value ?? null,
+        'spec:approve',
+    )
+    assert.match(runText(await fake2.runTool('spec_approve', {})), /规格已审批/)
+    assert.equal(tui2.ex.length, 1)
+    assert.match(tui2.ex[0] ?? '', /^lua:open_file_tab .*\.dsh\/specs\/.*\.md$/)
+    assert.ok(
+        tui2.pickers.some((picker) => picker.title.includes('需求文档目录')),
+        'the directory listing came from the popup',
+    )
 })
 
 test('reviewChannel=approval forces the generic seam, tui refuses without the API (regression)', async () => {
@@ -916,4 +1047,205 @@ test('a review that nobody answers fails closed (regression)', async () => {
     const mission = new MissionStoreRegistry().for(cwd).active('session-1')
     assert.equal(mission?.spec?.approvedAt, undefined, 'a timeout is never an approval')
     assert.match(text, /取消|超时|未/)
+})
+
+test('opening falls back when the primary route fails, and reports failures (regression)', async () => {
+    const cwd = tempWorkspace('spec-gate-open-fallback-')
+    const tui = fakeTui(cwd)
+    // Break the Lua route and the first ex route: the local-escape route must
+    // still open the file, and the human must see what happened.
+    ;(tui.api.nvim as { lua?: unknown }).lua = async () => {
+        throw new Error('lua 通道不可用')
+    }
+    // No panel/float surface either: the chain must reach the tab route.
+    delete (tui.api.ui as { panel?: unknown }).panel
+    delete (tui.api.ui as { float?: unknown }).float
+    let callCount = 0
+    ;(tui.api.nvim as { call?: unknown }).call = async () => {
+        callCount += 1
+        throw new Error('call 白名单拒绝')
+    }
+    const fake = createFakeHost({ cwd, services: { 'nvim-tui': tui.api } })
+    apply(fake.ctx as never, { logFile: path.join(cwd, 'spec-gate.log'), approval: 'seam' })
+    await fake.runTool('spec_create', DRAFT)
+    tui.queue('spec:open-spec', 'spec:approve')
+    assert.match(runText(await fake.runTool('spec_approve', {})), /规格已审批/)
+    assert.equal(callCount, 1, 'the fnameescape route was tried')
+    assert.equal(tui.ex.length, 1)
+    assert.match(tui.ex[0] ?? '', /^tabedit .*\.dsh\/specs\/.*\.md$/)
+    assert.ok(
+        tui.notices.some((notice) => notice.startsWith('已在新标签页打开')),
+        `notices: ${tui.notices.join(' | ')}`,
+    )
+
+    // Every route failing is reported, never silent, and never decides anything.
+    const other = tempWorkspace('spec-gate-open-fail-')
+    const tui2 = fakeTui(other)
+    delete (tui2.api.ui as { panel?: unknown }).panel
+    delete (tui2.api.ui as { float?: unknown }).float
+    ;(tui2.api.nvim as { lua?: unknown }).lua = async () => {
+        throw new Error('lua down')
+    }
+    ;(tui2.api.nvim as { ex?: unknown }).ex = async () => {
+        throw new Error('ex down')
+    }
+    ;(tui2.api.nvim as { call?: unknown }).call = async () => {
+        throw new Error('call down')
+    }
+    const fake2 = createFakeHost({ cwd: other, services: { 'nvim-tui': tui2.api } })
+    apply(fake2.ctx as never, { logFile: path.join(other, 'spec-gate.log'), approval: 'seam' })
+    await fake2.runTool('spec_create', DRAFT)
+    tui2.queue('spec:open-spec', 'spec:approve')
+    assert.match(runText(await fake2.runTool('spec_approve', {})), /规格已审批/, 'a failed open still leaves the review usable')
+    assert.ok(
+        tui2.notices.some((notice) => notice.startsWith('⚠ 打开失败')),
+        `notices: ${tui2.notices.join(' | ')}`,
+    )
+    // The failure is in the plugin log, so a user report can be diagnosed.
+    const log = fs.readFileSync(path.join(other, 'spec-gate.log'), 'utf8')
+    assert.match(log, /\[review\] ⚠ 打开失败/)
+})
+
+test('a stuck nvim RPC cannot wedge the review (regression)', async () => {
+    const cwd = tempWorkspace('spec-gate-open-hang-')
+    const tui = fakeTui(cwd)
+    // The Lua route never settles: the timeout must move on to the ex route.
+    delete (tui.api.ui as { panel?: unknown }).panel
+    delete (tui.api.ui as { float?: unknown }).float
+    ;(tui.api.nvim as { lua?: unknown }).lua = () => new Promise(() => undefined)
+    const fake = createFakeHost({ cwd, services: { 'nvim-tui': tui.api } })
+    apply(fake.ctx as never, { logFile: path.join(cwd, 'spec-gate.log'), approval: 'seam' })
+    await fake.runTool('spec_create', DRAFT)
+    tui.queue('spec:open-spec', 'spec:approve')
+    const text = runText(await fake.runTool('spec_approve', {}))
+    assert.match(text, /规格已审批/)
+    assert.ok(tui.ex.some((entry) => entry.startsWith('tabedit ')), `ex calls: ${tui.ex.join(' | ')}`)
+})
+
+test('the reviewer reads first: the menu waits until the viewer is closed (regression)', async () => {
+    const cwd = tempWorkspace('spec-gate-viewer-wait-')
+    const tui = fakeTui(cwd)
+    tui.holdViewer() // the human keeps reading
+    const fake = createFakeHost({ cwd, services: { 'nvim-tui': tui.api } })
+    apply(fake.ctx as never, { logFile: path.join(cwd, 'spec-gate.log'), approval: 'seam', reviewTimeoutMs: 6_000 })
+    await fake.runTool('spec_create', DRAFT)
+
+    tui.queue('spec:open-spec', 'spec:approve')
+    const pending = fake.runTool('spec_approve', {})
+    await new Promise((resolve) => setTimeout(resolve, 1_200))
+    // Still reading: one menu, one viewer, and the verdict has NOT been asked for
+    // again (a second picker on top of the document would hide it).
+    assert.equal(tui.viewers.length, 1)
+    assert.equal(tui.pickers.length, 1, `pickers: ${tui.pickers.length}`)
+
+    tui.closeViewer() // `q`
+    await new Promise((resolve) => setTimeout(resolve, 700))
+    assert.equal(tui.pickers.length, 2, 'the menu came back after the viewer closed')
+    assert.match(runText(await pending), /规格已审批/)
+
+    // If the human never closes it, the review deadline still ends the wait.
+    const other = tempWorkspace('spec-gate-viewer-timeout-')
+    const tui2 = fakeTui(other)
+    tui2.holdViewer()
+    const fake2 = createFakeHost({ cwd: other, services: { 'nvim-tui': tui2.api } })
+    apply(fake2.ctx as never, { logFile: path.join(other, 'spec-gate.log'), approval: 'seam', reviewTimeoutMs: 1_500 })
+    await fake2.runTool('spec_create', DRAFT)
+    tui2.queue('spec:open-spec')
+    const text = runText(await fake2.runTool('spec_approve', {}))
+    const mission = new MissionStoreRegistry().for(other).active('session-1')
+    assert.equal(mission?.spec?.approvedAt, undefined, 'a viewer left open is never an approval')
+    assert.match(text, /未决定|取消|超时/)
+    assert.equal(tui2.viewers.every((entry) => entry.closed), true, 'the viewer is closed on the way out')
+})
+
+test('i/o in the viewer jumps to the file and the menu stays out of the way (regression)', async () => {
+    const cwd = tempWorkspace('spec-gate-viewer-jump-')
+    const tui = fakeTui(cwd)
+    tui.holdViewer()
+    const fake = createFakeHost({ cwd, services: { 'nvim-tui': tui.api } })
+    apply(fake.ctx as never, { logFile: path.join(cwd, 'spec-gate.log'), approval: 'seam', reviewTimeoutMs: 8_000 })
+    await fake.runTool('spec_create', DRAFT)
+
+    tui.queue('spec:open-spec', 'spec:approve')
+    const pending = fake.runTool('spec_approve', {})
+    await new Promise((resolve) => setTimeout(resolve, 500))
+    assert.equal(tui.viewers.length, 1)
+    assert.equal(tui.pickers.length, 1)
+
+    // The human presses `i`: the viewer closes (nvim opens the file in a new
+    // tab). The menu must NOT reappear over that buffer.
+    tui.jumpToFileTab()
+    tui.closeViewer()
+    await new Promise((resolve) => setTimeout(resolve, 1_200))
+    assert.equal(tui.pickers.length, 1, 'the menu must not steal focus from the opened file')
+
+    // …and comes back once they return to the review tab.
+    tui.backToReviewTab()
+    await new Promise((resolve) => setTimeout(resolve, 800))
+    assert.equal(tui.pickers.length, 2, 'the menu returns after the human comes back')
+    assert.match(runText(await pending), /规格已审批/)
+})
+
+test('Esc in the rejection popup goes back instead of rejecting silently (regression)', async () => {
+    const cwd = tempWorkspace('spec-gate-reject-back-')
+    const tui = fakeTui(cwd)
+    const fake = createFakeHost({ cwd, services: { 'nvim-tui': tui.api } })
+    apply(fake.ctx as never, { logFile: path.join(cwd, 'spec-gate.log'), approval: 'seam' })
+    await fake.runTool('spec_create', DRAFT)
+
+    // The secondary popup must offer a way out, and Esc must mean the same.
+    tui.queue('spec:reject', null, 'spec:approve')
+    const text = runText(await fake.runTool('spec_approve', {}))
+    const mission = new MissionStoreRegistry().for(cwd).active('session-1')
+    assert.equal(mission?.approval, undefined, 'no rejection was recorded')
+    assert.ok((mission?.spec?.approvedAt ?? 0) > 0, 'the review continued and was approved')
+    assert.match(text, /规格已审批/)
+    assert.equal(tui.pickers.length, 3, 'reason popup → back → menu again')
+    assert.ok(
+        (tui.pickers[1]?.items ?? []).some((item) => item.label.includes('返回评审菜单')),
+        `the reason popup offers a way back: ${JSON.stringify(tui.pickers[1]?.items)}`,
+    )
+    assert.ok(
+        tui.notices.some((notice) => notice.includes('已返回评审菜单')),
+        `notices: ${tui.notices.join(' | ')}`,
+    )
+})
+
+test('the browse popup walks back out one level at a time (regression)', async () => {
+    const cwd = tempWorkspace('spec-gate-browse-back-')
+    const tui = fakeTui(cwd)
+    const fake = createFakeHost({ cwd, services: { 'nvim-tui': tui.api } })
+    apply(fake.ctx as never, { logFile: path.join(cwd, 'spec-gate.log'), approval: 'seam' })
+    await fake.runTool('spec_create', DRAFT)
+
+    // Drill into a subdirectory, then Esc: the PARENT listing comes back (not the
+    // verdict menu), and Esc again leaves for the menu.
+    const specs = path.join(cwd, '.dsh', 'specs')
+    fs.mkdirSync(path.join(specs, 'archive'), { recursive: true })
+    tui.queue(
+        'spec:list-specs',
+        () => path.join(specs, 'archive'),
+        null,
+        null,
+        'spec:approve',
+    )
+    assert.match(runText(await fake.runTool('spec_approve', {})), /规格已审批/)
+    const titles = tui.pickers.map((picker) => picker.title)
+    // menu → specs listing → inside archive → back to specs → menu again
+    assert.match(titles[1] ?? '', /specs$/, 'the specs listing')
+    assert.ok(
+        (tui.pickers[1]?.items ?? []).some((item) => item.label.includes('archive')),
+        'the subdirectory is listed',
+    )
+    assert.match(titles[2] ?? '', /archive/, 'inside the subdirectory')
+    assert.match(titles[3] ?? '', /specs$/, 'Esc came back to the parent listing')
+    assert.match(titles[4] ?? '', /规格审批/, 'Esc at the top returns to the review menu')
+    assert.ok(
+        (tui.pickers[2]?.items ?? []).some((item) => item.label.includes('返回上一级目录')),
+        'the nested listing says how to go up',
+    )
+    assert.ok(
+        (tui.pickers[1]?.items ?? []).some((item) => item.label.includes('返回评审菜单')),
+        'the top listing says how to leave',
+    )
 })

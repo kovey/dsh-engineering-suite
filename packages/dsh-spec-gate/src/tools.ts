@@ -635,6 +635,8 @@ async function requestApproval(
             title: `规格审批（第 ${roundForReview} 次送审）：${mission.title}`,
             body: renderApprovalPrompt(mission, roundForReview, missionsDir, note),
             artifacts: reviewArtifactsOf(mission, missionsDir),
+            cwd: mission.cwd,
+            log: (message: string) => deps.logger.for(mission.cwd).info(`[review] ${message}`),
             ...(context.signal === undefined ? {} : { signal: context.signal }),
             timeoutMs: config.reviewTimeoutMs,
         })

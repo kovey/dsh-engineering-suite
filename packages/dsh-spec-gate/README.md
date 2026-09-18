@@ -46,14 +46,45 @@ mission <id> · rev <n> · 摘要 <digest>
 | `tui` | 必须走卡片；服务缺失时**报错**而不是静默降级（"要么在 TUI 里评审，要么改配置"） |
 | `approval` | 始终走通用 seam（headless / web / CI） |
 
-**评审卡片**（`src/review.ts`，全部建立在 nvim-tui 的**公开**扩展 API 上，不需要改 TUI）：
+**评审用的全是 nvim-tui 的公开扩展 API**（`src/review.ts`，不需要改 TUI），并且区分"记录"与"决策"：
 
-- `ui.card` 渲染进会话 feed：正文是上面那份清单，动作 `1-6`；
-- `1`/`2` 打开需求文档 / 测试用例（`nvim.call('fnameescape')` + `nvim.ex('tabedit …')`）；
-- `3`/`4` 用 `ui.picker` 列出两个目录（可下钻）并打开选中的文件；
-- **打开工件不决定审批**：卡片与等待保持，只有 `5`（通过，`kind:'confirm'`）或 `6`（打回，`kind:'input'`）结束；
-- `6` 走 TUI 输入框，输入的文字直接成为人工意见 → 记进 `mission.approval.note`；
-- 等待上限 `reviewTimeoutMs`（默认 15 分钟）；超时/取消 = **不通过**（卡片标注"已超时未决定"）。
+- **决策在弹窗里**（`ui.picker` = TUI 自己的浮窗选择器，`<CR>` 确认 / `j k` 移动 / `Esc` 取消），菜单项：
+
+  ```
+  规格审批（第 N 次送审）：<标题>
+    ▸ 查看需求文档（只读预览，q 关闭） — .dsh/specs/<id>.md
+    ▸ 查看测试用例（只读预览，q 关闭） — .dsh/missions/<id>/test-design-review.md
+    ▸ 浏览需求文档目录 — .dsh/specs/
+    ▸ 浏览测试用例目录 — .dsh/missions/<id>/
+    ▸ ✅ 通过并放行（之后的写操作放行）
+    ▸ 🛑 打回重写（说明要改什么）
+    ▸ 取消（保持未审批，稍后再审）
+  ```
+
+  **预览用的是 nvim-tui 自己的只读浮窗**（`require('dsh_tui').show_lines_float(title, lines, path)`，
+  和它的设置/工作流查看器同一个表面）：nvim 原生滚动（`j/k/G/C-d`）、**`q`/`Esc` 关闭即回到原窗口**、
+  `i`/`o` 可直接打开该文件编辑。**插件的评审菜单会等这个浮窗关闭后再弹**——两个浮窗叠在一起会把文档挡住；
+  等不到就按 `reviewTimeoutMs` 收尾并自动关闭它。浮窗里的 `i`/`o` 会把工件**在新标签页打开**——
+  这时评审菜单**不会**跟过去抢焦点，而是等你回到评审所在的标签页再出现（真机反馈：菜单立刻弹出会盖住刚打开的 buffer）。宿主没有该入口时依次退化到 `ui.panel` → `ui.float` →
+  `nvim.ex('tabedit …')`（列表里不再单列"在新标签页打开"：真机确认那种打开方式会被 TUI 收回焦点而看不见）。
+
+  **为什么不能只靠新标签页**：nvim-tui 会把插件打开的 buffer 搬进新标签页，随后把焦点收回到自己的窗口
+  （输入框在主标签页），结果是"文件开了但屏幕上看不到"。这是真机踩到的坑（见
+  `docs/nvim-tui-approval-review.md`）。需要正经编辑时用预览浮窗里的 `[i/o]`（`editPath` 就是工件路径）。
+  选前四项只是**打开/浏览**：打开依次尝试 ①TUI 自己的公开入口 `require('dsh_tui').open_file_tab`
+  （`gF` 用的就是它，在 nvim 内部执行，最可靠）②`nvim.call('fnameescape')` + `nvim.ex('tabedit …')`
+  ③本地转义 + `nvim.ex`，每条 4s 超时；**成功/失败都会用 `ui.notice` 明确告知**（"已打开：<路径>" / "⚠ 打开失败：<原因>"），
+  目录用 picker 列出来、
+  看完菜单会再弹一次；只有"通过/打回/取消"结束等待。
+- **打回**会再弹一个 picker 问原因（验收标准 / 测试用例 / 边界约束 / 方案 + 「其它」+ 「↩︎ 返回评审菜单」）；
+  选"其它"则把输入框预填 `打回原因：`，让你直接在对话里说；原因会记进 `mission.approval.note`。
+  **二级弹窗永远不是死路**：`Esc`/`q` 与末项「↩︎ 返回」等价——回到上级菜单且**什么都不决定**
+  （早期版本里 `Esc` 会变成"无理由打回"，已修）。目录浏览同样是一个可回退的栈：
+  进入子目录后 `Esc` 回到上一级目录，顶层 `Esc` 才回到评审菜单。
+- **卡片只当记录**（`ui.card` 渲染在会话 feed 里）：正文是上面那份清单，动作固定 **4 个且全是"查看"**——
+  nvim-tui 的卡片底部只渲染前 4 个动作（`feed.ts: actions.slice(0,4)`），把裁决放在第 5、6 位会**根本看不见**。
+- 等待上限 `reviewTimeoutMs`（默认 15 分钟）；超时/取消/`Esc` = **不通过**（卡片标注"未决定/已超时"），
+  并提示重新调用 `spec_approve` 即可再评审。
 
 两个键都是 host-only 之外的可覆盖项：`<repo>/.dsh/spec-gate.json` 可以写 `reviewChannel` / `reviewTimeoutMs`。
 
