@@ -19,6 +19,17 @@ export interface SpecGateConfig {
     logFile: string
     /** Per-workspace log file template (host-only), e.g. `~/.dsh/logs/{project}/spec-gate.log`. */
     logFileTemplate?: string
+    /**
+     * Which channel asks the human to review a specification.
+     *
+     * `auto` (default) prefers the host TUI's review card — it can open the
+     * requirement document and the test cases and take a rejection note in its
+     * input box — and falls back to the generic approval seam (headless, web,
+     * CI). `tui` refuses instead of falling back; `approval` always uses the seam.
+     */
+    reviewChannel: 'auto' | 'tui' | 'approval'
+    /** How long a review card waits for a verdict before giving up (fail closed). */
+    reviewTimeoutMs: number
     layout: LayoutOptions
     /** Deny write-class tools while the session's mission has no approved spec. */
     enforce: EnforceMode
@@ -90,6 +101,8 @@ export const PROJECT_OVERRIDABLE_KEYS: readonly string[] = [
     'boundaryExemptPaths',
     'requireTestDesign',
     'approval',
+    'reviewChannel',
+    'reviewTimeoutMs',
 ]
 
 /** The resolved configuration plus where it came from. */
@@ -136,6 +149,11 @@ export function resolveEffectiveConfig(host: SpecGateConfig, layout: Layout, log
         requireTestDesign:
             typeof requireTestDesignRaw === 'boolean' ? requireTestDesignRaw : requireTestDesignRaw === 'auto' ? 'auto' : host.requireTestDesign,
         approval: raw['approval'] === 'seam' || raw['approval'] === 'auto' ? raw['approval'] : host.approval,
+        reviewChannel:
+            raw['reviewChannel'] === 'tui' || raw['reviewChannel'] === 'approval' || raw['reviewChannel'] === 'auto'
+                ? raw['reviewChannel']
+                : host.reviewChannel,
+        reviewTimeoutMs: Math.max(1_000, Math.floor(num(raw['reviewTimeoutMs'], host.reviewTimeoutMs))),
     }
     logger?.info(
         `spec-gate: 使用项目级配置 ${file.file}（enforce=${config.enforce}; boundaries=${config.enforceBoundaries}; shellPolicy=${config.shellPolicy}; approval=${config.approval}）`,
@@ -161,6 +179,8 @@ export function resolveConfig(input: unknown): SpecGateConfig {
         enabled: bool(raw['enabled'], true),
         logFile: str(raw['logFile'], '~/.dsh/spec-gate.log'),
         ...(typeof raw['logFileTemplate'] === 'string' && raw['logFileTemplate'] !== '' ? { logFileTemplate: raw['logFileTemplate'] } : {}),
+        reviewChannel: raw['reviewChannel'] === 'tui' ? 'tui' : raw['reviewChannel'] === 'approval' ? 'approval' : 'auto',
+        reviewTimeoutMs: Math.max(1_000, Math.floor(num(raw['reviewTimeoutMs'], 15 * 60_000))),
         layout: {
             ...(typeof raw['rootDir'] === 'string' ? { rootDir: raw['rootDir'] } : {}),
             ...(typeof raw['specsDir'] === 'string' ? { specsDir: raw['specsDir'] } : {}),

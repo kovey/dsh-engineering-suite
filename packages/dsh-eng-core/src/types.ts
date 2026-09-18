@@ -215,8 +215,30 @@ export interface MissionRecord {
     stage?: string
     /** Agent roles allowed to work on this mission (role-guard). */
     roles?: string[]
+    /**
+     * Human-review bookkeeping for the specification approval.
+     *
+     * The review is a LOOP: a rejection sends the model back to `spec_create`
+     * with the human's note, so the round number and the last outcome are what
+     * makes "第 2 次送审" visible to both sides.
+     */
+    approval?: MissionApproval
     /** Free-form labels. */
     labels?: string[]
+}
+
+/** Last human decision on a specification, plus the round it belongs to. */
+export interface MissionApproval {
+    /** `rejected` = 打回重写；`approved` = 本轮通过。 */
+    state: 'rejected' | 'approved'
+    /** 1-based submission round this decision closes. */
+    round: number
+    /** Decision time (epoch ms). */
+    at: number
+    /** Who decided (`approval` = the human through the seam, `auto` = configured auto). */
+    by: string
+    /** The human's note/reason, when they gave one. */
+    note?: string
 }
 
 /** Git state captured alongside evidence. */

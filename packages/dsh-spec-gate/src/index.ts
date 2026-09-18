@@ -80,6 +80,8 @@ export function apply(ctx: Context, config: unknown = {}): void {
             guard,
             testDesignMounted: () => context.tools.get('test_design_review') !== undefined,
             approval: () => context.get('approval') as ApprovalLike | undefined,
+            questions: () => context.get('userQuestions') as never,
+            nvimTui: () => context.get('nvim-tui') as never,
             logger,
         })
 

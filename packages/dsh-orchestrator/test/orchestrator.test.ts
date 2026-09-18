@@ -719,6 +719,7 @@ test('a WARN verdict becomes a declarative conditional edge when the host allows
     const strictId = missionIdOf(cwd)
     await orchestrate(strict, { action: 'advance', verdict: 'PASS' })
     assert.equal(missionIdOf(cwd), strictId)
+    await new Promise((resolve) => setTimeout(resolve, 5))
     strictStore.recordGate(strictId, { source: 'dsh-quality-gate', state: 'WARN', reason: 'lint failed', results: [] })
     const strictResult = await orchestrate(strict, { action: 'advance', verdict: 'PASS' })
     assert.match(strictResult, /回退|impl/)
@@ -732,6 +733,9 @@ test('a WARN verdict becomes a declarative conditional edge when the host allows
     await orchestrate(relaxed, { action: 'start' })
     const relaxedId = missionIdOf(relaxedCwd)
     await orchestrate(relaxed, { action: 'advance', verdict: 'PASS' })
+    // `<= enteredAt` counts as stale by design, so the gate must land in a later
+    // millisecond than the stage entry — otherwise this test is a coin flip.
+    await new Promise((resolve) => setTimeout(resolve, 5))
     relaxedStore.recordGate(relaxedId, { source: 'dsh-quality-gate', state: 'WARN', reason: 'lint failed', results: [] })
     const advanced = await orchestrate(relaxed, { action: 'advance', verdict: 'PASS' })
     assert.match(advanced, /delivery/)

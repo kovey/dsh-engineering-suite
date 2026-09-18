@@ -144,8 +144,10 @@ test('a rejected approval leaves the mission unwritable (fail closed)', async ()
     const fake = host({ approvalOutcome: 'rejected' })
     await fake.runTool('spec_create', DRAFT)
     const run = await fake.runTool('spec_approve', {})
-    assert.equal(run.isError, true)
-    assert.match(String(run.content), /审批被拒绝/)
+    // A rejection is a first-class review outcome, not a crash: the model gets
+    // the loop instructions instead of an opaque error.
+    assert.match(runText(run), /打回/)
+    assert.match(runText(run), /spec_create/)
     assert.match(fake.guardReason({ name: 'write', arguments: { file_path: 'src/server.ts' }, agent: fake.agent }) ?? '', /尚未审批/)
 })
 
@@ -398,7 +400,7 @@ test('the approval request carries the digest and the counts, not just a title (
     const request = fake.approvalRequests[0] as { reason?: string } | undefined
     assert.match(request?.reason ?? '', /摘要/)
     assert.match(request?.reason ?? '', /验收标准 2 条/)
-    assert.match(request?.reason ?? '', /测试用例 3 条/)
+    assert.match(request?.reason ?? '', /用例 3 条/)
 })
 
 test('spec_create with an unknown explicit missionId refuses instead of creating another mission (regression)', async () => {
@@ -652,4 +654,266 @@ test('denial counts are reported per workspace (regression)', async () => {
     const status = runText(await fake.runTool('spec_status', {}))
     assert.match(status, /拦截次数：本工作区 2 次/)
     assert.match(status, /合计 3 次/)
+})
+
+test('the approval prompt names both artifacts so the human can open them (regression)', async () => {
+    const fake = host({ approvalOutcome: 'allowed-once' })
+    await fake.runTool('spec_create', DRAFT)
+    await fake.runTool('spec_approve', {})
+    const reason = (fake.approvalRequests[0] as { reason?: string } | undefined)?.reason ?? ''
+    // The reviewer must not approve blind: both directories and both files.
+    assert.match(reason, /需求文档目录: \.dsh\/specs\//)
+    assert.match(reason, /测试用例目录: \.dsh\/missions\/[^/]+\//)
+    assert.match(reason, /需求文档: \.dsh\/specs\/[^)]+\.md（验收标准 \d+ 条）/)
+    assert.match(reason, /测试用例: \.dsh\/missions\/[^/]+\/test-design-review\.md（用例 \d+ 条/)
+    // …plus what each criterion and case actually says.
+    assert.match(reason, /AC-001/)
+    assert.match(reason, /TC-001/)
+    // …and what rejection means.
+    assert.match(reason, /第 1 次送审/)
+    assert.match(reason, /拒绝并在对话里说明要改什么/)
+    assert.match(reason, /\n/, 'multi-line: a UI can render it as a list')
+})
+
+test('a rejection records the round, asks what to change, and loops (regression)', async () => {
+    const cwd = tempWorkspace('spec-gate-loop-')
+    const asked: unknown[] = []
+    const fake = createFakeHost({
+        cwd,
+        approvalOutcome: 'rejected',
+        services: {
+            userQuestions: {
+                ask: async (request: unknown) => {
+                    asked.push(request)
+                    // Echo the caller's question id, like the real service does.
+                    const id = (request as { questions: { id: string }[] }).questions[0]?.id ?? ''
+                    return { answers: [{ id, selected: ['验收标准不全或不准确'], custom: '另外补一条 503 的用例' }] }
+                },
+            },
+        },
+    })
+    apply(fake.ctx as never, { logFile: path.join(cwd, 'spec-gate.log') })
+    await fake.runTool('spec_create', DRAFT)
+    const run = await fake.runTool('spec_approve', {})
+    const text = runText(run)
+
+    // The rejection is recorded with its round and the human's note.
+    const mission = new MissionStoreRegistry().for(cwd).active('session-1')
+    assert.equal(mission?.approval?.state, 'rejected')
+    assert.equal(mission?.approval?.round, 1)
+    assert.match(mission?.approval?.note ?? '', /验收标准不全或不准确/)
+    assert.match(mission?.approval?.note ?? '', /另外补一条 503 的用例/)
+    // The approval it reviewed is void, so no write path can slip through.
+    assert.equal(mission?.spec?.approvedAt, undefined)
+    assert.match(fake.guardReason({ name: 'write', arguments: { file_path: 'src/server.ts' }, agent: fake.agent }) ?? '', /尚未审批/)
+
+    // The human was asked through the host's question channel.
+    assert.equal(asked.length, 1)
+    const question = (asked[0] as { questions: { question: string; options?: unknown[] }[] }).questions[0]
+    assert.match(question?.question ?? '', /要改什么/)
+    assert.ok((question?.options ?? []).length >= 3)
+
+    // The model is told the note and the exact loop.
+    assert.match(text, /人工意见：验收标准不全或不准确；另外补一条 503 的用例/)
+    assert.match(text, /第 2 次/)
+
+    // The next submission is round 2 and can pass.
+    const again = host({ approvalOutcome: 'allowed-once', cwd })
+    await again.runTool('spec_create', DRAFT)
+    const second = await again.runTool('spec_approve', {})
+    assert.match(runText(second), /规格已审批/)
+    assert.match((again.approvalRequests[0] as { reason?: string })?.reason ?? '', /第 2 次送审/)
+})
+
+test('a rejection without a question channel still records and guides (regression)', async () => {
+    const cwd = tempWorkspace('spec-gate-loop-noq-')
+    const fake = createFakeHost({ cwd, approvalOutcome: 'rejected' })
+    apply(fake.ctx as never, { logFile: path.join(cwd, 'spec-gate.log') })
+    await fake.runTool('spec_create', DRAFT)
+    const text = runText(await fake.runTool('spec_approve', {}))
+    const mission = new MissionStoreRegistry().for(cwd).active('session-1')
+    assert.equal(mission?.approval?.state, 'rejected')
+    assert.equal(mission?.approval?.note, undefined)
+    assert.match(text, /打回/)
+    assert.match(text, /spec_create/)
+})
+
+/** A stand-in for nvim-tui's public ext API: records opens and fires actions. */
+function fakeTui(cwd: string) {
+    const ex: string[] = []
+    const notices: string[] = []
+    const cards: {
+        title: string
+        body: string
+        actions?: { label: string; value: string; kind?: string }[]
+        onAction?: (value: string) => void
+        updated: string[]
+        dismissed: boolean
+    }[] = []
+    const pickers: { title: string; items: { label: string; value: string }[] }[] = []
+    let pickAnswer: string | null = null
+    const api = {
+        version: '0.1.0',
+        capabilities: () => ({ card: true, float: true, picker: true }),
+        nvim: {
+            ex: async (cmd: string) => {
+                ex.push(cmd)
+            },
+            // nvim's own escaping, like the real layer.
+            call: async (fn: string) => (fn === 'fnameescape' ? 'escaped-by-nvim' : undefined),
+        },
+        ui: {
+            card: (opts: {
+                title: string
+                body: string
+                actions?: { label: string; value: string; kind?: string }[]
+                onAction?: (value: string) => void
+            }) => {
+                const record = { ...opts, updated: [] as string[], dismissed: false }
+                cards.push(record)
+                return {
+                    id: `card-${cards.length}`,
+                    update: (next: { title?: string; body?: string }) => record.updated.push(next.title ?? ''),
+                    dismiss: () => {
+                        record.dismissed = true
+                    },
+                }
+            },
+            picker: async (opts: { title: string; items: { label: string; value: string }[] }) => {
+                pickers.push(opts)
+                return pickAnswer
+            },
+            notice: (text: unknown) => notices.push(String(text)),
+        },
+    }
+    return { api, ex, cards, pickers, notices, setPick: (value: string | null) => { pickAnswer = value }, cwd }
+}
+
+test('the TUI review card opens both artifacts and takes the verdict (regression)', async () => {
+    const cwd = tempWorkspace('spec-gate-tui-')
+    const tui = fakeTui(cwd)
+    const fake = createFakeHost({ cwd, approvalOutcome: 'rejected', services: { 'nvim-tui': tui.api } })
+    apply(fake.ctx as never, { logFile: path.join(cwd, 'spec-gate.log'), approval: 'seam' })
+    await fake.runTool('spec_create', DRAFT)
+
+    // The card is rendered and the tool waits for a verdict.
+    const pending = fake.runTool('spec_approve', {})
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    assert.equal(tui.cards.length, 1)
+    const card = tui.cards[0]!
+    assert.match(card.title, /规格审批（第 1 次送审）/)
+    assert.match(card.body, /需求文档: \.dsh\/specs\//)
+    assert.match(card.body, /测试用例: \.dsh\/missions\//)
+    assert.deepEqual(
+        card.actions?.map((action) => action.value),
+        ['spec:open-spec', 'spec:open-design', 'spec:list-specs', 'spec:list-design', 'spec:approve', 'spec:reject'],
+    )
+    assert.equal(card.actions?.find((action) => action.value === 'spec:reject')?.kind, 'input')
+
+    // Opening the spec does NOT decide anything: it opens a tab and keeps waiting.
+    card.onAction?.('spec:open-spec')
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    assert.equal(tui.ex.length, 1)
+    assert.equal(tui.ex[0], 'tabedit escaped-by-nvim', 'nvim escapes the path, we do not guess')
+    assert.equal(card.updated.length, 0, 'still pending')
+
+    // The test-design artifact is openable too.
+    card.onAction?.('spec:open-design')
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    assert.equal(tui.ex[1], 'tabedit escaped-by-nvim')
+
+    // Approving resolves the tool call and records the approval.
+    card.onAction?.('spec:approve')
+    const result = runText(await pending)
+    assert.match(result, /规格已审批/)
+    const mission = new MissionStoreRegistry().for(cwd).active('session-1')
+    assert.ok((mission?.spec?.approvedAt ?? 0) > 0)
+})
+
+test('the review card rejects with the note typed in the input box (regression)', async () => {
+    const cwd = tempWorkspace('spec-gate-tui-reject-')
+    const tui = fakeTui(cwd)
+    const fake = createFakeHost({ cwd, services: { 'nvim-tui': tui.api } })
+    apply(fake.ctx as never, { logFile: path.join(cwd, 'spec-gate.log'), approval: 'seam' })
+    await fake.runTool('spec_create', DRAFT)
+    const pending = fake.runTool('spec_approve', {})
+    await new Promise((resolve) => setTimeout(resolve, 10))
+
+    // An `input` action delivers the TYPED text — that is the rejection note.
+    tui.cards[0]?.onAction?.('验收标准少了 503 分支，用例也要补边界')
+    const text = runText(await pending)
+    const mission = new MissionStoreRegistry().for(cwd).active('session-1')
+    assert.equal(mission?.approval?.state, 'rejected')
+    assert.match(mission?.approval?.note ?? '', /验收标准少了 503 分支/)
+    assert.equal(mission?.spec?.approvedAt, undefined)
+    assert.match(text, /人工意见：验收标准少了 503 分支，用例也要补边界/)
+    assert.match(text, /第 2 次/)
+    // The card says what happened to it.
+    assert.match(tui.cards[0]?.updated.join(' ') ?? '', /已打回/)
+    // …and no generic approval prompt was raised on top of it.
+    assert.equal(fake.approvalRequests.length, 0)
+})
+
+test('the card can list a directory and open the chosen file (regression)', async () => {
+    const cwd = tempWorkspace('spec-gate-tui-browse-')
+    const tui = fakeTui(cwd)
+    const fake = createFakeHost({ cwd, services: { 'nvim-tui': tui.api } })
+    apply(fake.ctx as never, { logFile: path.join(cwd, 'spec-gate.log'), approval: 'seam' })
+    await fake.runTool('spec_create', DRAFT)
+    const pending = fake.runTool('spec_approve', {})
+    await new Promise((resolve) => setTimeout(resolve, 10))
+
+    tui.setPick(null) // cancel the picker: nothing opens, the review stays pending
+    tui.cards[0]?.onAction?.('spec:list-specs')
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    assert.equal(tui.pickers.length, 1)
+    assert.match(tui.pickers[0]?.title ?? '', /需求文档目录/)
+    assert.equal(tui.ex.length, 0)
+
+    // Choosing the file from the picker opens it.
+    const specFile = tui.pickers[0]!.items.find((item) => item.value.endsWith('.md'))
+    assert.ok(specFile !== undefined, `picker items: ${JSON.stringify(tui.pickers[0]?.items)}`)
+    tui.setPick(specFile!.value)
+    tui.cards[0]?.onAction?.('spec:list-specs')
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    assert.equal(tui.ex.length, 1)
+    assert.equal(tui.ex[0], 'tabedit escaped-by-nvim')
+
+    tui.cards[0]?.onAction?.('spec:approve')
+    assert.match(runText(await pending), /规格已审批/)
+})
+
+test('reviewChannel=approval forces the generic seam, tui refuses without the API (regression)', async () => {
+    const cwd = tempWorkspace('spec-gate-tui-off-')
+    const tui = fakeTui(cwd)
+    const forced = createFakeHost({ cwd, approvalOutcome: 'allowed-once', services: { 'nvim-tui': tui.api } })
+    apply(forced.ctx as never, { logFile: path.join(cwd, 'spec-gate.log'), approval: 'seam', reviewChannel: 'approval' })
+    await forced.runTool('spec_create', DRAFT)
+    await forced.runTool('spec_approve', {})
+    assert.equal(tui.cards.length, 0, 'no card when the host asked for the seam')
+    assert.equal(forced.approvalRequests.length, 1)
+
+    // reviewChannel=tui without the API is a configuration error, not a silent downgrade.
+    const other = tempWorkspace('spec-gate-tui-missing-')
+    const strict = createFakeHost({ cwd: other, approvalOutcome: 'allowed-once' })
+    apply(strict.ctx as never, { logFile: path.join(other, 'spec-gate.log'), approval: 'seam', reviewChannel: 'tui' })
+    await strict.runTool('spec_create', DRAFT)
+    const refused = await strict.runTool('spec_approve', {})
+    assert.equal(refused.isError, true)
+    assert.match(String(refused.content), /nvim-tui|reviewChannel/)
+    assert.equal(strict.approvalRequests.length, 0)
+})
+
+test('a review that nobody answers fails closed (regression)', async () => {
+    const cwd = tempWorkspace('spec-gate-tui-timeout-')
+    const tui = fakeTui(cwd)
+    const fake = createFakeHost({ cwd, services: { 'nvim-tui': tui.api } })
+    apply(fake.ctx as never, { logFile: path.join(cwd, 'spec-gate.log'), approval: 'seam', reviewTimeoutMs: 1_000 })
+    await fake.runTool('spec_create', DRAFT)
+    const pending = fake.runTool('spec_approve', {})
+    await new Promise((resolve) => setTimeout(resolve, 1_200))
+    const text = runText(await pending)
+    const mission = new MissionStoreRegistry().for(cwd).active('session-1')
+    assert.equal(mission?.spec?.approvedAt, undefined, 'a timeout is never an approval')
+    assert.match(text, /取消|超时|未/)
 })

@@ -30,6 +30,7 @@ import type {
     GateRecord,
     GateState,
     GitFingerprint,
+    MissionApproval,
     MissionRecord,
     MissionStatus,
     GateScope,
@@ -294,6 +295,28 @@ export class MissionStore {
     // --- gates ------------------------------------------------------------
 
     /** Record one gate run (also appended to the evidence ledger). */
+    /**
+     * Record one human decision on a specification (the approval loop).
+     * @param id - mission id.
+     * @param decision - outcome, round, decider and optional note.
+     * @returns the updated record, or `undefined` when the mission is unknown.
+     */
+    recordApproval(id: string, decision: MissionApproval): MissionRecord | undefined {
+        return this.update(id, (record) => ({
+            approval: decision,
+            // A rejection must also invalidate the approval it was reviewing,
+            // so every write path agrees that the mission is not approved.
+            ...(decision.state === 'rejected' && record.spec !== undefined
+                ? { spec: { ...record.spec, approvedAt: undefined, approvedBy: undefined, updatedAt: Date.now() } }
+                : {}),
+        }))
+    }
+
+    /** The 1-based round the next submission will be. */
+    nextApprovalRound(id: string): number {
+        return (this.read(id)?.approval?.round ?? 0) + 1
+    }
+
     recordGate(id: string, input: GateInput): GateRecord {
         const dir = this.artifactPath(id, 'gates')
         ensureDir(dir)

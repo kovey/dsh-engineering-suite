@@ -419,3 +419,31 @@ test('log templates offer readable project ids (regression)', () => {
         '~/.dsh/logs/workspace-deepseek-dsh-project/dsh-project-quality-gate.log',
     )
 })
+
+test('a rejection invalidates the approval it reviewed and advances the round (regression)', () => {
+    const cwd = workspace()
+    const store = storeFor(cwd)
+    const mission = store.create({ title: 'approval loop', cwd })
+    store.update(mission.id, () => ({
+        status: 'spec-approved',
+        spec: {
+            title: 't', background: '', requirements: [], acceptanceCriteria: [],
+            fileBoundaries: [], negativeConstraints: [], revision: 1,
+            createdAt: Date.now(), updatedAt: Date.now(), approvedAt: Date.now(), approvedBy: 'approval',
+        },
+    }))
+    assert.equal(store.nextApprovalRound(mission.id), 1)
+
+    const rejected = store.recordApproval(mission.id, { state: 'rejected', round: 1, at: Date.now(), by: 'approval', note: '验收标准不全' })
+    // The rejection clears the approval: every write path must agree the
+    // mission is not approved while the model revises.
+    assert.equal(rejected?.spec?.approvedAt, undefined)
+    assert.equal(rejected?.approval?.state, 'rejected')
+    assert.equal(rejected?.approval?.note, '验收标准不全')
+    assert.equal(store.nextApprovalRound(mission.id), 2)
+
+    const approved = store.recordApproval(mission.id, { state: 'approved', round: 2, at: Date.now(), by: 'approval' })
+    assert.equal(approved?.approval?.round, 2)
+    assert.equal(approved?.spec?.approvedAt, undefined, 'the tool sets approvedAt, not the recorder')
+    assert.equal(store.nextApprovalRound(mission.id), 3)
+})

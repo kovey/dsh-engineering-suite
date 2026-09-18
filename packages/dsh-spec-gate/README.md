@@ -14,6 +14,49 @@
   拒绝理由里带下一步该调用什么工具（理由写给模型看）。
 - **提示注入**：把规格契约与表格格式（`SPEC_FORMAT_HINT`）写进系统提示。
 
+## 审批是回路：先看工件，再决定
+
+`spec_approve` 送到审批 UI 的是一份**可核对清单**（`renderApprovalPrompt()`），不是一行摘要：
+
+```
+规格审批（第 2 次送审）：<标题>
+mission <id> · rev <n> · 摘要 <digest>
+
+需求文档目录: .dsh/specs/
+需求文档: .dsh/specs/<id>.md（验收标准 N 条）
+  · AC-001 …
+测试用例目录: .dsh/missions/<id>/
+测试用例: .dsh/missions/<id>/test-design-review.md（用例 M 条，未覆盖 K）
+  · TC-001 → AC-001：…
+```
+
+人工拒绝（或取消）时：
+
+1. 记 `mission.approval = { state:'rejected', round, by, note }`，**并清空 `spec.approvedAt`**——旧审批作废；
+2. 宿主装配了 `ctx.userQuestions` 时，自动问「要改什么？」（多选：验收标准 / 测试用例 / 边界与约束 / 方案 / 暂不批，可自由文本）；
+3. `spec_approve` 返回人工意见与三步回路：`spec_create` 修订 → `test_design_review` → 再 `spec_approve`（第 N+1 次）；
+   返回**不是错误**（拒绝是正常结果），但 mission 仍未审批，写操作保持关闭；
+4. `spec_status` 显示两份工件路径与 `审批记录`（第几次、通过/打回、时间、人工意见）。
+
+### 评审通道（`reviewChannel`）
+
+| 值 | 行为 |
+|---|---|
+| `auto`（默认） | 宿主提供 nvim-tui 扩展 API（`ctx.get('nvim-tui')`）时用**评审卡片**，否则回退通用审批 seam |
+| `tui` | 必须走卡片；服务缺失时**报错**而不是静默降级（"要么在 TUI 里评审，要么改配置"） |
+| `approval` | 始终走通用 seam（headless / web / CI） |
+
+**评审卡片**（`src/review.ts`，全部建立在 nvim-tui 的**公开**扩展 API 上，不需要改 TUI）：
+
+- `ui.card` 渲染进会话 feed：正文是上面那份清单，动作 `1-6`；
+- `1`/`2` 打开需求文档 / 测试用例（`nvim.call('fnameescape')` + `nvim.ex('tabedit …')`）；
+- `3`/`4` 用 `ui.picker` 列出两个目录（可下钻）并打开选中的文件；
+- **打开工件不决定审批**：卡片与等待保持，只有 `5`（通过，`kind:'confirm'`）或 `6`（打回，`kind:'input'`）结束；
+- `6` 走 TUI 输入框，输入的文字直接成为人工意见 → 记进 `mission.approval.note`；
+- 等待上限 `reviewTimeoutMs`（默认 15 分钟）；超时/取消 = **不通过**（卡片标注"已超时未决定"）。
+
+两个键都是 host-only 之外的可覆盖项：`<repo>/.dsh/spec-gate.json` 可以写 `reviewChannel` / `reviewTimeoutMs`。
+
 ## 项目级配置（同一个 dsh 进程服务多个仓库）
 
 profile 是上限，每个仓库可以用 `.dsh/spec-gate.json` 决定**自己**被管多严：

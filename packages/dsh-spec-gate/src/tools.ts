@@ -3,6 +3,8 @@
  * @module dsh-spec-gate/tools
  */
 
+import path from 'node:path'
+import { tuiReview, type NvimTuiLike, type ReviewArtifacts } from './review.js'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import {
     formatTime,
@@ -45,6 +47,32 @@ export interface ToolDeps {
     approval: () => ApprovalLike | undefined
     /** Plugin logger; `deps.logger.for(cwd)` routes a line to that workspace's file. */
     logger: Logger
+    /**
+     * The host's structured-question channel (`ctx.get('userQuestions')`), used
+     * to ask WHY a specification was rejected. Absent = rejections carry no note.
+     */
+    questions: () => QuestionsLike | undefined
+    /**
+     * The nvim-tui extension API (`ctx.get('nvim-tui')`), when the host is that
+     * TUI: the review card lives there (open the artifacts, type the note).
+     */
+    nvimTui: () => NvimTuiLike | undefined
+}
+
+/** Structural view of `@deepseek-ai/dsh-user-questions`' service. */
+interface QuestionsLike {
+    ask: (request: {
+        agent: AgentLike
+        signal?: AbortSignal
+        questions: {
+            id: string
+            question: string
+            detail?: string
+            header?: string
+            multiSelect?: boolean
+            options?: { label: string; description?: string }[]
+        }[]
+    }) => Promise<{ answers: { id: string; selected: string[]; custom?: string }[] }>
 }
 
 interface CreateArgs {
@@ -350,7 +378,14 @@ export function registerTools(
                         )
                     }
                 }
-                const approvedBy = await requestApproval(deps, exec, mission, args.note, effective)
+                const decision = await requestApproval(deps, exec, mission, args.note, effective)
+                if (typeof decision !== 'string') {
+                    // Rejected (or cancelled): record the round, keep the human's
+                    // note when the review card already collected one, and send the
+                    // model back to `spec_create`.
+                    return await handleRejection(deps, exec, mission, decision.outcome, decision.note ?? args.note)
+                }
+                const approvedBy = decision
                 const approved = store.update(mission.id, (record) => ({
                     status: 'spec-approved',
                     spec: record.spec === undefined ? undefined : { ...record.spec, approvedAt: Date.now(), approvedBy, updatedAt: Date.now() },
@@ -403,6 +438,20 @@ export function registerTools(
                 lines.push(
                     `latest gate: ${gate === undefined ? '(none)' : `${gate.state} by ${gate.source} — ${gate.reason}`}`,
                 )
+                // The two artifacts a human reviews, and how the review has gone
+                // so far: the approval is a loop, so its history is status.
+                const missionsDir = store.layout.missionsDir
+                lines.push(`需求文档: ${mission.specPath ?? `(未生成)`}`)
+                lines.push(`测试用例: ${path.relative(mission.cwd, path.join(missionsDir, mission.id, 'test-design-review.md'))}`)
+                lines.push(
+                    mission.approval === undefined
+                        ? '审批记录: 尚无（第 1 次送审还未决定）'
+                        : `审批记录: 第 ${mission.approval.round} 次 → ${
+                              mission.approval.state === 'approved' ? '通过' : '打回'
+                          }（by ${mission.approval.by}，${formatTime(mission.approval.at)}）${
+                              mission.approval.note === undefined ? '' : `；人工意见：${mission.approval.note}`
+                          }`,
+                )
                 lines.push(
                     `spec-gate 拦截次数：本工作区 ${deps.guard.denialsFor(store.layout.rootDir)} 次` +
                         `（进程内全部工作区合计 ${deps.guard.denials()} 次）`,
@@ -421,15 +470,185 @@ export function registerTools(
  * @returns the approver label recorded on the specification.
  * @throws when the approval is rejected, unavailable, or cancelled (fail closed).
  */
+/**
+ * What happens when the human rejects the specification.
+ *
+ * The review is a loop, so a rejection is a first-class outcome, not an error
+ * to swallow: the round is recorded (visible in `spec_status`), the human is
+ * asked what to change when the host has a question channel, and the model gets
+ * a result that names the exact next steps. Nothing here can approve anything —
+ * the mission simply stays unapproved until a later round passes.
+ */
+async function handleRejection(
+    deps: ToolDeps,
+    exec: unknown,
+    mission: MissionRecord,
+    outcome: string,
+    note?: string,
+): Promise<string> {
+    const store = deps.stores.for(mission.cwd)
+    const round = store.nextApprovalRound(mission.id)
+    const context = exec as { agent?: AgentLike; signal?: AbortSignal }
+    // The note may already exist (typed into the review card's input box); only
+    // ask again when the rejection arrived without one.
+    const reason = note ?? (await askWhatToChange(deps, context, mission))
+    const recorded = store.recordApproval(mission.id, {
+        state: 'rejected',
+        round,
+        at: Date.now(),
+        by: outcome === 'cancelled' ? 'cancelled' : 'approval',
+        ...(reason ?? note) === undefined ? {} : { note: (reason ?? note) as string },
+    })
+    const problems = deps.configFor(mission.cwd).problems ?? []
+    void problems
+    return [
+        outcome === 'cancelled'
+            ? `⏸️ 第 ${round} 次送审被取消（没有人给出决定）：mission ${mission.id} 仍未审批，写操作保持关闭。`
+            : `🛑 第 ${round} 次送审被人工打回：mission ${mission.id} 回到未审批状态（旧审批已作废）。`,
+        ...(reason === undefined ? [] : ['', `人工意见：${reason}`]),
+        '',
+        '下一步（必须走完才能再写代码）：',
+        '1. 按人工意见修改规格——重新调用 `spec_create`（带上修订后的验收标准/边界/负面约束/测试设计），旧审批与旧测试设计评审都会失效；',
+        '2. 调用 `test_design_review` 让测试设计重新通过；',
+        '3. 再调用 `spec_approve` 送审（第 ' + String(round + 1) + ' 次）。',
+        '如果人工意见不清楚，先用一问一答的方式问清楚要点，不要猜测后直接重写。',
+        ...(recorded === undefined ? [`（注意：mission ${mission.id} 的记录未找到）`] : []),
+    ].join('\n')
+}
+
+/**
+ * Ask the human what made them reject, through the host's question channel.
+ * @returns their note, or `undefined` when there is no channel / they skipped.
+ */
+async function askWhatToChange(
+    deps: ToolDeps,
+    context: { agent?: AgentLike; signal?: AbortSignal },
+    mission: MissionRecord,
+): Promise<string | undefined> {
+    const questions = deps.questions()
+    if (questions === undefined || context.agent === undefined) return undefined
+    try {
+        const answer = await questions.ask({
+            agent: context.agent,
+            ...(context.signal === undefined ? {} : { signal: context.signal }),
+            questions: [
+                {
+                    id: `spec-reject-${mission.id}`,
+                    header: '打回重写',
+                    question: `第 ${mission.id} 号规格要改什么？（可多选；也可直接在对话里说明）`,
+                    detail: '选完/输入后，模型会据此重写规格并重新送审。',
+                    multiSelect: true,
+                    options: [
+                        { label: '验收标准不全或不准确', description: '补充/修正「验收标准」条目' },
+                        { label: '测试用例不合格', description: '覆盖、步骤或预期结果需要重写' },
+                        { label: '文件边界/负面约束不对', description: '允许改动的范围需要调整' },
+                        { label: '方案本身要换', description: '实现思路或范围需要重新设计' },
+                        { label: '暂时不批，先别改', description: '保持草稿，等进一步指示' },
+                    ],
+                },
+            ],
+        })
+        const item = answer.answers.find((entry) => entry.id === `spec-reject-${mission.id}`)
+        if (item === undefined) return undefined
+        const parts = [...item.selected]
+        if (item.custom !== undefined && item.custom.trim() !== '') parts.push(item.custom.trim())
+        return parts.length === 0 ? undefined : parts.join('；')
+    } catch {
+        // A question channel that fails must never turn a rejection into an
+        // approval: fall through with no note.
+        return undefined
+    }
+}
+
+/** The workspace-relative spelling of a path (for prompts). */
+function relativePathOf(mission: MissionRecord, candidate: string): string {
+    return path.isAbsolute(candidate) ? path.relative(mission.cwd, candidate) || candidate : candidate
+}
+
+/** Absolute paths of everything a reviewer may want to open. */
+function reviewArtifactsOf(mission: MissionRecord, missionsDir: string): ReviewArtifacts {
+    const specAbs = path.isAbsolute(mission.specPath ?? '')
+        ? (mission.specPath as string)
+        : path.join(mission.cwd, mission.specPath ?? path.join('.dsh', 'specs', `${mission.id}.md`))
+    return {
+        specFile: specAbs,
+        designFile: path.join(missionsDir, mission.id, 'test-design-review.md'),
+        specsDir: path.dirname(specAbs),
+        missionDir: path.join(missionsDir, mission.id),
+    }
+}
+
+/**
+ * The text the human reads in the approval prompt.
+ *
+ * Two directories and two files, so a reviewer can open them (a UI may render
+ * the `需求文档:` / `测试用例:` lines as openable paths), the numbers that
+ * matter, and what rejection means — the review is a loop, not a one-shot.
+ */
+export function renderApprovalPrompt(mission: MissionRecord, round: number, missionsDir: string, note?: string): string {
+    const spec = mission.spec
+    const criteria = spec?.acceptanceCriteria ?? []
+    const cases = mission.testDesign?.cases ?? []
+    const uncovered = mission.testDesign?.uncovered ?? []
+    const relativeMissions = path.relative(mission.cwd, missionsDir) || missionsDir
+    const specFile = relativePathOf(mission, mission.specPath ?? `.dsh/specs/${mission.id}.md`)
+    const designFile = `${relativeMissions}/${mission.id}/test-design-review.md`
+    const lines = [
+        note === undefined ? `规格审批（第 ${round} 次送审）：${mission.title}` : `${note}（第 ${round} 次送审）`,
+        `mission ${mission.id} · rev ${spec?.revision ?? '?'} · 摘要 ${(mission.specDigest ?? '').slice(0, 12) || '?'}`,
+        '',
+        '需求文档目录: .dsh/specs/',
+        `需求文档: ${specFile}（验收标准 ${criteria.length} 条）`,
+        ...criteria.slice(0, 6).map((criterion) => `  · ${criterion.id} ${criterion.text}`),
+        ...(criteria.length > 6 ? [`  · …另有 ${criteria.length - 6} 条`] : []),
+        '',
+        `测试用例目录: ${relativeMissions}/${mission.id}/`,
+        `测试用例: ${designFile}（用例 ${cases.length} 条${uncovered.length === 0 ? '，覆盖全部验收标准' : `，未覆盖 ${uncovered.join('、')}`}）`,
+        ...cases.slice(0, 6).map((entry) => `  · ${entry.id} → ${entry.covers.join('、') || '(未标注)'}：${entry.expected.slice(0, 40)}`),
+        ...(cases.length > 6 ? [`  · …另有 ${cases.length - 6} 条`] : []),
+        '',
+        '通过：写操作放行。',
+        '不合格：拒绝并在对话里说明要改什么——规格会回到草稿，模型据此重写后再次送审（可反复多轮）。',
+    ]
+    return lines.join('\n')
+}
+
 async function requestApproval(
     deps: ToolDeps,
     exec: unknown,
     mission: MissionRecord,
     note: string | undefined,
     config: SpecGateConfig,
-): Promise<string> {
+): Promise<string | { outcome: string; note?: string }> {
     if (config.approval === 'auto') return 'auto'
     const context = exec as { agent?: AgentLike; signal?: AbortSignal }
+    const missionsDir = deps.stores.for(mission.cwd).layout.missionsDir
+    const roundForReview = deps.stores.for(mission.cwd).nextApprovalRound(mission.id)
+
+    // Preferred channel: the host TUI's own card UI (nvim-tui's public ext API),
+    // which can OPEN the artifacts and take the rejection note in its input box.
+    const tui = deps.nvimTui()
+    if (config.reviewChannel !== 'approval' && tui !== undefined) {
+        const outcome = await tuiReview({
+            api: tui,
+            ...(sessionIdOf(context.agent) === undefined ? {} : { sessionId: sessionIdOf(context.agent) as string }),
+            title: `规格审批（第 ${roundForReview} 次送审）：${mission.title}`,
+            body: renderApprovalPrompt(mission, roundForReview, missionsDir, note),
+            artifacts: reviewArtifactsOf(mission, missionsDir),
+            ...(context.signal === undefined ? {} : { signal: context.signal }),
+            timeoutMs: config.reviewTimeoutMs,
+        })
+        if (outcome.decision === 'approved') return 'approval'
+        if (outcome.decision === 'rejected') return { outcome: 'rejected', ...(outcome.note === undefined ? {} : { note: outcome.note }) }
+        if (outcome.decision === 'cancelled') return { outcome: 'cancelled' }
+        // `unavailable`: fall through to the generic seam below.
+    }
+    if (config.reviewChannel === 'tui') {
+        throw new Error(
+            '规格审批未进行：reviewChannel=tui，但宿主没有可用的 nvim-tui 扩展 API（ctx.get("nvim-tui")）。' +
+                '请把 reviewChannel 改回 auto/approval，或在 TUI 里运行。（mission ' + mission.id + '）',
+        )
+    }
     const approval = deps.approval()
     if (approval === undefined) {
         throw new Error(
@@ -437,19 +656,15 @@ async function requestApproval(
                 `请让人类审批后把 approval 改为 auto，或装配审批插件。（mission ${mission.id}）`,
         )
     }
-    const spec = mission.spec
-    const detail = [
-        `mission ${mission.id}：${mission.title}`,
-        `规格 rev ${spec?.revision ?? '?'}，摘要 ${(mission.specDigest ?? '').slice(0, 12) || '?'}`,
-        `验收标准 ${spec?.acceptanceCriteria.length ?? 0} 条，测试用例 ${mission.testDesign?.cases.length ?? 0} 条（未覆盖 ${mission.testDesign?.uncovered.length ?? 0}）`,
-        `工件 ${mission.specPath ?? '.dsh/specs/<id>.md'}`,
-    ].join('；')
+    const round = deps.stores.for(mission.cwd).nextApprovalRound(mission.id)
     const outcome = await approval.request({
         ...(context.agent === undefined ? {} : { agent: context.agent }),
         toolName: 'spec_approve',
-        reason: note === undefined ? `审批规格（${detail}）` : `${note}（${detail}）`,
+        // Multi-line on purpose: the human must be able to READ the two
+        // artifacts (and open them) before deciding, not approve blind.
+        reason: renderApprovalPrompt(mission, round, deps.stores.for(mission.cwd).layout.missionsDir, note),
         ...(context.signal === undefined ? {} : { signal: context.signal }),
     })
     if (outcome === 'allowed-once') return 'approval'
-    throw new Error(`规格审批被拒绝（outcome: ${outcome}）：mission ${mission.id} 仍不可写。`)
+    return { outcome } as never
 }
