@@ -171,12 +171,26 @@ bash scripts/e2e-mission.sh          # 建立隔离 profile、起 stub、跑一�
 | **日志文件** | ✓ 两种模式：默认单文件但**行内带项目名**（可 grep）；配 `logFileTemplate`（host-only，如 `~/.dsh/logs/{projectPath}/quality-gate.log`，`{projectPath}` 完全可读 / `{project}` 短哈希 / `{basename}` 仅目录名）则**按项目分文件**，未绑定工作区的行仍进 `logFile` |
 | `role-guard` / `orchestrator` | 按用户决定本轮不动（角色文件与阶段工件本身就是仓库自带工件） |
 
+## 附一之三：存量项目接入（`spec_bootstrap`）的诚实边界
+
+- **推断不是需求**：没有需求文档时，验收标准由代码面（导出函数/路由/CLI/已有测试名）推断，全部带 `[推断]`；
+  它描述"代码现在做了什么"，不等于"应该做什么"——必须由人确认后才是规格。
+- **索引有上限**：默认最多 4000 个文件、单文件 256 KiB，索引条目 40 条；超出会截断并提示"用 glob/grep 自己继续找"。
+  扫描器只用于**索引与缺口**，不充当草稿的证据来源。
+- **语言覆盖**：Go / TypeScript / JavaScript / Python 的**浅层**符号与用例提取（正则级，不做类型解析）；
+  其它语言只会被计入 `stats.languages`，不产出符号。动态注册的路由/命令（运行时拼出来的）识别不到。
+- **模型读代码，插件只校验"形状"**：草稿由模型（当前 agent 或只读子代理）读代码后写出；插件检查解析、覆盖、
+  步骤长度与占位符，**不判断内容对不对**（"这条标准是否真的成立"仍需人工过目）。
+- **草稿不是审批**：`.dsh/bootstrap/<stamp>/spec-draft.md` 不写 mission、不签发门禁记录、不产生回执；
+  脚手架里的 `[待确认]` 占位会被 `test_design_review` 拒绝（刻意）。
+- **没有"自动补齐到通过"**：套件不会为了让你过关而降低标准；草稿 → 人工确认 → 审批这条链一步都不能省。
+
 ## 附二：项目级配置的完整键表（一个 dsh 进程服务多个仓库）
 
 | 文件 | 可覆盖（人类提交在仓库里） | 拒绝并记日志（profile 是上限） |
 |---|---|---|
 | `<repo>/.dsh/quality-gate.json` | `commands`（替换）、`limits.maxChangedFiles`、`defaultTimeoutMs`、`maxOutputBytes`、`writeTools`、`turnStop.{enabled,maxBlocksPerTurn}`、`afterWrite.{enabled,blockOnFailure,maxPerTurn}` | `enabled`、`logFile`、布局 |
-| `<repo>/.dsh/spec-gate.json` | `enforce`、`enforceBoundaries`、`writeTools`、`shellTools`、`shellPolicy`、`boundaryExemptPaths`、`requireTestDesign`、`approval` | `enabled`、`logFile`、`rootDir`/`specsDir`/`missionsDir` |
+| `<repo>/.dsh/spec-gate.json` | `enforce`、`enforceBoundaries`、`writeTools`、`shellTools`、`shellPolicy`、`boundaryExemptPaths`、`requireTestDesign`、`approval`、`reviewChannel`、`reviewTimeoutMs`、`bootstrap` | `enabled`、`logFile`、`rootDir`/`specsDir`/`missionsDir` |
 | `<repo>/.dsh/evidence-gate.json` | `requiredEvidenceKinds`、`requireGate`、`gateSource`、`requireCleanTree`、`maxGateAgeMinutes`、`maxOutputTail` | `enabled`、`logFile`、布局、**`allowForceOverride`**（它放松的是模型能主动传的 `force`）、`prompt` |
 | `<repo>/.dsh/audit-trail.json` | `snapshot.{enabled,maxFileBytes,maxFilesPerTurn}`、`writeTools`、`trackTools`、`ignoreTools`、`maxArgsSummary`、`maxResultTail`、`redactArgs` | `enabled`、`logFile`、`auditDir`/`rootDir`/`stateDir`、`prompt` |
 | `<repo>/.dsh/test-design-gate.json` | `minTextLength`、`strict`、`allowDanglingCase`、`requireAllScenarios` | `enabled`、`logFile`、布局、`prompt` |

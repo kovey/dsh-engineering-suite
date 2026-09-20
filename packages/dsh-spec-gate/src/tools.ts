@@ -1,5 +1,6 @@
 /**
- * The model-facing tool surface: `spec_create`, `spec_approve`, `spec_status`.
+ * The model-facing tool surface: `spec_create`, `spec_approve`, `spec_status`,
+ * `spec_bootstrap`.
  * @module dsh-spec-gate/tools
  */
 
@@ -7,22 +8,79 @@ import path from 'node:path'
 import { tuiReview, type NvimTuiLike, type ReviewArtifacts } from './review.js'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import {
+    ensureDir,
     formatTime,
     parentSessionIdOf,
+    scanGaps,
+    scanWorkspace,
     sessionIdOf,
     sha256,
     specReviewDigest,
+    writeJsonAtomic,
+    writeTextAtomic,
     type AgentLike,
+    type GapReport,
     type MissionRecord,
     type MissionStoreRegistry,
+    type ScanResult,
 } from 'dsh-eng-core'
 import type { Logger } from 'dsh-eng-core'
+import { buildIndex, checkDraft, parseDraftAnswer, renderBrief, renderDraft } from './bootstrap.js'
 import type { SpecGateConfig } from './config.js'
 import type { WriteGuard } from './guard.js'
 import { describeConstraints } from './constraints.js'
 import { buildSpec, describeMission, parseDraftTestDesign, renderSpec, validateDraft, type SpecDraft } from './spec.js'
 
 const TEXT_OUTPUT = { type: 'string' } as const
+
+/**
+ * The deterministic evidence report.
+ *
+ * A gap report is what makes bootstrapping honest: it says what the repository
+ * HAS, what the specification would be missing, and where each finding came
+ * from — no prose, no model, nothing to approve.
+ */
+function renderScanReport(scan: ScanResult, gaps: GapReport, notes?: string): string {
+    const languages = Object.entries(scan.stats.languages)
+        .sort((a, b) => b[1] - a[1])
+        .map(([language, files]) => `${language} ${files}`)
+        .join('、')
+    return [
+        '## 工作区扫描（spec_bootstrap · scan）',
+        '',
+        `扫描文件 ${scan.stats.filesScanned} 个${scan.stats.truncated ? '（已达上限，结果被截断）' : ''}${languages === '' ? '' : `；语言：${languages}`}`,
+        `构建文件：${scan.buildFiles.join(', ') || '(未识别)'}`,
+        `需求文档 ${scan.requirements.length} 份、代码符号 ${scan.symbols.length} 个、测试文件 ${scan.tests.length} 个（用例名 ${scan.tests.reduce((total, file) => total + file.cases.length, 0)} 个）`,
+        '',
+        '### 识别到的验证命令',
+        '',
+        ...(scan.suggestedCommands.length === 0
+            ? ['- (未识别：请在 `.dsh/quality-gate.json` 里声明门禁命令)']
+            : scan.suggestedCommands.map(
+                  (command) => `- \`${command.command}\`（${command.phase}${command.required ? '，必需' : ''}）`,
+              )),
+        '',
+        '### 需求文档',
+        '',
+        ...(scan.requirements.length === 0
+            ? ['- (没有找到需求类文档：验收标准只能从代码推断，会全部标 `[推断]`)']
+            : scan.requirements.map((doc) => `- ${doc.path}${doc.title === undefined ? '' : ` — ${doc.title}`}（候选条目 ${doc.candidates.length}）`)),
+        '',
+        '### 缺口',
+        '',
+        `- 无用例的验收标准：${gaps.criteriaWithoutCases.length} 条`,
+        ...gaps.criteriaWithoutCases.slice(0, 10).map((gap) => `  - ${gap.id} ${gap.text}`),
+        `- 步骤/预期过短的用例：${gaps.casesWithThinSteps.length} 条`,
+        ...gaps.casesWithThinSteps.slice(0, 10).map((gap) => `  - ${gap.id}（${gap.reason}）`),
+        `- 覆盖了不存在验收标准的用例：${gaps.testsWithoutCriteria.length} 条`,
+        `- 没有任何用例覆盖的代码面：${gaps.uncoveredSymbols.length} 个`,
+        ...gaps.uncoveredSymbols.slice(0, 15).map((symbol) => `  - ${symbol.kind} ${symbol.name} — ${symbol.path}:${symbol.line}`),
+        `- 缺失的工件：${gaps.missingArtifacts.join('、') || '(无)'}`,
+        '',
+        ...(notes === undefined || notes.trim() === '' ? [] : [`人工补充说明：${notes.trim()}`, '']),
+        '下一步：`spec_bootstrap({ action: "draft" })` 依据这些证据生成规格草稿（草稿仍需 `spec_create` → `test_design_review` → `spec_approve`）。',
+    ].join('\n')
+}
 
 /** Minimal structural view of `ctx.approval`. */
 export interface ApprovalLike {
@@ -57,6 +115,8 @@ export interface ToolDeps {
      * TUI: the review card lives there (open the artifacts, type the note).
      */
     nvimTui: () => NvimTuiLike | undefined
+    /** `ctx.get('subagents')`, used to dispatch the READ-ONLY drafting child. */
+    subagents: () => SubagentsLike | undefined
 }
 
 /** Structural view of `@deepseek-ai/dsh-user-questions`' service. */
@@ -93,6 +153,51 @@ interface ApproveArgs {
 
 interface StatusArgs {
     missionId?: string
+}
+
+interface BootstrapArgs {
+    action?: 'brief' | 'draft' | 'check'
+    acceptanceCriteria?: string[]
+    testDesign?: string
+    missionId?: string
+    focus?: string
+    maxCases?: number
+}
+
+/** Minimal structural view of `ctx.subagents`. */
+interface SubagentsLike {
+    start: (
+        provider: string,
+        request: {
+            label?: string
+            prompt: { type: 'text'; text: string }[]
+            parent: never
+            signal: AbortSignal
+            toolFilter?: { allow?: readonly string[]; deny?: readonly string[] }
+            persona?: string
+            maxDepth?: number
+        },
+    ) => Promise<{
+        id: string
+        result: Promise<{ stopReason?: string; output?: { type?: string; text?: string }[]; diagnostic?: string }>
+        dispose?: () => Promise<void>
+    }>
+}
+
+/** Bound one child-agent run so a stuck draft cannot wedge the tool call. */
+async function withDeadline<T>(work: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+        return await Promise.race([
+            work,
+            new Promise<never>((_resolve, reject) => {
+                timer = setTimeout(() => reject(new Error(`${label} 超时（${timeoutMs}ms）`)), Math.max(1_000, timeoutMs))
+                timer.unref?.()
+            }),
+        ])
+    } finally {
+        if (timer !== undefined) clearTimeout(timer)
+    }
 }
 
 function agentOf(exec: unknown): AgentLike | undefined {
@@ -460,6 +565,212 @@ export function registerTools(
             },
         }),
         'spec_status',
+    )
+
+    register(
+        defineTool({
+            name: 'spec_bootstrap',
+            description:
+                'Bootstrap a specification for a repository that already exists. The MODEL reads the code: `action:"brief"` returns the authoring contract (acceptance criteria + the test-design table with 前置条件/操作步骤/预期结果) plus a read-only index of where to look and the known gaps — then you read the repository with your own read/grep/glob and write the draft. `action:"draft"` does the same through a READ-ONLY CHILD agent (its tool filter has no write/edit/bash), returning the draft it produced. `action:"check"` validates an authored draft before you submit it: unparsable rows, acceptance criteria without cases, steps shorter than the minimum, leftover placeholders. A draft is never an approval — it still goes through spec_create → test_design_review → spec_approve.',
+            parameters: {
+                action: {
+                    type: 'string',
+                    enum: ['brief', 'draft', 'check'],
+                    required: true,
+                    description: 'brief = contract + index for you to write; draft = the same task handed to a read-only child agent; check = validate a draft.',
+                },
+                acceptanceCriteria: {
+                    type: 'array',
+                    items: { type: 'string' },
+                    description: 'check: the criteria lines (`AC-001 …`).',
+                },
+                testDesign: { type: 'string', description: 'check: the `## 测试设计` markdown (three scenario sections, five columns).' },
+                missionId: { type: 'string', description: 'Compare against this mission (default: the session mission, if any).' },
+                focus: { type: 'string', description: 'Extra focus for the drafting child (e.g. "重点补 HTTP 层").' },
+                maxCases: { type: 'integer', description: 'Upper bound on cases (default: host config).' },
+            },
+            output: { schema: TEXT_OUTPUT, render: (_args, value) => [{ type: 'text', text: value }] },
+            async execute(args: BootstrapArgs = {} as BootstrapArgs, exec) {
+                const agent = agentOf(exec)
+                const cwd = declaredCwdOf(agent)
+                const config = effectiveFor(deps, agent)
+                if (!config.bootstrap.enabled) {
+                    throw new Error('spec_bootstrap 已被宿主禁用（bootstrap.enabled=false）')
+                }
+                const store = deps.stores.for(cwd)
+                const mission = resolveStrict(deps, exec, args.missionId)
+
+                // `check` needs no scan: it validates what the caller wrote.
+                if (args.action === 'check') {
+                    const criteria = args.acceptanceCriteria ?? []
+                    const design = args.testDesign ?? ''
+                    if (criteria.length === 0 || design.trim() === '') {
+                        throw new Error('check 需要同时给出 acceptanceCriteria（`AC-001 …` 行数组）与 testDesign（`## 测试设计` Markdown）')
+                    }
+                    const check = checkDraft({ acceptanceCriteria: criteria, testDesign: design, minTextLength: config.bootstrap.minTextLength })
+                    return [
+                        check.ok
+                            ? `✅ 草稿通过自查：验收标准 ${check.criteria.length} 条、用例 ${check.cases} 条，每个 AC 都有用例覆盖，步骤/预期长度达标。`
+                            : `❌ 草稿还有 ${check.findings.length} 个问题（改完再 spec_create）：`,
+                        '',
+                        ...check.findings.map((finding) => `- [${finding.kind}] ${finding.detail}`),
+                        ...(check.ok ? ['', '下一步：`spec_create`（把两段内容原样填入）→ `test_design_review` → `spec_approve`。'] : []),
+                    ].join('\n')
+                }
+
+                const scan = scanWorkspace({ cwd, ...(deps.logger === undefined ? {} : { logger: deps.logger }) })
+                const gaps = scanGaps({
+                    scan,
+                    ...(mission?.spec === undefined ? {} : { spec: mission.spec }),
+                    ...(mission?.testDesign === undefined ? {} : { testDesign: mission.testDesign }),
+                })
+                const { brief } = buildIndex(scan, gaps, config.bootstrap.maxIndexEntries)
+                const briefText = renderBrief(brief, cwd)
+
+                if (args.action === 'brief') {
+                    return briefText
+                }
+
+                // `draft`: hand the SAME task to a read-only child agent, so the
+                // repository is read by a model with full tool agency instead of
+                // being pre-digested into a summary here.
+                const subagents = deps.subagents()
+                if (subagents === undefined) {
+                    throw new Error(
+                        '宿主没有装配子代理服务（ctx.subagents）：无法派发只读草稿代理。\n' +
+                            '下一步：改用 `spec_bootstrap({ action: "brief" })` 自己读代码写草稿，或在宿主里装配子代理 provider。',
+                    )
+                }
+                const signal = (exec as { signal?: AbortSignal }).signal
+                const prompt = [
+                    `为下面这个已有代码、缺规格的仓库写一份**规格草稿**（验收标准 + 测试设计）。`,
+                    `工作目录：${cwd}`,
+                    '',
+                    briefText,
+                    ...(args.focus === undefined || args.focus.trim() === '' ? [] : ['', `额外关注：${args.focus.trim()}`]),
+                    '',
+                    '严格要求：**只读**——你可以读文件、搜索、列目录，但绝不能修改任何文件；',
+                    '最终回答只包含 DRAFT 的两段 Markdown（验收标准表 + 测试设计三场景表），不要解释过程。',
+                ].join('\n')
+                let child
+                try {
+                    child = await subagents.start(config.bootstrap.provider, {
+                        label: `规格草稿 · ${path.basename(cwd)}`,
+                        prompt: [{ type: 'text', text: prompt }],
+                        parent: agent as never,
+                        signal: signal ?? new AbortController().signal,
+                        toolFilter: { allow: [...config.bootstrap.readTools] },
+                        persona: [
+                            '你是规格草稿员：读代码、写可验证的验收标准与可执行的测试用例步骤。',
+                            '你只有只读工具：绝不修改文件，也不要尝试。',
+                            '证据不足就标注 [推断] 或 [待确认]，禁止发明行为。',
+                        ].join('\n'),
+                    })
+                } catch (error) {
+                    throw new Error(
+                        `派发只读草稿代理失败（provider ${config.bootstrap.provider}）：${(error as Error).message}\n` +
+                            '常见原因：白名单里写了当前部署不存在的全局工具名（scope-local 工具不能进 toolFilter）。\n' +
+                            '下一步：用 `spec_bootstrap({ action: "brief" })` 自己写，或修正 bootstrap.readTools/provider。',
+                    )
+                }
+                let answer = ''
+                let stopReason = 'unknown'
+                try {
+                    const settled = (await withDeadline(child.result, config.bootstrap.timeoutMs, '草稿代理')) as {
+                        stopReason?: unknown
+                        output?: { type?: unknown; text?: unknown }[]
+                        diagnostic?: unknown
+                    }
+                    stopReason = typeof settled.stopReason === 'string' ? settled.stopReason : 'unknown'
+                    answer = (settled.output ?? [])
+                        .filter((block) => block.type === 'text' && typeof block.text === 'string')
+                        .map((block) => block.text as string)
+                        .join('\n')
+                    if (answer.trim() === '') {
+                        const diagnostic = typeof settled.diagnostic === 'string' ? `（${settled.diagnostic}）` : ''
+                        throw new Error(`只读草稿代理没有返回文本${diagnostic}`)
+                    }
+                } finally {
+                    try {
+                        await child.dispose?.()
+                    } catch {
+                        // disposal must never mask the draft result
+                    }
+                }
+
+                const parsed = parseDraftAnswer(answer, { maxCases: args.maxCases ?? config.bootstrap.maxCases })
+                if ('problem' in parsed) {
+                    return [
+                        `❌ 只读草稿代理的输出不可用：${parsed.problem}`,
+                        '',
+                        '（没有退化成脚手架：草稿必须由读代码得出，不能由插件猜。）',
+                        '下一步：`spec_bootstrap({ action: "brief" })` 拿到契约后自己读代码写，或用 focus 参数再派一次。',
+                        '',
+                        '--- 代理原始输出（供排查）---',
+                        answer.slice(0, 4_000),
+                    ].join('\n')
+                }
+
+                const check = checkDraft({
+                    acceptanceCriteria: parsed.criteria.map((criterion) => `${criterion.id} ${criterion.text}`),
+                    testDesign: parsed.designMarkdown,
+                    minTextLength: config.bootstrap.minTextLength,
+                })
+
+                const draft: SpecDraft = {
+                    title: `补齐规格：${path.basename(cwd)}`,
+                    background: [
+                        '由只读草稿代理读代码后生成（spec_bootstrap）。',
+                        `需求文档 ${scan.requirements.length} 份；代码符号索引 ${scan.symbols.length} 个；已有测试文件 ${scan.tests.length} 个。`,
+                        ...(scan.requirements.length === 0 ? ['仓库里没有需求文档：条目由代码推断，请人工确认带 [推断] 的部分。'] : []),
+                    ].join('\n'),
+                    requirements: [],
+                    acceptanceCriteria: parsed.criteria.map((criterion) => `${criterion.id} ${criterion.text}`),
+                    fileBoundaries: [],
+                    negativeConstraints: [],
+                    testDesignMarkdown: parsed.designMarkdown,
+                }
+
+                const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+                const dir = path.join(store.layout.rootDir, 'bootstrap', stamp)
+                const markdown = renderDraft(draft, {
+                    source: `只读草稿代理（${config.bootstrap.provider}，stopReason=${stopReason}）`,
+                    findings: check.findings.map((finding) => `[${finding.kind}] ${finding.detail}`),
+                })
+                let written: string | undefined
+                try {
+                    ensureDir(dir)
+                    writeTextAtomic(path.join(dir, 'spec-draft.md'), markdown)
+                    writeJsonAtomic(path.join(dir, 'spec-draft.json'), { source: 'subagent', stopReason, draft, findings: check.findings })
+                    written = path.join(dir, 'spec-draft.md')
+                    deps.logger?.for(cwd).info(`spec_bootstrap: 草稿已写入 ${written}（子代理 ${stopReason}）`)
+                } catch (error) {
+                    check.findings.push({ kind: 'shape', detail: `草稿落盘失败（${(error as Error).message}）：内容仍在下面的输出里` })
+                }
+
+                return [
+                    `## 规格草稿（只读子代理读代码生成 · ${config.bootstrap.provider} · ${stopReason}）`,
+                    ...(written === undefined ? [] : [`落盘：${written}（同目录还有 spec-draft.json）`]),
+                    '',
+                    ...(check.ok
+                        ? ['✅ 自查通过：每个 AC 都有用例覆盖，步骤/预期长度达标。']
+                        : [`⚠️ 自查还有 ${check.findings.length} 个问题：`, '', ...check.findings.map((finding) => `- [${finding.kind}] ${finding.detail}`)]),
+                    '',
+                    '⚠️ 这是草稿、没有任何审批效力。下一步：按上面问题修正 → `spec_create` → `test_design_review` → `spec_approve`。',
+                    '',
+                    '### 验收标准',
+                    '',
+                    '| 编号 | 验收标准 |',
+                    '|------|----------|',
+                    ...parsed.criteria.map((criterion) => `| ${criterion.id} | ${criterion.text} |`),
+                    '',
+                    '### 测试设计',
+                    '',
+                    parsed.designMarkdown,
+                ].join('\n')
+            },
+        }),
+        'spec_bootstrap',
     )
 
     return { disposers, registered, failed, ...(registrationError === undefined ? {} : { lastError: registrationError }) }

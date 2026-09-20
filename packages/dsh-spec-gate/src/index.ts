@@ -82,6 +82,9 @@ export function apply(ctx: Context, config: unknown = {}): void {
             approval: () => context.get('approval') as ApprovalLike | undefined,
             questions: () => context.get('userQuestions') as never,
             nvimTui: () => context.get('nvim-tui') as never,
+            // Drafting dispatches a READ-ONLY child agent (`spec_bootstrap`);
+            // every gate decision in this plugin stays deterministic.
+            subagents: () => context.get('subagents') as never,
             logger,
         })
 

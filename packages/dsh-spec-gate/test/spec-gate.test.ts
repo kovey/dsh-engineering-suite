@@ -63,7 +63,7 @@ test('the plugin declares its name and required services', () => {
 
 test('apply() registers the three tools, the guard and the prompt section', () => {
     const fake = host()
-    assert.deepEqual([...fake.tools.keys()].sort(), ['spec_approve', 'spec_create', 'spec_status'])
+    assert.deepEqual([...fake.tools.keys()].sort(), ['spec_approve', 'spec_bootstrap', 'spec_create', 'spec_status'])
     assert.equal(fake.guards.length, 1)
     assert.deepEqual(
         fake.sections.map((section) => section.name),
@@ -1248,4 +1248,267 @@ test('the browse popup walks back out one level at a time (regression)', async (
         (tui.pickers[1]?.items ?? []).some((item) => item.label.includes('返回评审菜单')),
         'the top listing says how to leave',
     )
+})
+
+// ---------------------------------------------------------------------------
+// spec_bootstrap: the MODEL reads the code; the plugin owns contract + check
+// ---------------------------------------------------------------------------
+
+/** A scripted read-only drafting child: records the dispatch, answers once. */
+function fakeSubagents(answer: string | (() => Promise<never>)) {
+    const calls: { provider: string; request: { toolFilter?: { allow?: readonly string[] }; prompt: { text: string }[] } }[] = []
+    const disposed: string[] = []
+    let counter = 0
+    const service = {
+        start: async (provider: string, request: { toolFilter?: { allow?: readonly string[] }; prompt: { text: string }[] }) => {
+            calls.push({ provider, request })
+            const id = `run-${(counter += 1)}`
+            return {
+                id,
+                result:
+                    typeof answer === 'function'
+                        ? answer()
+                        : Promise.resolve({ stopReason: 'completed', output: [{ type: 'text', text: answer }] }),
+                dispose: async () => {
+                    disposed.push(id)
+                },
+            }
+        },
+    }
+    return { service, calls, disposed }
+}
+
+/** A legacy repository: requirement doc + code + one test, no spec at all. */
+function legacyRepo(): string {
+    const cwd = tempWorkspace('spec-gate-legacy-')
+    fs.mkdirSync(path.join(cwd, 'docs'), { recursive: true })
+    fs.writeFileSync(
+        path.join(cwd, 'README.md'),
+        ['# 图片爬虫', '', '## 功能需求', '', '- 支持按页面地址抓取图片', '- 支持按描述分类落盘'].join('\n'),
+    )
+    fs.writeFileSync(path.join(cwd, 'docs', 'design.md'), ['# 设计', '', '## 要求', '', '- 单次抓取不超过 100 张'].join('\n'))
+    fs.writeFileSync(path.join(cwd, 'go.mod'), 'module spider\n\ngo 1.26\n')
+    fs.mkdirSync(path.join(cwd, 'internal', 'crawler'), { recursive: true })
+    fs.writeFileSync(
+        path.join(cwd, 'internal', 'crawler', 'crawl.go'),
+        ['package crawler', '', 'func Fetch(url string) ([]byte, error) { return nil, nil }'].join('\n'),
+    )
+    fs.writeFileSync(
+        path.join(cwd, 'internal', 'crawler', 'crawl_test.go'),
+        ['package crawler', '', 'import "testing"', '', 'func TestFetch(t *testing.T) {', '\tt.Run("拒绝空地址", func(t *testing.T) {})', '}'].join('\n'),
+    )
+    return cwd
+}
+
+const DRAFT_ANSWER = [
+    '## 验收标准',
+    '',
+    '| 编号 | 验收标准 |',
+    '|------|----------|',
+    '| AC-001 | `go run ./cmd/spider -url <页面>` 能把页面里的图片抓到目标目录并写入清单 |',
+    '| AC-002 | `-url ""` 时进程以非 0 退出码结束且不写任何文件 |',
+    '',
+    '## 测试设计',
+    '',
+    '### 正向场景',
+    '',
+    '| 用例ID | 前置条件 | 操作步骤 | 预期结果 | 覆盖验收标准 |',
+    '|--------|----------|----------|----------|--------------|',
+    '| TC-001 | 本地有一个含 3 张图片的测试页面 | 执行 `go run ./cmd/spider -url http://127.0.0.1:8080/demo.html -out /tmp/out` | 退出码 0，/tmp/out 下有 3 个图片文件，清单文件包含这 3 条记录 | AC-001 |',
+    '',
+    '### 异常场景',
+    '',
+    '| 用例ID | 前置条件 | 操作步骤 | 预期结果 | 覆盖验收标准 |',
+    '|--------|----------|----------|----------|--------------|',
+    '| TC-002 | 无 | 执行 `go run ./cmd/spider -url ""` | 退出码非 0，stderr 含 "url is required"，目标目录未被创建 | AC-002 |',
+    '',
+    '### 边界场景',
+    '',
+    '| 用例ID | 前置条件 | 操作步骤 | 预期结果 | 覆盖验收标准 |',
+    '|--------|----------|----------|----------|--------------|',
+    '| TC-003 | 测试页面恰好有 100 张图片 | 执行 `go run ./cmd/spider -url http://127.0.0.1:8080/hundred.html -out /tmp/out100` | 100 张全部落盘，清单含 100 条记录，退出码 0 | AC-001 |',
+].join('\n')
+
+test('spec_bootstrap brief hands over the contract and where to look (regression)', async () => {
+    const cwd = legacyRepo()
+    const fake = createFakeHost({ cwd })
+    apply(fake.ctx as never, { logFile: path.join(cwd, 'spec-gate.log') })
+    const brief = runText(await fake.runTool('spec_bootstrap', { action: 'brief' }))
+
+    // The contract: what to write, and the rule that the MODEL reads the code.
+    assert.match(brief, /\| 用例ID \| 前置条件 \| 操作步骤 \| 预期结果 \| 覆盖验收标准 \|/)
+    assert.match(brief, /必须真的读代码/)
+    assert.match(brief, /禁止发明/)
+    // The index points at real files instead of summarising them.
+    assert.match(brief, /README\.md/)
+    assert.match(brief, /docs\/design\.md/)
+    assert.match(brief, /crawl_test\.go/)
+    assert.match(brief, /go test \.\/\.\.\./)
+    // Gaps: nothing is approved yet, so the missing spec is named.
+    assert.match(brief, /缺的工件：.*spec/)
+    assert.match(brief, /spec_bootstrap\(\{ action: "check"/)
+})
+
+test('spec_bootstrap draft dispatches a READ-ONLY child and validates what it returns (regression)', async () => {
+    const cwd = legacyRepo()
+    const child = fakeSubagents(DRAFT_ANSWER)
+    const fake = createFakeHost({ cwd, services: { subagents: child.service } })
+    apply(fake.ctx as never, { logFile: path.join(cwd, 'spec-gate.log') })
+    const out = runText(await fake.runTool('spec_bootstrap', { action: 'draft', focus: '重点补 HTTP 层' }))
+
+    // Least privilege by construction: the child cannot write anything.
+    assert.equal(child.calls.length, 1)
+    assert.deepEqual(child.calls[0]?.request.toolFilter?.allow, ['read', 'grep', 'glob'])
+    assert.equal(child.calls[0]?.request.toolFilter?.allow?.includes('write'), false)
+    assert.equal(child.calls[0]?.request.toolFilter?.allow?.includes('bash'), false)
+    const prompt = child.calls[0]?.request.prompt[0]?.text ?? ''
+    assert.match(prompt, /必须真的读代码/)
+    assert.match(prompt, /只读/)
+    assert.match(prompt, /重点补 HTTP 层/)
+    // The child is disposed even on the happy path.
+    assert.deepEqual(child.disposed, ['run-1'])
+
+    // The answer was parsed, validated and written as a DRAFT.
+    assert.match(out, /规格草稿（只读子代理读代码生成/)
+    assert.match(out, /✅ 自查通过/)
+    assert.match(out, /\| AC-001 \|/)
+    assert.match(out, /\| TC-001 \|/)
+    assert.match(out, /没有任何审批效力/)
+    const dir = path.join(cwd, '.dsh', 'bootstrap')
+    const stamps = fs.readdirSync(dir)
+    assert.equal(stamps.length, 1)
+    const markdown = fs.readFileSync(path.join(dir, stamps[0]!, 'spec-draft.md'), 'utf8')
+    assert.match(markdown, /## 验收标准/)
+    assert.match(markdown, /### 正向场景/)
+    assert.match(markdown, /还没有|没有任何审批效力/)
+    // A draft is not a specification: no mission, no spec artifact.
+    assert.equal(new MissionStoreRegistry().for(cwd).list().length, 0)
+    assert.equal(fs.existsSync(path.join(cwd, '.dsh', 'specs')), false)
+})
+
+test('spec_bootstrap draft surfaces the check findings instead of hiding them (regression)', async () => {
+    const cwd = legacyRepo()
+    // A child answer that parses but leaves an AC uncovered and a placeholder.
+    const weak = [
+        '## 验收标准',
+        '',
+        '| 编号 | 验收标准 |',
+        '|------|----------|',
+        '| AC-001 | 抓取能落盘 |',
+        '| AC-002 | 空地址报错 |',
+        '',
+        '## 测试设计',
+        '',
+        '### 正向场景',
+        '',
+        '| 用例ID | 前置条件 | 操作步骤 | 预期结果 | 覆盖验收标准 |',
+        '|--------|----------|----------|----------|--------------|',
+        '| TC-001 | [待确认] | [待确认] | [待确认] | AC-001 |',
+    ].join('\n')
+    const child = fakeSubagents(weak)
+    const fake = createFakeHost({ cwd, services: { subagents: child.service } })
+    apply(fake.ctx as never, { logFile: path.join(cwd, 'spec-gate.log') })
+    const out = runText(await fake.runTool('spec_bootstrap', { action: 'draft' }))
+
+    assert.match(out, /⚠️ 自查还有 \d+ 个问题/)
+    assert.match(out, /\[coverage\] AC-002 没有任何用例覆盖/)
+    assert.match(out, /\[placeholder\] TC-001 还留着占位符/)
+    assert.match(out, /\[steps\] TC-001 的操作步骤或预期结果过短/)
+    // The draft is still written (a human may want to fix it), the findings ride along.
+    const stamps = fs.readdirSync(path.join(cwd, '.dsh', 'bootstrap'))
+    const markdown = fs.readFileSync(path.join(cwd, '.dsh', 'bootstrap', stamps[0]!, 'spec-draft.md'), 'utf8')
+    assert.match(markdown, /自查发现的问题/)
+})
+
+test('spec_bootstrap refuses to invent a draft when the child is unusable (regression)', async () => {
+    // (a) The child returns prose that is not a draft: report it, write nothing.
+    const cwd = legacyRepo()
+    const chatty = fakeSubagents('这个仓库看起来是个爬虫，我觉得写得不错。')
+    const fake = createFakeHost({ cwd, services: { subagents: chatty.service } })
+    apply(fake.ctx as never, { logFile: path.join(cwd, 'spec-gate.log') })
+    const out = runText(await fake.runTool('spec_bootstrap', { action: 'draft' }))
+    assert.match(out, /只读草稿代理的输出不可用/)
+    assert.match(out, /没有退化成脚手架/)
+    assert.match(out, /--- 代理原始输出/)
+    assert.equal(fs.existsSync(path.join(cwd, '.dsh', 'bootstrap')), false, 'nothing is written for an unusable answer')
+
+    // (b) The child fails outright: the failure is reported, not swallowed.
+    const other = legacyRepo()
+    const broken = fakeSubagents(() => Promise.reject(new Error('child exploded')))
+    const failing = createFakeHost({ cwd: other, services: { subagents: broken.service } })
+    apply(failing.ctx as never, { logFile: path.join(other, 'spec-gate.log') })
+    const failed = await failing.runTool('spec_bootstrap', { action: 'draft' })
+    assert.equal(failed.isError, true)
+    assert.match(String(failed.content), /child exploded/)
+
+    // (c) No subagent service at all: point at the path that still works.
+    const bare = legacyRepo()
+    const noSub = createFakeHost({ cwd: bare })
+    apply(noSub.ctx as never, { logFile: path.join(bare, 'spec-gate.log') })
+    const refused = await noSub.runTool('spec_bootstrap', { action: 'draft' })
+    assert.equal(refused.isError, true)
+    assert.match(String(refused.content), /action: "brief"/)
+    // …and briefing still works without any child.
+    assert.match(runText(await noSub.runTool('spec_bootstrap', { action: 'brief' })), /必须真的读代码/)
+})
+
+test('spec_bootstrap check catches what spec_create would silently accept (regression)', async () => {
+    const cwd = legacyRepo()
+    const fake = createFakeHost({ cwd })
+    apply(fake.ctx as never, { logFile: path.join(cwd, 'spec-gate.log') })
+
+    // A good draft passes.
+    const good = runText(
+        await fake.runTool('spec_bootstrap', {
+            action: 'check',
+            acceptanceCriteria: ['AC-001 抓取能落盘并写清单', 'AC-002 空地址报错'],
+            testDesign: DRAFT_ANSWER.slice(DRAFT_ANSWER.indexOf('## 测试设计')),
+        }),
+    )
+    assert.match(good, /✅ 草稿通过自查/)
+
+    // Malformed criteria, an uncovered AC, thin steps and a leftover placeholder.
+    const bad = runText(
+        await fake.runTool('spec_bootstrap', {
+            action: 'check',
+            acceptanceCriteria: ['AC-001 抓取能落盘', '这条没有编号', 'AC-003 空地址报错'],
+            testDesign: [
+                '## 测试设计',
+                '',
+                '### 正向场景',
+                '',
+                '| 用例ID | 前置条件 | 操作步骤 | 预期结果 | 覆盖验收标准 |',
+                '|--------|----------|----------|----------|--------------|',
+                '| TC-001 | [待确认] | [待确认] | [待确认] | AC-001 |',
+            ].join('\n'),
+        }),
+    )
+    assert.match(bad, /\[shape\]/)
+    assert.match(bad, /\[coverage\] AC-003 没有任何用例覆盖/)
+    assert.match(bad, /\[steps\] TC-001/)
+    assert.match(bad, /\[placeholder\] TC-001/)
+    assert.match(bad, /改完再 spec_create/)
+
+    // Missing inputs is a caller error, not a silent pass.
+    const incomplete = await fake.runTool('spec_bootstrap', { action: 'check' })
+    assert.equal(incomplete.isError, true)
+})
+
+test('spec_bootstrap can be disabled, and never touches the mission ledger (regression)', async () => {
+    const cwd = legacyRepo()
+    const fake = createFakeHost({ cwd })
+    apply(fake.ctx as never, { logFile: path.join(cwd, 'spec-gate.log'), bootstrap: { enabled: false } })
+    const refused = await fake.runTool('spec_bootstrap', { action: 'brief' })
+    assert.equal(refused.isError, true)
+    assert.match(String(refused.content), /bootstrap\.enabled=false/)
+
+    // Even with drafting enabled, no mission/spec exists afterwards.
+    const other = legacyRepo()
+    const child = fakeSubagents(DRAFT_ANSWER)
+    const drafting = createFakeHost({ cwd: other, services: { subagents: child.service } })
+    apply(drafting.ctx as never, { logFile: path.join(other, 'spec-gate.log'), bootstrap: { minTextLength: 4 } })
+    await drafting.runTool('spec_bootstrap', { action: 'draft' })
+    const stores = new MissionStoreRegistry().for(other)
+    assert.equal(stores.list().length, 0)
+    assert.equal(stores.active('session-1'), undefined)
 })

@@ -30,6 +30,27 @@ export interface SpecGateConfig {
     reviewChannel: 'auto' | 'tui' | 'approval'
     /** How long a review card waits for a verdict before giving up (fail closed). */
     reviewTimeoutMs: number
+    /**
+     * Drafting specifications for repositories that already exist
+     * (`spec_bootstrap`): the scan is deterministic, the model only writes the
+     * missing prose, and nothing it returns is approved automatically.
+     */
+    bootstrap: {
+        /** `false` disables the tool entirely. */
+        enabled: boolean
+        /** `ctx.subagents` provider used for the read-only drafting child. */
+        provider: string
+        /** Tools the drafting child may use — read-only by construction. */
+        readTools: readonly string[]
+        /** Deadline for one drafting child. */
+        timeoutMs: number
+        /** Bound on how many index entries the brief lists. */
+        maxIndexEntries: number
+        /** Bound on the cases a draft may contain. */
+        maxCases: number
+        /** Minimum length of a case's steps/expected before `check` complains. */
+        minTextLength: number
+    }
     layout: LayoutOptions
     /** Deny write-class tools while the session's mission has no approved spec. */
     enforce: EnforceMode
@@ -103,6 +124,7 @@ export const PROJECT_OVERRIDABLE_KEYS: readonly string[] = [
     'approval',
     'reviewChannel',
     'reviewTimeoutMs',
+    'bootstrap',
 ]
 
 /** The resolved configuration plus where it came from. */
@@ -154,6 +176,7 @@ export function resolveEffectiveConfig(host: SpecGateConfig, layout: Layout, log
                 ? raw['reviewChannel']
                 : host.reviewChannel,
         reviewTimeoutMs: Math.max(1_000, Math.floor(num(raw['reviewTimeoutMs'], host.reviewTimeoutMs))),
+        bootstrap: mergeBootstrap(raw['bootstrap'], host.bootstrap),
     }
     logger?.info(
         `spec-gate: 使用项目级配置 ${file.file}（enforce=${config.enforce}; boundaries=${config.enforceBoundaries}; shellPolicy=${config.shellPolicy}; approval=${config.approval}）`,
@@ -163,6 +186,34 @@ export function resolveEffectiveConfig(host: SpecGateConfig, layout: Layout, log
 
 /** The write-class tools the harness ships. */
 export const DEFAULT_WRITE_TOOLS: readonly string[] = ['write', 'edit']
+
+/**
+ * Parse the `bootstrap` section.
+ *
+ * A model route is optional: when it is omitted the drafter asks the host's
+ * `agentDefaultModel`, so the common case needs no configuration at all.
+ */
+/** The read-only tool set a drafting child gets (no write/edit/bash by design). */
+export const DEFAULT_BOOTSTRAP_READ_TOOLS: readonly string[] = ['read', 'grep', 'glob']
+
+export function resolveBootstrap(value: unknown): SpecGateConfig['bootstrap'] {
+    const raw = isRecord(value) ? value : {}
+    return {
+        enabled: bool(raw['enabled'], true),
+        provider: str(raw['provider'], 'spawn'),
+        readTools: strList(raw['readTools'], DEFAULT_BOOTSTRAP_READ_TOOLS),
+        timeoutMs: Math.max(10_000, Math.floor(num(raw['timeoutMs'], 10 * 60_000))),
+        maxIndexEntries: Math.max(5, Math.floor(num(raw['maxIndexEntries'], 40))),
+        maxCases: Math.max(1, Math.floor(num(raw['maxCases'], 80))),
+        minTextLength: Math.max(1, Math.floor(num(raw['minTextLength'], 12))),
+    }
+}
+
+/** Overlay one project-level `bootstrap` object onto the host's. */
+function mergeBootstrap(value: unknown, host: SpecGateConfig['bootstrap']): SpecGateConfig['bootstrap'] {
+    if (!isRecord(value)) return host
+    return resolveBootstrap({ ...host, ...value })
+}
 
 /** Shell tools inspected for write targets (see `shell.ts`). */
 export const DEFAULT_SHELL_TOOLS: readonly string[] = ['bash', 'pwsh']
@@ -181,6 +232,7 @@ export function resolveConfig(input: unknown): SpecGateConfig {
         ...(typeof raw['logFileTemplate'] === 'string' && raw['logFileTemplate'] !== '' ? { logFileTemplate: raw['logFileTemplate'] } : {}),
         reviewChannel: raw['reviewChannel'] === 'tui' ? 'tui' : raw['reviewChannel'] === 'approval' ? 'approval' : 'auto',
         reviewTimeoutMs: Math.max(1_000, Math.floor(num(raw['reviewTimeoutMs'], 15 * 60_000))),
+        bootstrap: resolveBootstrap(raw['bootstrap']),
         layout: {
             ...(typeof raw['rootDir'] === 'string' ? { rootDir: raw['rootDir'] } : {}),
             ...(typeof raw['specsDir'] === 'string' ? { specsDir: raw['specsDir'] } : {}),

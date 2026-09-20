@@ -14,6 +14,32 @@
   拒绝理由里带下一步该调用什么工具（理由写给模型看）。
 - **提示注入**：把规格契约与表格格式（`SPEC_FORMAT_HINT`）写进系统提示。
 
+## 存量项目接入：`spec_bootstrap`（**模型读代码**，插件给契约与校验）
+
+已有代码、没有规格的仓库进不了门禁（没有可审批的东西、也没有可验证的依据）。
+这里**不把仓库嚼成摘要**再喂模型——智能在模型侧：它用 `read`/`grep`/`glob` 真去读代码；
+插件只负责三件模型不该被托付的事：**契约、校验、边界**。
+
+| 动作 | 做什么 |
+|---|---|
+| `{ action: "brief" }` | 把**写作契约**交给当前 agent：验收标准表 + 测试设计三场景五列表（前置条件 / **操作步骤** / 预期结果）+ 写法要求（必须真读代码、禁止发明、推断要标 `[推断]`、不确定标 `[待确认]`），外加**只读索引**（需求文档、已有测试、构建文件、已识别的验证命令）与已知缺口。索引只是"从哪看起"，结论必须来自模型自己读到的代码。 |
+| `{ action: "draft" }` | 把同一份任务派给**只读子代理**（`toolFilter.allow = ['read','grep','glob']`，**没有 write/edit/bash**；带只读 persona 与超时），由它读代码写出草稿；父侧用与手写草稿**完全相同**的规则解析与校验，落盘 `.dsh/bootstrap/<时间戳>/spec-draft.md`。 |
+| `{ action: "check" }` | 提交前自查任意草稿：行无法解析 / 行数与用例数不一致、**有 AC 没有被任何用例覆盖**、用例覆盖了不存在的 AC、**操作步骤或预期结果过短**、仍留 `[待确认]` 占位、标准没写成 `AC-001 …` 形状。 |
+
+- 草稿落到 `.dsh/bootstrap/<时间戳>/spec-draft.md`（+ `.json`）：**不是规格**——没有 digest、不建 mission、不参与任何门禁、**零审批效力**；
+- 子代理输出不可用（比如只说了几句感想）→ **如实报错并附原始输出，不写文件、不退化成脚手架**（草稿必须由读代码得出，不能由插件猜）；
+- 无子代理服务 / `enabled:false` → 给出可执行的下一步（改用 `brief` 自己写）；
+- 下一步固定：`spec_create` → `test_design_review` → `spec_approve`。
+
+配置（profile 或 `<repo>/.dsh/spec-gate.json`）：
+
+```yaml
+- id: spec-gate
+  config:
+    bootstrap: { enabled: true, provider: spawn, readTools: [read, grep, glob],
+                 timeoutMs: 600000, maxIndexEntries: 40, maxCases: 80, minTextLength: 12 }
+```
+
 ## 审批是回路：先看工件，再决定
 
 `spec_approve` 送到审批 UI 的是一份**可核对清单**（`renderApprovalPrompt()`），不是一行摘要：
