@@ -169,7 +169,7 @@ bash scripts/e2e-mission.sh          # 建立隔离 profile、起 stub、跑一�
 | 会话级内存态（gate 计数、turn 归属、自动推进记账） | 按 session 键即正确（一个会话只属于一个工作区） |
 | 存储缓存（MissionStoreRegistry 按 rootDir、项目配置按文件路径） | 键已是工作区粒度 |
 | **日志文件** | ✓ 两种模式：默认单文件但**行内带项目名**（可 grep）；配 `logFileTemplate`（host-only，如 `~/.dsh/logs/{projectPath}/quality-gate.log`，`{projectPath}` 完全可读 / `{project}` 短哈希 / `{basename}` 仅目录名）则**按项目分文件**，未绑定工作区的行仍进 `logFile` |
-| `role-guard` / `orchestrator` | 按用户决定本轮不动（角色文件与阶段工件本身就是仓库自带工件） |
+| `role-guard` / `orchestrator` | 角色文件与阶段流水线本身是仓库自带工件；`routing`（按难度选模型）与 `autoDispatch`（自主派发）由宿主 profile 配置 |
 
 ## 附一之三：存量项目接入（`spec_bootstrap`）的诚实边界
 
@@ -184,6 +184,34 @@ bash scripts/e2e-mission.sh          # 建立隔离 profile、起 stub、跑一�
 - **草稿不是审批**：`.dsh/bootstrap/<stamp>/spec-draft.md` 不写 mission、不签发门禁记录、不产生回执；
   脚手架里的 `[待确认]` 占位会被 `test_design_review` 拒绝（刻意）。
 - **没有"自动补齐到通过"**：套件不会为了让你过关而降低标准；草稿 → 人工确认 → 审批这条链一步都不能省。
+
+## 附一之四：模型路由（difficulty → routing）的边界
+
+- **是声明，不是切换**：orchestrator 无法改变当前会话的模型，它只在阶段工件与报告里写明路由与应调用的形式；
+  真正的落实靠 `team_delegate` 的按调用覆盖（`dsh-role-guard`）。不派发就没有路由。
+- **需要宿主配置**：`routing` 没配 → 难度只作为提示，阶段沿用会话默认模型（报告里会说明）。
+- **成本开关在宿主**：`allowModelOverride: false` 时按调用覆盖被忽略，沿用角色路由（防止模型自行选更贵的模型）。
+- **草稿子代理单独配置**：`spec_bootstrap` 读代码的只读子代理用 `bootstrap.model`（不配则沿用会话模型）——
+  大批量读代码是最适合下沉到便宜模型的工作。
+- **不校验模型是否存在**：路由里写了不存在的 provider/model，要等宿主 provider 在真实调用时报错；
+  插件只保证"传下去的路由字段是一致的"。写例子时请用适配器当前声明的模型
+  （DeepSeek 适配器：`deepseek-v4-flash` / `deepseek-v4-pro` / `deepseek-v4-flash-vision-exp`，
+  provider 为 `deepseek-official`；`reasoningEffort` 认 `off` / `low` / `high` / `max`，没有 `medium`）。
+
+## 附一之五：自主派发（autoDispatch）的边界与代价
+
+- **它会自己花 token**：进入阶段即派子代理，不需要模型同意；因此默认 `enabled: false`，且建议只给
+  真正需要的阶段开（如 `implement`）。
+- **派发不等于完成**：子代理说"做完了"不是证据；门禁仍需通过，`mission_complete` 仍要证据与门禁记录。
+- **需要 `ctx.subagents`**：宿主没装配子代理 provider 时只报告不派发（阶段照旧可手动执行）。
+- **一个阶段一个子代理**：不做并行/多子代理竞争；子代理之间不共享上下文，靠 mission 工件与文件传递信息。
+- **权限取决于角色可用性**：`dsh-role-guard` 的 service 缺失或角色文件损坏时，配置里的 `toolFilter` 兜底
+  （此时"谁来写"由配置决定，而不是角色文件）；角色未知一律**拒绝派发**。
+- **超时后子代理可能仍在跑**：超时只是停止等待并记录，宿主是否真正终止该子代理取决于 provider。
+- **仍会阻塞工具调用**：派发是同步等待（默认上限 10 分钟，`autoDispatch.timeoutMs`），期间 `orchestrate`
+  不返回。中断靠调用方的 `signal`（已接通），但"后台派发 + 完成后通知"尚未实现。
+- **递归只能靠结构性禁止**：子代理的工具过滤里被强制去掉 `orchestrate` 且 `maxDepth=1`；
+  若宿主自己把 `orchestrate` 又塞回子代理（例如另开一个 provider 绕开本插件），仍可能递归。
 
 ## 附二：项目级配置的完整键表（一个 dsh 进程服务多个仓库）
 

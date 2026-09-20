@@ -22,6 +22,7 @@
  * @module dsh-orchestrator
  */
 
+import path from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import { MissionStoreRegistry, createLogger, expandHome, sessionIdOf } from 'dsh-eng-core'
 import type { AgentLike } from 'dsh-eng-core'
@@ -68,9 +69,36 @@ export function apply(ctx: Context, config: unknown = {}): void {
                 `config.stages 无效，已回退到默认流水线（${resolved.stages.map((stage) => stage.id).join(' → ')}）：\n- ${issues.join('\n- ')}`,
             )
         }
+        // GAP-10: report autoDispatch configuration problems too. Silently
+        // dispatching the DEFAULT stage list — or silently switching the feature
+        // off — is exactly the kind of surprise a host cannot debug.
+        if (resolved.autoDispatch.issues.length > 0) {
+            logger.warn(`config.autoDispatch 有问题（已按说明处理）：\n- ${resolved.autoDispatch.issues.join('\n- ')}`)
+        }
+        if (resolved.autoDispatch.enabled) {
+            logger.info(
+                `autoDispatch：已启用（provider=${resolved.autoDispatch.provider}；阶段 ${resolved.autoDispatch.stages.join(', ') || '(空：不会派发)'}；上限 ${Math.round(resolved.autoDispatch.timeoutMs / 1000)}s）`,
+            )
+        }
         const context = ctx as unknown as ContextLike
         const stores = new MissionStoreRegistry({ ...resolved.layout, logger })
         logger.info(`probes: ${Object.entries(mergeProbes(resolved.probes)).map(([plugin, probe]) => `${plugin}(${probe.tool ?? probe.service ?? '-'})`).join(', ')}`)
+
+        // Autonomous dispatch: entering a stage can hand the work to a child
+        // agent instead of waiting for the model to call team_delegate.
+        // Off unless config.autoDispatch.enabled; never settles a stage.
+        const dispatchDeps = {
+            config: resolved,
+            subagents: () => context.get('subagents') as never,
+            roleGuard: () => context.get('role-guard') as never,
+            stagesDir: (cwd: string, missionId: string) => {
+                try {
+                    return path.join(stores.for(cwd).layout.missionsDir, missionId, 'stages')
+                } catch (error) {
+                    throw new Error(`无法确定阶段工件目录（${(error as Error).message}）`)
+                }
+            },
+        }
 
         const tools = registerTools(context as never, {
             config: resolved,
@@ -78,6 +106,7 @@ export function apply(ctx: Context, config: unknown = {}): void {
             // Probes are scope-aware, so they are rebuilt per call: the registry
             // view of a delegated child may differ from the root's.
             probesFor: (agent) => createProbes(context, resolved.probes, agent),
+            dispatch: dispatchDeps,
         })
 
         const disposers: (() => void)[] = [...tools.disposers]
@@ -93,6 +122,11 @@ export function apply(ctx: Context, config: unknown = {}): void {
                     config: resolved,
                     stores,
                     probesFor: (agent) => createProbes(context, resolved.probes, agent),
+                    // BUG-1: the automatic transition enters stages through the
+                    // same code path as `advance`, so it needs the dispatch deps
+                    // too — otherwise the one path with NO model in the loop was
+                    // exactly the one that never dispatched.
+                    dispatch: dispatchDeps,
                     sessions,
                     autoStages,
                     logger,

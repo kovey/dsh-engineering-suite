@@ -11,6 +11,8 @@ import test from 'node:test'
 import { MissionStoreRegistry, type MissionStore } from 'dsh-eng-core'
 import { createFakeHost, runText, tempWorkspace, type FakeHost } from 'dsh-eng-core/testing'
 import { apply, inject, name } from '../dist/index.js'
+import { resolveConfig } from '../dist/config.js'
+import { dispatchStage } from '../dist/dispatch.js'
 
 /** One steered message, as the harness would receive it from `agent.steer`. */
 interface Steered {
@@ -53,9 +55,21 @@ function stubTools(fake: FakeHost): void {
  * instance, and a leaked tool registration would make a later test see a plugin
  * that is supposed to be "not mounted".
  */
-function host(options: { cwd?: string; withPlugins?: boolean; config?: Record<string, unknown> } = {}): FakeHost & { steers: Steered[] } {
+function host(
+    options: {
+        cwd?: string
+        withPlugins?: boolean
+        config?: Record<string, unknown>
+        withSubagents?: boolean
+        services?: Record<string, unknown>
+    } = {},
+): FakeHost & { steers: Steered[] } {
     const cwd = options.cwd ?? tempWorkspace('orchestrator-')
-    const fake = createFakeHost({ cwd })
+    const fake = createFakeHost({
+        cwd,
+        ...(options.withSubagents === true ? { withSubagents: true } : {}),
+        ...(options.services === undefined ? {} : { services: options.services }),
+    })
     hosts.push(fake)
     // The fake agent has no steering channel; collect what the plugin tells the
     // model (the automatic transition must be visible to it).
@@ -160,10 +174,31 @@ async function orchestrate(fake: FakeHost, args: Record<string, unknown>): Promi
     return runText(run)
 }
 
-function stageFile(cwd: string, missionId: string, stageId: string): { state: string; attempt: number; gateState?: string; next?: string; role?: string } {
+function stageFile(
+    cwd: string,
+    missionId: string,
+    stageId: string,
+): {
+    state: string
+    attempt: number
+    gateState?: string
+    next?: string
+    role?: string
+    difficulty?: string
+    route?: { provider?: string; model?: string; reasoningEffort?: string; maxTokens?: number; source: string }
+    dispatch?: { runId?: string; stopReason?: string; outputFile?: string; error?: string; role?: string; at: number }
+} {
     const file = path.join(cwd, '.dsh', 'missions', missionId, 'stages', `${stageId}.json`)
     assert.equal(fs.existsSync(file), true, `missing stage artifact ${file}`)
-    return JSON.parse(fs.readFileSync(file, 'utf8')) as { state: string; attempt: number; gateState?: string; role?: string }
+    return JSON.parse(fs.readFileSync(file, 'utf8')) as {
+        state: string
+        attempt: number
+        gateState?: string
+        role?: string
+        difficulty?: string
+        route?: { provider?: string; model?: string; reasoningEffort?: string; maxTokens?: number; source: string }
+        dispatch?: { runId?: string; stopReason?: string; outputFile?: string; error?: string; role?: string; at: number }
+    }
 }
 
 /** The `status` table row of one stage (empty when the stage is absent). */
@@ -1086,4 +1121,534 @@ test('auto-advance is off by default: the turn-stopping listener is a no-op (reg
 
     fake.dispose()
     assert.equal(fake.listeners.get('agent/turn-stopping')?.length ?? 0, 0)
+})
+
+test('every stage declares a difficulty and the host maps it to a model (regression)', async () => {
+    disposeHosts()
+    const cwd = tempWorkspace('orchestrator-routing-')
+    const fake = host({
+        cwd,
+        config: {
+            routing: {
+                cheap: { provider: 'deepseek-official', model: 'deepseek-v4-flash' },
+                deep: { provider: 'deepseek-official', model: 'deepseek-v4-pro', reasoningEffort: 'high', maxTokens: 32000 },
+            },
+        },
+    })
+    const store = storeFor(cwd)
+    await orchestrate(fake, { action: 'start' })
+    const id = missionIdOf(cwd)
+
+    // The `stages` listing shows every step's difficulty and its resolved route.
+    const stages = await orchestrate(fake, { action: 'stages' })
+    assert.match(stages, /难度\/模型：deepseek-official\/deepseek-v4-flash（难度 cheap → 宿主 routing）/)
+    assert.match(stages, /难度\/模型：难度 standard，但宿主没有配置 routing 映射/)
+
+    // A stage entry names the route, where it came from, and the exact call that
+    // applies it — the orchestrator cannot change the session's model itself.
+    const entry = await orchestrate(fake, { action: 'rerun' })
+    assert.match(entry, /模型：deepseek-official\/deepseek-v4-flash（难度 cheap → 宿主 routing）/)
+    assert.match(entry, /team_delegate\(\{ role: /)
+
+    // …and the stage artifact records it, so the ledger answers "what ran this".
+    const first = stageFile(cwd, id, 'spec-clarify')
+    assert.equal(first.difficulty, 'cheap')
+    assert.equal(first.route?.model, 'deepseek-v4-flash')
+    assert.equal(first.route?.source, 'difficulty')
+
+    // A stage whose difficulty has no mapping keeps working, and says so.
+    await orchestrate(fake, { action: 'advance', verdict: 'PASS' })
+    const design = stageFile(cwd, id, 'test-design-review')
+    assert.equal(design.difficulty, 'standard')
+    assert.equal(design.route, undefined, 'no mapping for standard → no route recorded')
+})
+
+test('a stage can name a model directly, overriding its difficulty (regression)', async () => {
+    disposeHosts()
+    const cwd = tempWorkspace('orchestrator-routing-stage-')
+    const fake = host({
+        cwd,
+        config: {
+            routing: { deep: { provider: 'deepseek-official', model: 'deepseek-v4-pro' } },
+            stages: [
+                { id: 'impl', prompt: '实现', requiredPlugins: ['dsh-role-guard'], difficulty: 'deep', next: 'review' },
+                {
+                    id: 'review',
+                    prompt: '评审',
+                    requiredPlugins: ['dsh-role-guard'],
+                    model: 'deepseek-official/deepseek-v4-pro',
+                    reasoningEffort: 'high',
+                    next: 'done',
+                },
+                { id: 'done', prompt: '收尾', requiredPlugins: ['dsh-role-guard'] },
+            ],
+        },
+    })
+    const store = storeFor(cwd)
+    await orchestrate(fake, { action: 'start' })
+    const id = missionIdOf(cwd)
+    const impl = stageFile(cwd, id, 'impl')
+    assert.equal(impl.route?.model, 'deepseek-v4-pro', 'difficulty wins when the stage names no model')
+    assert.equal(impl.route?.source, 'difficulty')
+
+    await orchestrate(fake, { action: 'advance', verdict: 'PASS' })
+    const review = stageFile(cwd, id, 'review')
+    assert.equal(review.route?.provider, 'deepseek-official')
+    assert.equal(review.route?.model, 'deepseek-v4-pro')
+    assert.equal(review.route?.reasoningEffort, 'high')
+    assert.equal(review.route?.source, 'stage', 'an explicit model on the stage overrides the difficulty mapping')
+})
+
+test('routing configuration is validated instead of silently mis-routing (regression)', () => {
+    // Only the three classes, and an entry that names no model is dropped.
+    const resolved = resolveConfig({
+        routing: {
+            cheap: { provider: 'p', model: 'm' },
+            standard: { reasoningEffort: 'high' },
+            deep: { provider: 'p' },
+            bogus: { provider: 'x', model: 'y' },
+        },
+        stages: [{ id: 'a', prompt: 'a', difficulty: 'cheap', next: 'b' }, { id: 'b', prompt: 'b' }],
+    })
+    assert.deepEqual(Object.keys(resolved.config.routing).sort(), ['cheap', 'deep'])
+
+    // A bad difficulty on a stage falls the whole pipeline back to the default
+    // (the existing "invalid stages config" path), with the issue reported.
+    const invalid = resolveConfig({
+        stages: [{ id: 'a', prompt: 'a', difficulty: 'enormous' }, { id: 'b', prompt: 'b' }],
+    })
+    assert.ok(invalid.config.stages.some((stage) => stage.id === 'spec-clarify'), 'fell back to the built-in pipeline')
+    assert.match(invalid.issues.join('\n'), /difficulty 只能是/)
+})
+
+// ---------------------------------------------------------------------------
+// autonomous stage dispatch: entering a stage hands the work to a child agent
+// ---------------------------------------------------------------------------
+
+test('autoDispatch is off by default: entering a stage starts no child (regression)', async () => {
+    disposeHosts()
+    const cwd = tempWorkspace('orchestrator-no-autodispatch-')
+    const fake = host({ cwd, withSubagents: true })
+    await orchestrate(fake, { action: 'start' })
+    assert.equal(fake.subagentStarts.length, 0, 'nothing is dispatched unless the host opts in')
+    const report = await orchestrate(fake, { action: 'status' })
+    assert.doesNotMatch(report, /已自动派发/)
+})
+
+test('entering a stage dispatches a child with the stage role, route and filter (regression)', async () => {
+    disposeHosts()
+    const cwd = tempWorkspace('orchestrator-autodispatch-')
+    const fake = host({
+        cwd,
+        withSubagents: true,
+        config: {
+            routing: { deep: { provider: 'deepseek-official', model: 'deepseek-v4-pro', reasoningEffort: 'high' } },
+            autoDispatch: { enabled: true, stages: ['impl'], toolFilter: { allow: ['read'] } },
+            stages: [
+                { id: 'impl', prompt: '实现这个需求', requiredPlugins: [], difficulty: 'deep', role: 'developer', next: 'review' },
+                { id: 'review', prompt: '评审', requiredPlugins: [] },
+            ],
+        },
+        services: {
+            'role-guard': {
+                plan: () => ({
+                    persona: '你是开发者：只改规格允许的文件。',
+                    mode: 'write',
+                    toolFilter: { allow: ['read', 'grep', 'glob', 'edit', 'write', 'bash'] },
+                    dropped: ['tree-sitter'],
+                    route: { provider: 'deepseek-official', model: 'deepseek-v4-pro', reasoningEffort: 'high' },
+                }),
+            },
+        },
+    })
+    const report = await orchestrate(fake, { action: 'start', summary: '自动派发验证' })
+
+    assert.equal(fake.subagentStarts.length, 1, 'one child per entry')
+    const start = fake.subagentStarts[0] as {
+        provider: string
+        request: { prompt: { text: string }[]; persona?: string; toolFilter?: { allow?: readonly string[] }; agentOptions?: Record<string, unknown> }
+    }
+    assert.equal(start.provider, 'spawn')
+    // The ROLE decides rights — not the configured filter.
+    assert.deepEqual(start.request.toolFilter?.allow, ['read', 'grep', 'glob', 'edit', 'write', 'bash'])
+    assert.match(start.request.persona ?? '', /只改规格允许的文件/)
+    assert.deepEqual(start.request.agentOptions, {
+        provider: 'deepseek-official',
+        model: 'deepseek-v4-pro',
+        reasoningEffort: 'high',
+    })
+    // The prompt carries the stage task, the mission and the rules.
+    const prompt = start.request.prompt[0]?.text ?? ''
+    assert.match(prompt, /实现这个需求/)
+    assert.match(prompt, /阶段 `impl`/)
+    assert.match(prompt, /不要调用 orchestrate/)
+    // …and the report tells the model what happened, including the dropped tool.
+    assert.match(report, /### 已自动派发本阶段/)
+    assert.match(report, /子代理运行：run-1/)
+    assert.match(report, /本部署缺少 tree-sitter/)
+    assert.match(report, /派发\*\*不结算\*\*本阶段/)
+
+    // INVARIANT: the stage is entered, not settled — the gate still decides.
+    const missionId = missionIdOf(cwd)
+    const artifact = stageFile(cwd, missionId, 'impl')
+    assert.equal(artifact.state, 'entered')
+    assert.equal(artifact.gateState, undefined, 'a completed child is not a gate verdict')
+    // …and the LEDGER (not just the report) says what worked this stage.
+    assert.equal(artifact.dispatch?.runId, 'run-1')
+    assert.equal(artifact.dispatch?.stopReason, 'completed')
+    assert.equal(artifact.dispatch?.role, 'developer')
+    assert.match(
+        artifact.dispatch?.outputFile ?? '',
+        /impl-dispatch-a1-run-1\.md$/,
+        'the transcript name carries the attempt and the run id (a re-dispatch cannot overwrite it)',
+    )
+
+    // The pipeline listing shows which stages will run by themselves.
+    const stages = await orchestrate(fake, { action: 'stages' })
+    assert.match(stages, /自动派发：已开启（进入本阶段时自动派子代理执行）/)
+    assert.match(stages, /自动派发：未开启（本阶段不在派发范围）/)
+})
+
+test('a failing child never breaks stage entry: it is reported, the stage stays entered (regression)', async () => {
+    disposeHosts()
+    const cwd = tempWorkspace('orchestrator-autodispatch-fail-')
+    const fake = host({
+        cwd,
+        config: {
+            autoDispatch: { enabled: true, stages: ['impl'] },
+            stages: [
+                { id: 'impl', prompt: '实现', requiredPlugins: [], next: 'review' },
+                { id: 'review', prompt: '评审', requiredPlugins: [] },
+            ],
+        },
+        services: {
+            // A child whose run rejects outright.
+            subagents: {
+                start: async () => ({
+                    id: 'run-boom',
+                    result: Promise.reject(new Error('child exploded')),
+                    dispose: async () => undefined,
+                }),
+            },
+        },
+    })
+    const report = await orchestrate(fake, { action: 'start' })
+    assert.match(report, /⚠️ 未产出可用结果：child exploded/)
+    assert.equal(stageFile(cwd, missionIdOf(cwd), 'impl').state, 'entered')
+    // The next action is unchanged: the model can still do the work itself.
+    assert.match(report, /orchestrate\(\{ action: "advance"/)
+})
+
+test('a stage can opt out of dispatch, and a missing role-guard service is explained (regression)', async () => {
+    disposeHosts()
+    const cwd = tempWorkspace('orchestrator-autodispatch-optout-')
+    const fake = host({
+        cwd,
+        withSubagents: true,
+        config: {
+            // The id list says "dispatch everything", the stage says no.
+            autoDispatch: { enabled: true, stages: ['impl', 'review'] },
+            stages: [
+                { id: 'impl', prompt: '实现', requiredPlugins: [], autoDispatch: false, next: 'review' },
+                { id: 'review', prompt: '评审', requiredPlugins: [], role: 'reviewer' },
+            ],
+        },
+    })
+    await orchestrate(fake, { action: 'start' })
+    assert.equal(fake.subagentStarts.length, 0, 'autoDispatch:false wins over the id list')
+
+    // A role with no role-guard service: the configured filter is the fallback,
+    // and the report says who decided what.
+    const other = tempWorkspace('orchestrator-autodispatch-norole-')
+    const fallback = host({
+        cwd: other,
+        withSubagents: true,
+        config: {
+            autoDispatch: { enabled: true, stages: ['review'], toolFilter: { allow: ['read'] } },
+            stages: [
+                { id: 'impl', prompt: '实现', requiredPlugins: [], autoDispatch: false, next: 'review' },
+                { id: 'review', prompt: '评审', requiredPlugins: [], role: 'reviewer' },
+            ],
+        },
+    })
+    await orchestrate(fallback, { action: 'start' })
+    await orchestrate(fallback, { action: 'advance', verdict: 'PASS' })
+    const start = fallback.subagentStarts[0] as { request: { toolFilter?: { allow?: readonly string[] } } }
+    assert.deepEqual(start.request.toolFilter?.allow, ['read'], 'config filter is the fallback')
+})
+
+test('a dispatch that never answers is bounded, and the stage survives it (regression)', async () => {
+    // Unit-level on purpose: the tool-level timeout is 20 minutes by default,
+    // so the bound is proven against `dispatchStage` directly with a 50ms cap.
+    const cwd = tempWorkspace('orchestrator-autodispatch-timeout-')
+    const outcome = await dispatchStage(
+        {
+            config: {
+                autoDispatch: { enabled: true, provider: 'spawn', stages: ['impl'], timeoutMs: 50 },
+            } as never,
+            subagents: () => ({
+                start: async () => ({ id: 'run-stuck', result: new Promise(() => undefined) }),
+            }),
+            roleGuard: () => undefined,
+            stagesDir: () => path.join(cwd, 'stages'),
+        },
+        {
+            stage: { id: 'impl', prompt: '实现', requiredPlugins: [], gate: { kind: 'none', phase: 'exit', label: '无', verdict: 'pass-or-warn' } } as never,
+            mission: { id: 'm-1', title: '超时验证', status: 'implementing', cwd, createdAt: 0, updatedAt: 0 } as never,
+            cwd,
+        },
+    )
+    assert.equal(outcome.dispatched, true)
+    assert.match(outcome.error ?? '', /超时/)
+    assert.ok(outcome.outputFile !== undefined, 'the attempt is still recorded for a human')
+    assert.match(String(outcome.note), /未产出可用结果/)
+})
+
+// ---------------------------------------------------------------------------
+// the fixes the adversarial audits demanded (each one reproduced a real defect)
+// ---------------------------------------------------------------------------
+
+test('the host-driven automatic transition dispatches too (regression: BUG-1)', async () => {
+    disposeHosts()
+    const cwd = tempWorkspace('orchestrator-autodispatch-hook-')
+    const fake = host({
+        cwd,
+        withSubagents: true,
+        config: {
+            autoDispatch: { enabled: true, stages: ['review'] },
+            stages: autoStages({ successorPlugins: [] }),
+        },
+    })
+    const store = storeFor(cwd)
+    await orchestrate(fake, { action: 'start', summary: 'hook dispatch' })
+    const id = missionIdOf(cwd)
+    approveMission(store, id)
+    await orchestrate(fake, { action: 'advance' }) // → impl (not dispatched)
+    assert.equal(fake.subagentStarts.length, 0, 'impl is not in the dispatch list')
+
+    // The turn-stopping trigger enters `review`: the one entry path with no model
+    // in the loop, which used to skip dispatch entirely.
+    await turnStop(fake, { turn: 3 })
+    assert.equal(store.read(id)?.stage, 'review')
+    assert.equal(fake.subagentStarts.length, 1, 'the automatic transition must dispatch like advance does')
+    assert.equal(stageFile(cwd, id, 'review').dispatch?.runId, 'run-1')
+})
+
+test('a settled stage keeps the route and the dispatch record (regression: BUG-2)', async () => {
+    disposeHosts()
+    const cwd = tempWorkspace('orchestrator-settled-route-')
+    const fake = host({
+        cwd,
+        withSubagents: true,
+        config: {
+            routing: { cheap: { provider: 'deepseek-official', model: 'deepseek-v4-flash' } },
+            autoDispatch: { enabled: true, stages: ['plan'] },
+            stages: [
+                { id: 'plan', prompt: '计划', requiredPlugins: [], difficulty: 'cheap', next: 'done' },
+                { id: 'done', prompt: '收尾', requiredPlugins: [] },
+            ],
+        },
+    })
+    await orchestrate(fake, { action: 'start' })
+    await orchestrate(fake, { action: 'advance', verdict: 'PASS', summary: '计划完成' })
+    const artifact = stageFile(cwd, missionIdOf(cwd), 'plan')
+    assert.equal(artifact.state, 'passed')
+    assert.equal(artifact.difficulty, 'cheap', 'the ledger still says how hard the stage was')
+    assert.equal(artifact.route?.model, 'deepseek-v4-flash', 'and which model ran it')
+    assert.equal(artifact.dispatch?.runId, 'run-1', 'and that a child worked it')
+})
+
+test('a cancelled caller never starts a child (regression: BUG-3)', async () => {
+    disposeHosts()
+    const cwd = tempWorkspace('orchestrator-abort-')
+    const fake = host({
+        cwd,
+        withSubagents: true,
+        config: {
+            autoDispatch: { enabled: true, stages: ['plan'] },
+            stages: [{ id: 'plan', prompt: '计划', requiredPlugins: [], next: 'done' }, { id: 'done', prompt: 'x', requiredPlugins: [] }],
+        },
+    })
+    const controller = new AbortController()
+    controller.abort()
+    const run = await fake.runTool('orchestrate', { action: 'start' }, { signal: controller.signal } as never)
+    assert.equal(run.isError, false)
+    assert.equal(fake.subagentStarts.length, 0, 'an aborted call must not spend tokens on a child')
+    assert.match(runText(run), /signal 已 abort|已取消/)
+})
+
+test('the effective route is recorded, and the label names the role (regression: BUG-4)', async () => {
+    disposeHosts()
+    const cwd = tempWorkspace('orchestrator-role-route-')
+    const fake = host({
+        cwd,
+        withSubagents: true,
+        config: {
+            routing: { deep: { provider: 'cfg-provider', model: 'cfg-model' } },
+            autoDispatch: { enabled: true, stages: ['impl'] },
+            stages: [{ id: 'impl', prompt: '实现', requiredPlugins: [], difficulty: 'deep', role: 'developer', next: 'done' }, { id: 'done', prompt: 'x', requiredPlugins: [] }],
+        },
+        services: {
+            'role-guard': {
+                plan: () => ({
+                    persona: 'p',
+                    toolFilter: { allow: ['read'] },
+                    dropped: [],
+                    skills: ['spec-review'],
+                    route: { provider: 'role-provider', model: 'role-model', reasoningEffort: 'high' },
+                }),
+                bind: () => ({ sessionId: 'run-1' }),
+            },
+        },
+    })
+    const report = await orchestrate(fake, { action: 'start' })
+    const start = fake.subagentStarts[0] as { request: { agentOptions?: Record<string, unknown> } }
+    assert.deepEqual(start.request.agentOptions, { provider: 'role-provider', model: 'role-model', reasoningEffort: 'high' })
+    assert.match(report, /权限来源：角色 developer/, 'the report must say who decided the child rights')
+    assert.match(report, /技能白名单 spec-review/)
+    const artifact = stageFile(cwd, missionIdOf(cwd), 'impl')
+    const transcript = fs.readFileSync(artifact.dispatch?.outputFile ?? '', 'utf8')
+    assert.match(transcript, /role-provider\/role-model · effort=high（角色文件）/, 'the transcript must name the role as the route source')
+    assert.equal(artifact.route?.model, 'role-model', 'the ledger must agree with the child')
+    assert.equal(artifact.route?.source, 'role')
+})
+
+test('an empty allow-list refuses to dispatch instead of handing over everything (regression: BUG-5)', async () => {
+    disposeHosts()
+    const cwd = tempWorkspace('orchestrator-empty-allow-')
+    const fake = host({
+        cwd,
+        withSubagents: true,
+        config: {
+            autoDispatch: { enabled: true, stages: ['plan'], toolFilter: { allow: [] } },
+            stages: [{ id: 'plan', prompt: '计划', requiredPlugins: [], next: 'done' }, { id: 'done', prompt: 'x', requiredPlugins: [] }],
+        },
+    })
+    const report = await orchestrate(fake, { action: 'start' })
+    assert.equal(fake.subagentStarts.length, 0)
+    assert.match(report, /toolFilter\.allow 为空数组/)
+})
+
+test('resume does not dispatch the same attempt twice (regression: GAP-7)', async () => {
+    disposeHosts()
+    const cwd = tempWorkspace('orchestrator-resume-dedupe-')
+    const fake = host({
+        cwd,
+        withSubagents: true,
+        config: {
+            autoDispatch: { enabled: true, stages: ['plan'] },
+            stages: [{ id: 'plan', prompt: '计划', requiredPlugins: [], next: 'done' }, { id: 'done', prompt: 'x', requiredPlugins: [] }],
+        },
+    })
+    await orchestrate(fake, { action: 'start' })
+    assert.equal(fake.subagentStarts.length, 1)
+    const resumed = await orchestrate(fake, { action: 'resume' })
+    assert.equal(fake.subagentStarts.length, 1, 'resume must not spawn a second child for the same attempt')
+    assert.match(resumed, /已经派发过/)
+})
+
+test('a child is not dispatched into a stage whose entry gate is unmet (regression: GAP-9)', async () => {
+    disposeHosts()
+    const cwd = tempWorkspace('orchestrator-entry-gate-')
+    const fake = host({
+        cwd,
+        withSubagents: true,
+        config: {
+            autoDispatch: { enabled: true, stages: ['gated'] },
+            stages: [
+                { id: 'gated', prompt: '需要规格', requiredPlugins: [], gate: { kind: 'spec-approved', phase: 'entry', label: '规格已审批', verdict: 'pass-only' }, next: 'done' },
+                { id: 'done', prompt: 'x', requiredPlugins: [] },
+            ],
+        },
+    })
+    const report = await orchestrate(fake, { action: 'start' })
+    assert.equal(fake.subagentStarts.length, 0, 'spending tokens before the entry gate is met is not allowed')
+    assert.match(report, /进入门禁未通过/)
+    assert.match(report, /规格尚未审批/)
+})
+
+test('autoDispatch configuration problems are reported, not silently defaulted (regression: GAP-10)', () => {
+    const stringStages = resolveConfig({ autoDispatch: { enabled: true, stages: 'implement' } as never })
+    assert.match(stringStages.config.autoDispatch.issues.join('\n'), /必须是数组/)
+    const unknown = resolveConfig({ autoDispatch: { enabled: true, stages: ['nope'] }, stages: [{ id: 'a', prompt: 'a' }, { id: 'b', prompt: 'b' }] })
+    assert.match(unknown.config.autoDispatch.issues.join('\n'), /未知阶段：nope/)
+    const badTimeout = resolveConfig({ autoDispatch: { enabled: true, timeoutMs: '60000' } as never })
+    assert.match(badTimeout.config.autoDispatch.issues.join('\n'), /timeoutMs 必须是数字/)
+})
+
+test('repeating start on a live stage does not dispatch again (regression: runaway)', async () => {
+    // Found live: a scripted model that repeated `orchestrate start` produced 768
+    // child sessions for ONE mission at attempt 1 — every call re-entered the
+    // (still `entered`) stage and dispatched another child.
+    disposeHosts()
+    const cwd = tempWorkspace('orchestrator-start-idempotent-')
+    const fake = host({
+        cwd,
+        withSubagents: true,
+        config: {
+            autoDispatch: { enabled: true, stages: ['plan'] },
+            stages: [{ id: 'plan', prompt: '计划', requiredPlugins: [], next: 'done' }, { id: 'done', prompt: 'x', requiredPlugins: [] }],
+        },
+    })
+    await orchestrate(fake, { action: 'start', summary: '重复 start 验证' })
+    assert.equal(fake.subagentStarts.length, 1)
+    const again = await orchestrate(fake, { action: 'start', summary: '重复 start 验证' })
+    assert.equal(fake.subagentStarts.length, 1, 'a repeated start must not spawn another child')
+    assert.match(again, /已经在阶段 plan 中/)
+    const stages = fs.readdirSync(path.join(cwd, '.dsh', 'missions', missionIdOf(cwd), 'stages'))
+    assert.equal(stages.filter((name) => name.includes('dispatch')).length, 1, `no extra transcript: ${stages.join(', ')}`)
+})
+
+test('a dispatched child can never re-enter the pipeline (regression: recursion runaway)', async () => {
+    // Found live: the child inherited `orchestrate`, called `orchestrate start`
+    // itself, and my own auto-dispatch spawned a grandchild — recursion until the
+    // harness depth limit, ~800 sessions from one stage entry.
+    disposeHosts()
+    const cwd = tempWorkspace('orchestrator-child-no-orchestrate-')
+    const fake = host({
+        cwd,
+        withSubagents: true,
+        config: {
+            autoDispatch: { enabled: true, stages: ['plan'] },
+            stages: [{ id: 'plan', prompt: '计划', requiredPlugins: [], next: 'done' }, { id: 'done', prompt: 'x', requiredPlugins: [] }],
+        },
+    })
+    await orchestrate(fake, { action: 'start' })
+    const start = fake.subagentStarts[0] as { request: { toolFilter?: { allow?: readonly string[]; deny?: readonly string[] }; maxDepth?: number } }
+    const filter = start.request.toolFilter
+    assert.equal(filter?.allow?.includes('orchestrate') ?? false, false, 'the child must not hold orchestrate')
+    assert.ok(filter?.deny?.includes('orchestrate'), `orchestrate must be denied explicitly: ${JSON.stringify(filter)}`)
+    assert.equal(start.request.maxDepth, 1, 'a stage worker must not fan out further')
+    // With no role, the filter is deny-only: every other tool survives untouched.
+    assert.equal(filter?.allow, undefined, 'a role-less dispatch must not narrow the tool surface beyond orchestrate')
+})
+
+test('a role whitelist keeps its tools but loses orchestrate (regression)', async () => {
+    disposeHosts()
+    const cwd = tempWorkspace('orchestrator-child-role-filter-')
+    const fake = host({
+        cwd,
+        withSubagents: true,
+        config: {
+            autoDispatch: { enabled: true, stages: ['impl'] },
+            stages: [{ id: 'impl', prompt: '实现', requiredPlugins: [], role: 'developer', next: 'done' }, { id: 'done', prompt: 'x', requiredPlugins: [] }],
+        },
+        services: {
+            'role-guard': {
+                plan: () => ({
+                    persona: 'p',
+                    toolFilter: { allow: ['read', 'grep', 'glob', 'orchestrate'] },
+                    dropped: [],
+                    skills: [],
+                    route: {},
+                }),
+                bind: () => ({ sessionId: 'run-1' }),
+            },
+        },
+    })
+    await orchestrate(fake, { action: 'start' })
+    const filter = (fake.subagentStarts[0] as { request: { toolFilter?: { allow?: readonly string[]; deny?: readonly string[] } } }).request
+        .toolFilter
+    assert.deepEqual(filter?.allow, ['read', 'grep', 'glob'], 'the role keeps its tools, minus the pipeline one')
+    assert.ok(filter?.deny?.includes('orchestrate'))
 })

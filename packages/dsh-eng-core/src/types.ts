@@ -192,6 +192,50 @@ export interface StageResult {
     gateState?: GateState
     /** Stage the run moved to next. */
     next?: string
+    /** Agent role this stage declares (a declaration; role-guard enforces it). */
+    role?: string
+    /**
+     * The autonomous dispatch that ran for this stage, when one did.
+     *
+     * Recorded so the ledger answers "what actually worked this stage" without
+     * reading the orchestrator's report: the child's run id, how it ended and
+     * where its full output was written. A dispatch is NOT a gate verdict —
+     * `gateState` stays unset until the gate decides.
+     */
+    dispatch?: {
+        /** Child session/run id. */
+        runId?: string
+        /** How the child ended (`completed`, `aborted`, …). */
+        stopReason?: string
+        /** Absolute path of the child's full output. */
+        outputFile?: string
+        /** Why the dispatch produced nothing usable, when it did not. */
+        error?: string
+        /** The role the child ran as, when the stage declared one. */
+        role?: string
+        /** The stage attempt this dispatch belongs to. */
+        attempt?: number
+        /** When the dispatch finished. */
+        at: number
+    }
+    /**
+     * Difficulty class the stage declared, when it did.
+     * @see OrchestratorConfig.routing for the model it maps to.
+     */
+    difficulty?: 'cheap' | 'standard' | 'deep'
+    /**
+     * The model route resolved for this stage, and where it came from.
+     *
+     * Recorded so an audit can answer "what ran the expensive part" without
+     * replaying the host's configuration of that day.
+     */
+    route?: {
+        provider?: string
+        model?: string
+        reasoningEffort?: string
+        maxTokens?: number
+        source: 'stage' | 'difficulty' | 'role' | 'none'
+    }
 }
 
 /** Versioned workspace state of one mission. */

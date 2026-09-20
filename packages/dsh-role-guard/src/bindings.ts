@@ -20,6 +20,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { assertSafeId, parentSessionIdOf, readJson, sessionIdOf, writeJsonAtomic } from 'dsh-eng-core'
 import type { AgentLike, Layout, Logger } from 'dsh-eng-core'
+import type { EffectiveRoute } from './route.js'
 import type { Role, RoleMode } from './roles.js'
 
 /** One durable session → role binding. */
@@ -36,6 +37,12 @@ export interface RoleBinding {
     skills: readonly string[]
     /** The role's tool whitelist (recorded for diagnostics). */
     tools: readonly string[]
+    /**
+     * The LLM route the child actually ran on, so an audit can tell which
+     * model a delegated session used. Absent when the child inherited the
+     * host's own route (this plugin handed nothing over).
+     */
+    route?: EffectiveRoute
     updatedAt: number
 }
 
@@ -53,6 +60,41 @@ function stringList(value: unknown): string[] {
     return Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === 'string' && entry !== '') : []
 }
 
+/**
+ * Read back the stored route.
+ *
+ * Additive and total: a file written before this field existed simply has no
+ * route, and a hand-edited or corrupt route degrades to "the fields that are
+ * usable" instead of making the whole binding unusable — losing the skill
+ * whitelist because of a bad `maxTokens` would be a security regression.
+ */
+function asRoute(value: unknown): EffectiveRoute | undefined {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined
+    const record = value as Record<string, unknown>
+    const field = (key: string): string | undefined => {
+        const raw = record[key]
+        return typeof raw === 'string' && raw !== '' ? raw : undefined
+    }
+    const provider = field('provider')
+    const model = field('model')
+    const reasoningEffort = field('reasoningEffort')
+    const rawMaxTokens = record['maxTokens']
+    const maxTokens = typeof rawMaxTokens === 'number' && Number.isFinite(rawMaxTokens) && rawMaxTokens > 0 ? rawMaxTokens : undefined
+    if (provider === undefined && model === undefined && reasoningEffort === undefined && maxTokens === undefined) return undefined
+    return {
+        ...(provider === undefined ? {} : { provider }),
+        ...(model === undefined ? {} : { model }),
+        ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
+        ...(maxTokens === undefined ? {} : { maxTokens }),
+    }
+}
+
+/** Keep only the fields that carry a value, so the file stays comparable. */
+function compactRoute(route: EffectiveRoute | undefined): EffectiveRoute | undefined {
+    if (route === undefined) return undefined
+    return asRoute(route)
+}
+
 /** Validate a parsed file into a binding, or `undefined` when unusable. */
 function asBinding(value: unknown, sessionId: string): RoleBinding | undefined {
     if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined
@@ -60,6 +102,7 @@ function asBinding(value: unknown, sessionId: string): RoleBinding | undefined {
     const roleId = typeof record['roleId'] === 'string' && record['roleId'] !== '' ? record['roleId'] : undefined
     if (roleId === undefined) return undefined
     const stored = record['sessionId']
+    const route = asRoute(record['route'])
     return {
         sessionId: typeof stored === 'string' && stored !== '' ? stored : sessionId,
         roleId,
@@ -67,6 +110,7 @@ function asBinding(value: unknown, sessionId: string): RoleBinding | undefined {
         mode: record['mode'] === 'read' ? 'read' : 'write',
         skills: stringList(record['skills']),
         tools: stringList(record['tools']),
+        ...(route === undefined ? {} : { route }),
         updatedAt: typeof record['updatedAt'] === 'number' && Number.isFinite(record['updatedAt']) ? record['updatedAt'] : 0,
     }
 }
@@ -88,13 +132,35 @@ export class RoleBindingStore {
 
     /**
      * Record the role that created one child session.
+     * @param agent - the delegating agent (supplies the workspace).
+     * @param sessionId - the child session id.
+     * @param role - the role the child was created with.
+     * @param route - the effective model route the child ran on (optional and
+     *   additive: a binding written without it stays readable).
      * @returns the recorded binding, or `undefined` when it could not be written
      *   (the caller must warn: an unwritten binding means no skill enforcement
      *   for that child).
      */
-    bind(agent: AgentLike | undefined, sessionId: string, role: Role): RoleBinding | undefined {
+    bind(agent: AgentLike | undefined, sessionId: string, role: Role, route?: EffectiveRoute): RoleBinding | undefined {
+        return this.bindAt(this.layoutFor(agent), sessionId, role, route)
+    }
+
+    /**
+     * Record a binding for an explicitly known workspace.
+     *
+     * A caller that knows the workspace (an autonomous dispatcher acting on a
+     * mission) must not go through `layoutFor(agent)`: with no agent that falls
+     * back to the PROCESS directory, which would write the child's binding into
+     * the wrong `.dsh/` — leaving the real child unbound and the skill gate blind.
+     * @param layout - the workspace layout the child belongs to.
+     * @param sessionId - the child session id.
+     * @param role - the role the child was created with.
+     * @param route - the effective route the child ran on.
+     */
+    bindAt(layout: Layout, sessionId: string, role: Role, route?: EffectiveRoute): RoleBinding | undefined {
         try {
-            const file = bindingFile(this.layoutFor(agent), sessionId)
+            const file = bindingFile(layout, sessionId)
+            const effective = compactRoute(route)
             const binding: RoleBinding = {
                 sessionId,
                 roleId: role.id,
@@ -102,6 +168,7 @@ export class RoleBindingStore {
                 mode: role.mode,
                 skills: [...role.skills],
                 tools: [...role.tools],
+                ...(effective === undefined ? {} : { route: effective }),
                 updatedAt: Date.now(),
             }
             writeJsonAtomic(file, binding)
@@ -199,8 +266,14 @@ export class RoleBindingStore {
 }
 
 /** {@link RoleBindingStore.bind} as a free function. */
-export function bindRole(store: RoleBindingStore, agent: AgentLike | undefined, sessionId: string, role: Role): RoleBinding | undefined {
-    return store.bind(agent, sessionId, role)
+export function bindRole(
+    store: RoleBindingStore,
+    agent: AgentLike | undefined,
+    sessionId: string,
+    role: Role,
+    route?: EffectiveRoute,
+): RoleBinding | undefined {
+    return store.bind(agent, sessionId, role, route)
 }
 
 /**

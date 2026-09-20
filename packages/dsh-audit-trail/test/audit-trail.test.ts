@@ -994,3 +994,27 @@ test('audit tools refuse an undeclared workspace instead of rewinding the harnes
         process.chdir(previous)
     }
 })
+
+test('a creation written immediately after the record is still compensated (regression)', async () => {
+    // The old guard allowed only 5 ms between the journal row and the file's
+    // mtime, but the row is written at pre-execute — before the write. Measured
+    // jitter reaches ~5 ms under load, which made the ordinary case (write right
+    // after the hook returns) intermittently look like "modified later", so the
+    // compensation was skipped and the rewind reported one item instead of two.
+    const fake = host()
+    await step(fake, 9)
+    const created = path.join(fake.cwd, 'fresh.txt')
+    await pre(fake, { callId: 'c1', name: 'write', arguments: { file_path: 'fresh.txt', content: 'v1' } })
+
+    // Deterministically reproduce the jitter: 25 ms after the record, inside the
+    // old 5 ms tolerance's blind spot and well inside the new one.
+    await new Promise((resolve) => setTimeout(resolve, 25))
+    fs.writeFileSync(created, 'v1')
+
+    const dry = runText(await fake.runTool('audit_rewind', { turn: 9 }))
+    assert.match(dry, /删除 fresh\.txt/, `the creation must still be compensated: ${dry}`)
+    assert.doesNotMatch(dry, /将跳过删除/)
+    const done = runText(await fake.runTool('audit_rewind', { turn: 9, dryRun: false, confirm: true }))
+    assert.match(done, /已执行 1 项补偿/)
+    assert.equal(fs.existsSync(created), false)
+})

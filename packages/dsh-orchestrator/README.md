@@ -1,3 +1,72 @@
+## 到阶段就自动派子代理（autoDispatch）
+
+默认**关闭**：这是本插件唯一会"自己花 token"的功能。打开后，**进入阶段时由 orchestrator 直接派子代理执行**，
+不再依赖模型记得调用 `team_delegate`：
+
+```yaml
+- id: orchestrator
+  config:
+    autoDispatch:
+      enabled: true
+      provider: spawn
+      stages: [implement]            # 没有在阶段上单独声明时，按这个 id 列表派发
+      timeoutMs: 1200000             # 单个阶段的子代理上限（超时不阻断：阶段仍是 entered）
+      maxDepth: 1                    # 子代理不得再往下派（默认就是 1）
+      toolFilter: { allow: [read, grep, glob] }   # 仅在角色不可用时的兜底；orchestrate 一律被剔除
+      # 注意：allow 写成空数组会被拒绝派发（等于"不给任何工具"，静默放行会让子代理继承全部工具面）
+```
+
+- **阶段自己的声明优先**：`autoDispatch: true` 强制派发，`autoDispatch: false` 强制不派发（即使 id 在列表里）；
+- **权限由角色决定**：阶段声明了 `role` 且 `dsh-role-guard` 提供了 service 时，用角色解析出的
+  persona + 工具白名单 + 模型路由（与 `team_delegate` 同一套解析器）；角色不可用时退回 `toolFilter` 与 `routing`；
+  角色解析失败（未知角色）→ **拒绝派发**并说明原因，绝不"降级成更宽权限"；
+- **派发 ≠ 结算**：子代理跑完不等于门禁通过。阶段仍是 `entered`，`advance` 仍要裁决，`autoAdvance` 仍管自动推进；
+- **子代理拿不到 `orchestrate`，也不能再往下派**：工具过滤里**强制排除 `orchestrate`**，并给 provider 传
+  `maxDepth=1`。这不是洁癖——真机实测：子代理继承了 `orchestrate` 后自己调 `orchestrate start`，
+  于是又触发一次自动派发，递归到 harness 深度上限，**一次阶段进入产生了 ~800 个子会话**。
+  提示词里写"不要调用 orchestrate"不算权限模型，所以这一步是结构性的；
+- **同一会话重复 `start` 是幂等的**：阶段仍 `entered`（可能正有子代理在跑）时再调 `start` 只报告现状，
+  不会重新进入、更不会再派发（同一 runaway 的另一半原因：`start` 原本总会重入）；
+- **`resume` 不会重复派发同一次进入**：按"进入记录"（`enteredAt`）判重，而不是按尝试号；
+  要重跑用 `rerun`（新进入 → 新派发，产物名带 attempt 与 run id，不会覆盖上一次的记录）；
+- **失败不阻断**：子代理报错/超时/取消 → 报告里 `⚠️ 未产出可用结果：<原因>`，阶段照旧可用，模型可以自己做；
+- **产物可查**：子代理完整输出落在 `.dsh/missions/<id>/stages/<stage>-dispatch.md`，
+  报告里给出运行 id、stopReason、权限来源与文件路径。
+
+需要 `ctx.subagents`（宿主装配子代理 provider，如 `spawn`）；没装配时报告会说明并让模型手动执行本阶段。
+
+## 每一步按难度用不同的模型（difficulty → routing）
+
+阶段声明**难度**，宿主把难度映射成模型路由；派发时由 `team_delegate` 按调用覆盖模型：
+
+```yaml
+- id: orchestrator
+  config:
+    routing:
+      cheap:    { provider: deepseek-official, model: deepseek-v4-flash }
+      standard: { provider: deepseek-official, model: deepseek-v4-flash }
+      deep:     { provider: deepseek-official, model: deepseek-v4-pro, reasoningEffort: high, maxTokens: 32000 }
+```
+
+内置流水线的难度（可在自定义 `stages` 里改）：
+
+| 阶段 | 难度 | 理由 |
+|---|---|---|
+| spec-clarify | cheap | 把需求读清楚写成结构化规格，便宜模型足够 |
+| test-design-review | standard | 评审覆盖度需要中等推理 |
+| spec-approve | cheap | 送审与等待人工决定 |
+| **implement** | **deep** | 写代码最难，值得用最强模型 |
+| quality-verify | standard | 看门禁输出、定位失败原因 |
+| delivery | cheap | 登记证据、签发回执是流程性工作 |
+
+- 解析优先级：阶段显式 `model:` > `difficulty` 经 `routing` 映射 > 无（沿用会话默认模型）；
+- 阶段工件（`.dsh/missions/<id>/stages/<stage>.json`）记录 `difficulty` 与解析出的 `route`（含 `source`），
+  事后能回答"最贵的那步跑在哪个模型上"；
+- **orchestrator 不改变会话模型**：它在阶段报告里写明路由与应调用的形式
+  （`team_delegate({ role: "…", model: "deepseek-official/deepseek-v4-pro", reasoningEffort: "high", ... })`），
+  由 `dsh-role-guard` 在派发时落实；宿主可用 `allowModelOverride: false` 禁止按调用覆盖（成本控制）；
+- 阶段未声明难度、或难度没有映射时，一切照旧（沿用会话默认模型），并在报告里说明。
+
 # dsh-orchestrator
 
 dsh 工程体系的**顶层流程编排插件**（docs.md §4）：定义“什么阶段用哪个插件”，探测插件是否挂载，

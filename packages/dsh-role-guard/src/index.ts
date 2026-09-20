@@ -37,6 +37,7 @@ import { RoleRegistryCache } from './loader.js'
 import { PROMPT_SECTION, sectionText } from './prompt.js'
 import { createSkillGuard } from './skill-gate.js'
 import { registerTools, type SubagentsLike } from './tools.js'
+import { createRolePlanner } from './service.js'
 
 export const name = 'dsh-role-guard'
 
@@ -57,6 +58,8 @@ interface PromptRuntimeLike {
 interface ContextLike {
     tools: ToolRuntimeLike
     systemPrompt: PromptRuntimeLike
+    /** Service registry: an older runtime may not expose `provide`. */
+    provide?: (name: string, value: unknown) => () => void
     get: (name: string) => unknown
     on: (event: string, listener: (...args: never[]) => unknown) => () => void
     effect: (execute: () => (() => void) | void) => void
@@ -115,6 +118,41 @@ export function apply(ctx: Context, config: unknown = {}): void {
         })
 
         const disposers: (() => void)[] = [...tools.disposers]
+
+        // --- service seam: plan a delegation without a model in the loop ------
+        // `team_delegate` is the model-facing path; an autonomous dispatcher
+        // (e.g. the orchestrator acting on stage entry) consumes the SAME
+        // resolver through this service, so an auto-dispatched child cannot end
+        // up with rights a delegated one would not get. Optional: a runtime
+        // without `provide` simply skips it, and orchestrator config covers the
+        // no-role-guard case.
+        let serviceState: string
+        if (typeof context.provide !== 'function') {
+            serviceState = 'unavailable(no ctx.provide)'
+        } else {
+            try {
+                const service = createRolePlanner({
+                    rolesFor: (layout) => roles.for(layout),
+                    layoutFor,
+                    layoutForCwd: (cwd) => resolveLayout(cwd, resolved.layout),
+                    visibleTool: (toolName, agent) => {
+                        try {
+                            return context.tools.get(toolName, agent) !== undefined
+                        } catch {
+                            return false
+                        }
+                    },
+                    config: { readonlyDeny: resolved.readonlyDeny },
+                    bindings,
+                    logger,
+                })
+                disposers.push(context.provide('role-guard', service))
+                serviceState = 'on'
+            } catch (error) {
+                serviceState = 'failed'
+                logger.error('cannot provide the role-guard service:', error)
+            }
+        }
 
         // --- skill gate (invocation time; monotonic, cannot be allowed back) ---
         const skillTools = [...resolved.skillTools]
@@ -184,7 +222,7 @@ export function apply(ctx: Context, config: unknown = {}): void {
         })
 
         logger.info(
-            `applied (tools: ${tools.registered.join(', ') || 'none'}; provider=${resolved.provider}; defaultRole=${resolved.defaultRole}; skillGate=${skillGate})`,
+            `applied (tools: ${tools.registered.join(', ') || 'none'}; provider=${resolved.provider}; defaultRole=${resolved.defaultRole}; skillGate=${skillGate}; service=${serviceState})`,
         )
     } catch (error) {
         logger.error('apply failed:', error)

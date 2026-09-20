@@ -36,6 +36,33 @@ export interface GateSpec {
 }
 
 /** One resolved pipeline stage. */
+/** Difficulty classes a stage can declare (mapped to routes by the host). */
+export type Difficulty = 'cheap' | 'standard' | 'deep'
+
+/** One host-declared route. */
+export interface RouteConfig {
+    provider?: string
+    model?: string
+    reasoningEffort?: string
+    maxTokens?: number
+}
+
+/** The resolved route for one stage, with where it came from. */
+export interface StageRoute {
+    provider?: string
+    model?: string
+    reasoningEffort?: string
+    maxTokens?: number
+    /**
+     * `stage` = explicit `model:` on the stage, `difficulty` = mapped from the
+     * stage's difficulty, `role` = the role file's own route (set by the
+     * dispatcher, never by this resolver), `none` = nothing declared.
+     */
+    source: 'stage' | 'difficulty' | 'role' | 'none'
+    /** The difficulty class that produced it, when one did. */
+    difficulty?: Difficulty
+}
+
 export interface StageConfig {
     id: string
     /** What the agent must do in this stage (Chinese, injected into the prompt). */
@@ -67,6 +94,33 @@ export interface StageConfig {
      * `reviewer`, `qa`) are set on {@link DEFAULT_STAGES}.
      */
     role?: string
+    /**
+     * How hard this stage's work is, so the HOST can route it to a model
+     * (docs: 每一步按难度用不同的模型).
+     *
+     * The orchestrator never picks a model itself: it resolves the difficulty
+     * through the host's `routing` table, records the resulting route in the
+     * stage artifact and advertises it in the stage prompt, where the agent
+     * passes it to `team_delegate`. A deployment that declares no table gets no
+     * routing — the stage then simply runs on whatever the session uses.
+     */
+    difficulty?: Difficulty
+    /**
+     * Explicit route for this stage, overriding `difficulty` (same
+     * `provider/model` shorthand as a role file). For the one-off case where a
+     * stage needs a specific model rather than a difficulty class.
+     */
+    model?: string
+    /** Adapter-owned reasoning effort for this stage's route. */
+    reasoningEffort?: string
+    /**
+     * Dispatch this stage's work to a child agent on entry (see
+     * `OrchestratorConfig.autoDispatch`). A declaration here overrides the
+     * configured stage-id list in both directions.
+     *
+     * Dispatch is not settlement: the stage's gate still decides the transition.
+     */
+    autoDispatch?: boolean
     /**
      * Opt-in automatic transition (docs.md §4.2: 自动触发下一阶段).
      *
@@ -110,9 +164,66 @@ const DEFAULT_GATE_LABEL: Record<GateKind, string> = {
  * role at all. `autoAdvance` is left off everywhere: the built-in pipeline
  * keeps today's model-driven transitions unless a profile opts in.
  */
+/**
+ * Resolve one stage's model route.
+ *
+ * Precedence: an explicit `model:` on the stage wins; otherwise the stage's
+ * `difficulty` is looked up in the host's `routing` table. Everything is
+ * optional — a deployment that declares neither gets `source: 'none'` and no
+ * route is advertised, so the stage runs on the session's own model.
+ * @param stage - the configured stage.
+ * @param routing - the host's difficulty → route table.
+ */
+export function resolveStageRoute(stage: StageConfig, routing: Partial<Record<Difficulty, RouteConfig>>): StageRoute {
+    if (typeof stage.model === 'string' && stage.model.trim() !== '') {
+        const [provider, model] = stage.model.includes('/')
+            ? [stage.model.split('/', 1)[0], stage.model.slice(stage.model.indexOf('/') + 1)]
+            : [undefined, stage.model.trim()]
+        return {
+            ...(provider === undefined || provider === '' ? {} : { provider }),
+            ...(model === undefined || model === '' ? {} : { model }),
+            ...(stage.reasoningEffort === undefined ? {} : { reasoningEffort: stage.reasoningEffort }),
+            source: 'stage',
+            ...(stage.difficulty === undefined ? {} : { difficulty: stage.difficulty }),
+        }
+    }
+    if (stage.difficulty !== undefined) {
+        const route = routing[stage.difficulty]
+        if (route !== undefined) {
+            return {
+                ...(route.provider === undefined ? {} : { provider: route.provider }),
+                ...(route.model === undefined ? {} : { model: route.model }),
+                ...(route.reasoningEffort === undefined ? {} : { reasoningEffort: route.reasoningEffort }),
+                ...(route.maxTokens === undefined ? {} : { maxTokens: route.maxTokens }),
+                source: 'difficulty',
+                difficulty: stage.difficulty,
+            }
+        }
+    }
+    return { source: 'none', ...(stage.difficulty === undefined ? {} : { difficulty: stage.difficulty }) }
+}
+
+/** One-line description of a route, for the prompt and the artifacts. */
+export function describeStageRoute(route: StageRoute): string {
+    const target = route.model === undefined ? '' : `${route.provider === undefined ? '' : `${route.provider}/`}${route.model}`
+    if (route.source === 'none') {
+        return route.difficulty === undefined
+            ? '未声明模型路由（沿用会话默认模型）'
+            : `难度 ${route.difficulty}，但宿主没有配置 routing 映射（沿用会话默认模型）`
+    }
+    const origin =
+        route.source === 'stage'
+            ? '阶段显式声明'
+            : route.source === 'role'
+              ? '角色文件'
+              : `难度 ${route.difficulty} → 宿主 routing`
+    return `${target === '' ? '(未指定模型)' : target}${route.reasoningEffort === undefined ? '' : ` · effort=${route.reasoningEffort}`}（${origin}）`
+}
+
 export const DEFAULT_STAGES: readonly StageConfig[] = [
     {
         id: 'spec-clarify',
+        difficulty: 'cheap', // 把需求读清楚、写成结构化规格：便宜模型足够
         prompt: '澄清需求，产出规格草稿',
         requiredPlugins: ['dsh-spec-gate'],
         gate: { kind: 'none', phase: 'entry', label: DEFAULT_GATE_LABEL.none, verdict: 'pass-or-warn' },
@@ -120,6 +231,7 @@ export const DEFAULT_STAGES: readonly StageConfig[] = [
     },
     {
         id: 'test-design-review',
+        difficulty: 'standard', // 评审用例覆盖度需要中等推理
         prompt: '评审测试设计，确保覆盖度与可执行性',
         requiredPlugins: ['dsh-test-design-gate'],
         gate: { kind: 'test-design', phase: 'entry', label: DEFAULT_GATE_LABEL['test-design'], verdict: 'pass-or-warn' },
@@ -128,6 +240,7 @@ export const DEFAULT_STAGES: readonly StageConfig[] = [
     },
     {
         id: 'spec-approve',
+        difficulty: 'cheap', // 送审与等待人工决定，几乎不消耗推理
         prompt: '审批规格（人工审批门禁）',
         requiredPlugins: ['dsh-spec-gate'],
         gate: { kind: 'spec-approved', phase: 'entry', label: DEFAULT_GATE_LABEL['spec-approved'], verdict: 'pass-or-warn' },
@@ -136,6 +249,7 @@ export const DEFAULT_STAGES: readonly StageConfig[] = [
     },
     {
         id: 'implement',
+        difficulty: 'deep', // 写代码是最难的一步，值得用最强的模型
         prompt: '按规格实现代码',
         requiredPlugins: ['dsh-role-guard'],
         gate: { kind: 'none', phase: 'entry', label: DEFAULT_GATE_LABEL.none, verdict: 'pass-or-warn' },
@@ -145,6 +259,7 @@ export const DEFAULT_STAGES: readonly StageConfig[] = [
     },
     {
         id: 'quality-verify',
+        difficulty: 'standard', // 看门禁输出并定位失败原因
         prompt: '执行质量门禁并登记证据',
         requiredPlugins: ['dsh-quality-gate', 'dsh-evidence-gate'],
         gate: { kind: 'quality-pass', phase: 'exit', label: DEFAULT_GATE_LABEL['quality-pass'], verdict: 'pass-only' },
@@ -153,6 +268,7 @@ export const DEFAULT_STAGES: readonly StageConfig[] = [
     },
     {
         id: 'delivery',
+        difficulty: 'cheap', // 登记证据、签发回执是流程性工作
         prompt: '交付审计与回执',
         requiredPlugins: ['dsh-evidence-gate', 'dsh-audit-trail'],
         gate: { kind: 'receipt', phase: 'exit', label: DEFAULT_GATE_LABEL.receipt, verdict: 'pass-only' },
@@ -276,6 +392,10 @@ export function resolvePipeline(input: unknown, defaultMaxAttempts: number): { s
         maxAttempts: number | undefined
         next: string | undefined
         role: string | undefined
+        difficulty: Difficulty | undefined
+        model: string | undefined
+        reasoningEffort: string | undefined
+        autoDispatch: boolean | undefined
         autoAdvance: boolean | undefined
         index: number
         where: string
@@ -333,6 +453,22 @@ export function resolvePipeline(input: unknown, defaultMaxAttempts: number): { s
         if (autoAdvance !== undefined && typeof autoAdvance !== 'boolean') {
             issues.push(`${where} (${id}): autoAdvance 必须是布尔值（true = 门禁通过时由宿主自动推进）`)
         }
+        const difficulty = entry['difficulty']
+        if (difficulty !== undefined && difficulty !== 'cheap' && difficulty !== 'standard' && difficulty !== 'deep') {
+            issues.push(`${where} (${id}): difficulty 只能是 cheap / standard / deep（收到 ${JSON.stringify(difficulty)}）`)
+        }
+        const stageModel = entry['model']
+        if (stageModel !== undefined && (typeof stageModel !== 'string' || stageModel.trim() === '')) {
+            issues.push(`${where} (${id}): model 必须是非空字符串（"provider/model" 或裸模型名）`)
+        }
+        const effort = entry['reasoningEffort']
+        if (effort !== undefined && (typeof effort !== 'string' || effort.trim() === '')) {
+            issues.push(`${where} (${id}): reasoningEffort 必须是非空字符串`)
+        }
+        const stageDispatch = entry['autoDispatch']
+        if (stageDispatch !== undefined && typeof stageDispatch !== 'boolean') {
+            issues.push(`${where} (${id}): autoDispatch 必须是布尔值`)
+        }
         parsed.push({
             id,
             prompt: typeof prompt === 'string' ? prompt : '',
@@ -342,6 +478,11 @@ export function resolvePipeline(input: unknown, defaultMaxAttempts: number): { s
             maxAttempts: typeof maxAttempts === 'number' ? maxAttempts : undefined,
             next: readRef('next'),
             role: typeof role === 'string' && role.trim() !== '' ? role.trim() : undefined,
+            difficulty:
+                difficulty === 'cheap' || difficulty === 'standard' || difficulty === 'deep' ? difficulty : undefined,
+            model: typeof stageModel === 'string' && stageModel.trim() !== '' ? stageModel.trim() : undefined,
+            reasoningEffort: typeof effort === 'string' && effort.trim() !== '' ? effort.trim() : undefined,
+            autoDispatch: typeof stageDispatch === 'boolean' ? stageDispatch : undefined,
             autoAdvance: typeof autoAdvance === 'boolean' ? autoAdvance : undefined,
             index,
             where,
@@ -383,6 +524,10 @@ export function resolvePipeline(input: unknown, defaultMaxAttempts: number): { s
             // for a stage the host rewrote — silently binding `implement` to
             // developer would advertise a role the host did not ask for.
             ...(stage.role === undefined ? {} : { role: stage.role }),
+            ...(stage.difficulty === undefined ? {} : { difficulty: stage.difficulty }),
+            ...(stage.model === undefined ? {} : { model: stage.model }),
+            ...(stage.reasoningEffort === undefined ? {} : { reasoningEffort: stage.reasoningEffort }),
+            ...(stage.autoDispatch === undefined ? {} : { autoDispatch: stage.autoDispatch }),
             ...(stage.autoAdvance === undefined ? {} : { autoAdvance: stage.autoAdvance }),
         }
     })

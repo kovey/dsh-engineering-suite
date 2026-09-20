@@ -16,6 +16,7 @@ import type { AgentLike } from 'dsh-eng-core'
 import type { RoleBindingStore } from './bindings.js'
 import type { RoleGuardConfig } from './config.js'
 import type { RoleRegistryCache } from './loader.js'
+import { resolveRoute, routeLine } from './route.js'
 import type { Role } from './roles.js'
 
 const TEXT_OUTPUT = { type: 'string' } as const
@@ -63,6 +64,18 @@ export interface DelegateArgs {
     task: string
     context?: string
     deliverable?: string
+    /**
+     * Per-call route override: `provider/model` or a bare model id.
+     *
+     * `unknown` on purpose — the parameter schema does not constrain the type,
+     * so a malformed value reaches {@link resolveRoute}, which reports it and
+     * falls back per field instead of failing the whole delegation.
+     */
+    model?: unknown
+    /** Per-call reasoning-effort override (a non-empty string when well-formed). */
+    reasoningEffort?: unknown
+    /** Per-call output-token cap override (a positive integer when well-formed). */
+    maxTokens?: unknown
 }
 
 /** The filter actually handed to the provider, plus what was dropped. */
@@ -81,7 +94,10 @@ export interface ToolFilterPlan {
  * @param config - resolved configuration.
  * @param visible - predicate answering whether a tool is visible to the parent agent.
  */
-export function planToolFilter(role: Role, config: RoleGuardConfig, visible: (name: string) => boolean): ToolFilterPlan {
+/** The configuration slice `planToolFilter` actually reads. */
+export type FilterConfig = Pick<RoleGuardConfig, 'readonlyDeny'>
+
+export function planToolFilter(role: Role, config: FilterConfig, visible: (name: string) => boolean): ToolFilterPlan {
     const dropped: string[] = []
     // Only the allow-list reports dropped names: a deny entry naming a tool
     // this deployment lacks merely removes nothing, while a whitelist entry
@@ -287,6 +303,27 @@ export function registerTools(
                 task: { type: 'string', required: true, description: 'What the child must do, stated as an outcome.' },
                 context: { type: 'string', description: 'Facts the child needs: files, current state, prior findings.' },
                 deliverable: { type: 'string', description: 'The exact form of the answer you expect back.' },
+                // Types are declared, not "validated later": a wrong TYPE is a
+                // caller mistake the schema rejects immediately (the model sees
+                // `must be a string` and retries), while a value that is
+                // well-typed but cannot form a route (empty string, a bare model
+                // with no provider anywhere, a non-positive cap) falls back to
+                // the role's route with a reported problem — see resolveRoute.
+                model: {
+                    type: 'string',
+                    description:
+                        'Optional per-call model override: "provider/model" (same shorthand as a role file) or a bare model id, which keeps the role\'s provider. Takes precedence over the role file\'s model; the host may forbid overriding (allowModelOverride: false).',
+                },
+                reasoningEffort: {
+                    type: 'string',
+                    description:
+                        'Optional per-call reasoning-effort override (e.g. low/medium/high). Takes precedence over the role file; the host may forbid overriding.',
+                },
+                maxTokens: {
+                    type: 'integer',
+                    description:
+                        'Optional per-call output-token cap (positive). Takes precedence over the role file; the host may forbid overriding.',
+                },
             },
             output: { schema: TEXT_OUTPUT, render: (_args, value) => [{ type: 'text', text: value }] },
             async execute(args: DelegateArgs, exec) {
@@ -327,12 +364,15 @@ export function registerTools(
                     specSection: specSectionFor(deps, agent),
                     config: deps.config,
                 })
-                const agentOptions = {
-                    ...(role.provider === undefined ? {} : { provider: role.provider }),
-                    ...(role.model === undefined ? {} : { model: role.model }),
-                    ...(role.reasoningEffort === undefined ? {} : { reasoningEffort: role.reasoningEffort }),
-                    ...(role.maxTokens === undefined ? {} : { maxTokens: role.maxTokens }),
-                }
+                // The child's LLM route: explicit call parameters merged over the
+                // role's own route (call > role > host default). Malformed
+                // parameters fall back per field and are reported below.
+                const route = resolveRoute(
+                    role,
+                    { model: args.model, reasoningEffort: args.reasoningEffort, maxTokens: args.maxTokens },
+                    deps.config.allowModelOverride,
+                )
+                const agentOptions = route.route
                 const run = await startWithDiagnostics(subagents, deps.config.provider, {
                     label: `${role.name} · ${head(args.task, 60)}`,
                     prompt: [{ type: 'text', text: prompt }],
@@ -345,7 +385,9 @@ export function registerTools(
                 // A `SubagentRun`'s id IS the child session id, which is the key the
                 // invocation-time gates look the role up by. Recorded before the
                 // first result is awaited; the file is what survives a reload.
-                const binding = deps.bindings.bind(agent, run.id, role)
+                // The effective route travels with it, so an audit can see which
+                // model the child actually ran on.
+                const binding = deps.bindings.bind(agent, run.id, role, route.route)
                 let result: Awaited<typeof run.result>
                 try {
                     result = await run.result
@@ -359,6 +401,15 @@ export function registerTools(
                     }
                 }
                 const warnings: string[] = []
+                // Route warnings come first: they explain why the child ran where
+                // it did, which is what a cost/audit reader looks for.
+                if (route.ignored.length > 0) {
+                    warnings.push(
+                        `宿主禁用了按调用覆盖模型：沿用角色路由（被忽略的调用参数：${route.ignored.join('、')}）。` +
+                            '模型覆盖是成本决策，是否允许由宿主的 allowModelOverride 决定。',
+                    )
+                }
+                for (const problem of route.problems) warnings.push(problem)
                 if (plan.dropped.length > 0) {
                     warnings.push(`角色文件里这些工具在当前部署不存在，已从白名单剔除：${plan.dropped.join(', ')}`)
                 }
@@ -374,6 +425,7 @@ export function registerTools(
                     `stop reason: ${stopReasonText(result.stopReason)}`,
                     `tool whitelist: ${plan.filter?.allow?.join(', ') ?? '(继承全部，deny: ' + (plan.filter?.deny?.join(', ') ?? '无') + ')'}`,
                     `skill whitelist: ${role.skills.join(', ') || '(未声明 = 不限制)'}（调用时强制）`,
+                    routeLine(route),
                 ]
                 const body = tail(renderChildOutput(result.output), deps.config.maxOutputChars)
                 const diagnostic = result.diagnostic === undefined ? '' : `\ndiagnostic: ${result.diagnostic}`

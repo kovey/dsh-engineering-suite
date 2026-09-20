@@ -27,6 +27,12 @@ export interface RoleGuardConfig {
     readonlyDeny: readonly string[]
     /** Cap for the child's returned output. */
     maxOutputChars: number
+    /**
+     * Whether `team_delegate` may override the role's model route per call
+     * (`model` / `reasoningEffort` / `maxTokens`). A model override is a cost
+     * decision, so the host can forbid it.
+     */
+    allowModelOverride: boolean
     /** Include the mission's specification digest in the child prompt. */
     injectSpec: boolean
     /** Enforce a role's `skills` list at invocation time (see `skill-gate`). */
@@ -97,6 +103,7 @@ export function resolveConfig(input: unknown): RoleGuardConfig {
         defaultRole: str(raw['defaultRole'], 'developer'),
         readonlyDeny: strList(raw['readonlyDeny'], DEFAULT_READONLY_DENY),
         maxOutputChars: num(raw['maxOutputChars'], 6_000),
+        allowModelOverride: bool(raw['allowModelOverride'], true),
         injectSpec: bool(raw['injectSpec'], true),
         enforceSkillWhitelist: bool(raw['enforceSkillWhitelist'], true),
         skillTools: skillTools.length > 0 ? skillTools : [...DEFAULT_SKILL_TOOLS],

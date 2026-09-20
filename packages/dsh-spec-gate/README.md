@@ -37,6 +37,7 @@
 - id: spec-gate
   config:
     bootstrap: { enabled: true, provider: spawn, readTools: [read, grep, glob],
+                 model: deepseek-official/deepseek-v4-flash, reasoningEffort: low,
                  timeoutMs: 600000, maxIndexEntries: 40, maxCases: 80, minTextLength: 12 }
 ```
 

@@ -1256,11 +1256,17 @@ test('the browse popup walks back out one level at a time (regression)', async (
 
 /** A scripted read-only drafting child: records the dispatch, answers once. */
 function fakeSubagents(answer: string | (() => Promise<never>)) {
-    const calls: { provider: string; request: { toolFilter?: { allow?: readonly string[] }; prompt: { text: string }[] } }[] = []
+    const calls: {
+        provider: string
+        request: { toolFilter?: { allow?: readonly string[] }; prompt: { text: string }[]; agentOptions?: Record<string, unknown> }
+    }[] = []
     const disposed: string[] = []
     let counter = 0
     const service = {
-        start: async (provider: string, request: { toolFilter?: { allow?: readonly string[] }; prompt: { text: string }[] }) => {
+        start: async (
+            provider: string,
+            request: { toolFilter?: { allow?: readonly string[] }; prompt: { text: string }[]; agentOptions?: Record<string, unknown> },
+        ) => {
             calls.push({ provider, request })
             const id = `run-${(counter += 1)}`
             return {
@@ -1511,4 +1517,29 @@ test('spec_bootstrap can be disabled, and never touches the mission ledger (regr
     const stores = new MissionStoreRegistry().for(other)
     assert.equal(stores.list().length, 0)
     assert.equal(stores.active('session-1'), undefined)
+})
+
+test('the drafting child can be routed to a cheaper model (regression)', async () => {
+    const cwd = legacyRepo()
+    const child = fakeSubagents(DRAFT_ANSWER)
+    const fake = createFakeHost({ cwd, services: { subagents: child.service } })
+    apply(fake.ctx as never, {
+        logFile: path.join(cwd, 'spec-gate.log'),
+        bootstrap: { model: 'deepseek-official/deepseek-v4-flash', reasoningEffort: 'low', maxTokens: 8000 },
+    })
+    await fake.runTool('spec_bootstrap', { action: 'draft' })
+    const options = (child.calls[0]?.request as { agentOptions?: Record<string, unknown> }).agentOptions
+    assert.deepEqual(options, { provider: 'deepseek-official', model: 'deepseek-v4-flash', reasoningEffort: 'low', maxTokens: 8000 })
+
+    // With no route configured the child inherits the session's model.
+    const other = legacyRepo()
+    const inherited = fakeSubagents(DRAFT_ANSWER)
+    const bare = createFakeHost({ cwd: other, services: { subagents: inherited.service } })
+    apply(bare.ctx as never, { logFile: path.join(other, 'spec-gate.log') })
+    await bare.runTool('spec_bootstrap', { action: 'draft' })
+    assert.equal(
+        (inherited.calls[0]?.request as { agentOptions?: unknown }).agentOptions,
+        undefined,
+        'no configured route → no agentOptions, the child uses the session model',
+    )
 })

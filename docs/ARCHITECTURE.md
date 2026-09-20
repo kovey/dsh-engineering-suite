@@ -217,6 +217,61 @@ spec_create → test_design_review → spec_approve    照常走门禁链
 扫描器（`dsh-eng-core/src/scan.ts`）只用来做**索引与缺口报告**（默认 4000 文件 / 单文件 256 KiB / 不跟随符号链接），
 它不再充当草稿的"证据来源"。
 
+## 5.5 按难度路由模型：声明在阶段，落实在派发
+
+一个流水线里各步难度差别很大（澄清需求 vs 写代码），用同一个模型要么浪费要么不够。做法是**分层声明、单点落实**：
+
+```
+阶段（orchestrator）        difficulty: cheap | standard | deep，或显式 model: "provider/model"
+        ↓ 解析（优先级：阶段显式 > 难度经 routing 映射 > 无）
+宿主配置 routing             cheap/standard/deep → { provider, model, reasoningEffort, maxTokens }
+                          例：cheap/standard → deepseek-official/deepseek-v4-flash；deep → deepseek-official/deepseek-v4-pro
+        ↓ 记录 + 广播
+阶段工件 route{...,source}   事后可审计"这步跑在哪个模型上"
+        ↓ 阶段报告里给出确切调用（例：deepseek-official/deepseek-v4-pro）
+team_delegate(role, model)  role-guard 按调用覆盖（逐字段：只换 effort 不会丢角色的模型）
+        ↓
+子代理 agentOptions         { provider, model, reasoningEffort, maxTokens } → 宿主 provider
+```
+
+三条边界：
+
+1. **orchestrator 不改变会话模型**：它只能声明与广播，不能替宿主切换当前会话的模型——所以阶段报告里写的是
+   应调用的确切形式，而不是"已切换"；
+2. **类型错误与语义错误分开处理**：参数类型错误由工具 schema 在 `execute` 之前直接拒绝（模型立刻知道要传字符串），
+   类型正确但无法成路由的值（空串、裸模型 id 但全局无 provider、非正数上限）才回落到角色路由并在结果里报告；
+3. **成本可控**：宿主可 `allowModelOverride: false` 禁掉按调用覆盖，此时阶段难度只作为提示，派发沿用角色路由。
+
+## 5.6 自主派发：进入阶段就把活交出去
+
+默认的编排是"声明式"的：orchestrator 说清阶段任务、门禁与角色，具体谁做由模型决定（自己写或 `team_delegate`）。
+`autoDispatch` 打开后变成"执行式"：**进入阶段的那一刻，orchestrator 自己派子代理**。
+
+```
+orchestrate(start|advance|rerun|resume)
+        ↓ 记录阶段进入（stage artifact: state=entered）
+autoDispatch 判定      阶段 autoDispatch:true/false 优先；否则看配置的 stages 列表
+        ↓
+权限与路由            阶段有 role 且 role-guard 提供 service → 角色的 persona/工具白名单/模型路由
+        ↓             否则退回落配置 toolFilter + routing（并说明"角色服务不可用"）
+subagents.start(...)  prompt = 阶段任务 + mission 上下文 + 规则（只做本阶段、不要调 orchestrate、如实汇报）
+        ↓ 等待（受 timeoutMs 约束，失败/超时都只记录）
+产物 + 报告            .dsh/missions/<id>/stages/<stage>-dispatch.md；工具结果里给出运行 id/stopReason/权限来源
+```
+
+四条不变量：
+
+1. **派发不是结算**：子代理完成不写 gateState、不推进阶段；阶段门禁与 `autoAdvance` 完全不受影响；
+2. **权限只来自角色**：用与 `team_delegate` 同一个解析器；未知角色 **拒绝派发**，不会退化成更宽权限；
+   配置里的 `toolFilter` 只是"没有 role-guard 的部署"的兜底；
+3. **失败可见且不阻断**：子代理报错/超时 → 阶段仍是 `entered`，报告写明原因，模型可自行完成该阶段；
+4. **默认关闭**：`autoDispatch.enabled: false` 是默认值——唯一会自主消耗 token 的功能必须显式开启；
+5. **子代理不可重入流水线**：派发时**强制从工具过滤里去掉 `orchestrate`** 并传 `maxDepth=1`。
+   真机事故（2026-09-20）：子代理继承了 `orchestrate`，自己调 `orchestrate start` → 再次触发自动派发 →
+   递归到深度上限，**一次阶段进入产生 ~800 个子会话**。提示词约束不算权限模型，必须结构性禁止；
+6. **重复调用不放大工作量**：同一会话重复 `start` 对"正在进行的阶段"是幂等的；`resume` 按进入记录
+   （`enteredAt`）判重，不会为同一次进入再派一个子代理；每次派发的产物名带 `attempt` 与 run id，不覆盖历史。
+
 ## 6. 为什么这样切分
 
 - **一个关注点一个插件**：门禁可以单独失效（例如先只上 quality-gate），不影响其它环节。

@@ -660,6 +660,26 @@ export function registerTools(
                         parent: agent as never,
                         signal: signal ?? new AbortController().signal,
                         toolFilter: { allow: [...config.bootstrap.readTools] },
+                        // The host decides which model reads the repository: the
+                        // bulk reading is exactly the work a cheap model can do.
+                        ...(config.bootstrap.model === undefined
+                            ? {}
+                            : {
+                                  agentOptions: {
+                                      ...(config.bootstrap.model.includes('/')
+                                          ? { provider: config.bootstrap.model.split('/', 1)[0] as string }
+                                          : {}),
+                                      model: config.bootstrap.model.includes('/')
+                                          ? (config.bootstrap.model.split('/').slice(1).join('/') as string)
+                                          : config.bootstrap.model,
+                                      ...(config.bootstrap.reasoningEffort === undefined
+                                          ? {}
+                                          : { reasoningEffort: config.bootstrap.reasoningEffort }),
+                                      ...(config.bootstrap.maxTokens === undefined
+                                          ? {}
+                                          : { maxTokens: config.bootstrap.maxTokens }),
+                                  },
+                              }),
                         persona: [
                             '你是规格草稿员：读代码、写可验证的验收标准与可执行的测试用例步骤。',
                             '你只有只读工具：绝不修改文件，也不要尝试。',

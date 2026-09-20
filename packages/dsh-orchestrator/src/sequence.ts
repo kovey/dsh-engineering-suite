@@ -23,8 +23,18 @@ import {
     type StageResult,
 } from 'dsh-eng-core'
 import type { OrchestratorConfig } from './config.js'
+import { dispatchStage, shouldDispatch, type DispatchDeps, type DispatchOutcome } from './dispatch.js'
 import { evaluateGate, type Verdict } from './gates.js'
-import { describeGate, isGated, roleInstruction, rollbackTargetOf, stageById, successorOf } from './pipeline.js'
+import {
+    describeGate,
+    describeStageRoute,
+    isGated,
+    resolveStageRoute,
+    roleInstruction,
+    rollbackTargetOf,
+    stageById,
+    successorOf,
+} from './pipeline.js'
 import { buildRetrospective, ledgerPath, persistRetrospective, readLedger, renderHistory, type Retrospective } from './retrospective.js'
 import type { StageConfig } from './pipeline.js'
 import { describeMount, refusalForMissingPlugins, requiredPluginStates, type PluginProbe } from './probes.js'
@@ -44,6 +54,19 @@ type StageResultWithRole = StageResult & { role?: string }
 /** The optional `role` field of a stage result (spreadable, so a role-less stage adds nothing). */
 function roleField(stage: StageConfig): { role?: string } {
     return stage.role === undefined ? {} : { role: stage.role }
+}
+
+/**
+ * The model route this stage declares, resolved through the host's routing
+ * table. Recorded in every stage artifact so "which model ran this step" is
+ * answerable from the ledger, not from the config of the day.
+ */
+function routeField(deps: SequenceDeps, stage: StageConfig): { difficulty?: StageConfig['difficulty']; route?: StageResult['route'] } {
+    const route = resolveStageRoute(stage, deps.config.routing)
+    return {
+        ...(stage.difficulty === undefined ? {} : { difficulty: stage.difficulty }),
+        ...(route.source === 'none' ? {} : { route: { ...route } }),
+    }
 }
 
 
@@ -69,6 +92,8 @@ export interface OrchestrateArgs {
 /** Everything the handlers read at call time. */
 export interface SequenceDeps {
     config: OrchestratorConfig
+    /** Autonomous stage dispatch (see `dispatch.ts`); absent = never dispatch. */
+    dispatch?: DispatchDeps
     stores: MissionStoreRegistry
     /**
      * Build the probe table for one call. The tool registry is scope-aware, so
@@ -85,6 +110,14 @@ interface CallContext {
     cwd: string
     sessionId: string | undefined
     mission: MissionRecord | undefined
+    /**
+     * The caller's cancellation signal (BUG-3).
+     *
+     * Without it an auto-dispatched child cannot be cancelled: the orchestrator
+     * used to hand the provider a fresh `AbortController`, so a cancelled turn
+     * kept a child running (and spending tokens) to completion.
+     */
+    signal?: AbortSignal
 }
 
 /** The english model-facing description of `orchestrate`. */
@@ -110,7 +143,8 @@ function callContext(deps: SequenceDeps, exec: unknown, explicitId?: string): Ca
     const mission = store.resolveForAgent(agent, {
         ...(explicitId === undefined ? {} : { explicitId }),
     })
-    return { store, agent, cwd, sessionId: sessionIdOf(agent), mission }
+    const signal = (exec as { signal?: AbortSignal } | undefined)?.signal
+    return { store, agent, cwd, sessionId: sessionIdOf(agent), mission, ...(signal === undefined ? {} : { signal }) }
 }
 
 /** The mission id arg object, only when the caller supplied one. */
@@ -169,6 +203,120 @@ function nextAttempt(current: StageResult | undefined): number {
 }
 
 /**
+ * Record a stage entry, then dispatch its work when the configuration says so.
+ *
+ * Keeping the dispatch inside the entry path is the point of the feature: with
+ * `autoDispatch` on, a pipeline no longer depends on the model remembering to
+ * call `team_delegate`. The dispatch NEVER settles the stage — the gate and
+ * `autoAdvance` are untouched — and a failed dispatch is reported, not fatal.
+ */
+async function recordAndDispatch(
+    deps: SequenceDeps,
+    ctx: CallContext,
+    stage: StageConfig,
+    attempt: number,
+    summary?: string,
+    keepEntryTime?: number,
+    /** Why this entry must not dispatch (e.g. its entry gate is unmet). */
+    skipReason?: string,
+): Promise<{ recorded: ReturnType<typeof recordEntered>; dispatch?: DispatchOutcome }> {
+    // The record as the LEDGER has it: `recordEntered` builds a fresh object, so
+    // the dispatch recorded by an earlier entry of the same attempt is only
+    // visible here (that is what makes `resume` idempotent).
+    let persisted: StageResult | undefined
+    try {
+        persisted = ctx.store.readStageResult(ctx.mission?.id ?? '', stage.id)
+    } catch {
+        persisted = undefined
+    }
+    const recorded = recordEntered(deps, ctx, stage, attempt, summary, keepEntryTime)
+    // Re-recording an entry must not erase what the entry already produced: the
+    // artifact is the ledger, and `dispatch`/`route` belong to it.
+    if (persisted !== undefined && persisted.enteredAt === recorded.result.enteredAt) {
+        recorded.result.dispatch = persisted.dispatch ?? recorded.result.dispatch
+        recorded.result.route = persisted.route ?? recorded.result.route
+        try {
+            ctx.store.writeStageResult(ctx.mission?.id ?? '', recorded.result)
+        } catch {
+            // best effort: the entry record itself is already on disk
+        }
+    }
+    if (deps.dispatch === undefined) return { recorded }
+    if (skipReason !== undefined) {
+        return { recorded, dispatch: { dispatched: false, note: `自动派发未执行：${skipReason}` } }
+    }
+    // GAP-7: re-entering the SAME attempt (that is what `resume` does) must not
+    // spawn a second child — that would double the token spend and overwrite the
+    // first child's transcript. A settlement starts a new attempt, so it is not
+    // affected.
+    // Identity of an entry = its `enteredAt` (kept across `resume`, fresh for
+    // `rerun`/`advance`). Comparing attempts was not enough: a repeated `start`
+    // bumps the attempt counter, which let it dispatch again and again.
+    const sameEntry = persisted !== undefined && persisted.enteredAt === recorded.result.enteredAt
+    const already = sameEntry ? persisted?.dispatch : undefined
+    if (already !== undefined) {
+        return {
+            recorded,
+            dispatch: {
+                dispatched: false,
+                note: `本阶段第 ${attempt} 次进入已经派发过（run ${already.runId ?? '(未知)'}）：resume 不会重复派发。需要重跑请用 orchestrate({ action: "rerun" })。`,
+            },
+        }
+    }
+    const dispatch = await dispatchStage(deps.dispatch, {
+        stage,
+        mission: recorded.mission,
+        cwd: ctx.cwd,
+        ...(ctx.agent === undefined ? {} : { agent: ctx.agent }),
+        ...(ctx.signal === undefined ? {} : { signal: ctx.signal }),
+        attempt,
+    })
+    if (dispatch.dispatched) {
+        // Record it in the ledger, not only in the report: "what worked this
+        // stage, on which model, and did it produce anything" must be readable
+        // from `.dsh/missions/<id>/stages/<stage>.json` alone.
+        try {
+            const current = ctx.store.readStageResult(recorded.mission.id, stage.id) ?? recorded.result
+            ctx.store.writeStageResult(recorded.mission.id, {
+                ...current,
+                dispatch: {
+                    ...(dispatch.runId === undefined ? {} : { runId: dispatch.runId }),
+                    ...(dispatch.stopReason === undefined ? {} : { stopReason: dispatch.stopReason }),
+                    ...(dispatch.outputFile === undefined ? {} : { outputFile: dispatch.outputFile }),
+                    ...(dispatch.error === undefined ? {} : { error: dispatch.error }),
+                    ...(stage.role === undefined ? {} : { role: stage.role }),
+                    ...(dispatch.attempt === undefined ? {} : { attempt: dispatch.attempt }),
+                    at: Date.now(),
+                },
+                // BUG-4: the artifact must name the route the child actually ran
+                // on (the role's route can differ from the stage's difficulty map).
+                ...(dispatch.route === undefined ? {} : { route: dispatch.route }),
+            })
+        } catch (error) {
+            dispatch.note = `${dispatch.note === undefined ? '' : `${dispatch.note}；`}阶段工件未写入派发记录（${(error as Error).message}）`
+        }
+    }
+    return { recorded, dispatch }
+}
+
+/** The dispatch lines appended to an entry report (`[]` when nothing happened). */
+function dispatchLines(outcome: DispatchOutcome | undefined): string[] {
+    if (outcome === undefined || !outcome.dispatched) {
+        return outcome?.note === undefined ? [] : ['', `⚠️ ${outcome.note}`]
+    }
+    return [
+        '',
+        '### 已自动派发本阶段',
+        '',
+        ...(outcome.runId === undefined ? [] : [`- 子代理运行：${outcome.runId}（stopReason=${outcome.stopReason ?? 'unknown'}）`]),
+        ...(outcome.roleNote === undefined ? [] : [`- 权限来源：${outcome.roleNote}`]),
+        ...(outcome.outputFile === undefined ? [] : [`- 完整输出：${outcome.outputFile}`]),
+        ...(outcome.error === undefined ? ['- 结果：子代理已返回，请阅读其汇报'] : [`- ⚠️ 未产出可用结果：${outcome.error}`]),
+        '- 派发**不结算**本阶段：门禁仍需通过，推进仍用 `orchestrate({ action: "advance" })`。',
+    ]
+}
+
+/**
  * Write one entry record and point the mission at the stage.
  * @returns the persisted record (with the attempt number) and the file path.
  */
@@ -190,6 +338,7 @@ function recordEntered(
         enteredAt: now,
         ...(summary === undefined || summary === '' ? {} : { summary }),
         ...roleField(stage),
+        ...routeField(deps, stage),
     }
     const file = ctx.store.writeStageResult(missionId, result)
     const implied = missionStatusFor(stage.id)
@@ -244,6 +393,20 @@ function stageHeader(
         // The orchestrator declares the role; dsh-role-guard is what makes it
         // real (persona + tool whitelist), so the text names the exact call.
         lines.push(`角色：${stage.role} —— ${role}（角色定义与工具白名单由 dsh-role-guard 执行）`)
+    }
+    const route = resolveStageRoute(stage, deps.config.routing)
+    if (route.source !== 'none' || stage.difficulty !== undefined) {
+        // Declaration, like the role: the orchestrator cannot change the
+        // session's model, so it names the route and the call that applies it.
+        const target =
+            route.model === undefined
+                ? undefined
+                : `${route.provider === undefined ? '' : `${route.provider}/`}${route.model}`
+        const hint =
+            target === undefined
+                ? '（宿主还没有为这个难度配置 routing 映射，沿用会话默认模型）'
+                : `请通过 team_delegate({ role: "${stage.role ?? '<角色>'}", model: "${target}"${route.reasoningEffort === undefined ? '' : `, reasoningEffort: "${route.reasoningEffort}"`}, ... }) 派发本阶段工作（dsh-role-guard 按调用覆盖模型）。`
+        lines.push(`模型：${describeStageRoute(route)}${hint === '' ? '' : ` —— ${hint}`}`)
     }
     if (stage.autoAdvance === true && isGated(stage.gate)) {
         lines.push(`自动推进：已启用（宿主声明 autoAdvance；本阶段门禁通过时，本轮结束会自动结算并进入下一阶段）`)
@@ -310,6 +473,10 @@ function stagesReport(deps: SequenceDeps, probes: Record<string, PluginProbe>, c
         lines.push(`   门禁：${describeGate(stage.gate)}`)
         lines.push(`   回退：${rollbackTargetOf(deps.config.stages, stage) ?? '(无)'}　上限：${budgetOf(deps, stage)} 次`)
         lines.push(`   角色：${stage.role === undefined ? '无' : `${stage.role}（${roleInstruction(stage)}）`}`)
+        lines.push(`   难度/模型：${describeStageRoute(resolveStageRoute(stage, deps.config.routing))}`)
+        lines.push(
+            `   自动派发：${shouldDispatch(deps.config, stage) ? '已开启（进入本阶段时自动派子代理执行）' : deps.config.autoDispatch.enabled ? '未开启（本阶段不在派发范围）' : '未开启（宿主未启用 autoDispatch）'}`,
+        )
         lines.push(`   自动推进：${stage.autoAdvance === true ? '已启用（autoAdvance: true）' : '未启用（默认，由 orchestrate({ action: "advance" }) 推进）'}`)
         lines.push(`   要求插件：`)
         if (states.length === 0) lines.push('   - 无')
@@ -380,7 +547,7 @@ function statusReport(deps: SequenceDeps, probes: Record<string, PluginProbe>, c
 }
 
 /** `start` — resolve or create the mission and enter the first stage. */
-function startAction(deps: SequenceDeps, probes: Record<string, PluginProbe>, ctx: CallContext, args: OrchestrateArgs): string {
+async function startAction(deps: SequenceDeps, probes: Record<string, PluginProbe>, ctx: CallContext, args: OrchestrateArgs): Promise<string> {
     const blocked = ctx.mission === undefined ? undefined : blockedRefusal(ctx.mission, args.action)
     if (blocked !== undefined) return blocked
 
@@ -412,6 +579,26 @@ function startAction(deps: SequenceDeps, probes: Record<string, PluginProbe>, ct
     if (ctx.sessionId !== undefined) ctx.store.bindSession(ctx.sessionId, mission.id, first.id)
 
     const existing = stageResultOf(ctx.store, mission.id, first.id)
+    // A live (entered) record means the stage is IN PROGRESS — possibly with an
+    // auto-dispatched child working right now. Re-entering it would re-dispatch
+    // (one child per call) and overwrite the artifact, so `start` is idempotent
+    // for a live entry: a model that repeats the call must not multiply the work.
+    // Only the SAME session repeating the call is refused: a different session
+    // (or a resumed one) may legitimately pick up an unfinished mission, and the
+    // guard must not lock a workspace out of its own pipeline.
+    const sameSession = ctx.sessionId !== undefined && mission.sessionId === ctx.sessionId
+    if (sameSession && existing !== undefined && existing.state === 'entered') {
+        return [
+            `mission ${mission.id}（${mission.title}）已经在阶段 ${first.id} 中（第 ${existing.attempt} 次进入，尚未结算）。`,
+            `start 不会重新进入正在进行的阶段，也不会再派发一次：这只会重复消耗 token。`,
+            '',
+            `下一步：继续完成该阶段后用 orchestrate({ action: "advance", verdict: "PASS", summary: "<做了什么>" }) 推进；` +
+                `要重开会先结算/放弃当前尝试（action: "rerun"），查看现状用 action: "status"。`,
+            // The history is still worth showing: the caller asked to start, and
+            // the cross-run ledger is exactly what a fresh attempt should see.
+            ...(renderHistory(readLedger(ctx.store)) === '' ? [] : ['', renderHistory(readLedger(ctx.store))]),
+        ].join('\n')
+    }
     if (existing !== undefined && existing.state !== 'entered') {
         return [
             `mission ${mission.id}（${mission.title}）已经开始过：阶段 ${first.id} 的最近结果是 ${existing.state}（第 ${existing.attempt} 次）。`,
@@ -440,7 +627,7 @@ function startAction(deps: SequenceDeps, probes: Record<string, PluginProbe>, ct
     }
 
     const attempt = nextAttempt(existing)
-    const recorded = recordEntered(deps, { ...ctx, mission }, first, attempt, args.summary)
+    const { recorded, dispatch } = await recordAndDispatch(deps, { ...ctx, mission }, first, attempt, args.summary)
     const history = renderHistory(readLedger(ctx.store))
     return [
         entryReport(
@@ -454,6 +641,7 @@ function startAction(deps: SequenceDeps, probes: Record<string, PluginProbe>, ct
             `按上面的任务描述执行阶段 ${first.id}，完成后调用 orchestrate({ action: "advance", verdict: "PASS", summary: "<做了什么>" })。`,
         ),
         ...(history === '' ? [] : ['', history]),
+        ...dispatchLines(dispatch),
     ].join('\n')
 }
 
@@ -499,7 +687,7 @@ function unblockAction(deps: SequenceDeps, ctx: CallContext, args: OrchestrateAr
 }
 
 /** `advance` — settle the current stage and enter the next one. */
-function advanceAction(deps: SequenceDeps, probes: Record<string, PluginProbe>, ctx: CallContext, args: OrchestrateArgs): string {
+async function advanceAction(deps: SequenceDeps, probes: Record<string, PluginProbe>, ctx: CallContext, args: OrchestrateArgs): Promise<string> {
     const blocked = ctx.mission === undefined ? undefined : blockedRefusal(ctx.mission, args.action)
     if (blocked !== undefined) return blocked
 
@@ -565,7 +753,7 @@ function advanceAction(deps: SequenceDeps, probes: Record<string, PluginProbe>, 
 
     // 3. exit gate — a failure rolls back instead of advancing (docs.md §4.2).
     if (!outcome.ok) {
-        return rollback(deps, probes, ctx, mission, stage, args, outcome.state ?? verdict, outcome.detail, outcome.fix)
+        return await rollback(deps, probes, ctx, mission, stage, args, outcome.state ?? verdict, outcome.detail, outcome.fix)
     }
     // 4. the successor must be enterable before this stage is recorded as
     //    passed: no settled progress into a stage that cannot start.
@@ -593,6 +781,12 @@ function advanceAction(deps: SequenceDeps, probes: Record<string, PluginProbe>, 
         ...(args.summary === undefined || args.summary === '' ? {} : { summary: args.summary }),
         gateState: isGated(stage.gate) ? (outcome.state ?? verdict) : verdict,
         ...roleField(stage),
+        // BUG-2: the settled record must keep what the ENTRY recorded, or the
+        // ledger can no longer answer "which model ran this stage" the moment it
+        // is settled (and the dispatch record would vanish with it).
+        ...routeField(deps, stage),
+        ...(current?.route === undefined ? {} : { route: current.route }),
+        ...(current?.dispatch === undefined ? {} : { dispatch: current.dispatch }),
     }
     ctx.store.writeStageResult(mission.id, settled)
 
@@ -614,12 +808,12 @@ function advanceAction(deps: SequenceDeps, probes: Record<string, PluginProbe>, 
     return [
         `阶段 ${stage.id} 已通过（第 ${settled.attempt} 次，门禁裁决 ${settled.gateState}，${outcome.detail}）→ 下一阶段 ${next.id}。`,
         '',
-        ...enterStage(deps, probes, ctx, next, args.summary),
+        ...(await enterStage(deps, probes, ctx, next, args.summary)),
     ].join('\n')
 }
 
 /** Record a failed stage and move back to its rollback target (or break). */
-function rollback(
+async function rollback(
     deps: SequenceDeps,
     probes: Record<string, PluginProbe>,
     ctx: CallContext,
@@ -629,7 +823,7 @@ function rollback(
     verdict: Verdict,
     detail: string,
     fix: string | undefined,
-): string {
+): Promise<string> {
     const current = stageResultOf(ctx.store, mission.id, stage.id)
     const attempt = current?.attempt ?? 1
     const target = rollbackTargetOf(deps.config.stages, stage)
@@ -650,6 +844,8 @@ function rollback(
                 ...(args.summary === undefined || args.summary === '' ? {} : { summary: args.summary }),
                 gateState: verdict === 'PASS' ? 'BLOCK' : verdict,
                 ...roleField(stage),
+                ...routeField(deps, stage),
+                ...(current?.dispatch === undefined ? {} : { dispatch: current.dispatch }),
             })
             ctx.store.setStatus(mission.id, 'blocked')
             return breakerReport(deps, mission, targetStage, targetAttempt - 1, `阶段 ${stage.id} 门禁未通过（${detail}），而回退目标 ${targetStage.id} 已用满 ${budgetOf(deps, targetStage)} 次尝试`, fix ?? '人工检查失败原因并修复根因。')
@@ -664,6 +860,8 @@ function rollback(
         settledAt: Date.now(),
         ...(args.summary === undefined || args.summary === '' ? {} : { summary: args.summary }),
         gateState: verdict === 'PASS' ? 'BLOCK' : verdict,
+        ...routeField(deps, stage),
+        ...(current?.dispatch === undefined ? {} : { dispatch: current.dispatch }),
         ...(target === undefined ? {} : { next: target }),
         ...roleField(stage),
     })
@@ -679,7 +877,7 @@ function rollback(
         ].join('\n')
     }
 
-    const entered = enterStage(deps, probes, ctx, targetStage, args.summary, `回退：阶段 ${stage.id} 门禁未通过（${detail}），已回退到 ${targetStage.id}。`)
+    const entered = await enterStage(deps, probes, ctx, targetStage, args.summary, `回退：阶段 ${stage.id} 门禁未通过（${detail}），已回退到 ${targetStage.id}。`)
     return [
         `阶段 ${stage.id} 未通过（第 ${attempt} 次，裁决 ${verdict === 'PASS' ? 'BLOCK' : verdict}）：${detail}`,
         `回退目标：${targetStage.id}（onFail）`,
@@ -731,7 +929,14 @@ function entryBlockedBy(
  * Enter a stage: capability and attempt budget first, then record and report.
  * @param reason - extra first line (rollback/resume context), when any.
  */
-function enterStage(deps: SequenceDeps, probes: Record<string, PluginProbe>, ctx: CallContext, stage: StageConfig, summary?: string, reason?: string): string[] {
+async function enterStage(
+    deps: SequenceDeps,
+    probes: Record<string, PluginProbe>,
+    ctx: CallContext,
+    stage: StageConfig,
+    summary?: string,
+    reason?: string,
+): Promise<string[]> {
     const mission = ctx.mission
     if (mission === undefined) return ['没有 mission，无法进入阶段。', '', '下一步：调用 orchestrate({ action: "start", summary: "<一句话任务名>" })。']
     const states = requiredPluginStates(stage.requiredPlugins, probes)
@@ -745,7 +950,20 @@ function enterStage(deps: SequenceDeps, probes: Record<string, PluginProbe>, ctx
         ctx.store.setStatus(mission.id, 'blocked')
         return breakerReport(deps, mission, stage, attempt - 1, `阶段 ${stage.id} 的尝试次数已达上限，拒绝再次进入`, '人工检查失败原因并修复根因，或调整 config.stages 的 maxAttempts / config.defaultMaxAttempts 后重启会话，再用 orchestrate({ action: "rerun", stageId: "' + stage.id + '" }) 重开该阶段。').split('\n')
     }
-    const recorded = recordEntered(deps, { ...ctx, mission }, stage, attempt, summary, entryTimeOf(current))
+    // GAP-9: the entry gate is checked BEFORE a child is dispatched. Dispatching
+    // into a stage whose entry gate is unmet would spend tokens on work the
+    // pipeline has explicitly said must not start yet.
+    const entryProbe = evaluateGate(stage.gate, { store: ctx.store, mission, current })
+    const entryBlocked = stage.gate.phase === 'entry' && isGated(stage.gate) && !entryProbe.ok
+    const { recorded, dispatch } = await recordAndDispatch(
+        deps,
+        { ...ctx, mission },
+        stage,
+        attempt,
+        summary,
+        entryTimeOf(current),
+        entryBlocked ? `进入门禁未满足（${entryProbe.detail}）：本次不自动派发` : undefined,
+    )
     const history = renderHistory(readLedger(ctx.store))
     const entry = evaluateGate(stage.gate, { store: ctx.store, mission: recorded.mission, current })
     const entryNote =
@@ -759,13 +977,14 @@ function enterStage(deps: SequenceDeps, probes: Record<string, PluginProbe>, ctx
         ...stageHeader(deps, probes, recorded.mission, stage, attempt, recorded.result.enteredAt),
     ]
     if (entryNote !== undefined) lines.push(`门禁现状：${entryNote}`)
-    lines.push('', `下一步：${nextActionFor(deps, stage)}`)
     if (history !== '') lines.push('', history)
+    lines.push(...dispatchLines(dispatch))
+    lines.push('', `下一步：${nextActionFor(deps, stage)}`)
     return lines
 }
 
 /** `rerun` — re-enter a stage (attempt += 1) with the circuit breaker armed. */
-function rerunAction(deps: SequenceDeps, probes: Record<string, PluginProbe>, ctx: CallContext, args: OrchestrateArgs): string {
+async function rerunAction(deps: SequenceDeps, probes: Record<string, PluginProbe>, ctx: CallContext, args: OrchestrateArgs): Promise<string> {
     const blocked = ctx.mission === undefined ? undefined : blockedRefusal(ctx.mission, args.action)
     if (blocked !== undefined) return blocked
 
@@ -793,18 +1012,19 @@ function rerunAction(deps: SequenceDeps, probes: Record<string, PluginProbe>, ct
         ctx.store.setStatus(mission.id, 'blocked')
         return breakerReport(deps, mission, stage, attempt - 1, `阶段 ${stage.id} 的尝试次数已达上限，拒绝重跑`, '人工检查失败原因并修复根因，或调整 config.stages 的 maxAttempts 后重启会话。')
     }
-    const recorded = recordEntered(deps, { ...ctx, mission }, stage, attempt, args.summary)
+    const { recorded, dispatch } = await recordAndDispatch(deps, { ...ctx, mission }, stage, attempt, args.summary)
     return [
         `重跑阶段 ${stage.id}（第 ${attempt} 次，上限 ${budgetOf(deps, stage)} 次）。重跑会覆盖上一次的阶段结果文件，历史仍可从 mission 的 evidence/audit 追溯。`,
         '',
         ...stageHeader(deps, probes, recorded.mission, stage, attempt, recorded.result.enteredAt),
+        ...dispatchLines(dispatch),
         '',
         `下一步：执行阶段 ${stage.id}，完成后调用 orchestrate({ action: "advance", verdict: "PASS", summary: "<做了什么>" })。`,
     ].join('\n')
 }
 
 /** `resume` — re-enter the persisted `mission.stage` (断点恢复). */
-function resumeAction(deps: SequenceDeps, probes: Record<string, PluginProbe>, ctx: CallContext, args: OrchestrateArgs): string {
+async function resumeAction(deps: SequenceDeps, probes: Record<string, PluginProbe>, ctx: CallContext, args: OrchestrateArgs): Promise<string> {
     const blocked = ctx.mission === undefined ? undefined : blockedRefusal(ctx.mission, args.action)
     if (blocked !== undefined) return blocked
 
@@ -847,8 +1067,9 @@ function resumeAction(deps: SequenceDeps, probes: Record<string, PluginProbe>, c
         ctx.store.setStatus(mission.id, 'blocked')
         return breakerReport(deps, mission, stage, attempt - 1, `阶段 ${stage.id} 的尝试次数已达上限，拒绝恢复`, '人工检查失败原因并修复根因，或调整 config.stages 的 maxAttempts 后重启会话。')
     }
-    const recorded = recordEntered(deps, { ...ctx, mission }, stage, attempt, args.summary ?? current?.summary, entryTimeOf(current))
+    const { recorded, dispatch } = await recordAndDispatch(deps, { ...ctx, mission }, stage, attempt, args.summary ?? current?.summary, entryTimeOf(current))
     lines.push(...stageHeader(deps, probes, recorded.mission, stage, attempt, recorded.result.enteredAt))
+    lines.push(...dispatchLines(dispatch))
     lines.push('', `下一步：继续执行阶段 ${stage.id}，完成后调用 orchestrate({ action: "advance", verdict: "PASS", summary: "<做了什么>" })。`)
     return lines.join('\n')
 }
@@ -860,7 +1081,7 @@ function resumeAction(deps: SequenceDeps, probes: Record<string, PluginProbe>, c
  * @param exec - the tool execution context (agent, signal).
  * @returns the Chinese report; the last line is always the next action.
  */
-export function runOrchestrate(deps: SequenceDeps, args: OrchestrateArgs, exec: unknown): string {
+export async function runOrchestrate(deps: SequenceDeps, args: OrchestrateArgs, exec: unknown): Promise<string> {
     const action = ACTIONS.includes(args.action) ? args.action : undefined
     if (action === undefined) {
         return [
@@ -878,13 +1099,13 @@ export function runOrchestrate(deps: SequenceDeps, args: OrchestrateArgs, exec: 
         case 'status':
             return statusReport(deps, probes, ctx)
         case 'start':
-            return startAction(deps, probes, ctx, args)
+            return await startAction(deps, probes, ctx, args)
         case 'advance':
-            return advanceAction(deps, probes, ctx, args)
+            return await advanceAction(deps, probes, ctx, args)
         case 'rerun':
-            return rerunAction(deps, probes, ctx, args)
+            return await rerunAction(deps, probes, ctx, args)
         case 'resume':
-            return resumeAction(deps, probes, ctx, args)
+            return await resumeAction(deps, probes, ctx, args)
         case 'retro':
             return retroAction(deps, ctx)
         case 'unblock':

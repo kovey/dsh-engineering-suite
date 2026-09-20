@@ -243,7 +243,7 @@ async function evaluateAutoAdvance(deps: AutoAdvanceDeps, payload: TurnStoppingP
 
     // The one code path that moves a stage is `advance`; the trigger only
     // supplies the verdict the gate already proved.
-    const report = runOrchestrate(
+    const report = await runOrchestrate(
         deps,
         {
             action: 'advance',
@@ -254,12 +254,13 @@ async function evaluateAutoAdvance(deps: AutoAdvanceDeps, payload: TurnStoppingP
             verdict: 'PASS',
             summary: `阶段 ${stage.id} 由宿主自动推进（autoAdvance；${outcome.detail}）`,
         },
-        { agent },
+        { agent, signal: payload.signal },
     )
 
     const settled = stageResultOf(store, mission.id, stage.id)
     if (settled?.state !== 'passed') {
-        logger.warn(`阶段 ${stage.id} 的自动推进未完成：${report.split('\n')[0] ?? ''}`)
+        const head = report.trim().split('\n')[0] ?? ''
+        logger.warn(`阶段 ${stage.id} 的自动推进未完成：${head}`)
         return
     }
     state.count += 1
