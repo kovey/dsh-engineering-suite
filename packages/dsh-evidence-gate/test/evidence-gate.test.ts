@@ -1449,3 +1449,60 @@ test('未声明 header.cwd 时三个工具都拒绝执行，且不往宿主目�
         process.chdir(previous)
     }
 })
+
+test('an adopted standards gate must pass for this round of the code (regression)', async () => {
+    // Opt-in: the check exists only when the host requires it, and it is a
+    // SEPARATE axis from the quality gate — structural debt does not fail a build.
+    const cwd = tempWorkspace('evidence-standards-')
+    const fake = createFakeHost({ cwd })
+    apply(fake.ctx as never, { logFile: path.join(cwd, 'evidence-gate.log'), approval: 'auto', requireStandardsGate: true })
+    const store = new MissionStoreRegistry().for(cwd)
+    const mission = store.create({ title: '规范门禁', cwd, sessionId: 'session-1' })
+    store.bindSession('session-1', mission.id, 'implement')
+    const recorded = await fake.runTool('evidence_record', {
+        kind: 'test',
+        summary: '跑测试',
+        command: 'node --test test/*.test.ts',
+        exitCode: 0,
+        output: 'ok',
+    })
+    assert.equal(recorded.isError, false, runText(recorded))
+
+    // No standards record at all → delivery is refused with the exact fix.
+    // (A refusal is a REPORT here, not an isError: the mission state is left
+    // untouched and the report lists which checks failed.)
+    const missing = await fake.runTool('mission_complete', {})
+    const missingText = runText(missing)
+    assert.match(missingText, /不能交付/)
+    assert.match(missingText, /❌ 规范门禁/)
+    assert.match(missingText, /standards_check/)
+    assert.equal(store.read(mission.id)?.status !== 'delivered', true, 'no receipt was issued')
+
+    // A PASS recorded BEFORE the newest evidence proves nothing about this code.
+    store.recordGate(mission.id, { source: 'dsh-standards-gate', state: 'PASS', reason: '上一轮', results: [] })
+    const gatesDir = path.join(cwd, '.dsh', 'missions', mission.id, 'gates')
+    for (const name of fs.readdirSync(gatesDir)) {
+        const file = path.join(gatesDir, name)
+        const record = JSON.parse(fs.readFileSync(file, 'utf8'))
+        if (record.source === 'dsh-standards-gate') {
+            record.checkedAt = Date.now() - 600_000
+            fs.writeFileSync(file, JSON.stringify(record))
+        }
+    }
+    const stale = await fake.runTool('mission_complete', {})
+    assert.match(runText(stale), /❌ 规范门禁/)
+    assert.match(runText(stale), /早于最新证据/)
+
+    // A fresh PASS lets the (other) checks decide again. The millisecond gap is
+    // deliberate: a gate recorded in the SAME millisecond as the evidence is
+    // treated as stale (fail closed), exactly like the quality gate's own rule.
+    await new Promise((resolve) => setTimeout(resolve, 5))
+    store.recordGate(mission.id, { source: 'dsh-standards-gate', state: 'PASS', reason: '本轮无新增违规', results: [] })
+    const after = await fake.runTool('mission_complete', {})
+    const text = runText(after)
+    assert.doesNotMatch(text, /早于最新证据/)
+    assert.doesNotMatch(text, /没有任何来自 dsh-standards-gate 的门禁记录/)
+    // The report lists only the FAILING checks, so a satisfied standards axis is
+    // exactly "no ❌ 规范门禁 line" (the other axes still fail in this fixture).
+    assert.doesNotMatch(text, /❌ 规范门禁/)
+})

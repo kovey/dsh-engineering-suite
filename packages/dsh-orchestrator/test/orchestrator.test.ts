@@ -1652,3 +1652,58 @@ test('a role whitelist keeps its tools but loses orchestrate (regression)', asyn
     assert.deepEqual(filter?.allow, ['read', 'grep', 'glob'], 'the role keeps its tools, minus the pipeline one')
     assert.ok(filter?.deny?.includes('orchestrate'))
 })
+
+test('the standards gate requires a PASS from this round (regression)', async () => {
+    disposeHosts()
+    const cwd = tempWorkspace('orchestrator-standards-gate-')
+    const fake = host({
+        cwd,
+        config: {
+            stages: [
+                { id: 'build', prompt: '实现', requiredPlugins: [] },
+                { id: 'verify', prompt: '验证结构规范', requiredPlugins: [], gate: 'standards-pass', next: 'done' },
+                { id: 'done', prompt: '收尾', requiredPlugins: [] },
+            ],
+        },
+    })
+    const store = storeFor(cwd)
+    await orchestrate(fake, { action: 'start' })
+    const id = missionIdOf(cwd)
+    await orchestrate(fake, { action: 'advance' }) // → verify (entry gate is 'none')
+    assert.equal(store.read(id)?.stage, 'verify')
+
+    // No standards record at all → the stage cannot leave.
+    const blocked = await orchestrate(fake, { action: 'advance', verdict: 'PASS' })
+    assert.match(blocked, /没有任何规范门禁记录/)
+    assert.equal(store.read(id)?.stage, 'verify', 'the stage did not move')
+
+    // A FAILING standards gate → still blocked, with the reason.
+    store.recordGate(id, { source: 'dsh-standards-gate', state: 'BLOCK', reason: '新增 3 项违规', results: [] })
+    const failing = await orchestrate(fake, { action: 'advance', verdict: 'PASS' })
+    assert.match(failing, /新增 3 项违规/)
+    assert.equal(store.read(id)?.stage, 'verify')
+
+    // A PASS recorded BEFORE this stage was entered proves nothing about the
+    // current code: the gate must reject it.
+    const earlier = Date.now() - 60_000
+    store.writeStageResult(id, { stageId: 'verify', attempt: 1, state: 'entered', enteredAt: Date.now() })
+    store.recordGate(id, { source: 'dsh-standards-gate', state: 'PASS', reason: '上一轮的 PASS', results: [] })
+    const gates = path.join(cwd, '.dsh', 'missions', id, 'gates')
+    for (const name of fs.readdirSync(gates)) {
+        const file = path.join(gates, name)
+        const record = JSON.parse(fs.readFileSync(file, 'utf8'))
+        if (record.source === 'dsh-standards-gate' && record.state === 'PASS') {
+            record.checkedAt = earlier
+            fs.writeFileSync(file, JSON.stringify(record))
+        }
+    }
+    const stale = await orchestrate(fake, { action: 'advance', verdict: 'PASS' })
+    assert.match(stale, /早于本阶段进入时间/)
+    assert.equal(store.read(id)?.stage, 'verify')
+
+    // A fresh PASS from this round lets the stage leave.
+    store.recordGate(id, { source: 'dsh-standards-gate', state: 'PASS', reason: '本轮无新增违规', results: [] })
+    const passed = await orchestrate(fake, { action: 'advance', verdict: 'PASS' })
+    assert.match(passed, /规范门禁 .* PASS/)
+    assert.equal(store.read(id)?.stage, 'done')
+})

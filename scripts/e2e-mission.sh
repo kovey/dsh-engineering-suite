@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # e2e-mission.sh — run the REAL dsh harness against a SCRIPTED local model and
-# assert that the seven-plugin engineering suite actually produced its
+# assert that the eight-plugin engineering suite actually produced its
 # artifacts.
 #
 # Why: the suite had never been verified with a live agent loop (no
@@ -44,10 +44,11 @@ DO_BUILD=1
 KEEP=0
 PERMISSION_MODE="${E2E_PERMISSION_MODE:-danger-full-access}"
 
-# The seven plugins under verification (dsh-eng-core is a library dependency,
+# The eight plugins under verification (dsh-eng-core is a library dependency,
 # linked but not a bundle).
 SUITE=(
   dsh-role-guard
+  dsh-standards-gate
   dsh-spec-gate
   dsh-test-design-gate
   dsh-quality-gate
@@ -169,6 +170,12 @@ cat > "$E2E_HOME/profiles/$PROFILE/cordis.patch.yml" <<YAML
 
 - id: orchestrator
   config: { logFile: '$LOGS/orchestrator.log' }
+
+# The eighth plugin: structural standards. It is included so the harness proves
+# it ASSEMBLES in a live host (it never acts unless a tool is called, and
+# `requireStandardsGate` stays false, so the delivery flow is unchanged).
+- id: standards-gate
+  config: { logFile: '$LOGS/standards-gate.log' }
 YAML
 
 # Module resolution: the shipped @deepseek-ai packages come from the real
@@ -195,7 +202,7 @@ cat > "$E2E_HOME/script.json" <<'JSON'
       "tool": "spec_create",
       "arguments": {
         "title": "为 scratch 工作区添加 health 模块",
-        "background": "端到端验证：真实 harness + 脚本化模型，证明七个插件在活会话里工作。",
+        "background": "端到端验证：真实 harness + 脚本化模型，证明八个插件在活会话里工作。",
         "requirements": [
           "src/health.mjs 导出 health()，返回 { status: 'ok' }",
           "test/health.test.mjs 用 node --test 覆盖 health()"
@@ -532,7 +539,7 @@ fi
 # ---------------------------------------------------------------------------
 section "summary"
 if [ "$FAILURES" = "0" ]; then
-  printf '  \033[32mE2E GREEN\033[0m — the seven plugins ran a real mission in a live dsh session.\n'
+  printf '  \033[32mE2E GREEN\033[0m — the eight plugins ran a real mission in a live dsh session.\n'
   printf '  artifacts: %s\n' "$DOT"
   printf '  logs:      %s\n' "$LOGS"
   exit 0

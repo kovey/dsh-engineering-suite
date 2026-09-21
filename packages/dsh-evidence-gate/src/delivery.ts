@@ -172,6 +172,44 @@ export function evaluateDelivery(input: {
         fix: 'spec_create → spec_approve',
     })
 
+    // 1b. Code standards — a SEPARATE axis from "the commands passed".
+    //     Structural debt does not fail a build, yet it is what makes a codebase
+    //     unmaintainable, so a host that adopted standards can require a PASS
+    //     from this round of the code. Opt-in, and refused when the plugin is not
+    //     even mounted rather than silently satisfied.
+    const standardsGate = store.lastGate(mission.id, { source: config.standardsGateSource })
+    if (config.requireStandardsGate) {
+        // Freshness is measured against the newest COMMAND/TEST evidence — the
+        // same baseline the quality gate uses. Two details are deliberate:
+        //  * gate ledger rows are excluded: every gate writes a `kind: gate`
+        //    evidence row whose timestamp is a hair LATER than the gate record, so
+        //    counting them made every standards gate look stale by a millisecond;
+        //  * a same-millisecond tie counts as stale (fail closed), matching
+        //    `gate-stale`: a verdict that cannot be shown to cover the evidence
+        //    must not be trusted to cover it.
+        const codeProofs = evidence.filter((row) => row.kind === 'command' || row.kind === 'test')
+        const newestProofAt = codeProofs.reduce((newest, row) => (row.recordedAt > newest ? row.recordedAt : newest), 0)
+        const hasProof = codeProofs.length > 0
+        const fresh =
+            standardsGate !== undefined && (!hasProof || standardsGate.checkedAt > newestProofAt)
+        checks.push({
+            id: 'standards',
+            ok: standardsGate?.state === 'PASS' && fresh,
+            label: `规范门禁 PASS（source=${config.standardsGateSource}，且晚于最新改动）`,
+            detail:
+                standardsGate === undefined
+                    ? `没有任何来自 ${config.standardsGateSource} 的门禁记录：调用 standards_check`
+                    : standardsGate.state !== 'PASS'
+                      ? `${standardsGate.id} 是 ${standardsGate.state}：${standardsGate.reason}`
+                      : !fresh
+                        ? standardsGate.checkedAt === newestProofAt
+                          ? `${standardsGate.id} 与最新 command/test 证据记录在同一毫秒（${formatTime(newestProofAt)}）：无法证明它覆盖了该证据，按陈旧处理（fail closed）`
+                          : `${standardsGate.id} PASS 于 ${formatTime(standardsGate.checkedAt)}，早于最新证据（${formatTime(newestProofAt)}）：这是上一轮代码的结论`
+                        : `${standardsGate.id} PASS @ ${formatTime(standardsGate.checkedAt)}`,
+            fix: 'standards_check',
+        })
+    }
+
     // 2. The quality gate: exists, is a PASS, is complete, is genuine, is not
     //    stale, is not too old.
     const gate = store.lastGate(mission.id, { source: config.gateSource })

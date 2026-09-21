@@ -26,6 +26,17 @@ export interface EvidenceGateConfig {
     layout: LayoutOptions
     /** Require a `PASS` gate record before a mission may be delivered. */
     requireGate: boolean
+    /**
+     * Require a PASS from the code-standards gate as well.
+     *
+     * Structural quality is a separate concern from "the commands passed", so it
+     * gets its own check rather than being folded into `gateSource`. Opt-in: a
+     * repository that has not adopted code standards must still be able to
+     * deliver (it simply stays ungated on this axis).
+     */
+    requireStandardsGate: boolean
+    /** Which plugin's gate records satisfy {@link requireStandardsGate}. */
+    standardsGateSource: string
     /** Plugin id whose gate records count as the delivery gate. */
     gateSource: string
     /** Evidence kinds a delivery must carry. */
@@ -135,6 +146,7 @@ export const PROJECT_OVERRIDABLE_KEYS: readonly string[] = [
     'requiredEvidenceKinds',
     'requireCleanTree',
     'requireGate',
+    'requireStandardsGate',
     'gateSource',
     'maxGateAgeMinutes',
     'maxOutputTail',
@@ -336,6 +348,8 @@ export function resolveEffectiveConfig(
         ...host,
         requiredEvidenceKinds: readKinds(sink, raw, host.requiredEvidenceKinds),
         requireCleanTree: readBool(sink, raw, 'requireCleanTree', host.requireCleanTree),
+        requireStandardsGate: readBool(sink, raw, 'requireStandardsGate', host.requireStandardsGate),
+        standardsGateSource: readNonEmptyString(sink, raw, 'standardsGateSource', host.standardsGateSource),
         requireGate: readBool(sink, raw, 'requireGate', host.requireGate),
         gateSource: readNonEmptyString(sink, raw, 'gateSource', host.gateSource),
         maxGateAgeMinutes: readNonNegativeNumber(sink, raw, 'maxGateAgeMinutes', host.maxGateAgeMinutes),
@@ -398,6 +412,9 @@ export function resolveConfig(input: unknown): EvidenceGateConfig {
             ...(missionsDir === undefined ? {} : { missionsDir }),
         },
         requireGate: bool(raw['requireGate'], true),
+        // Opt-in: a repository that never adopted standards must still deliver.
+        requireStandardsGate: bool(raw['requireStandardsGate'], false),
+        standardsGateSource: str(raw['standardsGateSource'], 'dsh-standards-gate'),
         gateSource: str(raw['gateSource'], DEFAULT_GATE_SOURCE),
         requiredEvidenceKinds: kindList(raw['requiredEvidenceKinds'], DEFAULT_REQUIRED_EVIDENCE_KINDS),
         maxOutputTail: maxOutputTail < 0 ? 0 : maxOutputTail,

@@ -272,6 +272,37 @@ subagents.start(...)  prompt = 阶段任务 + mission 上下文 + 规则（只�
 6. **重复调用不放大工作量**：同一会话重复 `start` 对"正在进行的阶段"是幂等的；`resume` 按进入记录
    （`enteredAt`）判重，不会为同一次进入再派一个子代理；每次派发的产物名带 `attempt` 与 run id，不覆盖历史。
 
+## 5.7 代码规范门禁（`dsh-standards-gate`）：把"可维护"变成可门禁的
+
+其他六个门禁回答"能不能跑 / 做的对不对 / 能不能证明"，第八个回答**"还可维护吗"**。它只做**可机械判定**的部分：
+
+```
+<repo>/.dsh/standards.json            阈值 + 分层依赖规则 + 豁免（仓库所有，模型改不了：在 spec-gate 信任根内）
+<repo>/.dsh/standards-baseline.json   已接受的存量违规（棘轮；放宽需人工批准）
+        ↓ measureWorkspace（dsh-eng-core，确定性、有上限、不跟随符号链接）
+违规清单（文件/函数行数、嵌套、if 块、参数、导出面、分层、循环依赖）
+        ↓ 与基线比对
+added → 门禁失败；known → 不失败；fixed → 报告"已消除"（重构的进度）
+        ↓
+GateRecord(source: dsh-standards-gate) → 交付侧可要求"最新一条 PASS 且不早于最新 command/test 证据"
+```
+
+四条不变量：
+
+1. **阈值归仓库**：插件不猜阈值；缺 `standards.json` 时报"去 bootstrap"而不是"默认放行"；
+2. **棘轮只紧不松**：存量违规进基线后不挡门禁，**新增**违规才挡；放宽基线走人工审批
+   （`.dsh/**` 在信任根内，模型写不了）；
+3. **目标阈值而非 p90**：真机实测（`golang/im` 113 个 Go 文件）p90 文件长度是 588 行——
+   拿它当上限等于没有门禁。推荐**用目标值（文件 400 / 函数 80 / 嵌套 4 / if 块 20 / 参数 5）**
+   + 把当前违规冻结进基线，让数字随重构下降；
+4. **机械层是下限，判断层是上限**：内聚、命名、抽象是否多余判不出来 —— 由 `standards_review` 派**只读子代理**
+   （`allow: [read, glob, grep]`、剔除 `orchestrate`、`maxDepth: 1`）按 rubric 评审，结论标注为"意见"，
+   不写任何门禁状态；`role-guard` 的 `reviewer` 角色指向同一份 rubric。
+
+接入路径与 `spec_bootstrap` 对称：`standards_bootstrap({ action: "measure" })` 看分布与"按目标阈值现在有多少违规"，
+`freeze` 经人工批准写入规范文件，第一次 `standards_check({ accept: true, note: "存量债务" })` 冻结基线。
+生成代码（`*.pb.go`、`*.gen.go`、`mocks/`）与测试文件默认豁免：对生成代码执行人类阈值只会教人忽略门禁。
+
 ## 6. 为什么这样切分
 
 - **一个关注点一个插件**：门禁可以单独失效（例如先只上 quality-gate），不影响其它环节。

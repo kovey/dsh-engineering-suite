@@ -10,7 +10,7 @@
  */
 
 /** One deterministic entry/exit condition, named by the fact it asserts. */
-export type GateKind = 'spec-approved' | 'test-design' | 'quality-pass' | 'receipt' | 'none'
+export type GateKind = 'spec-approved' | 'test-design' | 'quality-pass' | 'standards-pass' | 'receipt' | 'none'
 
 /** A gate as a user writes it in config: a known kind, or an explicit spec. */
 export type GateInput =
@@ -139,12 +139,13 @@ export type Pipeline = StageConfig[]
 /** The verdict the transition policy maps onto a stage result. */
 export type Verdict = 'PASS' | 'WARN' | 'BLOCK'
 
-const GATE_KINDS: readonly GateKind[] = ['spec-approved', 'test-design', 'quality-pass', 'receipt', 'none']
+const GATE_KINDS: readonly GateKind[] = ['spec-approved', 'test-design', 'quality-pass', 'standards-pass', 'receipt', 'none']
 
 const DEFAULT_GATE_LABEL: Record<GateKind, string> = {
     'spec-approved': '规格已审批（mission.spec.approvedAt）',
     'test-design': '测试设计已登记（mission.testDesign）',
     'quality-pass': '质量门禁 PASS 且晚于本阶段进入时间（store.lastGate）',
+    'standards-pass': '规范门禁 PASS 且晚于本阶段进入时间（dsh-standards-gate 的门禁记录）',
     receipt: '已签发交付回执（store.readReceipts）',
     none: '无门禁',
 }

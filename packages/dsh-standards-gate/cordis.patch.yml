@@ -1,0 +1,19 @@
+# dsh-standards-gate bundle patch.
+#
+# `insert` is pure-append and the loader rejects duplicate entry ids, so the row
+# uses the plugin's short id (`standards-gate`) — a profile overrides parameters
+# with a top-level `- id: standards-gate` + `config:` block.
+#
+# The thresholds and the baseline are deliberately NOT here: they belong to the
+# target repository (`.dsh/standards.json`, `.dsh/standards-baseline.json`),
+# which spec-gate's trust root keeps out of the model's reach.
+- insert:
+    - id: standards-gate
+      name: 'dsh-standards-gate'
+      config:
+        enabled: true
+        logFile: '~/.dsh/standards-gate.log'
+        standardsFile: .dsh/standards.json
+        baselineFile: .dsh/standards-baseline.json
+        enforce: gate
+        requireApprovalForBaseline: true

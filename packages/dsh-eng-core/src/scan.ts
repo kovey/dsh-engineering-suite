@@ -118,10 +118,29 @@ const DEFAULT_IGNORE_DIRS: readonly string[] = [
     '__pycache__',
     'target',
     '.pnpm-store',
+    // Toolchain caches and generated-output trees. Found on a real repository:
+    // a Go module cache kept inside the workspace (`.gocache/mod/…`) held
+    // 7800-line generated `.pb.go` files, so the standards distribution was
+    // reporting the module cache instead of the project (p90 file length 1010
+    // lines, max 7822) — a threshold set from that would gate nothing real.
+    '.gocache',
+    '.cache',
+    '.gradle',
+    '.m2',
+    'coverage',
+    '.next',
+    '.nuxt',
+    '.turbo',
+    '.parcel-cache',
+    '.pytest_cache',
+    '.mypy_cache',
+    '.ruff_cache',
 ]
 
-const DEFAULT_MAX_FILES = 4000
-const DEFAULT_MAX_FILE_BYTES = 256 * 1024
+/** Default bound on files visited by one walk (also used by `metrics.ts`). */
+export const DEFAULT_MAX_FILES = 4000
+/** Default per-file byte bound of one walk (also used by `metrics.ts`). */
+export const DEFAULT_MAX_FILE_BYTES = 256 * 1024
 /** More candidate statements than this per document is a dump, not a draft. */
 const MAX_CANDIDATES_PER_DOC = 200
 /** A paragraph longer than this is prose, not a requirement statement. */
@@ -136,7 +155,7 @@ const MAX_UNCOVERED_SYMBOLS = 100
 // --- languages --------------------------------------------------------------
 
 /** Languages the scanner understands (detected by extension). */
-type Language = 'go' | 'ts' | 'js' | 'python'
+export type Language = 'go' | 'ts' | 'js' | 'python'
 
 const LANGUAGE_BY_EXTENSION: Readonly<Record<string, Language>> = {
     '.go': 'go',
@@ -178,7 +197,8 @@ function relativeTo(cwd: string, target: string): string {
     return path.relative(cwd, target).split(path.sep).join('/')
 }
 
-function languageOf(rel: string): Language | undefined {
+/** The language of a workspace-relative path, or `undefined` when nothing analyzes it. */
+export function languageOf(rel: string): Language | undefined {
     const base = path.posix.basename(rel).toLowerCase()
     const dot = base.lastIndexOf('.')
     if (dot <= 0) return undefined
@@ -189,9 +209,14 @@ function languageOf(rel: string): Language | undefined {
  * Read a file only when it fits the byte bound.
  *
  * `stat` comes first on purpose: a 2 GB log named `x.go` must be skipped
- * without ever being read into memory.
+ * without ever being read into memory. Exported because `metrics.ts` needs the
+ * same bound with the same "never throw" contract.
+ * @param file - absolute path.
+ * @param maxFileBytes - files larger than this are skipped by `stat`.
+ * @param logger - diagnostic sink for the skip.
+ * @returns the text, or `undefined` when oversized/unreadable.
  */
-function readBounded(file: string, maxFileBytes: number, logger: Logger): string | undefined {
+export function readCapped(file: string, maxFileBytes: number, logger: Logger): string | undefined {
     try {
         const stat = fs.statSync(file)
         if (stat.size > maxFileBytes) {
@@ -672,7 +697,7 @@ function suggestCommands(cwd: string, logger: Logger): SuggestedCommand[] {
     if (has('pyproject.toml') || has('pytest.ini') || isDirectory(path.join(cwd, 'tests'))) {
         const commands = [command('test', '单元测试', 'pytest -q', true, 'gate')]
         const pyproject = has('pyproject.toml')
-            ? readBounded(path.join(cwd, 'pyproject.toml'), DEFAULT_MAX_FILE_BYTES, logger)
+            ? readCapped(path.join(cwd, 'pyproject.toml'), DEFAULT_MAX_FILE_BYTES, logger)
             : undefined
         if (pyproject !== undefined && /ruff/i.test(pyproject)) {
             commands.push(command('lint', 'lint', 'ruff check .', false, 'lint'))
@@ -695,12 +720,125 @@ function suggestCommands(cwd: string, logger: Logger): SuggestedCommand[] {
         ]
     }
     if (has('Makefile')) {
-        const makefile = readBounded(path.join(cwd, 'Makefile'), DEFAULT_MAX_FILE_BYTES, logger)
+        const makefile = readCapped(path.join(cwd, 'Makefile'), DEFAULT_MAX_FILE_BYTES, logger)
         if (makefile !== undefined && /^test:/m.test(makefile)) {
             return [command('test', '单元测试', 'make test', true, 'gate')]
         }
     }
     return []
+}
+
+// --- walk -------------------------------------------------------------------
+
+/** One regular file a walk visited. */
+export interface WalkedFile {
+    /** Absolute path. */
+    abs: string
+    /** Workspace-relative POSIX path. */
+    rel: string
+}
+
+/** What one {@link walkWorkspace} run visited. */
+export interface WalkResult {
+    /** Regular files in breadth-first, sorted-per-directory order. */
+    files: WalkedFile[]
+    /** Entries consumed from the budget: regular files plus broken symlinks. */
+    visited: number
+    /** Whether the `maxFiles` budget stopped the walk. */
+    truncated: boolean
+}
+
+/** Bounds and inputs of {@link walkWorkspace}. */
+export interface WalkOptions {
+    cwd: string
+    /** Default {@link DEFAULT_MAX_FILES}. */
+    maxFiles?: number
+    /** Extra directory names to skip, on top of the defaults. */
+    ignoreDirs?: readonly string[]
+    logger?: Logger
+}
+
+/**
+ * Walk a workspace and return every regular file, without reading any of them.
+ *
+ * This is the ONE traversal of the package: `scanWorkspace` and
+ * `measureWorkspace` both go through it, so a bound fixed here is fixed
+ * everywhere. Breadth-first, each directory's entries sorted, symlinked
+ * directories never followed (a loop is therefore harmless), broken symlinks
+ * counted but skipped, unreadable directories skipped with a `debug` line.
+ * @param options - workspace root, the `maxFiles` budget and extra ignore dirs.
+ * @returns the files, how many entries the budget consumed, and whether it ran out.
+ */
+export function walkWorkspace(options: WalkOptions): WalkResult {
+    const cwd = path.resolve(options.cwd)
+    const logger = options.logger ?? silentLogger
+    const maxFiles = Math.max(0, options.maxFiles ?? DEFAULT_MAX_FILES)
+    const ignoreDirs = new Set<string>([...DEFAULT_IGNORE_DIRS, ...(options.ignoreDirs ?? [])])
+
+    const files: WalkedFile[] = []
+    let visited = 0
+    let truncated = false
+
+    // Breadth-first, deterministic: each directory's entries are sorted, and
+    // every directory of one level is expanded before the next level — so the
+    // budget lands on the structural files first (README, configs, entry
+    // points, the shallow source tree) instead of being eaten by one deep data
+    // directory. Symbolic links to directories are never followed, which is
+    // what makes a loop harmless.
+    const queue: string[] = [cwd]
+    let cursor = 0
+    let stopped = false
+    while (cursor < queue.length && !stopped) {
+        const dir = queue[cursor] as string
+        cursor += 1
+        let entries: fs.Dirent[]
+        try {
+            entries = fs.readdirSync(dir, { withFileTypes: true })
+        } catch (error) {
+            logger.debug(`scan: 无法读取目录 ${relativeTo(cwd, dir)}，已跳过`, error)
+            continue
+        }
+        entries.sort((left, right) => compareText(left.name, right.name))
+        for (const entry of entries) {
+            if (visited >= maxFiles) {
+                truncated = true
+                stopped = true
+                break
+            }
+            const abs = path.join(dir, entry.name)
+            const rel = relativeTo(cwd, abs)
+            let directory = false
+            let file = false
+            if (entry.isSymbolicLink()) {
+                let target: fs.Stats
+                try {
+                    target = fs.statSync(abs)
+                } catch (error) {
+                    logger.debug(`scan: 断链符号链接 ${rel}，已跳过`, error)
+                    visited += 1
+                    continue
+                }
+                if (target.isDirectory()) {
+                    logger.debug(`scan: 不跟随符号链接目录 ${rel}`)
+                    continue
+                }
+                file = target.isFile()
+            } else {
+                directory = entry.isDirectory()
+                file = entry.isFile()
+            }
+            if (directory) {
+                if (!ignoreDirs.has(entry.name)) queue.push(abs)
+                continue
+            }
+            if (!file) continue
+            visited += 1
+            files.push({ abs, rel })
+        }
+    }
+
+    if (truncated) logger.debug(`scan: 达到 maxFiles=${maxFiles}，结果已截断`)
+    return { files, visited, truncated }
 }
 
 // --- scan -------------------------------------------------------------------
@@ -719,13 +857,11 @@ export function scanWorkspace(options: ScanOptions): ScanResult {
     const logger = options.logger ?? silentLogger
     const maxFiles = Math.max(0, options.maxFiles ?? DEFAULT_MAX_FILES)
     const maxFileBytes = Math.max(0, options.maxFileBytes ?? DEFAULT_MAX_FILE_BYTES)
-    const ignoreDirs = new Set<string>([...DEFAULT_IGNORE_DIRS, ...(options.ignoreDirs ?? [])])
 
     const requirements: RequirementDoc[] = []
     const symbols: CodeSymbol[] = []
     const tests: TestEvidence[] = []
     const languages: Record<string, number> = {}
-    let filesScanned = 0
     let truncated = false
 
     /** Classify and parse one regular file; never throws. */
@@ -735,12 +871,12 @@ export function scanWorkspace(options: ScanOptions): ScanResult {
         try {
             const docKind = requirementKindOf(rel)
             if (docKind !== undefined) {
-                const text = readBounded(abs, maxFileBytes, logger)
+                const text = readCapped(abs, maxFileBytes, logger)
                 if (text !== undefined) requirements.push(parseRequirementDoc(rel, text, docKind))
                 return
             }
             if (language === undefined) return
-            const text = readBounded(abs, maxFileBytes, logger)
+            const text = readCapped(abs, maxFileBytes, logger)
             if (text === undefined) return
 
             if (language === 'go') {
@@ -768,63 +904,18 @@ export function scanWorkspace(options: ScanOptions): ScanResult {
         }
     }
 
-    // Breadth-first, deterministic: each directory's entries are sorted, and
-    // every directory of one level is expanded before the next level — so the
-    // budget lands on the structural files first (README, configs, entry
-    // points, the shallow source tree) instead of being eaten by one deep data
-    // directory. Symbolic links to directories are never followed, which is
-    // what makes a loop harmless.
-    const queue: string[] = [cwd]
-    let cursor = 0
-    let stopped = false
-    while (cursor < queue.length && !stopped) {
-        const dir = queue[cursor] as string
-        cursor += 1
-        let entries: fs.Dirent[]
-        try {
-            entries = fs.readdirSync(dir, { withFileTypes: true })
-        } catch (error) {
-            logger.debug(`scan: 无法读取目录 ${relativeTo(cwd, dir)}，已跳过`, error)
-            continue
-        }
-        entries.sort((left, right) => compareText(left.name, right.name))
-        for (const entry of entries) {
-            if (filesScanned >= maxFiles) {
-                truncated = true
-                stopped = true
-                break
-            }
-            const abs = path.join(dir, entry.name)
-            const rel = relativeTo(cwd, abs)
-            let directory = false
-            let file = false
-            if (entry.isSymbolicLink()) {
-                let target: fs.Stats
-                try {
-                    target = fs.statSync(abs)
-                } catch (error) {
-                    logger.debug(`scan: 断链符号链接 ${rel}，已跳过`, error)
-                    filesScanned += 1
-                    continue
-                }
-                if (target.isDirectory()) {
-                    logger.debug(`scan: 不跟随符号链接目录 ${rel}`)
-                    continue
-                }
-                file = target.isFile()
-            } else {
-                directory = entry.isDirectory()
-                file = entry.isFile()
-            }
-            if (directory) {
-                if (!ignoreDirs.has(entry.name)) queue.push(abs)
-                continue
-            }
-            if (!file) continue
-            filesScanned += 1
-            visit(abs, rel)
-        }
-    }
+    // The traversal itself lives in `walkWorkspace` so that `metrics.ts`
+    // measures with the exact same bounds (and so there is only one place
+    // where the sandbox/ignore rules can drift).
+    const walk = walkWorkspace({
+        cwd,
+        maxFiles,
+        ...(options.ignoreDirs === undefined ? {} : { ignoreDirs: options.ignoreDirs }),
+        logger,
+    })
+    let filesScanned = walk.visited
+    truncated = walk.truncated
+    for (const entry of walk.files) visit(entry.abs, entry.rel)
 
     // `.dsh` is never walked (the whole engineering trail is off-limits to a
     // code scan), but an existing rendered spec IS the strongest requirement
@@ -840,7 +931,7 @@ export function scanWorkspace(options: ScanOptions): ScanResult {
         const abs = path.join(specsDir, name)
         const rel = relativeTo(cwd, abs)
         try {
-            const text = readBounded(abs, maxFileBytes, logger)
+            const text = readCapped(abs, maxFileBytes, logger)
             if (text !== undefined) requirements.push(parseRequirementDoc(rel, text, 'spec'))
         } catch (error) {
             logger.debug(`scan: 解析 ${rel} 失败，已跳过`, error)
@@ -850,7 +941,7 @@ export function scanWorkspace(options: ScanOptions): ScanResult {
     const packageJson = path.join(cwd, 'package.json')
     if (exists(packageJson)) {
         try {
-            const text = readBounded(packageJson, maxFileBytes, logger)
+            const text = readCapped(packageJson, maxFileBytes, logger)
             if (text !== undefined) symbols.push(...scanPackageScripts(packageJson, 'package.json', text))
         } catch (error) {
             logger.debug('scan: 解析 package.json 失败，已跳过', error)

@@ -155,6 +155,43 @@ function evaluateFacts(gate: GateSpec, facts: GateFacts): GateOutcome {
                         : `质量门禁 WARN 按配置放行（条件边 verdict=pass-or-warn；${accepted.id} @ ${formatTime(accepted.checkedAt)}，原因：${accepted.reason}）`,
             }
         }
+        case 'standards-pass': {
+            // Structural quality is a separate concern from "the commands pass",
+            // so it is a separate gate: the newest `dsh-standards-gate` record
+            // must be PASS and must not predate this stage entry (a verdict from
+            // an earlier round proves nothing about the code as it stands now).
+            const acceptable = facts.store.lastGate(facts.mission.id, { source: 'dsh-standards-gate', state: 'PASS' })
+            const latest = facts.store.lastGate(facts.mission.id, { source: 'dsh-standards-gate' })
+            if (acceptable === undefined) {
+                return {
+                    ok: false,
+                    state: latest?.state ?? 'BLOCK',
+                    detail:
+                        latest === undefined
+                            ? `mission ${facts.mission.id} 没有任何规范门禁记录（先跑 standards_check）`
+                            : `最近一次规范门禁是 ${latest.state}（${latest.reason}）`,
+                    fix: '调用 standards_check：新增违规要改代码消除；存量债务需要放宽时走人工批准（standards_check({ accept: true })）。',
+                }
+            }
+            const enteredAt = facts.current?.enteredAt
+            if (enteredAt === undefined) {
+                return {
+                    ok: false,
+                    state: acceptable.state,
+                    detail: `无法确认本阶段的进入时间，因此无法证明规范门禁 ${acceptable.id} 覆盖了这一轮的代码`,
+                    fix: '用 orchestrate({ action: "rerun", stageId: "<当前阶段>" }) 重新进入该阶段并重跑 standards_check。',
+                }
+            }
+            if (acceptable.checkedAt < enteredAt) {
+                return {
+                    ok: false,
+                    state: acceptable.state,
+                    detail: `规范门禁 ${acceptable.id}（${formatTime(acceptable.checkedAt)}）早于本阶段进入时间（${formatTime(enteredAt)}）：它证明的是上一轮的代码`,
+                    fix: '重新调用 standards_check 后再推进本阶段。',
+                }
+            }
+            return { ok: true, state: 'PASS', detail: `规范门禁 ${acceptable.id} PASS（${formatTime(acceptable.checkedAt)}，晚于本阶段进入时间）` }
+        }
         case 'receipt': {
             const receipts = facts.store.readReceipts(facts.mission.id)
             const receipt = receipts[receipts.length - 1]

@@ -9,7 +9,7 @@
 bash scripts/verify.sh
 ```
 
-最近一次结果：**8 个包 + 1 个根集成测试，203 个测试，202 通过 / 0 失败 / 1 跳过**
+最近一次结果：**9 个包 + 1 个根集成测试，342 个测试，341 通过 / 0 失败 / 1 跳过**（另有真机 harness：8 个插件全部 `applied`，E2E GREEN）
 （跳过的是一条需要 `ps` 的子进程回收测试——本机沙箱不允许列进程，测试会如实跳过而不是假通过）。
 
 第一轮（实现完成时）130 个测试；第二轮对抗式审计把漏洞变成回归测试（+49）；第三轮补齐七项已知边界（+24）。
@@ -23,6 +23,7 @@ bash scripts/verify.sh
 | `dsh-quality-gate` | 21 | 配置解析与去重、三态裁决与覆盖范围（`scope.full`）、门禁记录与证据、写后 lint 回路（同失败只报一次 + 每轮上限 + 换轮重置）、收尾阻断与 steer、取消不产生裁决、改动预算、命令不经 shell |
 | `dsh-evidence-gate` | 32 | 四类证据登记、fail-closed 清单、缺规格/缺门禁/部分门禁/无结果门禁/伪造门禁/缺证据/陈旧门禁/超龄门禁/熔断全部阻断、证据必须 exitCode=0、回执不可覆盖、跨轮回执失效、**force 需宿主 allowForceOverride 才生效** |
 | `dsh-audit-trail` | 27 | pre/result 配对、快照与还原、dry-run、符号链接与"回滚点后被改"保护、权限位还原、诚实统计、**轮次从三个事件学习 + since/sinceMinutes 时间回滚** |
+| `dsh-standards-gate` | 12 |
 | `dsh-orchestrator` | 38 | 默认六阶段、能力探测、入口/出口门禁（含新鲜度）、回退、熔断 latch + 人工 unblock、断点恢复、只能结算当前阶段、条件边、复盘与跨 run 台账回注、**阶段角色声明 + 可选 autoAdvance** |
 | `test/integration.test.ts` | 3 | **七个插件同宿主跑完整条流水线**（下节） |
 
