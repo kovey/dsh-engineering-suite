@@ -61,9 +61,12 @@ test('the plugin declares its name and required services', () => {
     assert.deepEqual(inject, ['tools', 'systemPrompt'])
 })
 
-test('apply() registers the three tools, the guard and the prompt section', () => {
+test('apply() registers the tool surface, the guard and the prompt section', () => {
     const fake = host()
-    assert.deepEqual([...fake.tools.keys()].sort(), ['spec_approve', 'spec_bootstrap', 'spec_create', 'spec_status'])
+    assert.deepEqual(
+        [...fake.tools.keys()].sort(),
+        ['spec_amend', 'spec_approve', 'spec_bootstrap', 'spec_create', 'spec_status'],
+    )
     assert.equal(fake.guards.length, 1)
     assert.deepEqual(
         fake.sections.map((section) => section.name),
@@ -1568,4 +1571,148 @@ test('the trust root survives a symlink (regression: SECURITY)', async () => {
     // refused for that separate, expected reason).
     const ordinary = fake.guardReason({ name: 'write', arguments: { file_path: 'src/ok.ts' }, agent: fake.agent })
     assert.doesNotMatch(ordinary ?? '', /工程台账|信任根/)
+})
+
+test('spec_amend adds a requirement without disturbing existing ids (regression)', async () => {
+    const fake = host()
+    await fake.runTool('spec_create', DRAFT)
+    const store = new MissionStoreRegistry().for(fake.cwd)
+    const id = store.list()[0]!.id
+
+    const added = runText(await fake.runTool('spec_amend', { part: 'criterion', action: 'add', text: '健康检查在 1 秒内返回', note: 'SLO' }))
+    assert.match(added, /已改动规格（revision 2）/)
+    assert.match(added, /AC-003/) // next free id, not a renumbering
+    const spec = store.read(id)!.spec!
+    assert.deepEqual(
+        spec.acceptanceCriteria.map((criterion) => [criterion.id, criterion.text]),
+        [
+            ['AC-001', 'GET /health 返回 200'],
+            ['AC-002', '端口占用时启动失败'],
+            ['AC-003', '健康检查在 1 秒内返回'],
+        ],
+        'existing ids keep pointing at the same statements',
+    )
+    assert.deepEqual(spec.requirements.map((requirement) => [requirement.id, requirement.text]), [['R-001', '暴露 GET /health']])
+    // A revision revokes the approval and records the change.
+    assert.equal(spec.approvedAt, undefined)
+    assert.equal(spec.changes?.length, 1)
+    assert.equal(spec.changes?.[0]?.kind, 'add-criterion')
+    assert.equal(spec.changes?.[0]?.note, 'SLO')
+    // …and the artifact a human approves carries the new criterion and the history.
+    const artifact = fs.readFileSync(path.join(fake.cwd, store.read(id)!.specPath!), 'utf8')
+    assert.match(artifact, /AC-003/)
+    assert.match(artifact, /变更历史/)
+})
+
+test('spec_amend rewording keeps the id, and the approval is revoked (regression)', async () => {
+    // The fake host refuses approvals unless asked otherwise, which is the
+    // fail-closed default; this test needs a real approval first.
+    const fake = host({ approvalOutcome: 'allowed-once' })
+    await fake.runTool('spec_create', DRAFT)
+    await fake.runTool('spec_approve', { note: 'ok' })
+    const store = new MissionStoreRegistry().for(fake.cwd)
+    const id = store.list()[0]!.id
+    assert.equal(store.read(id)!.spec!.approvedAt !== undefined, true, 'precondition: approved')
+
+    const out = runText(await fake.runTool('spec_amend', { part: 'criterion', action: 'update', target: 'AC-002', text: '端口被占用时启动失败并给出提示' }))
+    assert.match(out, /修改 AC-002/)
+    assert.match(out, /撤销/)
+    const spec = store.read(id)!.spec!
+    assert.equal(spec.acceptanceCriteria[1]?.id, 'AC-002', 'the id is the address: it survives a rewording')
+    assert.equal(spec.acceptanceCriteria[1]?.text, '端口被占用时启动失败并给出提示')
+    assert.equal(spec.approvedAt, undefined, 'a human approved a different document')
+    assert.equal(spec.changes?.[0]?.before, '端口占用时启动失败')
+    assert.equal(spec.changes?.[0]?.after, '端口被占用时启动失败并给出提示')
+})
+
+test('removing a covered criterion is refused until the caller decides about the cases (regression)', async () => {
+    const fake = host()
+    await fake.runTool('spec_create', DRAFT)
+    const store = new MissionStoreRegistry().for(fake.cwd)
+    const id = store.list()[0]!.id
+
+    const refused = runText(await fake.runTool('spec_amend', { part: 'criterion', action: 'remove', target: 'AC-002' }))
+    assert.match(refused, /未改动/)
+    assert.match(refused, /被 1 个测试用例引用（TC-002）/)
+    assert.match(refused, /cascade: true/)
+    assert.equal(store.read(id)!.spec!.acceptanceCriteria.length, 2, 'nothing was removed')
+
+    // With cascade the criterion AND its case go, and the design must be re-reviewed.
+    const cascaded = runText(await fake.runTool('spec_amend', { part: 'criterion', action: 'remove', target: 'AC-002', cascade: true, note: '范围缩小' }))
+    assert.match(cascaded, /已移除用例：TC-002/)
+    const after = store.read(id)!
+    assert.deepEqual(after.spec!.acceptanceCriteria.map((criterion) => criterion.id), ['AC-001'])
+    assert.deepEqual(after.testDesign?.cases.map((testCase) => testCase.id), ['TC-001', 'TC-003'])
+    assert.equal(after.testDesign?.passed, undefined, 'a design whose cases changed must be reviewed again')
+})
+
+test('a removed id is never handed out again (regression)', async () => {
+    // Reusing a retired id would let an old test-case citation resolve to a
+    // brand-new requirement — coverage that looks green and checks nothing.
+    const fake = host()
+    await fake.runTool('spec_create', DRAFT)
+    const store = new MissionStoreRegistry().for(fake.cwd)
+    const id = store.list()[0]!.id
+    await fake.runTool('spec_amend', { part: 'criterion', action: 'add', text: '临时要求' })      // AC-003
+    await fake.runTool('spec_amend', { part: 'criterion', action: 'remove', target: 'AC-003' })   // retired
+    await fake.runTool('spec_amend', { part: 'criterion', action: 'add', text: '另一条要求' })
+    const spec = store.read(id)!.spec!
+    assert.deepEqual(spec.acceptanceCriteria.map((criterion) => criterion.id), ['AC-001', 'AC-002', 'AC-004'])
+    assert.deepEqual(spec.retired, ['AC-003'])
+    // Addressing the retired id is refused with the reason, not silently ignored.
+    const dead = runText(await fake.runTool('spec_amend', { part: 'criterion', action: 'update', target: 'AC-003', text: 'x' }))
+    assert.match(dead, /已经被删除过/)
+})
+
+test('requirements are addressable too: add, reword and remove (regression)', async () => {
+    const fake = host()
+    await fake.runTool('spec_create', DRAFT)
+    const store = new MissionStoreRegistry().for(fake.cwd)
+    const id = store.list()[0]!.id
+
+    await fake.runTool('spec_amend', { part: 'requirement', action: 'add', text: '支持优雅关闭' })
+    await fake.runTool('spec_amend', { part: 'requirement', action: 'update', target: 'R-002', text: '支持优雅关闭（SIGTERM 后 5 秒内退出）' })
+    await fake.runTool('spec_amend', { part: 'requirement', action: 'remove', target: 'R-001' })
+    const spec = store.read(id)!.spec!
+    assert.deepEqual(
+        spec.requirements.map((requirement) => [requirement.id, requirement.text]),
+        [['R-002', '支持优雅关闭（SIGTERM 后 5 秒内退出）']],
+    )
+    assert.deepEqual(spec.retired, ['R-001'])
+})
+
+test('a re-created specification keeps ids for unchanged text (regression)', async () => {
+    // The original numbering restarted at 1 on every rewrite, so inserting a
+    // criterion in the middle silently repointed every citation after it.
+    const fake = host()
+    await fake.runTool('spec_create', DRAFT)
+    const store = new MissionStoreRegistry().for(fake.cwd)
+    const id = store.list()[0]!.id
+    await fake.runTool('spec_create', {
+        ...DRAFT,
+        acceptanceCriteria: ['新增的第一条', 'GET /health 返回 200', '端口占用时启动失败'],
+    })
+    const spec = store.read(id)!.spec!
+    assert.deepEqual(
+        spec.acceptanceCriteria.map((criterion) => [criterion.id, criterion.text]),
+        [
+            ['AC-003', '新增的第一条'],
+            ['AC-001', 'GET /health 返回 200'],
+            ['AC-002', '端口占用时启动失败'],
+        ],
+        'unchanged statements keep their ids; the new one continues the sequence',
+    )
+})
+
+test('spec_amend refuses an empty or duplicate statement (regression)', async () => {
+    const fake = host()
+    await fake.runTool('spec_create', DRAFT)
+    const empty = runText(await fake.runTool('spec_amend', { part: 'criterion', action: 'add', text: '   ' }))
+    assert.match(empty, /必须给出 text/)
+    const duplicate = runText(await fake.runTool('spec_amend', { part: 'criterion', action: 'add', text: 'GET /health 返回 200' }))
+    assert.match(duplicate, /已经存在/)
+    const missingTarget = runText(await fake.runTool('spec_amend', { part: 'criterion', action: 'update', text: 'x' }))
+    assert.match(missingTarget, /必须给出 target/)
+    const unknown = runText(await fake.runTool('spec_amend', { part: 'criterion', action: 'remove', target: 'AC-099' }))
+    assert.match(unknown, /没有 AC-099/)
 })

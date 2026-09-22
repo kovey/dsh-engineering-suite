@@ -11,6 +11,7 @@ import {
     ensureDir,
     formatTime,
     parentSessionIdOf,
+    nextStepsAfter,
     scanGaps,
     scanWorkspace,
     sessionIdOf,
@@ -19,10 +20,12 @@ import {
     writeJsonAtomic,
     writeTextAtomic,
     type AgentLike,
+    type AmendRequest,
     type GapReport,
     type MissionRecord,
     type MissionStoreRegistry,
     type ScanResult,
+    type SpecChange,
 } from 'dsh-eng-core'
 import type { Logger } from 'dsh-eng-core'
 import { buildIndex, checkDraft, parseDraftAnswer, renderBrief, renderDraft } from './bootstrap.js'
@@ -30,6 +33,7 @@ import type { SpecGateConfig } from './config.js'
 import type { WriteGuard } from './guard.js'
 import { describeConstraints } from './constraints.js'
 import { buildSpec, describeMission, parseDraftTestDesign, renderSpec, validateDraft, type SpecDraft } from './spec.js'
+import { amendMissionSpec } from './amend.js'
 
 const TEXT_OUTPUT = { type: 'string' } as const
 
@@ -152,6 +156,16 @@ interface ApproveArgs {
 }
 
 interface StatusArgs {
+    missionId?: string
+}
+
+interface AmendArgs {
+    part: 'requirement' | 'criterion'
+    action: 'add' | 'update' | 'remove'
+    target?: string
+    text?: string
+    note?: string
+    cascade?: boolean
     missionId?: string
 }
 
@@ -280,6 +294,20 @@ function needsTestDesign(deps: ToolDeps, config: SpecGateConfig = deps.config): 
 function effectiveFor(deps: ToolDeps, agent: AgentLike | undefined): SpecGateConfig {
     const cwd = agent?.session?.header?.cwd
     return cwd === undefined ? deps.config : deps.configFor(cwd).config
+}
+
+/** One line of the change history a report shows. */
+function renderChangeLine(change: SpecChange): string {
+    const body = change.kind.startsWith('add-')
+        ? `新增 → ${change.after ?? ''}`
+        : change.kind.startsWith('update-')
+          ? `修改：${change.before ?? ''} → ${change.after ?? ''}`
+          : `删除（原内容：${change.before ?? ''}）${
+                change.coveredBy === undefined ? '' : `，同时移除用例 ${change.coveredBy.join('、')}`
+            }`
+    return `- ${formatTime(change.at)} [${change.kind}] ${change.target} ${body}${
+        change.note === undefined ? '' : `（理由：${change.note}）`
+    }`
 }
 
 /** Register every spec-gate tool. */
@@ -505,6 +533,88 @@ export function registerTools(
             },
         }),
         'spec_approve',
+    )
+
+    register(
+        defineTool({
+            name: 'spec_amend',
+            description:
+                'Add, reword or remove ONE requirement or acceptance criterion of an existing specification, without losing the standard process. Ids are stable: an edit keeps them attached to their text (a test case citing AC-003 keeps meaning the same statement), a removed id is RETIRED and never reused, and the change is recorded (who/when/before→after) in the specification a human approves. The revision invalidates the approval, so the mission goes back to the specification stage: update the affected test cases, run test_design_review again, then spec_approve. Removing a criterion that test cases cover is REFUSED unless `cascade: true`, which also drops those cases (and forces a re-review) — a deletion must never leave coverage pointing at nothing.',
+            parameters: {
+                part: {
+                    type: 'string',
+                    enum: ['requirement', 'criterion'],
+                    required: true,
+                    description: 'requirement = the 需求 list (R-00n); criterion = the 验收标准 table (AC-00n).',
+                },
+                action: {
+                    type: 'string',
+                    enum: ['add', 'update', 'remove'],
+                    required: true,
+                    description: 'add (needs text) / update (needs target + text) / remove (needs target).',
+                },
+                target: { type: 'string', description: 'The id to change, e.g. `AC-003`; omitted for add.' },
+                text: { type: 'string', description: 'The new statement; required for add and update.' },
+                note: { type: 'string', description: 'Why the change; recorded in the change history.' },
+                cascade: {
+                    type: 'boolean',
+                    description: 'Allow removing a criterion that test cases cover (the cases are dropped too and must be re-reviewed).',
+                },
+                missionId: { type: 'string', description: 'Mission whose specification is edited (default: the session mission).' },
+            },
+            output: { schema: TEXT_OUTPUT, render: (_args, value) => [{ type: 'text', text: value }] },
+            async execute(args: AmendArgs = {} as AmendArgs, exec) {
+                const { store, agent } = storeFor(deps, exec)
+                const mission = resolveStrict(deps, exec, args.missionId)
+                if (mission === undefined) {
+                    return [
+                        '当前会话没有绑定 mission：没有可增删改的规格。',
+                        '',
+                        '下一步：先 `spec_create` 建立规格；已有规格的 mission 请显式传 missionId。',
+                    ].join('\n')
+                }
+                const request: AmendRequest = {
+                    part: args.part,
+                    action: args.action,
+                    ...(args.target === undefined || args.target === '' ? {} : { target: args.target }),
+                    ...(args.text === undefined ? {} : { text: args.text }),
+                    ...(args.note === undefined ? {} : { note: args.note }),
+                    ...(args.cascade === true ? { cascade: true } : {}),
+                }
+                const outcome = amendMissionSpec(
+                    { store, ...(args.missionId === undefined ? {} : {}) },
+                    mission.id,
+                    request,
+                    sessionIdOf(agent) ?? 'spec_amend',
+                )
+                if (!outcome.ok) {
+                    return [
+                        `## 未改动（${args.action} ${args.part}${args.target === undefined ? '' : ` ${args.target}`}）`,
+                        '',
+                        outcome.problem,
+                        ...(outcome.coveredBy === undefined ? [] : ['', `涉及用例：${outcome.coveredBy.join('、')}`]),
+                        ...(outcome.nextSteps === undefined ? [] : ['', '### 下一步', '', outcome.nextSteps]),
+                    ].join('\n')
+                }
+                const history = (store.read(mission.id)?.spec?.changes ?? []).slice(-5)
+                return [
+                    `## 已改动规格（revision ${outcome.revision}）`,
+                    '',
+                    outcome.summary,
+                    `需求文档：${path.relative(mission.cwd, path.join(store.layout.missionsDir, mission.id, 'spec.md'))}（已重新渲染）`,
+                    ...(outcome.removedCases.length === 0 ? [] : [`已移除用例：${outcome.removedCases.join('、')}`]),
+                    '',
+                    '### 变更历史（最近 5 条）',
+                    '',
+                    ...history.map(renderChangeLine),
+                    '',
+                    '### 下一步（标准流程）',
+                    '',
+                    nextStepsAfter(store.read(mission.id)?.spec ?? mission.spec!, [outcome.summary]),
+                ].join('\n')
+            },
+        }),
+        'spec_amend',
     )
 
     register(

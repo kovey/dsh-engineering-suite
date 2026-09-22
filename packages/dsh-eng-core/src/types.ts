@@ -69,10 +69,36 @@ export interface TestDesign {
 }
 
 /** The approved specification of one mission (docs.md §3.2). */
+/** One requirement statement, addressed by a stable id. */
+export interface Requirement {
+    /** Stable id quoted by criteria and reports (`R-001`). */
+    id: string
+    text: string
+}
+
+/** What one editing action did to a specification. */
+export interface SpecChange {
+    /** `add-requirement` / `update-criterion` / `remove-requirement` / … */
+    kind: 'add-requirement' | 'update-requirement' | 'remove-requirement' | 'add-criterion' | 'update-criterion' | 'remove-criterion'
+    at: number
+    /** Agent/session that asked for it (or `approval`). */
+    by: string
+    /** `R-003` / `AC-002`. */
+    target: string
+    /** Previous text, for updates and removals. */
+    before?: string
+    /** New text, for additions and updates. */
+    after?: string
+    /** Why, when the caller explained. */
+    note?: string
+    /** Test cases that referenced the target when it was removed. */
+    coveredBy?: string[]
+}
+
 export interface SpecRecord {
     title: string
     background: string
-    requirements: string[]
+    requirements: Requirement[]
     acceptanceCriteria: AcceptanceCriterion[]
     /** Files/directories the agent may touch. */
     fileBoundaries: string[]
@@ -85,6 +111,13 @@ export interface SpecRecord {
     approvedAt?: number
     /** Who approved it (`approval` = the harness approval seam, `auto` = configured). */
     approvedBy?: string
+    /**
+     * Ids removed by earlier revisions. A retired id is never handed out again:
+     * reusing it would let an old test-case citation resolve to a new statement.
+     */
+    retired?: string[]
+    /** Append-only history of requirement/criterion edits. */
+    changes?: SpecChange[]
 }
 
 /** Evidence kinds the delivery gate accepts. */

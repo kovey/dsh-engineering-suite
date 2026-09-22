@@ -447,3 +447,27 @@ test('a rejection invalidates the approval it reviewed and advances the round (r
     assert.equal(approved?.spec?.approvedAt, undefined, 'the tool sets approvedAt, not the recorder')
     assert.equal(store.nextApprovalRound(mission.id), 3)
 })
+
+test('a design chapter that restates its own heading still parses (regression)', () => {
+    // The format hint tells a model to submit `## 测试设计` + the three scenario
+    // sections, and spec-gate wraps that submission in another `## 测试设计`.
+    // The duplicate heading used to end the chapter body, so the canonical form
+    // parsed as ZERO cases while only the heading-less form worked — a live run
+    // found it, a fixture never would have (the fixtures submit bare tables).
+    const design = [
+        '## 测试设计',
+        '',
+        '### 正向场景',
+        '',
+        '| 用例ID | 前置条件 | 操作步骤 | 预期结果 | 覆盖验收标准 |',
+        '|--------|----------|----------|----------|--------------|',
+        '| TC-001 | 服务已启动 | 请求 /health | 返回 200 | AC-001 |',
+        '',
+    ].join('\n')
+    const wrapped = `## 验收标准\n\n| 编号 | 验收标准 |\n|------|----------|\n| AC-001 | x |\n\n## 测试设计\n\n${design}\n`
+    const withHeading = parseTestDesign(wrapped)
+    const withoutHeading = parseTestDesign(`## 验收标准\n\n| 编号 | 验收标准 |\n|------|----------|\n| AC-001 | x |\n\n## 测试设计\n\n${design.split('\n').slice(2).join('\n')}\n`)
+    assert.equal(withHeading.cases.length, 1, 'the canonical form must parse')
+    assert.deepEqual(withHeading.cases.map((testCase) => testCase.id), withoutHeading.cases.map((testCase) => testCase.id))
+    assert.deepEqual(withHeading.cases[0]?.covers, ['AC-001'])
+})

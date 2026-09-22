@@ -4,6 +4,8 @@
  */
 
 import {
+    allocateCriteriaStable,
+    allocateRequirements,
     designRowCounts,
     parseTestDesign,
     renderSpecMarkdown,
@@ -71,9 +73,23 @@ export function validateDraft(draft: SpecDraft): SpecIssue[] {
     return issues
 }
 
-/** Assign `AC-00n` ids in declaration order. */
-export function allocateCriteria(texts: readonly string[]): AcceptanceCriterion[] {
-    return texts.map((text, index) => ({ id: `AC-${String(index + 1).padStart(3, '0')}`, text: text.trim() }))
+/**
+ * Assign ids to a freshly submitted draft, PRESERVING the previous ones.
+ *
+ * The first version numbered the criteria from 1 on every rewrite, so inserting
+ * one in the middle renumbered everything after it — and every test case that
+ * cited `AC-003` silently started pointing at a different requirement. Ids are
+ * now matched by text and kept; new ones are allocated after the highest live or
+ * RETIRED number, so a removed id is never handed out again.
+ * @param texts - the submitted criteria, in document order.
+ * @param previous - the previous revision, when this is a rewrite.
+ */
+export function allocateCriteria(texts: readonly string[], previous?: SpecRecord): AcceptanceCriterion[] {
+    return allocateCriteriaStable(
+        texts,
+        previous?.acceptanceCriteria ?? [],
+        previous?.retired ?? [],
+    )
 }
 
 /**
@@ -86,13 +102,21 @@ export function buildSpec(draft: SpecDraft, previous?: SpecRecord): SpecRecord {
     return {
         title: draft.title.trim(),
         background: draft.background.trim(),
-        requirements: draft.requirements.map((entry) => entry.trim()).filter((entry) => entry !== ''),
-        acceptanceCriteria: allocateCriteria(draft.acceptanceCriteria),
+        requirements: allocateRequirements(
+            draft.requirements.map((entry) => entry.trim()).filter((entry) => entry !== ''),
+            previous?.requirements ?? [],
+            previous?.retired ?? [],
+        ),
+        acceptanceCriteria: allocateCriteria(draft.acceptanceCriteria, previous),
         fileBoundaries: draft.fileBoundaries.map((entry) => entry.trim()).filter((entry) => entry !== ''),
         negativeConstraints: draft.negativeConstraints.map((entry) => entry.trim()).filter((entry) => entry !== ''),
         revision: (previous?.revision ?? 0) + 1,
         createdAt: previous?.createdAt ?? now,
         updatedAt: now,
+        // History and retirement survive a rewrite: a re-created document that
+        // forgot them would let a retired id come back (and lose the audit trail).
+        ...(previous?.retired === undefined ? {} : { retired: previous.retired }),
+        ...(previous?.changes === undefined ? {} : { changes: previous.changes }),
         // A revision invalidates a previous approval: the human approved a
         // different document.
     }

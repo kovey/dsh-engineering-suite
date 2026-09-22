@@ -104,6 +104,14 @@ dsh 本身是 Agent 运行时，我们的软件工程体系是运行在其上的
 - 门禁结果以 `PASS` / `WARN` / `BLOCK` 三态返回。`BLOCK` 时**拒绝状态流转**，强制 Agent 修复后重新提交。
 - 可集成已有的 lint 反馈循环模式：在 Agent 编辑文件后自动触发 lint，发现问题立即反馈给 Agent 修复。
 
+**需求的增 / 改 / 删（同一套流程）**：`spec_amend({ part, action, target, text, cascade })`
+
+- `add` 分配新编号；`update` 按编号改写（编号不变）；`remove` 使编号作废（**永不复用**）。
+- 删除被测试用例引用的验收标准会被**拒绝**，除非 `cascade: true`（连同用例移除并要求重新评审测试设计）。
+- 任何改动都会 `revision + 1` 并**撤销审批**：需求文档里会渲染变更历史（改动前后 + 理由 + 已作废编号），
+  流程回到 `test_design_review` → `spec_approve`，阶段门禁 `spec-approved` 重新生效。
+- `spec_create` 的整篇重写按**文本**保留未变条目的编号，因此不会再出现"插入一条就整体重编号"。
+
 ### 3.5 `dsh-evidence-gate`：证据与交付层
 
 **职责**：确保 Agent 提交的“完成”有可验证的证据支撑。

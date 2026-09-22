@@ -205,9 +205,23 @@ function bulletLines(body: string): string[] {
         .filter((line) => line !== '')
 }
 
+/**
+ * Split one rendered requirement line into its id and text.
+ *
+ * Documents written before ids existed (and documents a human edited by hand)
+ * have no `R-00n`: the id is left empty and the builder allocates one, which is
+ * exactly what the previous revisions did.
+ * @param line - the bullet's text, without the bullet marker.
+ */
+export function parseRequirementLine(line: string): { id: string; text: string } {
+    const match = /^(R-\d+)\s+(.+)$/.exec(line.trim())
+    if (match === null) return { id: '', text: line.trim() }
+    return { id: match[1] as string, text: (match[2] as string).trim() }
+}
+
 /** Parse the spec's requirement, boundary and constraint lists. */
 export function parseLists(sections: readonly MdSection[]): {
-    requirements: string[]
+    requirements: { id: string; text: string }[]
     fileBoundaries: string[]
     negativeConstraints: string[]
     background: string
@@ -215,7 +229,7 @@ export function parseLists(sections: readonly MdSection[]): {
     const background = (findSection(sections, 'background')?.body ?? '').trim()
     return {
         background,
-        requirements: bulletLines(findSection(sections, 'requirements')?.body ?? ''),
+        requirements: bulletLines(findSection(sections, 'requirements')?.body ?? '').map(parseRequirementLine),
         fileBoundaries: bulletLines(findSection(sections, 'boundaries')?.body ?? ''),
         negativeConstraints: bulletLines(findSection(sections, 'negative')?.body ?? ''),
     }
@@ -269,7 +283,19 @@ function chapterBodyOf(markdown: string): string | undefined {
         const body: string[] = []
         for (let next = index + 1; next < lines.length; next += 1) {
             const heading = /^(#{1,6})\s+/.exec(lines[next] ?? '')
-            if (heading !== null && (heading[1] ?? '').length <= level) break
+            if (heading !== null && (heading[1] ?? '').length <= level) {
+                // A design chapter that RESTATES its own heading (`## 测试设计`
+                // wrapping a submitted `## 测试设计` + `### 正向场景`, which is
+                // exactly what the format hint tells a model to send) would end
+                // the body here and every scenario would vanish. Skip that repeat
+                // instead of treating it as the next chapter — a live run caught
+                // this: the canonical form parsed as 0 cases while only the
+                // heading-less form worked.
+                const repeat = /^(#{1,6})\s+(.*)$/.exec(lines[next] ?? '')
+                const repeatTitle = (repeat?.[2] ?? '').trim().toLowerCase()
+                if (repeat !== null && aliases.some((alias) => alias.toLowerCase() === repeatTitle)) continue
+                break
+            }
             body.push(lines[next] ?? '')
         }
         return body.join('\n')
@@ -393,7 +419,12 @@ export function renderSpecMarkdown(mission: MissionRecord): string {
     lines.push('')
     lines.push('## 需求')
     lines.push('')
-    pushList(lines, spec.requirements)
+    // Ids ride along in the document: a rendered spec is what a human approves,
+    // and the ids are how later edits and test cases address each requirement.
+    pushList(
+        lines,
+        spec.requirements.map((requirement) => `${requirement.id} ${requirement.text}`),
+    )
     lines.push('')
     lines.push('## 验收标准')
     lines.push('')
@@ -403,6 +434,20 @@ export function renderSpecMarkdown(mission: MissionRecord): string {
         lines.push(`| ${cell(criterion.id)} | ${cell(criterion.text)} |`)
     }
     lines.push('')
+    // The change history rides along: the artifact is what a human approves, and
+    // "what changed since the last approval" is the first thing they need.
+    if ((spec.changes ?? []).length > 0) {
+        lines.push('## 变更历史')
+        lines.push('')
+        for (const change of (spec.changes ?? []).slice(-20)) {
+            lines.push(`- ${formatTime(change.at)} \`${change.kind}\` ${change.target} ${change.before === undefined ? '' : `「${change.before}」→ `}${change.after ?? ''}${change.note === undefined ? '' : `（${change.note}）`}`)
+        }
+        if ((spec.retired ?? []).length > 0) {
+            lines.push('')
+            lines.push(`已作废编号（不会复用）：${(spec.retired ?? []).join('、')}`)
+        }
+        lines.push('')
+    }
     lines.push('## 文件边界')
     lines.push('')
     pushList(lines, spec.fileBoundaries)

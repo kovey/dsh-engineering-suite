@@ -137,6 +137,7 @@ profile 是上限，每个仓库可以用 `.dsh/spec-gate.json` 决定**自己**
 | `spec_create` | `title`(必填) `background` `requirements[]`(必填) `acceptanceCriteria[]`(必填) `fileBoundaries[]`(必填) `negativeConstraints[]`(必填) `testDesign` `missionId` | 新建或修订规格；缺项直接报错且**不写任何文件** |
 | `spec_approve` | `missionId` `note` | 走审批 seam；被拒绝/通道缺失时 fail closed |
 | `spec_status` | `missionId` | 只读汇总 |
+| `spec_amend` | **增 / 改 / 删单条需求或验收标准**：编号稳定（改写不改号、插入不打乱、删除后作废不复用）、删除被用例引用的验收标准会被拒绝（除非 `cascade: true` 连同用例移除）、变更记入历史并渲染进审批文档、**修订即撤销审批**（回到 test_design_review → spec_approve 的标准流程） |
 
 ## 配置
 
