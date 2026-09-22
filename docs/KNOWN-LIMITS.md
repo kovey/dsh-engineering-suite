@@ -170,6 +170,7 @@ bash scripts/e2e-mission.sh          # 建立隔离 profile、起 stub、跑一�
 | 存储缓存（MissionStoreRegistry 按 rootDir、项目配置按文件路径） | 键已是工作区粒度 |
 | **日志文件** | ✓ 两种模式：默认单文件但**行内带项目名**（可 grep）；配 `logFileTemplate`（host-only，如 `~/.dsh/logs/{projectPath}/quality-gate.log`，`{projectPath}` 完全可读 / `{project}` 短哈希 / `{basename}` 仅目录名）则**按项目分文件**，未绑定工作区的行仍进 `logFile` |
 | `role-guard` / `orchestrator` | 角色文件与阶段流水线本身是仓库自带工件；`routing`（按难度选模型）与 `autoDispatch`（自主派发）由宿主 profile 配置 |
+| `standards-gate` | 阈值与基线是**目标仓库**的工件（`.dsh/standards.json`、`.dsh/standards-baseline.json`，受信任根保护）；项目级只能细化 `enforce`/`standardsFile`/`baselineFile`/`maxFiles`/`maxFileBytes`，`requireApprovalForBaseline` 与 `review*` **不可被项目放大**（否则仓库能自己把审批关掉） |
 
 ## 附一之三：存量项目接入（`spec_bootstrap`）的诚实边界
 
@@ -228,6 +229,22 @@ bash scripts/e2e-mission.sh          # 建立隔离 profile、起 stub、跑一�
 - **基线文件损坏按"没有基线"处理**（会报告全部违规），而不是"全部已接受"——先失败，再让人修。
 - **交付侧的门禁新鲜度**按"最新 command/test 证据"判断，同毫秒算陈旧（fail closed）：门禁自己写的 ledger 行
   不算证据，否则每条门禁都会被它自己的一毫秒判成过期。
+
+## 附一之七：规范门禁的棘轮与"账本不能撒谎"（审计后的加固）
+
+- **棘轮带量级**：基线不只记 key，还记"接受时它有多大"。同一个 key 从 420 行涨到 900 行 → **恶化**，门禁失败。
+  老基线（只有 key、没有量级）按原样接受，不会凭空发明一个上限。
+- **消除自动收紧**：某条违规消失后，它的 key 会从基线里删除（只收紧、不放松，所以不需要人工批准）。
+  否则"删掉文件让门禁变绿、之后再放回来"就能靠旧批准通过。
+- **扫描不完整时不许声称"已消除"**：达到 `maxFiles` 上限的报告会明确标注"本次不完整"，且不做自动收紧。
+- **规范门禁也要防伪造**：交付侧（`requireStandardsGate`）像质量门禁一样要求
+  `kind: 'gate'` 且 `data.gateId` 匹配的台账行；手写 `gates/GATE-*.json` 一律视为伪造。
+- **"最新一条"才算数**：`standards-pass` 门禁看的是该来源**最新**的记录——先 PASS 后 BLOCK 必须重新关闭；
+  与阶段进入时间**同毫秒**的裁决按陈旧处理（fail closed），与 `quality-pass` 一致。
+- **运行 id 不是文件名**：`standards_review` 派出的子代理返回的 id 会被净化成单一路径段，
+  防止 `../..` 这类 id 把报告写到 mission 目录之外。
+- **信任根按真实路径判定**：`write` 类工具落到 `.dsh/**` 的判定走 `realpath`，
+  所以"在工作区里放一个符号链接指向 `.dsh/`"不再能绕过（此前是词法判定）。
 
 ## 附二：项目级配置的完整键表（一个 dsh 进程服务多个仓库）
 

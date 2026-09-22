@@ -192,12 +192,21 @@ export function evaluateDelivery(input: {
         const hasProof = codeProofs.length > 0
         const fresh =
             standardsGate !== undefined && (!hasProof || standardsGate.checkedAt > newestProofAt)
+        // Forgery: a gate RECORD is not evidence. The quality gate has always
+        // required a `kind: 'gate'` ledger row with a matching `data.gateId`, so a
+        // hand-written `gates/GATE-….json` is refused. An audit showed the
+        // standards axis accepted exactly that trick, so it gets the same check.
+        const standardsRow =
+            standardsGate === undefined ? undefined : evidence.find((row) => row.kind === 'gate' && gateIdOf(row) === standardsGate.id)
+        const forged = standardsGate !== undefined && standardsRow === undefined
         checks.push({
             id: 'standards',
-            ok: standardsGate?.state === 'PASS' && fresh,
+            ok: standardsGate?.state === 'PASS' && fresh && !forged,
             label: `规范门禁 PASS（source=${config.standardsGateSource}，且晚于最新改动）`,
             detail:
-                standardsGate === undefined
+                forged
+                    ? `gates/${standardsGate?.id}.json 在证据台账里没有对应的 gate 证据行（data.gateId=${standardsGate?.id}）：手工写入的 gates/*.json 视为伪造，拒绝交付`
+                    : standardsGate === undefined
                     ? `没有任何来自 ${config.standardsGateSource} 的门禁记录：调用 standards_check`
                     : standardsGate.state !== 'PASS'
                       ? `${standardsGate.id} 是 ${standardsGate.state}：${standardsGate.reason}`

@@ -215,7 +215,11 @@ export async function runStructuralReview(
     let outputFile: string | undefined
     try {
         const stamp = new Date().toISOString().replace(/[:.]/g, '-')
-        const file = path.join(deps.reportDir, `review-${stamp}-${child.id}.md`)
+        // The run id comes from the provider, so it is NOT a filename: an
+        // adversarial audit had a hostile id write `/tmp/…/ESCAPED.md` outside
+        // the mission directory. Keep one path segment, drop everything else.
+        const safeId = String(child.id).replace(/[^A-Za-z0-9._-]/g, '_').replace(/^\.+/, '_').slice(0, 80)
+        const file = path.join(deps.reportDir, `review-${stamp}-${safeId}.md`)
         ensureDir(deps.reportDir)
         writeTextAtomic(
             file,

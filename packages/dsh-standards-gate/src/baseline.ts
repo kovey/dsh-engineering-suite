@@ -21,6 +21,7 @@
 import {
     compareToBaseline,
     ensureDir,
+    parseBaseline,
     readText,
     writeTextAtomic,
     writeJsonAtomic,
@@ -33,10 +34,17 @@ import {
 export interface BaselineComparison {
     /** Violations this change introduced: what the gate fails on. */
     added: Violation[]
-    /** Violations the baseline already accepted. */
+    /** Violations the baseline already accepted, at or below the accepted size. */
     known: Violation[]
     /** Accepted keys that no longer exist: the repository improved. */
     fixed: string[]
+    /**
+     * Accepted keys whose violation got BIGGER than what was accepted.
+     *
+     * A ratchet that ignores magnitude is not a ratchet — a 420-line file
+     * accepted today must not silently pass at 900 lines tomorrow.
+     */
+    worsened: Violation[]
     /** Whether a baseline file was found at all. */
     present: boolean
 }
@@ -65,30 +73,14 @@ export function readBaseline(file: string, logger?: Logger): BaselineFile | unde
 /**
  * Parse baseline JSON.
  *
- * Kept here (not in core) because the shape is this plugin's contract; core only
- * carries the type.
+ * Delegates to core: a second implementation here silently dropped the recorded
+ * magnitudes, which disabled the "a violation that got bigger fails" rule while
+ * the tests still passed. One parser, one behaviour.
  * @param text - raw file content.
  * @returns the baseline, or `undefined` when it is not usable.
  */
 export function parseBaselineText(text: string): BaselineFile | undefined {
-    let value: unknown
-    try {
-        value = JSON.parse(text)
-    } catch {
-        return undefined
-    }
-    if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined
-    const record = value as { version?: unknown; frozenAt?: unknown; note?: unknown; accepted?: unknown }
-    if (record.version !== 1) return undefined
-    if (typeof record.frozenAt !== 'string' || record.frozenAt === '') return undefined
-    if (!Array.isArray(record.accepted)) return undefined
-    const accepted = record.accepted.filter((entry): entry is string => typeof entry === 'string' && entry !== '')
-    return {
-        version: 1,
-        frozenAt: record.frozenAt,
-        ...(typeof record.note === 'string' && record.note !== '' ? { note: record.note } : {}),
-        accepted: [...new Set(accepted)].sort(),
-    }
+    return parseBaseline(text)
 }
 
 /**
@@ -124,10 +116,45 @@ export function freezeBaseline(input: {
         frozenAt: new Date(input.now ?? Date.now()).toISOString(),
         note: input.note,
         accepted: [...new Set(input.violations.map((violation) => violation.key))].sort(),
+        // Magnitudes are what make tomorrow's bigger violation fail.
+        entries: input.violations
+            .map((violation) => ({ key: violation.key, actual: violation.actual, limit: violation.limit }))
+            .sort((left, right) => left.key.localeCompare(right.key)),
     }
     ensureDir(input.file.replace(/\/[^/]*$/, ''))
     writeTextAtomic(input.file, `${JSON.stringify(baseline, null, 2)}\n`)
     return baseline
+}
+
+/**
+ * Drop accepted keys whose violation no longer exists.
+ *
+ * Tightening only — it can never accept anything new — so it needs no approval,
+ * and it closes the loophole where a violation is deleted (making the gate
+ * green) and restored later (passing on the old acceptance).
+ * @param file - the baseline file to rewrite.
+ * @param fixed - keys to drop.
+ * @param previous - the baseline that was read.
+ * @returns the pruned baseline, or `undefined` when nothing had to change.
+ */
+export function pruneBaseline(
+    file: string,
+    fixed: readonly string[],
+    previous: BaselineFile | undefined,
+): BaselineFile | undefined {
+    if (previous === undefined || fixed.length === 0) return undefined
+    const dropped = new Set(fixed)
+    const accepted = previous.accepted.filter((key) => !dropped.has(key))
+    if (accepted.length === previous.accepted.length) return undefined
+    const pruned: BaselineFile = {
+        version: 1,
+        frozenAt: previous.frozenAt,
+        ...(previous.note === undefined ? {} : { note: previous.note }),
+        accepted,
+        ...(previous.entries === undefined ? {} : { entries: previous.entries.filter((entry) => !dropped.has(entry.key)) }),
+    }
+    writeTextAtomic(file, `${JSON.stringify(pruned, null, 2)}\n`)
+    return pruned
 }
 
 /** Count violations per rule, for the report. */

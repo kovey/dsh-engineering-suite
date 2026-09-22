@@ -8,6 +8,7 @@ import { apply, inject, name, resolveEffectiveConfig } from '../dist/index.js'
 import { resolveConfig } from '../dist/config.js'
 import { compareViolations, freezeBaseline, parseBaselineText } from '../dist/baseline.js'
 import { suggestThresholds, loadStandards } from '../dist/tools.js'
+import { trendsOf } from '../dist/trends.js'
 
 const hosts: FakeHost[] = []
 
@@ -138,7 +139,11 @@ test('new violations block the gate; baseline-accepted ones do not (regression)'
     const first = runText(await fake.runTool('standards_check', {}))
     assert.match(first, /— BLOCK/)
     assert.match(first, /新增违规/)
-    assert.match(first, /maxFunctionLines|maxFileLines|maxParams|maxDepth/)
+    // Name every rule: an alternation like /A|B|C|D/ survives deleting three of
+    // them (the audit called this out).
+    for (const rule of ['maxDepth', 'maxFunctionLines', 'maxParams']) {
+        assert.match(first, new RegExp(rule), `${rule} must be reported`)
+    }
     const gates = new MissionStoreRegistry().for(cwd)
     // No mission in this fake: the check still reports, just without a gate id.
     assert.equal(gates.list().length, 0)
@@ -150,6 +155,20 @@ test('new violations block the gate; baseline-accepted ones do not (regression)'
     const baseline = JSON.parse(fs.readFileSync(path.join(cwd, '.dsh', 'standards-baseline.json'), 'utf8'))
     const rules = baseline.accepted.map((key: string) => key.split('|')[0]).sort()
     assert.deepEqual(rules, ['maxDepth', 'maxFileLines', 'maxFunctionLines', 'maxParams'], `accepted keys: ${baseline.accepted.join(', ')}`)
+    // …and the per-function labels survive: collapsing them is exactly the
+    // "accept one = accept all" hole the ratchet must not have.
+    const functionKeys = baseline.accepted.filter((key: string) => key.startsWith('maxFunctionLines|'))
+    assert.ok(
+        functionKeys.every((key: string) => key.split('|').length >= 3 && key.split('|')[2] !== ''),
+        `per-function keys must carry a label: ${functionKeys.join(', ')}`,
+    )
+    assert.equal(
+        new Set(baseline.accepted).size,
+        baseline.accepted.length,
+        'keys are unique (a duplicate would make one acceptance cover two violations)',
+    )
+    // Magnitudes are recorded, otherwise tomorrow's bigger violation passes.
+    assert.ok((baseline.entries?.length ?? 0) >= 1, 'the baseline records what it accepted')
     assert.equal(baseline.note, '存量债务')
 
     const second = runText(await fake.runTool('standards_check', {}))
@@ -354,4 +373,193 @@ test('a structural review without a subagent service explains itself (regression
 
 test.after(() => {
     for (const fake of hosts.splice(0)) fake.dispose()
+})
+
+test('enforce=warn reports without ever blocking a delivery (regression)', async () => {
+    // A BLOCK record would be consumed by the orchestrator's `standards-pass`
+    // gate and by evidence-gate's `requireStandardsGate`: a host that asked for
+    // "tell me, do not block me" must not get silently blocked.
+    const cwd = longGoRepo()
+    writeStandards(cwd, { languages: { go: { maxFileLines: 100 } } })
+    const fake = host(cwd, { enforce: 'warn' })
+    const out = runText(await fake.runTool('standards_check', {}))
+    assert.match(out, /— WARN/)
+    assert.match(out, /enforce=warn/)
+    assert.match(out, /不阻断交付/)
+})
+
+test('enforce=off records nothing at all (regression)', async () => {
+    const cwd = longGoRepo()
+    writeStandards(cwd, { languages: { go: { maxFileLines: 100 } } })
+    const fake = host(cwd, { enforce: 'off' })
+    const out = runText(await fake.runTool('standards_check', {}))
+    assert.match(out, /未记录门禁/)
+    assert.match(out, /enforce=off/)
+})
+
+test('standards_status reports what got fatter during the mission (regression)', async () => {
+    const cwd = longGoRepo()
+    writeStandards(cwd, { languages: { go: { maxFileLines: 400 } } })
+    const fake = host(cwd)
+    // Without a mission there is nothing to compare, and the report says so.
+    const first = runText(await fake.runTool('standards_status', {}))
+    assert.match(first, /本次 mission 的变化/)
+    assert.match(first, /没有 mission/)
+
+    // The trend itself is a pure function over two measurements.
+    const dir = path.join(cwd, '.dsh', 'measure')
+    fs.mkdirSync(dir, { recursive: true })
+    fs.writeFileSync(path.join(dir, 'a.json'), JSON.stringify({ checkedAt: 1, sizes: { 'a.go': 100, 'b.go': 50 }, violations: ['k1'] }))
+    fs.writeFileSync(path.join(dir, 'b.json'), JSON.stringify({ checkedAt: 2, sizes: { 'a.go': 160, 'b.go': 40, 'c.go': 600 }, violations: ['k1', 'k2'] }))
+    const trends = trendsOf(dir, 8)
+    assert.ok(trends !== undefined)
+    assert.deepEqual(trends.grew.map((delta) => [delta.path, delta.lines]), [['c.go', 600], ['a.go', 60]], 'new files count as growth')
+    assert.deepEqual(trends.shrank.map((delta) => [delta.path, delta.lines]), [['b.go', -10]])
+    assert.deepEqual(trends.addedViolations, ['k2'])
+    assert.deepEqual(trends.fixedViolations, [])
+})
+
+test('a hostile run id cannot escape the mission directory (regression: SECURITY)', async () => {
+    const cwd = longGoRepo()
+    writeStandards(cwd, { languages: { go: { maxFileLines: 400 } } })
+    const child = fakeSubagents('结论：没问题。')
+    ;(child.service as { start: unknown }).start = (async (provider: string, request: never) => {
+        void provider
+        void request
+        return { id: '../../ESCAPED', result: Promise.resolve({ stopReason: 'completed', output: [{ type: 'text', text: 'x' }] }), dispose: async () => undefined }
+    }) as never
+    const fake = host(cwd, {}, { subagents: child.service })
+    await fake.runTool('standards_review', {})
+    const dir = path.join(cwd, '.dsh', 'standards-reviews')
+    const files = fs.readdirSync(dir)
+    assert.equal(files.length, 1, `expected exactly one report, got ${files.join(', ')}`)
+    assert.doesNotMatch(files[0]!, /[\\/]/, 'the report name must be a single path segment')
+    assert.equal(fs.existsSync(path.join(cwd, 'ESCAPED.md')), false)
+    assert.equal(fs.existsSync(path.join(cwd, '.dsh', 'ESCAPED.md')), false)
+})
+
+test('the ratchet notices a violation that got BIGGER (regression)', async () => {
+    // Keys alone are not a ratchet: accepting a 420-line file today must not make
+    // a 900-line version of it pass tomorrow.
+    const cwd = longGoRepo()
+    writeStandards(cwd, { languages: { go: { maxFileLines: 400 } } })
+    const fake = host(cwd)
+    await fake.runTool('standards_check', { accept: true, note: '存量' })
+    assert.match(runText(await fake.runTool('standards_check', {})), /— PASS/)
+
+    // The same file grows far beyond what was accepted, same violation key.
+    const target = path.join(cwd, 'internal', 'crawler', 'long.go')
+    fs.writeFileSync(target, ['package crawler', ...Array.from({ length: 900 }, (_, index) => `// 行 ${index}`)].join('\n'))
+    const out = runText(await fake.runTool('standards_check', {}))
+    assert.match(out, /— BLOCK/)
+    assert.match(out, /恶化（1 项：基线接受过，但比当初更严重）/)
+    assert.match(out, /90[01] 行/, 'the report names the new size')
+})
+
+test('a fixed violation is pruned so a revert cannot ride the old acceptance (regression)', async () => {
+    const cwd = longGoRepo()
+    writeStandards(cwd, { languages: { go: { maxFileLines: 400 } } })
+    const fake = host(cwd)
+    await fake.runTool('standards_check', { accept: true, note: '存量' })
+    const baselinePath = path.join(cwd, '.dsh', 'standards-baseline.json')
+    const before = JSON.parse(fs.readFileSync(baselinePath, 'utf8')).accepted.length
+
+    // Fix the violation: the file shrinks below the limit.
+    fs.writeFileSync(path.join(cwd, 'internal', 'crawler', 'long.go'), 'package crawler\n\nfunc Long() int {\n\treturn 1\n}\n')
+    const pass = runText(await fake.runTool('standards_check', {}))
+    assert.match(pass, /— PASS/)
+    const after = JSON.parse(fs.readFileSync(baselinePath, 'utf8'))
+    assert.ok(after.accepted.length < before, `the baseline should shrink: ${before} → ${after.accepted.length}`)
+    assert.equal(after.accepted.some((key: string) => key.includes('long.go')), false)
+
+    // …and the revert is a NEW violation again, not a grandfathered one.
+    fs.writeFileSync(path.join(cwd, 'internal', 'crawler', 'long.go'), ['package crawler', ...Array.from({ length: 500 }, (_, index) => `// 行 ${index}`)].join('\n'))
+    const revert = runText(await fake.runTool('standards_check', {}))
+    assert.match(revert, /— BLOCK/)
+    assert.match(revert, /新增/)
+})
+
+test('a project override never resets settings it does not name (regression)', () => {
+    // The first version re-resolved the merged row from the profile, so every key
+    // the overlay forgot to copy was reset to the PLUGIN default — adding the
+    // review* settings made `{"enforce":"warn"}` widen a 60s review timeout to
+    // 600s and drop a custom provider. A profile is a ceiling.
+    const cwd = tempWorkspace('standards-gate-overlay-')
+    fs.mkdirSync(path.join(cwd, '.dsh'), { recursive: true })
+    fs.writeFileSync(path.join(cwd, '.dsh', 'standards-gate.json'), JSON.stringify({ enforce: 'warn' }))
+    const hostConfig = resolveConfig({
+        enforce: 'gate',
+        reviewProvider: 'custom',
+        reviewTargets: 9,
+        reviewTimeoutMs: 60_000,
+        reviewMaxDepth: 2,
+        requireApprovalForBaseline: true,
+    })
+    const layout = new MissionStoreRegistry().for(cwd).layout
+    const effective = resolveEffectiveConfig(hostConfig, layout)
+    assert.equal(effective.source, 'project')
+    assert.equal(effective.config.enforce, 'warn', 'the named key applies')
+    assert.equal(effective.config.reviewProvider, 'custom', 'unnamed keys keep the profile value')
+    assert.equal(effective.config.reviewTargets, 9)
+    assert.equal(effective.config.reviewTimeoutMs, 60_000)
+    assert.equal(effective.config.reviewMaxDepth, 2)
+
+    // An unusable value keeps the PROFILE value (not a plugin default).
+    fs.writeFileSync(path.join(cwd, '.dsh', 'standards-gate.json'), JSON.stringify({ maxFiles: 'lots', baselineFile: 42 }))
+    const fallback = resolveEffectiveConfig(resolveConfig({ maxFiles: 5, baselineFile: '.dsh/host.json' }), layout)
+    assert.equal(fallback.source, 'profile', 'nothing valid applied → the profile stays in force')
+    assert.equal(fallback.config.maxFiles, 5)
+    assert.equal(fallback.config.baselineFile, '.dsh/host.json')
+    assert.match(fallback.problems.join('\n'), /maxFiles 必须是正数/)
+    assert.match(fallback.problems.join('\n'), /baselineFile 必须是非空字符串/)
+})
+
+test('a corrupt baseline is treated as absent at TOOL level, not as "all accepted" (regression)', async () => {
+    const cwd = longGoRepo()
+    writeStandards(cwd, { languages: { go: { maxFileLines: 400, maxFunctionLines: 80 } } })
+    fs.mkdirSync(path.join(cwd, '.dsh'), { recursive: true })
+    fs.writeFileSync(path.join(cwd, '.dsh', 'standards-baseline.json'), '{ this is not json')
+    const fake = host(cwd)
+    const out = runText(await fake.runTool('standards_check', {}))
+    assert.match(out, /— BLOCK/, 'a broken baseline must not legalise anything')
+    assert.match(out, /新增/)
+    // …and status says WHY it is being ignored instead of claiming there is none.
+    const status = runText(await fake.runTool('standards_status', {}))
+    assert.match(status, /无法解析/)
+})
+
+test('the ledger says what the report says (regression: record vs words)', async () => {
+    // Two audit findings lived exactly here: `enforce: warn` recorded BLOCK, and
+    // the accept path printed PASS without recording anything. Assert the RECORD,
+    // not the prose.
+    const cwd = longGoRepo()
+    writeStandards(cwd, { languages: { go: { maxFileLines: 100 } } })
+    const fake = host(cwd)
+    const store = new MissionStoreRegistry().for(cwd)
+    const mission = store.create({ title: '账本一致', cwd, sessionId: 'session-1' })
+    store.bindSession('session-1', mission.id, 'implement')
+
+    const blocked = runText(await fake.runTool('standards_check', {}))
+    assert.match(blocked, /— BLOCK/)
+    assert.equal(store.lastGate(mission.id, { source: 'dsh-standards-gate' })?.state, 'BLOCK')
+
+    const accepted = runText(await fake.runTool('standards_check', { accept: true, note: '存量债务' }))
+    assert.match(accepted, /— PASS/)
+    assert.equal(
+        store.lastGate(mission.id, { source: 'dsh-standards-gate' })?.state,
+        'PASS',
+        'an accepted baseline must be recorded, not only printed',
+    )
+    // …and the measurement artifact of that run exists (progress is traceable).
+    const artifacts = fs.readdirSync(path.join(cwd, '.dsh', 'missions', mission.id, 'standards'))
+    assert.equal(artifacts.length, 2, `one artifact per run: ${artifacts.join(', ')}`)
+})
+
+test('an unknown mission id is refused instead of silently recording nothing (regression)', async () => {
+    const cwd = longGoRepo()
+    writeStandards(cwd, { languages: { go: { maxFileLines: 100 } } })
+    const fake = host(cwd)
+    const run = await fake.runTool('standards_check', { missionId: 'does-not-exist' })
+    assert.equal(run.isError, true)
+    assert.match(runText(run), /未知 mission/)
 })

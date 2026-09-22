@@ -143,6 +143,15 @@ export interface BaselineFile {
     note?: string
     /** Accepted violation keys. */
     accepted: readonly string[]
+    /**
+     * What each accepted key measured when it was accepted.
+     *
+     * Without this a ratchet is not a ratchet: `maxFileLines|a.go|(file)` accepted
+     * at 420 lines would keep passing at 900. A baseline written before this
+     * field existed simply has no magnitudes, and `compareToBaseline` then
+     * accepts the key as-is (documented, and reported by the caller).
+     */
+    entries?: readonly { key: string; actual: number; limit: number }[]
 }
 
 // --- text helpers -----------------------------------------------------------
@@ -180,6 +189,8 @@ interface StringLiteral {
 
 /** A source file lexed once: comments/strings blanked out, plus a line index. */
 interface Lexed {
+    /** Language the file was lexed as (Go's `if` needs no parentheses, TS's does). */
+    language: Language
     /** Same length as the source: comment and string bodies replaced by spaces (newlines kept). */
     masked: string
     /** Raw lines, `\r` stripped (0-based; a trailing newline adds no line). */
@@ -318,7 +329,7 @@ function lexSource(text: string, language: Language): Lexed {
     }
     const lines = text === '' ? [] : splitLines(text)
     const maskedLines = text === '' ? [] : splitLines(masked)
-    return { masked, lines, maskedLines, lineStarts, strings }
+    return { language, masked, lines, maskedLines, lineStarts, strings }
 }
 
 /**
@@ -744,13 +755,26 @@ function goImports(lexed: Lexed): RawImport[] {
     return raw
 }
 
-/** Exported top-level identifiers of one Go file. */
+/**
+ * Exported top-level identifiers of one Go file.
+ *
+ * Every name a top-level `func`, `type`, `var` or `const` declares that starts
+ * with an upper-case letter counts: methods too, both names of `var A, B = …`,
+ * every spec of a grouped declaration (`var ( … )`, `const ( … )`, `type ( … )`)
+ * and a spec whose names are separated from their type (`var FS embed.FS`,
+ * `const Typed uint64 = 1`). Only DECLARED names count, so a continuation line
+ * of a multi-line value is not a declaration of its own.
+ */
 function goExports(lexed: Lexed, braces: Braces): number {
     const maskedLines = lexed.maskedLines
     let count = 0
     let group = false
+    let groupDepth = 0
+    let parens = 0
     for (let line = 0; line < maskedLines.length; line += 1) {
         const maskedLine = maskedLines[line] ?? ''
+        const lineDepth = parens
+        parens += bracketDelta(maskedLine)
         if ((braces.depthBeforeLine[line] ?? 0) !== 0) continue
         if (maskedLine.trim() === '') continue
         if (group) {
@@ -758,23 +782,50 @@ function goExports(lexed: Lexed, braces: Braces): number {
                 group = false
                 continue
             }
-            if (/^\s*[A-Z]/.test(maskedLine)) count += 1
+            // A spec that continues on an earlier line (`Value,` of a call) is
+            // not a declaration, however upper-case its first word is.
+            if (lineDepth > groupDepth) continue
+            count += exportedNames(maskedLine)
             continue
         }
         if (/^\s*(?:var|const|type)\s*\(\s*$/.test(maskedLine)) {
             group = true
+            groupDepth = parens
             continue
         }
         const value = /^\s*(?:var|const)\s+(.+)$/.exec(maskedLine)
         if (value !== null) {
-            for (const name of ((value[1] ?? '').split('=')[0] ?? '').split(',')) {
-                if (/^\s*[A-Z]\w*\s*$/.test(name)) count += 1
-            }
+            count += exportedNames(value[1] ?? '')
             continue
         }
         const named = /^\s*(?:type|func)\s+(?:\([^)]*\)\s*)?([A-Za-z_]\w*)/.exec(maskedLine)
         if (named !== null && /^[A-Z]/.test(named[1] ?? '')) count += 1
     }
+    return count
+}
+
+/** Net change of `(`/`[` nesting over one line. */
+function bracketDelta(line: string): number {
+    let delta = 0
+    for (const char of line) {
+        if (char === '(' || char === '[') delta += 1
+        else if (char === ')' || char === ']') delta -= 1
+    }
+    return delta
+}
+
+/**
+ * Uppercase-first names declared by one Go declaration (or grouped spec) line.
+ *
+ * The names are the leading identifier list — `A, B Type = …`, `C = 1`,
+ * `FS embed.FS`, `Typed uint64 = 1` — so a comma-separated list counts once per
+ * name and the type or value after it never contributes one.
+ */
+function exportedNames(text: string): number {
+    const match = /^\s*([A-Za-z_]\w*(?:\s*,\s*[A-Za-z_]\w*)*)/.exec(text)
+    if (match === null) return 0
+    let count = 0
+    for (const name of (match[1] ?? '').split(',')) if (/^\s*[A-Z]/.test(name)) count += 1
     return count
 }
 
@@ -789,6 +840,9 @@ const TS_RESERVED = new Set([
     'if', 'for', 'while', 'switch', 'catch', 'return', 'new', 'typeof', 'await', 'delete', 'do', 'else',
     'function', 'class', 'super', 'throw', 'yield', 'case', 'default', 'in', 'instanceof', 'void', 'with',
 ])
+
+/** Keywords that start a statement, so a declarator's `=` cannot lie past one. */
+const STARTS_A_STATEMENT = /(?:^|[^\w$])(?:const|let|var|function|class|import|export|return|throw|if|for|while|switch|try)\b/
 
 /** One `class` body found in a TS/JS file. */
 interface ClassScope {
@@ -853,6 +907,66 @@ function arrowAt(masked: string, from: number, limit: number): number {
     return -1
 }
 
+/** Bound on one `<…>` type-parameter list (longer than any real one, and finite). */
+const TYPE_PARAMS_MAX_CHARS = 400
+
+/**
+ * Offset just past a `<…>` type-parameter list starting at `at`, or -1.
+ *
+ * `function identity<T>(…)` and `const pick = <T,>(…) => …` both hide their
+ * parameter list behind one; a comparison (`a < b`) is rejected by the `(`
+ * the caller requires right after the list.
+ */
+function skipTypeParams(masked: string, at: number): number {
+    const stop = Math.min(masked.length, at + TYPE_PARAMS_MAX_CHARS)
+    let depth = 0
+    for (let index = at; index < stop; index += 1) {
+        const char = masked[index] ?? ''
+        if (char === '<') depth += 1
+        else if (char === '>') {
+            depth -= 1
+            if (depth === 0) return index + 1
+        } else if (char === ';') return -1
+    }
+    return -1
+}
+
+/**
+ * Whether the `=>` at `arrow` belongs to a type annotation rather than to the
+ * parameter list that ends at `from`.
+ *
+ * A return type may sit between a parameter list and its `=>` (`(a: T): T => a`)
+ * and may itself contain an arrow (`: (x: T) => U`); a cast (`as (exec) => void`)
+ * or a new statement (`… = (x) => x`) may not. Reading the next statement's
+ * arrow as this function's body is what produced a phantom `listener` in a
+ * real test file.
+ */
+function arrowIsInAType(masked: string, from: number, arrow: number): boolean {
+    const between = maskGroups(masked.slice(from, arrow))
+    // Only a return type may stand between the `)` and the `=>`: at the top
+    // level a `;` ends the statement and an `=` starts another one, while the
+    // `=` of an arrow (`: (x: T) => U`) does not.
+    if (/(?:^|[^\w$])(?:as|satisfies)\s/.test(between)) return true
+    return /[;]|=(?!>)/.test(between)
+}
+
+/** `text` with everything inside balanced `()`, `[]` and `{}` blanked out. */
+function maskGroups(text: string): string {
+    const chars = text.split('')
+    let depth = 0
+    for (let index = 0; index < chars.length; index += 1) {
+        const char = chars[index]
+        if (char === '(' || char === '[' || char === '{') {
+            depth += 1
+            chars[index] = ' '
+        } else if (char === ')' || char === ']' || char === '}') {
+            depth = Math.max(0, depth - 1)
+            chars[index] = ' '
+        } else if (depth > 0) chars[index] = ' '
+    }
+    return chars.join('')
+}
+
 /** Functions/classes/methods of one TS/JS file. */
 function tsFunctions(lexed: Lexed, braces: Braces): MeasuredFunction[] {
     const functions: MeasuredFunction[] = []
@@ -908,13 +1022,68 @@ function tsFunctions(lexed: Lexed, braces: Braces): MeasuredFunction[] {
         })
     }
 
-    /** The `(params)` right after `at`, or -1. */
+    /** The `(params)` right after `at` (an optional `<…>` type-parameter list may sit between), or undefined. */
     const paramsAt = (at: number): { open: number; close: number } | undefined => {
-        const open = skipSpace(masked, at)
+        let open = skipSpace(masked, at)
+        if (masked[open] === '<') {
+            const after = skipTypeParams(masked, open)
+            if (after < 0) return undefined
+            open = skipSpace(masked, after)
+        }
         if (masked[open] !== '(') return undefined
         const close = matchParen(masked, open)
         if (close < 0) return undefined
         return { open, close }
+    }
+
+    /**
+     * Record the arrow function an initializer starting at `from` declares.
+     *
+     * The initializer is unwrapped first, so `((a, b) => c) as T` reports the
+     * arrow's own parameters (2, not 1) and the arrow's own body line instead of
+     * running into the next statement's `=>`. Parentheses are a parameter list
+     * when an `=>` follows them; otherwise they only wrap the function and the
+     * search continues inside them (bounded by `limit`, the wrapper's closer).
+     * @returns whether a function was recorded.
+     */
+    const recordArrow = (name: string, startLine: number, from: number, limit: number): boolean => {
+        let cursor = from
+        let bound = limit
+        for (let step = 0; step < 8; step += 1) {
+            if (masked[cursor] === '<') {
+                const after = skipTypeParams(masked, cursor)
+                if (after < 0) return false
+                cursor = skipSpace(masked, after)
+                continue
+            }
+            if (masked[cursor] === '(') {
+                const close = matchParen(masked, cursor)
+                if (close < 0 || close > bound) return false
+                const inner = skipSpace(masked, cursor + 1)
+                // `((a, b) => c) as T`: parentheses that open with another `(`
+                // and hold an arrow only WRAP the function, so the list inside
+                // them is the real one. A parameter of function type
+                // (`(event, listener: (…) => unknown)`) starts with a name and
+                // is therefore read as the parameter list it is.
+                if (inner < close && masked[inner] === '(' && arrowAt(masked, inner, close) >= 0) {
+                    cursor = inner
+                    bound = close
+                    continue
+                }
+                const arrow = arrowAt(masked, skipSpace(masked, close + 1), bound)
+                if (arrow < 0 || arrowIsInAType(masked, close + 1, arrow)) return false
+                record(name, startLine, paramCount(masked.slice(cursor + 1, close), true), arrow + 2)
+                return true
+            }
+            const arrow = arrowAt(masked, cursor, bound)
+            if (arrow < 0) return false
+            if (/^[A-Za-z_$][\w$]*$/.test(masked.slice(cursor, arrow).trim())) {
+                record(name, startLine, 1, arrow + 2)
+                return true
+            }
+            return false
+        }
+        return false
     }
 
     // 1. `function name(…)` declarations, nested ones included.
@@ -952,14 +1121,7 @@ function tsFunctions(lexed: Lexed, braces: Braces): MeasuredFunction[] {
                 record(name(property[1] ?? ''), line, paramCount(masked.slice(params.open + 1, params.close), true), params.close + 1)
                 continue
             }
-            const arrow = arrowAt(masked, start + property[0].length, start + 400)
-            if (arrow < 0) continue
-            const params = paramsAt(start + property[0].length)
-            if (params !== undefined && params.close < arrow) {
-                record(name(property[1] ?? ''), line, paramCount(masked.slice(params.open + 1, params.close), true), arrow + 2)
-                continue
-            }
-            record(name(property[1] ?? ''), line, 1, arrow + 2)
+            recordArrow(name(property[1] ?? ''), line, start + property[0].length, start + 400)
         }
     }
 
@@ -970,6 +1132,9 @@ function tsFunctions(lexed: Lexed, braces: Braces): MeasuredFunction[] {
         const start = lexed.lineStarts[line] ?? 0
         const assign = assignmentAt(masked, start + decl[0].length, start + 400)
         if (assign < 0) continue
+        // `let x: T` with no initializer must not steal the NEXT statement's
+        // `=` (that produced a phantom function named after the variable).
+        if (STARTS_A_STATEMENT.test(maskGroups(masked.slice(start + decl[0].length, assign)))) continue
         const name = decl[2] ?? ''
         let cursor = skipSpace(masked, assign + 1)
         if (/^async\b/.test(masked.slice(cursor, cursor + 6))) cursor = skipSpace(masked, cursor + 5)
@@ -979,14 +1144,7 @@ function tsFunctions(lexed: Lexed, braces: Braces): MeasuredFunction[] {
             record(name, line, paramCount(masked.slice(params.open + 1, params.close), true), params.close + 1)
             continue
         }
-        const arrow = arrowAt(masked, cursor, assign + 400)
-        if (arrow < 0) continue
-        const params = paramsAt(cursor)
-        if (params !== undefined && params.close < arrow) {
-            record(name, line, paramCount(masked.slice(params.open + 1, params.close), true), arrow + 2)
-            continue
-        }
-        if (/^[A-Za-z_$][\w$]*$/.test(masked.slice(cursor, arrow).trim())) record(name, line, 1, arrow + 2)
+        recordArrow(name, line, cursor, Math.min(masked.length, assign + 400))
     }
 
     return functions
@@ -1189,6 +1347,21 @@ function pythonExports(lexed: Lexed, structure: PyStructure): number {
 
 // --- if blocks (brace languages) --------------------------------------------
 
+/**
+ * How many lines an `if` header may span (see {@link ifBlockOpener}).
+ *
+ * Real headers are one line, or two-three when a call's arguments wrap
+ * (`if err := alerter.AddRule(observability.AlertRule{…}); err != nil {`).
+ * Twenty is generous and still bounds the work one `if` can cause on a
+ * pathological file — the old code used a 300-character window instead, which
+ * was both too small (it lost real blocks whose `{` sat 307 characters away)
+ * and unprincipled.
+ */
+const IF_HEADER_MAX_LINES = 20
+
+/** Characters that cannot start an `if` condition: `if:`/`if,` are object keys. */
+const NOT_A_CONDITION_START = ':,)]}=.'
+
 /** Whether the character can be part of an identifier. */
 function isWordChar(char: string | undefined): boolean {
     return char !== undefined && /[A-Za-z0-9_$]/.test(char)
@@ -1202,41 +1375,117 @@ function previousNonSpace(masked: string, from: number): number {
     return -1
 }
 
+/** Offset of the bracket matching the one at `open`, or -1 when it is not closed before `stop`. */
+function matchParenBefore(masked: string, open: number, stop: number): number {
+    let depth = 0
+    for (let index = open; index < Math.min(stop, masked.length); index += 1) {
+        const char = masked[index] ?? ''
+        if (char === '(' || char === '[' || char === '{') depth += 1
+        else if (char === ')' || char === ']' || char === '}') {
+            depth -= 1
+            if (depth === 0) return index
+            if (depth < 0) return -1
+        }
+    }
+    return -1
+}
+
+/**
+ * The `{` that opens the block of an `if` header, or -1 when there is none.
+ *
+ * `from` is the offset just after the `if` keyword. The header is PARSED, never
+ * guessed, so a brace-less one-liner (`if (!resolved.enabled) return`) can no
+ * longer adopt an unrelated `{` further down the file:
+ *
+ * - TS/JS require parentheses, so the condition is consumed by matching its `)`
+ *   and the block exists only when the next non-space character is `{`
+ *   (`if (x)\n{` is still a block, `if (x)\n  return` is not).
+ * - Go needs none, so the condition runs to the first `{` at bracket depth 0 on
+ *   the logical line, skipping a composite literal in the init statement
+ *   (`if want := []any{1}; !ok {`), the header may start with any character
+ *   (`if *flag {`, `if &x {`, `if 1 < 2 {`) and it may continue on the next line
+ *   when the line ends with an operator (`&&`), which is exactly Go's automatic
+ *   semicolon insertion rule.
+ *
+ * The scan is bounded to {@link IF_HEADER_MAX_LINES} lines — far more than any
+ * real header (the longest one in the repositories measured is 3) and enough to
+ * hold a composite literal inside the condition.
+ */
+function ifBlockOpener(lexed: Lexed, braces: Braces, from: number): number {
+    const masked = lexed.masked
+    const headerLine = lineOfOffset(lexed, from)
+    const lastLine = Math.min(headerLine + IF_HEADER_MAX_LINES, lexed.lineStarts.length - 1)
+    const stop = lexed.lineStarts[lastLine] ?? masked.length
+    const open = skipSpace(masked, from)
+    if (open >= stop) return -1
+    if (lexed.language !== 'go' && masked[open] === '(') {
+        const close = matchParenBefore(masked, open, stop)
+        if (close < 0) return -1
+        const next = skipSpace(masked, close + 1)
+        if (next >= stop) return -1
+        return masked[next] === '{' ? next : -1
+    }
+    if (NOT_A_CONDITION_START.includes(masked[open] ?? '')) return -1
+    let depth = 0
+    for (let index = open; index < stop; index += 1) {
+        const char = masked[index] ?? ''
+        if (char === '(' || char === '[') depth += 1
+        else if (char === ')' || char === ']') depth = Math.max(0, depth - 1)
+        else if (char === '{' && depth === 0) {
+            // A composite literal in an `if` init statement (`if v := T{a}; …`)
+            // is not the block: it is the only place where a `{` at depth 0 can
+            // be followed by `;` instead of a statement body.
+            const literal = compositeLiteralEnd(masked, braces, index)
+            if (literal >= 0) {
+                index = literal
+                continue
+            }
+            return index
+        } else if (char === '}' && depth === 0) return -1
+        else if (char === '\n' && depth === 0 && !continuesOnNextLine(masked, index)) return -1
+    }
+    return -1
+}
+
+/** Offset of the `}` closing a composite literal at `offset`, or -1 when there is none. */
+function compositeLiteralEnd(masked: string, braces: Braces, offset: number): number {
+    const index = braceIndexAt(braces, offset)
+    if (index < 0 || (braces.offsets[index] ?? -1) !== offset) return -1
+    const closer = braces.match[index] ?? -1
+    if (closer < 0) return -1
+    const end = braces.offsets[closer] ?? -1
+    if (end < 0) return -1
+    return masked[skipSpace(masked, end + 1)] === ';' ? end : -1
+}
+
+/**
+ * Whether a line ending at the `\n` at `newline` continues the statement.
+ *
+ * Go inserts a semicolon when a line ends with an identifier, a literal, `)`,
+ * `]`, `}`, `++`/`--` or `return`; a line ending in an operator does not end the
+ * statement, so an `if` condition may wrap (`… &&\n  other`).
+ */
+function continuesOnNextLine(masked: string, newline: number): boolean {
+    const previous = previousNonSpace(masked, newline)
+    if (previous < 0) return false
+    return ',;:+-*/%&|^<>=!.(['.includes(masked[previous] ?? '')
+}
+
 /**
  * Every `if`/`else if`/`else` block of a brace-language file.
  *
- * A one-liner without a block (`if (x) return`, `if err := f(); err != nil {…}`
- * is NOT one: its `;` and its `{` share a line) is skipped, `} else if (y) {`
- * counts as an `if` whose span starts at the `else`, and a bare `} else {`
- * counts as an `else`.
+ * A one-liner without a block (`if (x) return`, `if 1 < 2 return`) is skipped,
+ * `} else if (y) {` counts as an `if` whose span starts at the `else`, and a
+ * bare `} else {` counts as an `else`. A header whose condition spans several
+ * lines is still one block, and the opener may sit far from the `if` (up to
+ * {@link IF_HEADER_MAX_LINES} lines).
  */
 function braceIfBlocks(lexed: Lexed, braces: Braces): IfBlockMetric[] {
     const masked = lexed.masked
     const blocks: IfBlockMetric[] = []
     const seen = new Set<number>()
 
-    /** The `{` opening the block that follows `from`, or -1 for a one-liner. */
-    const openerAfter = (from: number): number => {
-        const stop = Math.min(masked.length, from + 300)
-        let depth = 0
-        let semicolon = -1
-        for (let index = from; index < stop; index += 1) {
-            const char = masked[index] ?? ''
-            if (char === '(' || char === '[') depth += 1
-            else if (char === ')' || char === ']') depth = Math.max(0, depth - 1)
-            else if (char === '}' && depth === 0) return -1
-            else if (char === ';' && depth === 0) {
-                if (semicolon < 0) semicolon = index
-            } else if (char === '{' && depth === 0) {
-                if (semicolon >= 0 && lineOfOffset(lexed, semicolon) < lineOfOffset(lexed, index)) return -1
-                return index
-            }
-        }
-        return -1
-    }
-
-    const collect = (keyword: number, headerLine: number, kind: 'if' | 'else'): void => {
-        const candidate = openerAfter(keyword)
+    const collect = (candidate: number, headerLine: number, kind: 'if' | 'else'): void => {
         if (candidate < 0 || masked[candidate] !== '{') return
         const index = braceIndexAt(braces, candidate)
         if (index < 0 || (braces.offsets[index] ?? -1) !== candidate) return
@@ -1257,9 +1506,7 @@ function braceIfBlocks(lexed: Lexed, braces: Braces): IfBlockMetric[] {
             const previous = before < 0 ? '' : masked[before] ?? ''
             // `else if` is collected from its `else`, so it is not counted twice.
             if (!gap.includes('\n') && !';{}()'.includes(previous)) continue
-            const first = masked[skipSpace(masked, index + 2)] ?? ''
-            if (!/[A-Za-z_$([!]/.test(first)) continue
-            collect(index, lineOfOffset(lexed, index), 'if')
+            collect(ifBlockOpener(lexed, braces, index + 2), lineOfOffset(lexed, index), 'if')
             continue
         }
         if (!masked.startsWith('else', index)) continue
@@ -1270,8 +1517,8 @@ function braceIfBlocks(lexed: Lexed, braces: Braces): IfBlockMetric[] {
         if (!gap.includes('\n') && previous !== '}' && previous !== ';') continue
         const next = skipSpace(masked, index + 4)
         const headerLine = lineOfOffset(lexed, index)
-        if (masked.startsWith('if', next) && !isWordChar(masked[next + 2])) collect(next, headerLine, 'if')
-        else if (masked[next] === '{') collect(next, headerLine, 'else')
+        if (masked.startsWith('if', next) && !isWordChar(masked[next + 2])) collect(ifBlockOpener(lexed, braces, next + 2), headerLine, 'if')
+        else collect(masked[next] === '{' ? next : -1, headerLine, 'else')
     }
     return blocks.sort((left, right) => left.line - right.line || compareText(left.kind, right.kind))
 }
@@ -1873,7 +2120,7 @@ export function parseBaseline(text: string): BaselineFile | undefined {
         return undefined
     }
     if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined
-    const record = value as { version?: unknown; frozenAt?: unknown; note?: unknown; accepted?: unknown }
+    const record = value as { version?: unknown; frozenAt?: unknown; note?: unknown; accepted?: unknown; entries?: unknown }
     if (record.version !== 1) return undefined
     if (typeof record.frozenAt !== 'string' || record.frozenAt === '') return undefined
     if (!Array.isArray(record.accepted)) return undefined
@@ -1882,11 +2129,28 @@ export function parseBaseline(text: string): BaselineFile | undefined {
         if (typeof entry !== 'string' || entry === '') continue
         if (!accepted.includes(entry)) accepted.push(entry)
     }
+    // Magnitudes are optional (a baseline written before they existed has none),
+    // but when present they are what makes a bigger violation fail.
+    const entries: { key: string; actual: number; limit: number }[] = []
+    if (Array.isArray(record.entries)) {
+        for (const entry of record.entries as unknown[]) {
+            if (typeof entry !== 'object' || entry === null) continue
+            const record2 = entry as { key?: unknown; actual?: unknown; limit?: unknown }
+            if (typeof record2.key !== 'string' || record2.key === '') continue
+            if (typeof record2.actual !== 'number' || !Number.isFinite(record2.actual)) continue
+            entries.push({
+                key: record2.key,
+                actual: record2.actual,
+                limit: typeof record2.limit === 'number' && Number.isFinite(record2.limit) ? record2.limit : 0,
+            })
+        }
+    }
     return {
         version: 1,
         frozenAt: record.frozenAt,
         ...(typeof record.note === 'string' && record.note !== '' ? { note: record.note } : {}),
         accepted,
+        ...(entries.length === 0 ? {} : { entries }),
     }
 }
 
@@ -1903,18 +2167,28 @@ export function parseBaseline(text: string): BaselineFile | undefined {
 export function compareToBaseline(
     violations: readonly Violation[],
     baseline: BaselineFile | undefined,
-): { added: Violation[]; known: Violation[]; fixed: string[] } {
+): { added: Violation[]; known: Violation[]; fixed: string[]; worsened: Violation[] } {
     const accepted = new Set(baseline?.accepted ?? [])
+    const magnitude = new Map((baseline?.entries ?? []).map((entry) => [entry.key, entry.actual]))
     const added: Violation[] = []
     const known: Violation[] = []
+    const worsened: Violation[] = []
     for (const violation of violations) {
-        if (accepted.has(violation.key)) known.push(violation)
-        else added.push(violation)
+        if (!accepted.has(violation.key)) {
+            added.push(violation)
+            continue
+        }
+        const acceptedAt = magnitude.get(violation.key)
+        // Only "bigger than what we accepted" fails: shrinking is progress and is
+        // never punished. A key with no recorded magnitude (an older baseline)
+        // passes as before rather than inventing a limit.
+        if (acceptedAt !== undefined && violation.actual > acceptedAt) worsened.push(violation)
+        else known.push(violation)
     }
     const today = new Set(violations.map((violation) => violation.key))
     const fixed: string[] = []
     for (const key of baseline?.accepted ?? []) {
         if (!today.has(key) && !fixed.includes(key)) fixed.push(key)
     }
-    return { added, known, fixed }
+    return { added, known, fixed, worsened }
 }

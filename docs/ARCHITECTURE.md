@@ -1,4 +1,4 @@
-# 架构：七个插件如何编织成一条可审计流水线
+# 架构：八个插件如何编织成一条可审计流水线
 
 本文说明 `docs.md` 的设计如何在代码里落地：**共享契约是什么、每个插件负责什么、它们之间
 如何在不互相 import 的前提下协作**。
@@ -154,6 +154,11 @@ profile 的 loader 行 config           ← 宿主决策：是否启用、日志
 
 实现落在 `dsh-eng-core/src/project-config.ts`（按 mtime+size 缓存的读取），五个插件共用同一层；
 `dsh-role-guard` / `dsh-orchestrator` 目前不需要项目级配置（角色文件与阶段流水线本身就是仓库自带的工件）。
+
+为仓库生成配置：`bash scripts/project-config.sh --workspace <repo> --write [--spec on] [--standards on]`
+
+`--standards on` 会按仓库实际语言写出 `.dsh/standards.json` 骨架（目标阈值 + 生成/测试代码豁免 + 禁止循环依赖）；
+阈值最终仍应由人在会话里用 `standards_bootstrap` 确认后冻结。
 
 ## 5.3 一个进程服务多个仓库：所有"会认错项目"的地方都要按会话解析
 

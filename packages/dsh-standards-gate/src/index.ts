@@ -72,7 +72,11 @@ interface EffectiveConfig {
  * @param logger - optional diagnostic sink.
  * @returns the effective configuration and its provenance.
  */
-export function resolveEffectiveConfig(host: StandardsGateConfig, layout: Layout, logger?: { warn: (message: string) => void }): EffectiveConfig {
+export function resolveEffectiveConfig(
+    host: StandardsGateConfig,
+    layout: Layout,
+    logger?: { warn: (message: string) => void },
+): EffectiveConfig {
     const file = loadProjectConfig<Record<string, unknown>>(layout, 'standards-gate')
     const problems = [...file.problems]
     for (const problem of problems) logger?.warn(problem)
@@ -85,24 +89,59 @@ export function resolveEffectiveConfig(host: StandardsGateConfig, layout: Layout
             logger?.warn(problem)
         }
     }
-    const applied = Object.keys(raw).filter((key) => PROJECT_OVERRIDABLE.includes(key))
-    if (applied.length === 0) return { config: host, source: 'profile', file: file.file, problems }
-    // Re-resolve from the profile row plus the accepted keys, so every field is
-    // parsed by exactly one code path.
-    const merged = resolveConfig({
-        logFile: host.logFile,
-        ...(host.logFileTemplate === undefined ? {} : { logFileTemplate: host.logFileTemplate }),
-        layout: host.layout,
-        standardsFile: host.standardsFile,
-        baselineFile: host.baselineFile,
-        enforce: host.enforce,
-        maxFiles: host.maxFiles,
-        maxFileBytes: host.maxFileBytes,
-        requireApprovalForBaseline: host.requireApprovalForBaseline,
-        prompt: host.prompt,
-        ...Object.fromEntries(applied.map((key) => [key, raw[key]])),
-    })
-    return { config: merged, source: 'project', file: file.file, problems }
+
+    // Overlay key by key onto the HOST config, validating each value.
+    //
+    // Re-resolving from the profile row instead (the first version) silently
+    // reset every field the overlay code forgot to copy — adding the review*
+    // settings later meant any accepted project key widened the profile's
+    // 60s review timeout to the plugin default of 600s. Overlaying cannot forget
+    // a field, and an unusable value keeps the profile's value rather than
+    // falling back to a plugin default.
+    const next: StandardsGateConfig = { ...host, prompt: host.prompt }
+    let applied = 0
+    const takeString = (key: 'standardsFile' | 'baselineFile'): void => {
+        const value = raw[key]
+        if (value === undefined) return
+        if (typeof value === 'string' && value.trim() !== '') {
+            next[key] = value.trim()
+            applied += 1
+            return
+        }
+        const problem = `${file.file}: ${key} 必须是非空字符串，已忽略（继续使用 profile 的值）`
+        problems.push(problem)
+        logger?.warn(problem)
+    }
+    const takePositiveInt = (key: 'maxFiles' | 'maxFileBytes'): void => {
+        const value = raw[key]
+        if (value === undefined) return
+        if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
+            next[key] = Math.floor(value)
+            applied += 1
+            return
+        }
+        const problem = `${file.file}: ${key} 必须是正数，已忽略（继续使用 profile 的值）`
+        problems.push(problem)
+        logger?.warn(problem)
+    }
+    if (raw['enforce'] !== undefined) {
+        const value = raw['enforce']
+        if (value === 'gate' || value === 'warn' || value === 'off') {
+            next.enforce = value
+            applied += 1
+        } else {
+            const problem = `${file.file}: enforce 只能是 gate / warn / off，已忽略（继续使用 profile 的值）`
+            problems.push(problem)
+            logger?.warn(problem)
+        }
+    }
+    takeString('standardsFile')
+    takeString('baselineFile')
+    takePositiveInt('maxFiles')
+    takePositiveInt('maxFileBytes')
+
+    if (applied === 0) return { config: host, source: 'profile', file: file.file, problems }
+    return { config: next, source: 'project', file: file.file, problems }
 }
 
 /** Register the plugin. */

@@ -550,3 +550,397 @@ test('a workspace without go.mod resolves no Go import, and non-code files are n
     assert.deepEqual(fileNamed(result, 'main.go').imports, [])
     assert.equal(result.stats.filesScanned, 2)
 })
+
+// --- regressions: the adversarial audit of this module ----------------------
+//
+// Every test below FAILS on the code as it was merged, and each fixture states
+// the exact number its text implies — no expectation is read back out of the
+// implementation.
+
+test('if blocks: a brace-less one-liner never adopts the next unrelated block', () => {
+    const root = workspace()
+    write(
+        root,
+        'src/check.ts',
+        [
+            'export function check(resolved: { enabled: boolean }, items: number[]): number {',
+            '    if (!resolved.enabled) return 0',
+            '    const total = items.length',
+            '    if (total > 0) {',
+            '        for (const item of items) {',
+            '            if (item > 10) {',
+            '                return item',
+            '            }',
+            '        }',
+            '    }',
+            '    return total',
+            '}',
+            '',
+        ].join('\n'),
+    )
+    const result = measureWorkspace({ cwd: root, standards: { languages: { ts: { maxIfBlockLines: 5 } } } })
+    const file = fileNamed(result, 'src/check.ts')
+    // `if (!resolved.enabled) return 0` is a one-liner with no block at all: the
+    // only blocks in the file are the two below it. (It used to adopt the `{` of
+    // `if (total > 0)` and report a 9-line block for a one-liner.)
+    assert.deepEqual(file.ifBlocks, [
+        { line: 4, lines: 7, kind: 'if' },
+        { line: 6, lines: 3, kind: 'if' },
+    ])
+    assert.deepEqual(
+        result.violations.map((violation) => [violation.rule, violation.line, violation.actual, violation.limit]),
+        [['maxIfBlockLines', 4, 7, 5]],
+    )
+})
+
+test('if blocks: object keys and labels named `if` are not statements', () => {
+    const root = workspace()
+    write(
+        root,
+        'src/rules.ts',
+        [
+            'export const rules = {',
+            '    if: { then: 1 },',
+            '    else: 2,',
+            '}',
+            '',
+            'export const when = rules.if',
+            '',
+        ].join('\n'),
+    )
+    const result = measureWorkspace({ cwd: root, standards: { languages: { ts: { maxIfBlockLines: 0 } } } })
+    // `if: { then: 1 }` is a property whose value is an object, not a block: a
+    // scanner that only looked for the next `{` would report one.
+    assert.deepEqual(fileNamed(result, 'src/rules.ts').ifBlocks, [])
+    assert.deepEqual(result.violations, [])
+})
+
+test('if blocks: a Go header may start with any character and the `{` may sit far away', () => {
+    const padding = 'p'.repeat(400)
+    const longHeader = `\tif err := apply(names, "${padding}"); err != nil {`
+    // The old scanner gave up 300 characters after the `if` and only accepted a
+    // condition starting with a name/`(`/`[`/`!`, so `*flag`, `&x`, `1 < 2` and
+    // any header with a long call in it were invisible.
+    assert.ok(longHeader.indexOf('{') > 300, 'the fixture must place the block opener beyond the old window')
+    const root = workspace()
+    write(
+        root,
+        'run.go',
+        [
+            'package demo',
+            '',
+            'func run(verbose *bool, limit int, count int, names []string) int {',
+            '\tif *verbose {',
+            '\t\treturn 1',
+            '\t}',
+            '\tif &limit != nil {',
+            '\t\treturn 2',
+            '\t}',
+            '\tif 1 < 2 {',
+            '\t\treturn 3',
+            '\t}',
+            longHeader,
+            '\t\treturn 4',
+            '\t}',
+            '\treturn 0',
+            '}',
+            '',
+        ].join('\n'),
+    )
+    const result = measureWorkspace({ cwd: root, standards: { languages: { go: {} } } })
+    assert.deepEqual(fileNamed(result, 'run.go').ifBlocks, [
+        { line: 4, lines: 3, kind: 'if' },
+        { line: 7, lines: 3, kind: 'if' },
+        { line: 10, lines: 3, kind: 'if' },
+        { line: 13, lines: 3, kind: 'if' },
+    ])
+})
+
+test('if blocks: a Go composite literal in the init is not the block, a wrapped condition is', () => {
+    const root = workspace()
+    write(
+        root,
+        'check.go',
+        [
+            'package demo',
+            '',
+            'func check(args []any, sleeps []int, want []int) bool {',
+            '\tif got := []any{"a", 1}; !reflect.DeepEqual(args, got) {',
+            '\t\treturn false',
+            '\t}',
+            '\tif len(sleeps) != len(want) && sleeps[0] > 0 &&',
+            '\t\twant[0] > 0 {',
+            '\t\treturn true',
+            '\t}',
+            '\treturn false',
+            '}',
+            '',
+        ].join('\n'),
+    )
+    const result = measureWorkspace({ cwd: root, standards: { languages: { go: {} } } })
+    // `[]any{"a", 1}` is a literal in the init statement: the block starts at
+    // the `{` after the `;`, and the wrapped condition counts its own line.
+    assert.deepEqual(fileNamed(result, 'check.go').ifBlocks, [
+        { line: 4, lines: 3, kind: 'if' },
+        { line: 7, lines: 4, kind: 'if' },
+    ])
+})
+
+test('Go exports: names separated from their type, several names per spec, grouped declarations', () => {
+    const root = workspace()
+    write(
+        root,
+        'exports.go',
+        [
+            'package demo',
+            '',
+            'var FS embed.FS',
+            'var local, Exported = 1, 2',
+            'const Typed uint64 = 1',
+            'const private = 2',
+            '',
+            'var (',
+            '\t// Grouped values: the comment and a continuation line are not specs.',
+            '\tAlpha, Beta = 1, 2',
+            '\tGamma string',
+            '\thidden = 3',
+            '\tDelta = map[string]int{',
+            '\t\t"Key": 1,',
+            '\t}',
+            '\tEta = compute(',
+            '\t\tValue,',
+            '\t)',
+            ')',
+            '',
+            'const (',
+            '\tEpsilon = 1',
+            '\tZeta    = 2',
+            ')',
+            '',
+            'type Widget struct {',
+            '\tName string',
+            '}',
+            '',
+            'type hiddenType int',
+            '',
+            'func Exported() {}',
+            'func hidden() {}',
+            'func (w Widget) Method() {}',
+            'func (w Widget) method() {}',
+            '',
+        ].join('\n'),
+    )
+    const result = measureWorkspace({ cwd: root, standards: { languages: { go: {} } } })
+    // FS + Exported + Typed (3), Alpha/Beta/Gamma/Delta/Eta (5), Epsilon/Zeta (2),
+    // Widget (1), Exported (1), Method (1). `Value,` is an argument of `compute`,
+    // not a declaration, and the comment is not a line to count.
+    assert.equal(fileNamed(result, 'exports.go').exports, 13)
+})
+
+test('TS: generic functions are counted, with their type parameters left out of `params`', () => {
+    const root = workspace()
+    write(
+        root,
+        'src/generic.ts',
+        [
+            'export function identity<T>(value: T): T {',
+            '    return value',
+            '}',
+            '',
+            'export const pick = <T,>(items: T[], index: number): T | undefined => items[index]',
+            '',
+            'export const tuple = <A, B>(first: A, second: B): [A, B] => [first, second]',
+            '',
+            'class Box {',
+            '    map<U>(fn: (value: number) => U): U {',
+            '        return fn(1)',
+            '    }',
+            '}',
+            '',
+        ].join('\n'),
+    )
+    const result = measureWorkspace({ cwd: root, standards: { languages: { ts: {} } } })
+    assert.deepEqual(fileNamed(result, 'src/generic.ts').functions, [
+        // Type parameters are not value parameters: `identity` takes one, `pick` two.
+        { name: 'identity', line: 1, lines: 3, depth: 1, params: 1 },
+        { name: 'pick', line: 5, lines: 1, depth: 1, params: 2 },
+        { name: 'tuple', line: 7, lines: 1, depth: 1, params: 2 },
+        { name: 'Box.map', line: 10, lines: 3, depth: 1, params: 1 },
+    ])
+})
+
+test('TS: a parenthesised arrow behind a cast keeps its own parameters and span', () => {
+    const root = workspace()
+    write(
+        root,
+        'src/logger.ts',
+        [
+            'type Logger = (level: string, ...args: unknown[]) => void',
+            '',
+            'export function make(): Logger {',
+            '    const logger = ((level: string, ...args: unknown[]) => write(level, args)) as Logger',
+            '    const handler = (event: string) => event',
+            '    const listener = (handlers[0] ?? []) as unknown as (a: unknown, b: unknown) => void',
+            '    return logger',
+            '}',
+            '',
+            'function write(level: string, args: unknown[]): void {}',
+            '',
+        ].join('\n'),
+    )
+    const result = measureWorkspace({ cwd: root, standards: { languages: { ts: {} } } })
+    const functions = fileNamed(result, 'src/logger.ts').functions
+    assert.deepEqual(
+        functions.map((fn) => [fn.name, fn.line, fn.lines, fn.params]),
+        [
+            // Two declared parameters and ONE line: the arrow is on line 4, and
+            // line 5 is an unrelated statement (it used to be the span's end).
+            ['make', 3, 6, 0],
+            ['logger', 4, 1, 2],
+            ['handler', 5, 1, 1],
+            ['write', 10, 1, 2],
+        ],
+    )
+    // `listener` is a call result cast to a function type, not a function: no record.
+    assert.ok(!functions.some((fn) => fn.name === 'listener'))
+})
+
+test('TS exports: `export {}` counts zero, every other form counts its own names', () => {
+    const root = workspace()
+    write(root, 'src/other.ts', 'export const three = 3\nexport const four = 4\nexport const five = 5\n')
+    write(
+        root,
+        'src/api.ts',
+        [
+            "import { three } from './other'",
+            '',
+            'export const one = 1, two = 2',
+            'export { three, four }',
+            'export {}',
+            "export * from './other'",
+            "export { five as alias } from './other'",
+            'export default function main(): void {}',
+            '',
+        ].join('\n'),
+    )
+    const result = measureWorkspace({ cwd: root, standards: { languages: { ts: {} } } })
+    // `one`+`two`, `three`+`four`, nothing for `export {}`, `export *`, the
+    // re-exported alias and the default function = 7.
+    assert.equal(fileNamed(result, 'src/api.ts').exports, 7)
+})
+
+test('TS: a division is not a regex literal, even when a `/` follows later on the line', () => {
+    const root = workspace()
+    write(
+        root,
+        'src/rate.ts',
+        [
+            'export const rate = bytes / seconds; const unit = "km/h"',
+            '',
+            'export function keep(value: number): number {',
+            '    return value',
+            '}',
+            '',
+        ].join('\n'),
+    )
+    const result = measureWorkspace({ cwd: root, standards: { languages: { ts: {} } } })
+    const file = fileNamed(result, 'src/rate.ts')
+    // With "every `/` is a regex" the `/` after `bytes` would close on the `/`
+    // inside "km/h", blank the rest of the line and swallow the whole file.
+    assert.deepEqual(file.functions, [{ name: 'keep', line: 3, lines: 3, depth: 1, params: 1 }])
+    assert.equal(file.exports, 2)
+})
+
+test('parameters: a trailing comma is not an extra parameter (Go and TS)', () => {
+    const root = workspace()
+    write(root, 'go.mod', 'module example.com/demo\n')
+    write(
+        root,
+        'wide.go',
+        ['package demo', '', 'func Wide(', '\ta int,', '\tb string,', ') {', '}', ''].join('\n'),
+    )
+    write(root, 'src/wide.ts', ['export const pair = (first: number, second: number,) => first + second', ''].join('\n'))
+    const result = measureWorkspace({ cwd: root, standards: { languages: { go: {}, ts: {} } } })
+    assert.deepEqual(fileNamed(result, 'wide.go').functions, [{ name: 'Wide', line: 3, lines: 5, depth: 1, params: 2 }])
+    assert.deepEqual(fileNamed(result, 'src/wide.ts').functions, [{ name: 'pair', line: 1, lines: 1, depth: 1, params: 2 }])
+})
+
+test('Python: nesting follows the file own indent step (2 spaces, and tabs)', () => {
+    const root = workspace()
+    write(root, 'two.py', ['def outer():', '  if a:', '    if b:', '      return 1', '  return 0', ''].join('\n'))
+    write(root, 'tabs.py', ['def outer():', '\tif a:', '\t\treturn 1', '\treturn 0', ''].join('\n'))
+    const result = measureWorkspace({ cwd: root, standards: { languages: { python: {} } } })
+    // A step of 2: depths 0/1/2/3, so the deepest line is 3 levels in and the
+    // function's own body holds 3 — a hard-coded step of 4 would say 1.
+    assert.deepEqual(fileNamed(result, 'two.py').functions, [{ name: 'outer', line: 1, lines: 5, depth: 3, params: 0 }])
+    assert.deepEqual(fileNamed(result, 'two.py').ifBlocks, [
+        { line: 2, lines: 3, kind: 'if' },
+        { line: 3, lines: 2, kind: 'if' },
+    ])
+    assert.equal(fileNamed(result, 'two.py').maxDepth, 3)
+    // Tabs count as one step of 4 each: depths 0/1/2.
+    assert.deepEqual(fileNamed(result, 'tabs.py').functions, [{ name: 'outer', line: 1, lines: 4, depth: 2, params: 0 }])
+    assert.equal(fileNamed(result, 'tabs.py').maxDepth, 2)
+})
+
+test('scan: build-output names are ignored at the workspace root only', () => {
+    const root = workspace()
+    const go = (name: string): string => `package ${name}\n\nfunc ${name}() {}\n`
+    // Root build trees: ignored.
+    write(root, 'build/root.go', go('buildroot'))
+    write(root, 'dist/root.js', 'export const distRoot = 1\n')
+    write(root, 'coverage/root.go', go('coverageroot'))
+    write(root, 'target/root.go', go('targetroot'))
+    write(root, 'vendor/dep/dep.go', go('vendored'))
+    // The same names deeper down are ordinary source layout: measured.
+    write(root, 'src/build/nested.go', go('srcbuild'))
+    write(root, 'pkg/coverage/nested.go', go('pkgcoverage'))
+    write(root, 'deep/target/nested.go', go('deeptarget'))
+    write(root, 'src/vendor/nested.go', go('srcvendor'))
+    write(root, 'src/dist/nested.js', 'export const nestedDist = 1\n')
+    // Toolchain and VCS directories are ignored at ANY depth.
+    write(root, 'deep/node_modules/dep/index.js', 'export const dependency = 1\n')
+    write(root, 'src/.gocache/mod/cached.go', go('cached'))
+    write(root, 'pkg/.venv/lib.py', 'value = 1\n')
+    write(root, 'src/__pycache__/cached.py', 'value = 1\n')
+
+    const result = measureWorkspace({ cwd: root, standards: { languages: { go: {}, js: {}, python: {} } } })
+    assert.deepEqual(result.files.map((file) => file.path).sort(), [
+        'deep/target/nested.go',
+        'pkg/coverage/nested.go',
+        'src/build/nested.go',
+        'src/dist/nested.js',
+        'src/vendor/nested.go',
+    ])
+    // The nested module cache must NOT come back: it holds generated code.
+    assert.equal(result.stats.languages.go, 4)
+})
+
+test('layers: every `mayImport` prefix counts, not only the first', () => {
+    const root = workspace()
+    write(root, 'go.mod', 'module example.com/demo\n')
+    write(root, 'internal/domain/value.go', 'package domain\n')
+    write(root, 'internal/infra/db.go', 'package infra\n')
+    write(root, 'internal/util/log.go', 'package util\n')
+    write(root, 'internal/app/ok.go', 'package app\n\nimport (\n\t"example.com/demo/internal/infra"\n)\n')
+    write(root, 'internal/app/bad.go', 'package app\n\nimport (\n\t"example.com/demo/internal/util"\n)\n')
+    const standards: StandardsConfig = {
+        languages: { go: {} },
+        layers: [{ path: 'internal/app', mayImport: ['internal/domain', 'internal/infra'] }],
+    }
+    const result = measureWorkspace({ cwd: root, standards })
+    const layers = result.violations.filter((violation) => violation.rule === 'layer')
+    // `internal/infra` is the SECOND prefix: allowed. `internal/util` is in none.
+    assert.deepEqual(
+        layers.map((violation) => [violation.key, violation.line]),
+        [['layer|internal/app/bad.go|internal/util', 4]],
+    )
+})
+
+test('imports: a `./x.js` specifier resolves to the `x.ts` source beside it', () => {
+    const root = workspace()
+    write(root, 'src/helper.ts', 'export const helper = 1\n')
+    write(root, 'src/store.ts', "import { helper } from './helper.js'\nexport const store = helper\n")
+    const result = measureWorkspace({ cwd: root, standards: { languages: { ts: {} } } })
+    assert.deepEqual(fileNamed(result, 'src/store.ts').imports, ['src/helper.ts'])
+})

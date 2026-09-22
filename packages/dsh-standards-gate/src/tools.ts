@@ -35,11 +35,15 @@ import {
     type RuleSet,
     type StandardsConfig,
 } from 'dsh-eng-core'
-import { compareViolations, countByRule, freezeBaseline, parseBaselineText, readBaseline, writeMeasurement } from './baseline.js'
+import { compareViolations, countByRule, freezeBaseline, parseBaselineText, pruneBaseline, readBaseline, writeMeasurement } from './baseline.js'
 import { runStructuralReview, selectReviewTargets, type SubagentsLike } from './review.js'
+import { trendsOf } from './trends.js'
 import type { StandardsGateConfig } from './config.js'
 
 const TEXT_OUTPUT = { type: 'string' } as const
+
+/** How many file sizes one measurement artifact stores (largest first). */
+const SIZE_SAMPLE_LIMIT = 2_000
 
 /** Minimal structural view of `ctx.approval` (same seam spec-gate uses). */
 export interface ApprovalLike {
@@ -106,6 +110,11 @@ interface CheckOutcome {
     measurementFile?: string
 }
 
+/** Resolve a repository-owned artifact path (an absolute value stays absolute). */
+export function artifactPathOf(cwd: string, file: string): string {
+    return path.isAbsolute(file) ? file : path.join(cwd, file)
+}
+
 function agentOf(exec: unknown): AgentLike | undefined {
     return (exec as { agent?: AgentLike }).agent
 }
@@ -133,7 +142,7 @@ function declaredCwdOf(agent: AgentLike | undefined): string {
  * cannot end up ungated by accident.
  */
 export function loadStandards(cwd: string, file: string, logger?: Logger): { standards?: StandardsConfig; problem?: string; path: string } {
-    const target = path.isAbsolute(file) ? file : path.join(cwd, file)
+    const target = artifactPathOf(cwd, file)
     const raw = readJson<Record<string, unknown>>(target)
     if (raw === undefined) {
         return {
@@ -178,14 +187,15 @@ function runCheck(deps: ToolDeps, cwd: string, config: StandardsGateConfig): Che
         maxFileBytes: config.maxFileBytes,
         ...(deps.logger === undefined ? {} : { logger: deps.logger }),
     })
-    const baselinePath = path.isAbsolute(config.baselineFile) ? config.baselineFile : path.join(cwd, config.baselineFile)
+    const baselinePath = artifactPathOf(cwd, config.baselineFile)
     const baseline = readBaseline(baselinePath, deps.logger)
     const comparison = compareViolations(result.violations, baseline)
-    const verdict: CheckOutcome['verdict'] =
-        comparison.added.length > 0 ? 'BLOCK' : result.stats.truncated ? 'WARN' : 'PASS'
+    const failed = comparison.added.length + comparison.worsened.length
+    const verdict: CheckOutcome['verdict'] = failed > 0 ? 'BLOCK' : result.stats.truncated ? 'WARN' : 'PASS'
     const reason =
-        comparison.added.length > 0
-            ? `新增 ${comparison.added.length} 项规范违规（基线已接受 ${comparison.known.length} 项）`
+        failed > 0
+            ? `新增 ${comparison.added.length} 项、恶化 ${comparison.worsened.length} 项规范违规（基线已接受 ${comparison.known.length} 项）`
+
             : result.stats.truncated
               ? `本次扫描达到文件上限（${config.maxFiles}）：覆盖面不完整，结论按 WARN 处理`
               : `无新增违规（基线已接受 ${comparison.known.length} 项，本次扫描 ${result.stats.filesScanned} 个文件）`
@@ -224,9 +234,26 @@ export function renderCheck(outcome: CheckOutcome, config: StandardsGateConfig):
                   ...comparison.added.slice(0, 25).map((violation) => `- ${violation.detail}`),
                   ...(comparison.added.length > 25 ? [`- …另有 ${comparison.added.length - 25} 项（见度量明细）`] : []),
               ]),
+        ...(comparison.worsened.length === 0
+            ? []
+            : [
+                  '',
+                  `### 恶化（${comparison.worsened.length} 项：基线接受过，但比当初更严重）`,
+                  '',
+                  ...comparison.worsened.slice(0, 15).map((violation) => `- ${violation.detail}`),
+                  '这些不是"新问题"，而是旧债变大：要么改回去，要么重新走一次 accept（人工批准）把新的尺度记进基线。',
+              ]),
         ...(comparison.fixed.length === 0
             ? []
-            : ['', `### 已消除（${comparison.fixed.length} 项）`, '', ...comparison.fixed.slice(0, 10).map((key) => `- ${key}`)]),
+            : result.stats.truncated
+              ? [
+                    '',
+                    `### 已消除（${comparison.fixed.length} 项）— **本次扫描不完整，不能当真**`,
+                    '',
+                    `本次只扫了 ${result.stats.filesScanned} 个文件（已达上限）：这些"已消除"可能只是没被扫到。`,
+                    '提高 maxFiles 或缩小工作区后重跑，再据此收紧基线。',
+                ]
+              : ['', `### 已消除（${comparison.fixed.length} 项）`, '', ...comparison.fixed.slice(0, 10).map((key) => `- ${key}`)]),
         '',
         ...(comparison.added.length === 0
             ? []
@@ -290,6 +317,11 @@ export const DEFAULT_EXEMPT: readonly string[] = [
     '**/*.spec.ts',
     '**/testdata/**',
     '**/vendor/**',
+    // Build output is ignored at the workspace root, but a monorepo keeps a
+    // `dist/` (or `build/`) next to every package: generated bundles must not be
+    // measured as if a human had written them.
+    '**/dist/**',
+    '**/build/**',
     '**/*.pb.go',
     '**/*_gen.go',
     '**/*.gen.go',
@@ -329,6 +361,65 @@ export function suggestThresholds(result: MetricsResult): { suggested: Record<st
         )
     }
     return { suggested, basis }
+}
+
+/**
+ * Record the gate for a standards run.
+ *
+ * A helper (not inline code) because the `accept` path must record too: printing
+ * a verdict the ledger does not contain is how a report starts lying.
+ */
+function recordStandardsGate(
+    deps: ToolDeps,
+    store: ReturnType<MissionStoreRegistry['for']>,
+    missionId: string,
+    outcome: CheckOutcome,
+    cwd: string,
+    fingerprint = gitFingerprint(cwd),
+): string {
+    return store.recordGate(missionId, {
+        source: 'dsh-standards-gate',
+        state: outcome.verdict,
+        reason: outcome.reason,
+        results: [],
+        scope: { selected: ['standards'], total: 1, full: !outcome.result.stats.truncated },
+        fingerprint,
+    }).id
+}
+
+/** Write the measurement detail (violations + file sizes) next to the gate. */
+function writeStandardsArtifact(
+    deps: ToolDeps,
+    store: ReturnType<MissionStoreRegistry['for']>,
+    missionId: string,
+    outcome: CheckOutcome,
+): string | undefined {
+    if (outcome.gateId === undefined) return undefined
+    const file = store.artifactPath(missionId, path.join('standards', `${outcome.gateId}.json`))
+    try {
+        // File sizes ride along (bounded): one measurement per run is enough to
+        // answer "which file got fatter during this mission" by comparing the
+        // first and the last one.
+        const sizes: Record<string, number> = {}
+        for (const entry of [...outcome.result.files].sort((a, b) => b.lines - a.lines).slice(0, SIZE_SAMPLE_LIMIT)) {
+            sizes[entry.path] = entry.lines
+        }
+        writeMeasurement(file, {
+            checkedAt: Date.now(),
+            verdict: outcome.verdict,
+            reason: outcome.reason,
+            scanned: outcome.result.stats,
+            sizes,
+            violations: outcome.result.violations,
+            added: outcome.comparison.added.map((violation) => violation.key),
+            known: outcome.comparison.known.length,
+            fixed: outcome.comparison.fixed,
+        })
+        return file
+    } catch (error) {
+        deps.logger?.warn('度量明细写入失败：', error)
+        return undefined
+    }
 }
 
 /**
@@ -375,6 +466,13 @@ export function registerTools(
                 if ('problem' in outcome) throw new Error(outcome.problem)
 
                 const store = deps.stores.for(cwd)
+                if (args.missionId !== undefined && args.missionId !== '' && store.read(args.missionId) === undefined) {
+                    const known = store.list().map((mission) => mission.id)
+                    throw new Error(
+                        `未知 mission "${args.missionId}"：按 fail closed 拒绝（否则这次检查会静默地不记录任何门禁，看起来却像成功）。` +
+                            `可用 mission：${known.join(', ') || '(无)'}。`,
+                    )
+                }
                 const mission = store.resolveForAgent(agent, {
                     ...(args.missionId === undefined || args.missionId === '' ? {} : { explicitId: args.missionId }),
                 })
@@ -407,7 +505,9 @@ export function registerTools(
                                 `规范检查要求放宽基线：把 ${outcome.comparison.added.length} 项**新增**违规记为"已接受"。`,
                                 '',
                                 ...outcome.comparison.added.slice(0, 12).map((violation) => `- ${violation.detail}`),
-                                ...(outcome.comparison.added.length > 12 ? [`- …另有 ${outcome.comparison.added.length - 12} 项`] : []),
+                                ...(outcome.comparison.added.length > 12
+                                    ? [`- …另有 ${outcome.comparison.added.length - 12} 项未列出（合计 ${outcome.comparison.added.length} 项）`]
+                                    : []),
                                 '',
                                 `基线文件：${path.join(cwd, config.baselineFile)}`,
                                 args.note === undefined || args.note === '' ? '（未填理由）' : `理由：${args.note}`,
@@ -424,7 +524,7 @@ export function registerTools(
                             ].join('\n')
                         }
                     }
-                    const baselinePath = path.join(cwd, config.baselineFile)
+                    const baselinePath = artifactPathOf(cwd, config.baselineFile)
                     const accepted = freezeBaseline({
                         file: baselinePath,
                         violations: outcome.result.violations,
@@ -434,13 +534,47 @@ export function registerTools(
                                 : args.note,
                     })
                     deps.logger?.for(cwd).info(`standards-gate: 基线已更新（${baselinePath}，接受 ${accepted.accepted.length} 项）`)
-                    outcome.comparison = { added: [], known: outcome.result.violations, fixed: outcome.comparison.fixed, present: true }
+                    outcome.comparison = { added: [], known: outcome.result.violations, fixed: outcome.comparison.fixed, worsened: [], present: true }
                     outcome.verdict = outcome.result.stats.truncated ? 'WARN' : 'PASS'
                     outcome.reason = `基线已更新：接受 ${accepted.accepted.length} 项违规（人工批准）`
-                    return [renderCheck(outcome, config), '', `基线已写入 ${baselinePath}（${formatTime(Date.now())}）。`].join('\n')
+                    // The report says PASS, so the LEDGER must say PASS too: a
+                    // version that returned here without recording left the old
+                    // BLOCK in place while the tool printed a pass (an audit
+                    // caught exactly that difference between words and records).
+                    const acceptedGateId = mission === undefined ? undefined : recordStandardsGate(deps, store, mission.id, outcome, cwd)
+                    // The artifact writer keys off `outcome.gateId`; forgetting this
+                    // assignment meant the accepted run left no measurement detail
+                    // (caught by the ledger-vs-words test below).
+                    outcome.gateId = acceptedGateId
+                    const measured = mission === undefined ? undefined : writeStandardsArtifact(deps, store, mission.id, outcome)
+                    return [
+                        renderCheck(outcome, config),
+                        '',
+                        `基线已写入 ${baselinePath}（${formatTime(Date.now())}）。`,
+                        ...(acceptedGateId === undefined ? ['（没有 mission：未记录门禁）'] : [`门禁记录：${acceptedGateId}`]),
+                        ...(measured === undefined ? [] : [`度量明细：${measured}`]),
+                    ].join('\n')
                 }
 
                 const fingerprint = gitFingerprint(cwd)
+                // `warn` means "tell me, do not block me": a BLOCK record would be
+                // picked up by consumers that require a PASS (the orchestrator's
+                // standards-pass gate, evidence-gate's requireStandardsGate), which
+                // is exactly what the host asked not to happen.
+                if (config.enforce === 'warn' && outcome.verdict === 'BLOCK') {
+                    outcome.verdict = 'WARN'
+                    outcome.reason = `${outcome.reason}（宿主设 enforce=warn：记录为 WARN，不阻断交付）`
+                }
+                // A violation that disappeared is progress: drop its acceptance so a
+                // later revert cannot ride the old acceptance. Tightening only, so
+                // it needs no approval (and it is skipped when the scan was partial,
+                // because "not scanned" is not "fixed").
+                if (!outcome.result.stats.truncated && outcome.comparison.fixed.length > 0) {
+                    const pruned = pruneBaseline(artifactPathOf(cwd, config.baselineFile), outcome.comparison.fixed, readBaseline(artifactPathOf(cwd, config.baselineFile), deps.logger))
+                    if (pruned !== undefined) {
+                        deps.logger?.for(cwd).info(`standards-gate: 基线收紧（消除 ${outcome.comparison.fixed.length} 项）`)
+                    }
+                }
                 if (config.enforce === 'off') {
                     return [
                         renderCheck(outcome, config),
@@ -451,29 +585,11 @@ export function registerTools(
                     ].join('\n')
                 }
                 if (mission !== undefined) {
-                    outcome.gateId = store.recordGate(mission.id, {
-                        source: 'dsh-standards-gate',
-                        state: outcome.verdict,
-                        reason: outcome.reason,
-                        results: [],
-                        scope: { selected: ['standards'], total: 1, full: !outcome.result.stats.truncated },
-                        fingerprint,
-                    }).id
-                    const file = store.artifactPath(mission.id, path.join('standards', `${outcome.gateId}.json`))
-                    try {
-                        writeMeasurement(file, {
-                            verdict: outcome.verdict,
-                            reason: outcome.reason,
-                            scanned: outcome.result.stats,
-                            violations: outcome.result.violations,
-                            added: outcome.comparison.added.map((violation) => violation.key),
-                            known: outcome.comparison.known.length,
-                            fixed: outcome.comparison.fixed,
-                        })
-                        outcome.measurementFile = file
-                    } catch (error) {
-                        deps.logger?.warn('度量明细写入失败：', error)
-                    }
+                    outcome.gateId = recordStandardsGate(deps, store, mission.id, outcome, cwd, fingerprint)
+                    // The detail (violations + file sizes) goes with the record:
+                    // it is what `standards_status` compares to show what got
+                    // fatter, and what a human reads when the gate says BLOCK.
+                    outcome.measurementFile = writeStandardsArtifact(deps, store, mission.id, outcome)
                 }
                 return renderCheck(outcome, config)
             },
@@ -529,7 +645,7 @@ export function registerTools(
                 const targetCounts = countByRule(atTarget.violations)
                 const files = worst(result.files, (file) => file.lines, 10)
                 const functions = worstFunctionList(result)
-                const target = path.join(cwd, config.standardsFile)
+                const target = artifactPathOf(cwd, config.standardsFile)
 
                 const report = [
                     '## 规范接入（standards_bootstrap）',
@@ -705,7 +821,7 @@ export function registerTools(
                 const cwd = declaredCwdOf(agent)
                 const config = deps.configFor(agent)
                 const loaded = loadStandards(cwd, config.standardsFile, deps.logger)
-                const baselinePath = path.isAbsolute(config.baselineFile) ? config.baselineFile : path.join(cwd, config.baselineFile)
+                const baselinePath = artifactPathOf(cwd, config.baselineFile)
                 const baselineText = readBaselineText(baselinePath)
                 const baseline = baselineText === undefined ? undefined : parseBaselineText(baselineText)
                 const store = deps.stores.for(cwd)
@@ -732,17 +848,39 @@ export function registerTools(
                         ? []
                         : ['', '### 依赖方向', '', ...loaded.standards.layers.map((layer) => `- \`${layer.path}\` 只能依赖：${layer.mayImport.join('、') || '(仅自身)'}`)]),
                     ...(loaded.standards?.forbidCycles === true ? ['', '- 禁止循环依赖：已开启'] : []),
-                    ...(loaded.standards?.exempt === undefined ? [] : ['', `节/豁免：${loaded.standards.exempt.join('、')}`]),
+                    ...(loaded.standards?.exempt === undefined ? [] : ['', `豁免：${loaded.standards.exempt.join('、')}`]),
                     '',
                     '### 基线（棘轮）',
                     '',
                     ...(baseline === undefined
-                        ? ['- 没有基线：当前所有违规都算新增（第一次 `standards_check({ accept: true })` 可冻结现状）']
+                        ? [
+                              baselineText === undefined
+                                  ? '- 没有基线：当前所有违规都算新增（第一次 `standards_check({ accept: true })` 可冻结现状）'
+                                  : `- ⚠️ 基线文件存在但**无法解析**（${baselinePath}）：按"没有基线"处理（会报告全部违规），请修好它或用 accept 重新冻结`,
+                          ]
                         : [
                               `- 已接受 ${baseline.accepted.length} 项违规`,
                               `- 冻结时间：${baseline.frozenAt}${baseline.note === undefined ? '' : `；理由：${baseline.note}`}`,
                               `- 文件：${baselinePath}`,
                           ]),
+                    '',
+                    '### 本次 mission 的变化',
+                    '',
+                    ...(mission === undefined
+                        ? ['- （没有 mission：无法比较历史测量）']
+                        : (() => {
+                              const trends = trendsOf(store.artifactPath(mission.id, 'standards'), 8)
+                              if (trends === undefined) {
+                                  return ['- 只有一次测量（或还没有）：跑第二次 `standards_check` 后这里会显示"哪个文件变胖/变瘦、哪些违规新增/消除"']
+                              }
+                              return [
+                                  ...(trends.grew.length === 0 ? ['- 没有文件变大'] : trends.grew.map((delta) => `- 变胖：${delta.path} ${delta.from} → ${delta.to} 行（+${delta.lines}）`)),
+                                  ...(trends.shrank.length === 0 ? [] : trends.shrank.map((delta) => `- 变瘦：${delta.path} ${delta.from} → ${delta.to} 行（${delta.lines}）`)),
+                                  `- 违规：新增 ${trends.addedViolations.length} 项、消除 ${trends.fixedViolations.length} 项`,
+                                  ...trends.addedViolations.slice(0, 5).map((key) => `  - 新增 ${key}`),
+                                  ...trends.fixedViolations.slice(0, 5).map((key) => `  - 消除 ${key}`),
+                              ]
+                          })()),
                     '',
                     '### 最近一次门禁',
                     '',

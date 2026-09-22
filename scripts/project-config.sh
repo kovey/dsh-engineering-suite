@@ -25,6 +25,7 @@ WRITE=0
 FORCE=0
 JSON_ONLY=0
 SPEC="skip"
+STANDARDS="skip"
 TEST_CMD=""
 LINT_CMD=""
 
@@ -35,9 +36,10 @@ while [ $# -gt 0 ]; do
     --force) FORCE=1; shift ;;
     --json) JSON_ONLY=1; shift ;;
     --spec) SPEC="${2:-skip}"; shift 2 ;;
+    --standards) STANDARDS="${2:-skip}"; shift 2 ;;
     --test) TEST_CMD="${2:-}"; shift 2 ;;
     --lint) LINT_CMD="${2:-}"; shift 2 ;;
-    -h|--help) sed -n '3,26p' "$0"; exit 0 ;;
+    -h|--help) sed -n '3,29p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -107,6 +109,54 @@ case "$SPEC" in
   *) echo "--spec 只能是 on / off / skip" >&2; exit 2 ;;
 esac
 
+# --- standards (optional) ---------------------------------------------------
+# The thresholds are the repository's decision, so this generator only offers a
+# starting point: the target values the suite recommends, per language it can see
+# in the workspace, plus the exemptions that keep generated and test code from
+# teaching people to ignore the gate. `standards_bootstrap` in a session is the
+# better path when a human can look at the distribution first.
+STANDARDS_JSON=""
+case "$STANDARDS" in
+  skip) ;;
+  on)
+    STANDARDS_JSON="$(
+      WS="$WS" python3 - <<'PY2'
+import json, os, pathlib
+
+root = pathlib.Path(os.environ["WS"])
+languages = {}
+def has(*names):
+    return any((root / name).exists() for name in names)
+
+targets = {
+    "go": {"maxFileLines": 400, "maxFunctionLines": 80, "maxDepth": 4, "maxIfBlockLines": 20, "maxParams": 5, "maxExports": 20},
+    "ts": {"maxFileLines": 300, "maxFunctionLines": 60, "maxDepth": 4, "maxIfBlockLines": 20, "maxParams": 5, "maxExports": 15},
+    "python": {"maxFileLines": 400, "maxFunctionLines": 60, "maxDepth": 4, "maxIfBlockLines": 20, "maxParams": 5, "maxExports": 20},
+}
+if has("go.mod"):
+    languages["go"] = targets["go"]
+if has("package.json", "tsconfig.json"):
+    languages["ts"] = targets["ts"]
+    languages["js"] = targets["ts"]
+if has("pyproject.toml", "setup.py", "requirements.txt"):
+    languages["python"] = targets["python"]
+if not languages:
+    languages["default"] = targets["go"]
+
+print(json.dumps({
+    "languages": languages,
+    "forbidCycles": True,
+    "exempt": [
+        "**/*_test.go", "**/*.test.ts", "**/*.spec.ts", "**/testdata/**", "**/vendor/**",
+        "**/*.pb.go", "**/*_gen.go", "**/*.gen.go", "**/*.generated.*", "**/mocks/**", "**/__mocks__/**",
+        "**/dist/**", "**/build/**",
+    ],
+}, indent=2, ensure_ascii=False))
+PY2
+    )" ;;
+  *) echo "--standards 只能是 on / skip" >&2; exit 2 ;;
+esac
+
 # --- report / write ---------------------------------------------------------
 report() {
   local target="$1" body="$2"
@@ -117,6 +167,7 @@ report() {
 if [ "$JSON_ONLY" = "1" ]; then
   report "quality-gate.json" "$QUALITY"
   [ -n "$SPEC_JSON" ] && report "spec-gate.json" "$SPEC_JSON"
+  [ -n "$STANDARDS_JSON" ] && report "standards.json" "$STANDARDS_JSON"
   exit 0
 fi
 
@@ -127,6 +178,7 @@ echo "lint      : ${LINT:-(无)}"
 echo "spec-gate : $SPEC"
 report "$WS/.dsh/quality-gate.json" "$QUALITY"
 [ -n "$SPEC_JSON" ] && report "$WS/.dsh/spec-gate.json" "$SPEC_JSON"
+[ -n "$STANDARDS_JSON" ] && report "$WS/.dsh/standards.json" "$STANDARDS_JSON"
 
 if [ "$WRITE" != "1" ]; then
   printf '\n(dry-run：加 --write 才会写入 .dsh/)\n'
@@ -145,5 +197,6 @@ write_one() {
 }
 write_one "$WS/.dsh/quality-gate.json" "$QUALITY"
 [ -n "$SPEC_JSON" ] && write_one "$WS/.dsh/spec-gate.json" "$SPEC_JSON"
+[ -n "$STANDARDS_JSON" ] && write_one "$WS/.dsh/standards.json" "$STANDARDS_JSON"
 echo
 echo "这些文件属于信任根（.dsh/** 对写类工具关闭），请提交到仓库；插件会在下一次门禁运行时读取。"

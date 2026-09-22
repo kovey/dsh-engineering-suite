@@ -89,7 +89,7 @@ export interface ScanOptions {
     maxFiles?: number
     /** Default 256 KiB: larger files are skipped, never read into memory. */
     maxFileBytes?: number
-    /** Extra directory names to skip, on top of the defaults. */
+    /** Extra directory names to skip wherever they appear, on top of the defaults. */
     ignoreDirs?: readonly string[]
     logger?: Logger
 }
@@ -105,29 +105,28 @@ export interface GapReport {
 
 // --- bounds -----------------------------------------------------------------
 
-/** Directories never walked (plus `ScanOptions.ignoreDirs`). */
-const DEFAULT_IGNORE_DIRS: readonly string[] = [
+/**
+ * Directories skipped at ANY depth (plus `ScanOptions.ignoreDirs`).
+ *
+ * Version control, toolchain caches and task state: none of them is ever
+ * project source, wherever they sit. Found on a real repository: a Go module
+ * cache kept inside the workspace (`.gocache/mod/…`) held 7800-line generated
+ * `.pb.go` files, so the standards distribution was reporting the module cache
+ * instead of the project (p90 file length 1010 lines, max 7822) — a threshold
+ * set from that would gate nothing real.
+ */
+const IGNORE_ANY_DEPTH: readonly string[] = [
     'node_modules',
     '.git',
     '.dsh',
-    'dist',
-    'build',
     '.tmp',
-    'vendor',
     '.venv',
     '__pycache__',
-    'target',
     '.pnpm-store',
-    // Toolchain caches and generated-output trees. Found on a real repository:
-    // a Go module cache kept inside the workspace (`.gocache/mod/…`) held
-    // 7800-line generated `.pb.go` files, so the standards distribution was
-    // reporting the module cache instead of the project (p90 file length 1010
-    // lines, max 7822) — a threshold set from that would gate nothing real.
     '.gocache',
     '.cache',
     '.gradle',
     '.m2',
-    'coverage',
     '.next',
     '.nuxt',
     '.turbo',
@@ -136,6 +135,17 @@ const DEFAULT_IGNORE_DIRS: readonly string[] = [
     '.mypy_cache',
     '.ruff_cache',
 ]
+
+/**
+ * Build-output names skipped only at the workspace ROOT (depth 1).
+ *
+ * A directory called `build`, `coverage`, `target`, `dist` or `vendor` at the
+ * root is a tool's output tree, but the same name deeper down is ordinary
+ * source layout: `src/build/render.go` or `pkg/coverage/report.go` used to be
+ * silently unmeasured AND invisible in `stats`, so a project whose real code
+ * lives under such a directory was only partly checked.
+ */
+const IGNORE_AT_ROOT: readonly string[] = ['dist', 'build', 'coverage', 'target', 'vendor']
 
 /** Default bound on files visited by one walk (also used by `metrics.ts`). */
 export const DEFAULT_MAX_FILES = 4000
@@ -753,7 +763,7 @@ export interface WalkOptions {
     cwd: string
     /** Default {@link DEFAULT_MAX_FILES}. */
     maxFiles?: number
-    /** Extra directory names to skip, on top of the defaults. */
+    /** Extra directory names to skip wherever they appear, on top of the defaults. */
     ignoreDirs?: readonly string[]
     logger?: Logger
 }
@@ -773,7 +783,9 @@ export function walkWorkspace(options: WalkOptions): WalkResult {
     const cwd = path.resolve(options.cwd)
     const logger = options.logger ?? silentLogger
     const maxFiles = Math.max(0, options.maxFiles ?? DEFAULT_MAX_FILES)
-    const ignoreDirs = new Set<string>([...DEFAULT_IGNORE_DIRS, ...(options.ignoreDirs ?? [])])
+    // An explicit `ignoreDirs` entry means "skip this name wherever it appears";
+    // the ambiguous build-output names are handled at the root only.
+    const ignoreDirs = new Set<string>([...IGNORE_ANY_DEPTH, ...(options.ignoreDirs ?? [])])
 
     const files: WalkedFile[] = []
     let visited = 0
@@ -828,7 +840,11 @@ export function walkWorkspace(options: WalkOptions): WalkResult {
                 file = entry.isFile()
             }
             if (directory) {
-                if (!ignoreDirs.has(entry.name)) queue.push(abs)
+                // `rel` has no separator exactly at the workspace root.
+                const atRoot = !rel.includes('/')
+                if (ignoreDirs.has(entry.name)) continue
+                if (atRoot && IGNORE_AT_ROOT.includes(entry.name)) continue
+                queue.push(abs)
                 continue
             }
             if (!file) continue

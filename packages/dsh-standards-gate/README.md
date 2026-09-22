@@ -16,8 +16,8 @@
 | 工具 | 作用 |
 |---|---|
 | `standards_check` | 按**仓库自己声明**的阈值度量，产出违规清单，并把裁决写进 mission 的门禁记录（`source: dsh-standards-gate`）。**基线已接受的存量违规不算失败，新增违规失败。** |
-| `standards_bootstrap` | 存量项目接入：`measure` 给出分布（文件/函数行数、嵌套、分支、参数、导出的 p50/p90 与最差文件）与**建议阈值**（取 p90，先让规范立刻生效而不被存量债务卡死）；`freeze` 经**人工批准**后把阈值写进仓库。 |
-| `standards_status` | 只读：当前阈值、依赖方向规则、基线（接受了多少项、何时冻结、为什么）、最近一次门禁裁决。 |
+| `standards_bootstrap` | 存量项目接入：`measure` 给出分布（各语言的文件行数/函数行数/嵌套的 p90 与最差文件）、**推荐的目标阈值**（文件 400/300、函数 80/60、嵌套 4、分支 20、参数 5）以及"按目标阈值今天会有多少违规"，`freeze` 经**人工批准**后写入仓库。**不推荐按 p90 定阈值**——真机上 p90 文件长度是 588 行，那等于没有门禁；正确做法是目标阈值 + 把存量冻结进基线。 |
+| `standards_status` | 只读：当前阈值、依赖方向规则、基线（接受了多少项、何时冻结、为什么）、**本次 mission 的变化**（变胖/变瘦的文件、新增/消除的违规）、最近一次门禁裁决。 |
 
 ## 第四层：判断（`standards_review`）
 
@@ -39,7 +39,8 @@ rubric 明确要求"允许结论是没问题"（不要为了产出而编造问�
 <repo>/.dsh/standards-baseline.json  已接受的违规（棘轮）
 ```
 
-- 门禁只对**新增**违规失败（`added`），并报告**已消除**的项（`fixed`）；
+- 门禁对**新增**（`added`）与**恶化**（`worsened`：同一个 key 比当初接受时更大）失败，并报告**已消除**的项（`fixed`）；
+- 已消除的 key 会**自动从基线删除**（只收紧、不需要批准）：否则"删掉文件让门禁变绿、之后再放回来"就能靠旧批准通过；
 - 收紧靠重构（`fixed` 变多）；放宽只有一条路：`standards_check({ accept: true, note: "原因" })`，
   它会**要求人工审批**（`requireApprovalForBaseline`，默认开）；
 - `.dsh/**` 在 `dsh-spec-gate` 的信任根里 → **模型自己写不了阈值和基线**。
@@ -55,7 +56,7 @@ profile（宿主上限）与 `<repo>/.dsh/standards-gate.json`（项目只能细
     enabled: true
     standardsFile: .dsh/standards.json      # 仓库所有
     baselineFile: .dsh/standards-baseline.json
-    enforce: gate                            # gate | warn | off
+    enforce: gate                            # gate=PASS/BLOCK | warn=最多 WARN（只报告不阻断）| off=不写记录
     maxFiles: 4000
     maxFileBytes: 262144
     requireApprovalForBaseline: true         # 不得由项目级配置关闭
@@ -100,7 +101,7 @@ profile（宿主上限）与 `<repo>/.dsh/standards-gate.json`（项目只能细
 | `dsh-quality-gate` | 需要时把规范检查当普通命令；更强的是让本插件自己写门禁记录 |
 | `dsh-evidence-gate` | 交付不变式可以要求最新 standards 门禁 PASS |
 | `dsh-orchestrator` | `quality-verify` 阶段的离开门禁可扩展为"质量门禁 + 规范门禁" |
-| `dsh-audit-trail` | 度量明细落在 mission 目录，配合 diff 快照能看"这次让哪个文件变胖了" |
+| `dsh-audit-trail` | 每次门禁的度量明细（含文件尺寸）落在 mission 目录；`standards_status` 比较首末两次测量，直接给出"这次让哪个文件变胖/变瘦、哪些违规新增/消除" |
 | `dsh-role-guard` | 机械判不了的（内聚、命名、抽象）交给 reviewer 角色的 rubric |
 
 ## 诚实的边界

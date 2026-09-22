@@ -40,7 +40,7 @@ dsh 本身是 Agent 运行时，我们的软件工程体系是运行在其上的
 | **认知层** | 项目知识、架构决策、历史上下文 | 通过 `dsh-superpowers` 的 `brainstorming` / `writing-plans` 技能，将隐性知识固化为可检索的规格与计划工件 |
 | **编排层** | 多 Agent 角色分工、任务分发、依赖管理 | 自研流程编排插件（见第 5 节），参考 `dsh-expert-team` / `dsh-knj-workflow` |
 | **执行层** | 模型调用、工具执行、代码读写 | dsh 原生 `dsh-agent-loop` 插件驱动，支持声明式 Agent 与会话恢复 |
-| **治理层** | 质量门禁、审计、安全沙箱、成本追踪 | 自研插件组合：`dsh-role-guard`、`dsh-spec-gate`、`dsh-quality-gate`、`dsh-audit-trail`、`dsh-evidence-gate`、`dsh-test-design-gate` |
+| **治理层** | 质量门禁、结构规范、审计、安全沙箱、成本追踪 | 自研插件组合：`dsh-role-guard`、`dsh-spec-gate`、`dsh-quality-gate`、`dsh-standards-gate`、`dsh-audit-trail`、`dsh-evidence-gate`、`dsh-test-design-gate` |
 
 ---
 
@@ -114,7 +114,23 @@ dsh 本身是 Agent 运行时，我们的软件工程体系是运行在其上的
 - 缺失或不确定的证据 **fail closed**（默认阻断）。
 - 只有确定性 Quality Gate 产生 `APPROVED` 后，才生成不可变的 `Receipt` 工件。
 
-### 3.6 `dsh-audit-trail`：审计与追溯层
+### 3.6 `dsh-standards-gate`：代码规范（结构可维护性）门禁
+
+**职责**：把"代码规范"从文档变成**可执行的门禁**，只覆盖能机械判定的部分。
+
+**实现要点**：
+- 规范由**目标仓库自己拥有**：`<repo>/.dsh/standards.json` 声明阈值（文件/函数行数、嵌套深度、`if/else` 块行数、
+  参数个数、导出面大小）、分层依赖方向、循环依赖与豁免；`.dsh/**` 在 `dsh-spec-gate` 的信任根内，模型改不了。
+- **基线棘轮**：`<repo>/.dsh/standards-baseline.json` 记录已接受的存量违规；门禁只挡**新增**违规，
+  并报告"已消除"的项（重构进度）。放宽基线（`standards_check({ accept: true })`）**必须人工批准**。
+- 阈值取**目标值**而非分位数：先定"文件 400 行 / 函数 80 行 / 嵌套 4 / 分支 20 行"，
+  再把现有违规冻结进基线——这样就既不用为了存量债务放弃规范，也不会第一天全线飘红。
+- 人工判断的部分（高内聚、命名、抽象是否多余）交给 `standards_review` 派出的**只读评审者**按 rubric 判，
+  结论标注为"意见"，不写任何门禁状态。
+- 交付侧可要求它：`dsh-evidence-gate` 的 `requireStandardsGate` 要求最新一条规范门禁 PASS 且不早于最新
+  command/test 证据；`dsh-orchestrator` 提供 `gate: standards-pass` 供阶段使用。
+
+### 3.7 `dsh-audit-trail`：审计与追溯层
 
 **职责**：记录每一次工具调用的完整链路，支持事后回放和审计。
 

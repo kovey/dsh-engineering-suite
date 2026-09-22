@@ -147,6 +147,7 @@ export const PROJECT_OVERRIDABLE_KEYS: readonly string[] = [
     'requireCleanTree',
     'requireGate',
     'requireStandardsGate',
+    'standardsGateSource',
     'gateSource',
     'maxGateAgeMinutes',
     'maxOutputTail',
@@ -372,6 +373,8 @@ function overrides(host: EvidenceGateConfig, config: EvidenceGateConfig): boolea
     return (
         config.requireGate !== host.requireGate ||
         config.requireCleanTree !== host.requireCleanTree ||
+        config.requireStandardsGate !== host.requireStandardsGate ||
+        config.standardsGateSource !== host.standardsGateSource ||
         config.gateSource !== host.gateSource ||
         config.maxGateAgeMinutes !== host.maxGateAgeMinutes ||
         config.maxOutputTail !== host.maxOutputTail ||

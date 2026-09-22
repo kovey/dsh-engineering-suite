@@ -9,23 +9,23 @@
 bash scripts/verify.sh
 ```
 
-最近一次结果：**9 个包 + 1 个根集成测试，342 个测试，341 通过 / 0 失败 / 1 跳过**（另有真机 harness：8 个插件全部 `applied`，E2E GREEN）
+最近一次结果：**9 个包 + 1 个根集成测试，355 个测试，354 通过 / 0 失败 / 1 跳过**（另有真机 harness：8 个插件全部 `applied`，E2E GREEN）
 （跳过的是一条需要 `ps` 的子进程回收测试——本机沙箱不允许列进程，测试会如实跳过而不是假通过）。
 
 第一轮（实现完成时）130 个测试；第二轮对抗式审计把漏洞变成回归测试（+49）；第三轮补齐七项已知边界（+24）。
 
 | 包 | 测试数 | 覆盖重点 |
 |---|---|---|
-| `dsh-eng-core` | 11 | mission 工件持久化（含损坏文件读回 `undefined`、同秒 id 不冲突）、spec/测试设计 markdown 往返解析（含无前导竖线 / 全角竖线 / 无表头 / 标题串行）、无 shell 的命令执行、超时 / 抢占 / 进程组回收 |
-| `dsh-role-guard` | 24 | 角色文件解析与覆盖优先级（含 `skills: []` 曾被解析成字符串 `"[]"` 的修复）、白名单"空即拒绝"、**技能白名单执行级强制 + 会话→角色持久绑定 + 孙会话继承**、只读角色剥离写工具、派发参数、mission 规格注入、子代理释放、角色文件热更新 |
-| `dsh-spec-gate` | 26 | 装配/卸载、缺项草稿拒绝、写拦截（无 mission / 未审批 / 信任根 / 越界 / 未声明路径）、**shell 写入目标提取 + 边界/信任根校验（shellPolicy）**、**负面约束可执行子集 path:/tool:/cmd:/argv:**、读操作不被写规则拦截、审批通过/拒绝、改版撤销旧评审、工件与记录一致、跨会话不回退 |
-| `dsh-test-design-gate` | 21 | 覆盖度 / 三类场景 / 可执行性 / 重复 id / 悬挂用例 / strict、报告工件与证据绑定、评审可重跑、评审摘要绑定规格 |
-| `dsh-quality-gate` | 21 | 配置解析与去重、三态裁决与覆盖范围（`scope.full`）、门禁记录与证据、写后 lint 回路（同失败只报一次 + 每轮上限 + 换轮重置）、收尾阻断与 steer、取消不产生裁决、改动预算、命令不经 shell |
-| `dsh-evidence-gate` | 32 | 四类证据登记、fail-closed 清单、缺规格/缺门禁/部分门禁/无结果门禁/伪造门禁/缺证据/陈旧门禁/超龄门禁/熔断全部阻断、证据必须 exitCode=0、回执不可覆盖、跨轮回执失效、**force 需宿主 allowForceOverride 才生效** |
-| `dsh-audit-trail` | 27 | pre/result 配对、快照与还原、dry-run、符号链接与"回滚点后被改"保护、权限位还原、诚实统计、**轮次从三个事件学习 + since/sinceMinutes 时间回滚** |
-| `dsh-standards-gate` | 12 |
-| `dsh-orchestrator` | 38 | 默认六阶段、能力探测、入口/出口门禁（含新鲜度）、回退、熔断 latch + 人工 unblock、断点恢复、只能结算当前阶段、条件边、复盘与跨 run 台账回注、**阶段角色声明 + 可选 autoAdvance** |
-| `test/integration.test.ts` | 3 | **七个插件同宿主跑完整条流水线**（下节） |
+| `dsh-eng-core` | 50 | mission 工件持久化（含损坏文件读回 `undefined`、同秒 id 不冲突）、spec/测试设计 markdown 往返解析（含无前导竖线 / 全角竖线 / 无表头 / 标题串行）、无 shell 的命令执行、超时 / 抢占 / 进程组回收 |
+| `dsh-role-guard` | 34 | 角色文件解析与覆盖优先级（含 `skills: []` 曾被解析成字符串 `"[]"` 的修复）、白名单"空即拒绝"、**技能白名单执行级强制 + 会话→角色持久绑定 + 孙会话继承**、只读角色剥离写工具、派发参数、mission 规格注入、子代理释放、角色文件热更新 |
+| `dsh-spec-gate` | 55 | 装配/卸载、缺项草稿拒绝、写拦截（无 mission / 未审批 / 信任根 / 越界 / 未声明路径）、**shell 写入目标提取 + 边界/信任根校验（shellPolicy）**、**负面约束可执行子集 path:/tool:/cmd:/argv:**、读操作不被写规则拦截、审批通过/拒绝、改版撤销旧评审、工件与记录一致、跨会话不回退 |
+| `dsh-test-design-gate` | 26 | 覆盖度 / 三类场景 / 可执行性 / 重复 id / 悬挂用例 / strict、报告工件与证据绑定、评审可重跑、评审摘要绑定规格 |
+| `dsh-quality-gate` | 28 | 配置解析与去重、三态裁决与覆盖范围（`scope.full`）、门禁记录与证据、写后 lint 回路（同失败只报一次 + 每轮上限 + 换轮重置）、收尾阻断与 steer、取消不产生裁决、改动预算、命令不经 shell |
+| `dsh-evidence-gate` | 43 | 四类证据登记、fail-closed 清单、缺规格/缺门禁/部分门禁/无结果门禁/伪造门禁/缺证据/陈旧门禁/超龄门禁/熔断全部阻断、证据必须 exitCode=0、回执不可覆盖、跨轮回执失效、**force 需宿主 allowForceOverride 才生效** |
+| `dsh-audit-trail` | 36 | pre/result 配对、快照与还原、dry-run、符号链接与"回滚点后被改"保护、权限位还原、诚实统计、**轮次从三个事件学习 + since/sinceMinutes 时间回滚** |
+| `dsh-standards-gate` | 22 | 阈值来自仓库（`.dsh/standards.json`）而非插件、基线棘轮（新增/恶化才挡、消除自动收紧、放宽需人工批准）、度量明细与本次 mission 的变胖/变瘦对比、`standards_review` 只读评审的护栏（工具白名单、禁止 orchestrate、maxDepth=1、路径不得逃逸）、项目级覆盖只允许指定键且不重置其它设置 |
+| `dsh-orchestrator` | 59 | 默认六阶段、能力探测、入口/出口门禁（含新鲜度）、回退、熔断 latch + 人工 unblock、断点恢复、只能结算当前阶段、条件边、复盘与跨 run 台账回注、**阶段角色声明 + 可选 autoAdvance** |
+| `test/integration.test.ts` | 3 | **八个插件同宿主跑完整条流水线**（下节） |
 
 跨包集成测试走的路径（任何一处契约漂移都会让它失败）：
 
@@ -52,7 +52,7 @@ DSH_HOME=/tmp/dsh-eng-verify dsh --profile headless "任务"           # 真实�
 
 - `--dump-config` 输出了 7 个 bundle 的行与配置（`role-guard` … `orchestrator`），
   **没有** `duplicate loader entry id` 之类的装配错误。
-- 真实进程启动后，7 个插件的日志各自写出 `applied (...)`，证明 `apply()` 在真实宿主里跑通、
+- 真实进程启动后，8 个插件的日志各自写出 `applied (...)`，证明 `apply()` 在真实宿主里跑通、
   工具注册成功、系统提示段装配成功：
 
 ```
@@ -125,7 +125,7 @@ PASS all 7 plugins logged their own 'applied (' mount line
 → spec_approve → write → write → bash(node --test 真跑) → evidence_record → bash → evidence_record →
 quality_gate_run → mission_complete`。
 
-**诚实的边界**：stub 证明的是**框架路径**（harness 事件与工具链路、七个插件的门禁与钩子），
+**诚实的边界**：stub 证明的是**框架路径**（harness 事件与工具链路、八个插件的门禁与钩子），
 不是模型质量。真实模型会话的验证方式见下一节。
 
 ## 3. 用真实 API key 再验一次（可选）
@@ -231,7 +231,7 @@ STUB_SCRIPT=… STUB_PORT=8787 node scripts/stub-llm.mjs                   # 起
 ```
 
 产物位置：`/tmp/dsh-e2e/{profiles,ws,logs}`；`logs/stub-llm.log` 是桩的请求/决策流水，
-`logs/dsh.log` 是 harness 的 stdout/stderr，`logs/<entry-id>.log` 是七个插件各自的挂载与运行日志。
+`logs/dsh.log` 是 harness 的 stdout/stderr，`logs/<entry-id>.log` 是八个插件各自的挂载与运行日志。
 
 ### 5.4 它断言什么
 
@@ -240,18 +240,18 @@ STUB_SCRIPT=… STUB_PORT=8787 node scripts/stub-llm.mjs                   # 起
 - 审计流水里**恰好一次**失败的工具调用，且必须是审批前那次 `write`——其余全部成功。
   任何别的 `isError: true` 都算回归（这条断言正是为了抓住"bash 沙箱起不来"这种静默降级）。
 - 两个实现文件确实被 `write` 工具写出来（不是脚本自己造的）。
-- 七个插件各自写出 `applied (` 挂载行——文件存在不算证据，挂载行才算。
+- 八个插件各自写出 `applied (` 挂载行——文件存在不算证据，挂载行才算。
 - 桩的期望校验全过（`CHECK previous result matches …`），其中两条挂在 `bash` 步骤上，
   断言 `node --test` 的真实输出含 `pass 1`、`node -e` 的真实输出含 `health status = ok`。
   也就是说：**证据文本是脚本给的，但命令是真的跑了并且真的退出 0**。
 
 ### 5.5 隔离 profile 的关键覆盖与沙箱
 
-- 七个 bundle（role-guard / spec-gate / test-design-gate / quality-gate / evidence-gate /
-  audit-trail / orchestrator）挂进 `dsh.profile.bundles`；`@deepseek-ai` 与套件包都 symlink 进
+- 八个 bundle（role-guard / spec-gate / test-design-gate / quality-gate / evidence-gate /
+  audit-trail / orchestrator / standards-gate）挂进 `dsh.profile.bundles`；`@deepseek-ai` 与套件包都 symlink 进
   `$E2E_HOME/profiles/node_modules`（其余由 launcher 的 `healProfilesModuleFallback` 自愈）。
 - `spec-gate.approval: auto`（headless 没有审批应答方）、`quality-gate.commands` 一条必过命令、
-  七个 `logFile` 全部落在 `$E2E_HOME/logs`（默认值会写 `~/.dsh`，越界）、`session-title-llm` 关闭
+  八个 `logFile` 全部落在 `$E2E_HOME/logs`（默认值会写 `~/.dsh`，越界）、`session-title-llm` 关闭
   （否则会多出一次未脚本化的 LLM 请求）。
 - **沙箱**：脚本默认用 `DSH_PERMISSION_MODE=danger-full-access` 启动子 `dsh`。验证沙箱本身已被
   seatbelt 包住，嵌套 `sandbox-exec` 会 `sandbox_apply: Operation not permitted`，于是 bash 工具

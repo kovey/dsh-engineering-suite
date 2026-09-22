@@ -1659,9 +1659,18 @@ test('the standards gate requires a PASS from this round (regression)', async ()
     const fake = host({
         cwd,
         config: {
+            // The scenario drives several deliberate gate failures; the breaker
+            // blocking the mission mid-test is correct behaviour, not the subject.
+            defaultMaxAttempts: 8,
             stages: [
                 { id: 'build', prompt: '实现', requiredPlugins: [] },
-                { id: 'verify', prompt: '验证结构规范', requiredPlugins: [], gate: 'standards-pass', next: 'done' },
+                {
+                    id: 'verify',
+                    prompt: '验证结构规范',
+                    requiredPlugins: [],
+                    gate: { kind: 'standards-pass', phase: 'exit', label: '规范门禁 PASS' },
+                    next: 'done',
+                },
                 { id: 'done', prompt: '收尾', requiredPlugins: [] },
             ],
         },
@@ -1669,41 +1678,101 @@ test('the standards gate requires a PASS from this round (regression)', async ()
     const store = storeFor(cwd)
     await orchestrate(fake, { action: 'start' })
     const id = missionIdOf(cwd)
-    await orchestrate(fake, { action: 'advance' }) // → verify (entry gate is 'none')
+    await orchestrate(fake, { action: 'advance' }) // → verify (exit gate: entry is unrestricted)
     assert.equal(store.read(id)?.stage, 'verify')
 
-    // No standards record at all → the stage cannot leave.
+    // No standards record at all → the stage cannot leave. A failing EXIT gate
+    // rolls the mission back to `onFail` (its predecessor), the same way a
+    // failing quality-pass gate does — the stage does not silently stay put.
     const blocked = await orchestrate(fake, { action: 'advance', verdict: 'PASS' })
     assert.match(blocked, /没有任何规范门禁记录/)
-    assert.equal(store.read(id)?.stage, 'verify', 'the stage did not move')
+    assert.match(blocked, /回退目标：build/)
+    assert.equal(store.read(id)?.stage, 'build', 'a failed exit gate rolls back')
 
-    // A FAILING standards gate → still blocked, with the reason.
+    // Re-enter `verify` and record a FAILING standards verdict: same story, with
+    // the reason surfaced.
+    await orchestrate(fake, { action: 'advance' })
+    assert.equal(store.read(id)?.stage, 'verify')
     store.recordGate(id, { source: 'dsh-standards-gate', state: 'BLOCK', reason: '新增 3 项违规', results: [] })
     const failing = await orchestrate(fake, { action: 'advance', verdict: 'PASS' })
     assert.match(failing, /新增 3 项违规/)
-    assert.equal(store.read(id)?.stage, 'verify')
+    assert.equal(store.read(id)?.stage, 'build')
 
     // A PASS recorded BEFORE this stage was entered proves nothing about the
-    // current code: the gate must reject it.
-    const earlier = Date.now() - 60_000
-    store.writeStageResult(id, { stageId: 'verify', attempt: 1, state: 'entered', enteredAt: Date.now() })
+    // current code: the gate must reject it. The record order matters — the PASS
+    // has to be the NEWEST record (otherwise the earlier BLOCK decides) while
+    // still predating the stage entry.
+    await orchestrate(fake, { action: 'advance' }) // back into verify
+    const enteredAt = Date.now()
+    store.writeStageResult(id, { stageId: 'verify', attempt: 1, state: 'entered', enteredAt })
     store.recordGate(id, { source: 'dsh-standards-gate', state: 'PASS', reason: '上一轮的 PASS', results: [] })
     const gates = path.join(cwd, '.dsh', 'missions', id, 'gates')
     for (const name of fs.readdirSync(gates)) {
         const file = path.join(gates, name)
         const record = JSON.parse(fs.readFileSync(file, 'utf8'))
-        if (record.source === 'dsh-standards-gate' && record.state === 'PASS') {
-            record.checkedAt = earlier
-            fs.writeFileSync(file, JSON.stringify(record))
-        }
+        if (record.source !== 'dsh-standards-gate') continue
+        record.checkedAt = record.state === 'PASS' ? enteredAt - 60_000 : enteredAt - 120_000
+        fs.writeFileSync(file, JSON.stringify(record))
     }
     const stale = await orchestrate(fake, { action: 'advance', verdict: 'PASS' })
     assert.match(stale, /早于本阶段进入时间/)
-    assert.equal(store.read(id)?.stage, 'verify')
+    assert.equal(store.read(id)?.stage, 'build', 'a stale verdict also rolls back')
 
     // A fresh PASS from this round lets the stage leave.
+    await orchestrate(fake, { action: 'advance' }) // back into verify
     store.recordGate(id, { source: 'dsh-standards-gate', state: 'PASS', reason: '本轮无新增违规', results: [] })
     const passed = await orchestrate(fake, { action: 'advance', verdict: 'PASS' })
     assert.match(passed, /规范门禁 .* PASS/)
     assert.equal(store.read(id)?.stage, 'done')
+})
+
+test('a NEWER standards BLOCK closes the gate again (regression: fail-open)', async () => {
+    // The first version asked for "the newest PASS", so PASS@T1 followed by
+    // BLOCK@T2 still returned ok:true — a later failure could not close a gate
+    // that an earlier pass had opened.
+    disposeHosts()
+    const cwd = tempWorkspace('orchestrator-standards-newest-')
+    const fake = host({
+        cwd,
+        config: {
+            defaultMaxAttempts: 8,
+            stages: [
+                { id: 'build', prompt: '实现', requiredPlugins: [] },
+                {
+                    id: 'verify',
+                    prompt: '验证结构规范',
+                    requiredPlugins: [],
+                    gate: { kind: 'standards-pass', phase: 'exit', label: '规范门禁 PASS' },
+                    next: 'done',
+                },
+                { id: 'done', prompt: '收尾', requiredPlugins: [] },
+            ],
+        },
+    })
+    const store = storeFor(cwd)
+    await orchestrate(fake, { action: 'start' })
+    const id = missionIdOf(cwd)
+    await orchestrate(fake, { action: 'advance' }) // → verify
+    store.writeStageResult(id, { stageId: 'verify', attempt: 1, state: 'entered', enteredAt: Date.now() - 5_000 })
+
+    store.recordGate(id, { source: 'dsh-standards-gate', state: 'PASS', reason: '先通过', results: [] })
+    store.recordGate(id, { source: 'dsh-standards-gate', state: 'BLOCK', reason: '后来又有新增违规', results: [] })
+    const blocked = await orchestrate(fake, { action: 'advance', verdict: 'PASS' })
+    assert.match(blocked, /最近一次规范门禁是 BLOCK/)
+    assert.match(blocked, /后来又有新增违规/)
+    assert.equal(store.read(id)?.stage, 'build', 'a newer failure must not be ignored (it rolls back)')
+
+    // …and the same-millisecond tie is stale (fail closed), like quality-pass.
+    const enteredAt = Date.now()
+    store.writeStageResult(id, { stageId: 'verify', attempt: 1, state: 'entered', enteredAt })
+    const gateId = store.recordGate(id, { source: 'dsh-standards-gate', state: 'PASS', reason: '同毫秒', results: [] }).id
+    const gatesDir = path.join(cwd, '.dsh', 'missions', id, 'gates')
+    const file = path.join(gatesDir, `${gateId}.json`)
+    const record = JSON.parse(fs.readFileSync(file, 'utf8'))
+    record.checkedAt = enteredAt
+    fs.writeFileSync(file, JSON.stringify(record))
+    await orchestrate(fake, { action: 'advance' }) // back into verify
+    const tie = await orchestrate(fake, { action: 'advance', verdict: 'PASS' })
+    assert.match(tie, /同一毫秒/)
+    assert.equal(store.read(id)?.stage, 'build')
 })

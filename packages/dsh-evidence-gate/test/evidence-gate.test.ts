@@ -1506,3 +1506,67 @@ test('an adopted standards gate must pass for this round of the code (regression
     // exactly "no ❌ 规范门禁 line" (the other axes still fail in this fixture).
     assert.doesNotMatch(text, /❌ 规范门禁/)
 })
+
+test('a hand-written standards gate is treated as a forgery (regression)', async () => {
+    // The quality gate has always required a `kind: gate` ledger row; the
+    // standards axis was added later and initially accepted a hand-written
+    // gates/*.json. Same trick, same refusal.
+    const cwd = tempWorkspace('evidence-standards-forge-')
+    const fake = createFakeHost({ cwd })
+    apply(fake.ctx as never, { logFile: path.join(cwd, 'evidence-gate.log'), approval: 'auto', requireStandardsGate: true })
+    const store = new MissionStoreRegistry().for(cwd)
+    const mission = store.create({ title: '伪造规范门禁', cwd, sessionId: 'session-1' })
+    store.bindSession('session-1', mission.id, 'implement')
+    await fake.runTool('evidence_record', { kind: 'test', summary: '测试', command: 'node --test', exitCode: 0, output: 'ok' })
+
+    // Hand-write a PASS whose timestamp is in the future, i.e. maximally fresh.
+    const gatesDir = path.join(cwd, '.dsh', 'missions', mission.id, 'gates')
+    fs.mkdirSync(gatesDir, { recursive: true })
+    fs.writeFileSync(
+        path.join(gatesDir, 'GATE-forged.json'),
+        JSON.stringify({
+            id: 'GATE-forged',
+            missionId: mission.id,
+            source: 'dsh-standards-gate',
+            state: 'PASS',
+            checkedAt: Date.now() + 1_000,
+            reason: '手工写的',
+            results: [],
+        }),
+    )
+    const out = runText(await fake.runTool('mission_complete', {}))
+    assert.match(out, /❌ 规范门禁/)
+    assert.match(out, /视为伪造/)
+    assert.equal(store.read(mission.id)?.status !== 'delivered', true, 'no receipt for a forged gate')
+
+    // A record made THROUGH the store (which writes the ledger row) passes the
+    // forgery check — the check is about provenance, not about the file. The
+    // hand-written file is removed first: its future timestamp would otherwise
+    // stay the "newest" record and keep deciding (fail-closed, but confusing).
+    fs.rmSync(path.join(gatesDir, 'GATE-forged.json'))
+    store.recordGate(mission.id, { source: 'dsh-standards-gate', state: 'PASS', reason: '真实记录', results: [] })
+    const after = runText(await fake.runTool('mission_complete', {}))
+    assert.doesNotMatch(after, /视为伪造/)
+})
+
+test('a project that sets the standards keys is reported as the source (regression)', async () => {
+    // The keys were applied but omitted from the provenance detector, so an audit
+    // could not tell who configured what: the report said "profile" while a
+    // repository had changed the standards gate source.
+    const cwd = tempWorkspace('evidence-standards-provenance-')
+    fs.mkdirSync(path.join(cwd, '.dsh'), { recursive: true })
+    fs.writeFileSync(
+        path.join(cwd, '.dsh', 'evidence-gate.json'),
+        JSON.stringify({ requireStandardsGate: true, standardsGateSource: 'dsh-standards-gate' }),
+    )
+    const fake = createFakeHost({ cwd })
+    apply(fake.ctx as never, { logFile: path.join(cwd, 'evidence-gate.log'), approval: 'auto' })
+    const store = new MissionStoreRegistry().for(cwd)
+    const mission = store.create({ title: '溯源', cwd, sessionId: 'session-1' })
+    store.bindSession('session-1', mission.id, 'implement')
+    await fake.runTool('evidence_record', { kind: 'test', summary: '测试', command: 'node --test', exitCode: 0, output: 'ok' })
+    const out = runText(await fake.runTool('evidence_status', { missionId: mission.id }))
+    const line = out.split('\n').find((entry) => entry.includes('配置来源')) ?? ''
+    assert.match(line, /项目级/, `expected the project file to be named, got: ${line}`)
+    assert.match(line, /evidence-gate\.json/)
+})

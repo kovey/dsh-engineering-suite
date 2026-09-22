@@ -11,7 +11,7 @@
  * @module dsh-spec-gate/guard
  */
 
-import { isInside, pathMatchesAny, pathMatchesPattern, resolvePath, type MissionStore, type MissionStoreRegistry } from 'dsh-eng-core'
+import { isInside, isReallyInside, pathMatchesAny, pathMatchesPattern, resolvePath, type MissionStore, type MissionStoreRegistry } from 'dsh-eng-core'
 import path from 'node:path'
 import type { AgentLike } from 'dsh-eng-core'
 import { evaluateConstraints, type ConstraintViolation } from './constraints.js'
@@ -151,7 +151,11 @@ export function createWriteGuard(deps: WriteGuardDeps): WriteGuard {
         // approval and the gate approves itself.
         for (const declared of gated ? declaredTargets : []) {
             const resolved = resolvePath(declared, cwd)
-            if (!isInside(store.layout.rootDir, resolved)) continue
+            // Containment is checked on the REAL path: a symlink inside the
+            // workspace pointing into `.dsh/` would otherwise pass a lexical
+            // check while the bytes land in the trust root (the model could
+            // rewrite its own thresholds or baseline through `link/x.json`).
+            if (!isReallyInside(store.layout.rootDir, resolved, cwd)) continue
             // The rendered specification is derived and is the one artifact the
             // gate may let through without an approval; everything else under
             // the root is the trust root and stays closed.

@@ -30,8 +30,10 @@ export interface StandardsGateConfig {
     /** Repository-owned baseline (accepted violations), relative to the workspace. */
     baselineFile: string
     /**
-     * `gate` records a PASS/BLOCK verdict on the mission (the default: this is a
-     * gate), `warn` reports without recording, `off` measures only when asked.
+     * `gate` (default) records a PASS/BLOCK verdict on the mission.
+     * `warn` records at most a WARN — new violations are reported but never
+     * block a delivery, which is what a host asking for "report only" means.
+     * `off` records nothing at all.
      */
     enforce: EnforceMode
     /** Bound on files walked in one measurement. */

@@ -189,6 +189,11 @@ info "profile: $E2E_HOME/profiles/$PROFILE (bundles: ${SUITE[*]})"
 # ---------------------------------------------------------------------------
 # 3. the scripted model
 # ---------------------------------------------------------------------------
+# Logs are evidence, so they must not survive a previous run: under `--keep`
+# the profile/workspace are reused, and a stale `applied (` line would satisfy
+# the mount check below even if a plugin failed to load this time.
+rm -f "$LOGS"/*.log
+
 section "3/6 scripted model"
 cat > "$E2E_HOME/script.json" <<'JSON'
 {

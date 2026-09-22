@@ -91,12 +91,12 @@ const { added, known, fixed } = compareToBaseline(result.violations, parseBaseli
 | 度量项 | Go | TS/JS | Python |
 |---|---|---|---|
 | `lines` | 全文行数（无尾换行的最后一行也算；空文件 0 行） | 同左 | 同左 |
-| `functions` | `func Name(` 与 `func (r *T) m(`（名字为 `T.m`） | `function name`、类方法（`Class.method`）、`const/let/var name = (…) => …` / `= function (…)` | 顶层与嵌套 `def`/`async def`，名字带限定（`Class.method`、`outer.inner`），单行 `def f(): pass` 也计入 |
+| `functions` | `func Name(` 与 `func (r *T) m(`（名字为 `T.m`） | `function name`、类方法（`Class.method`）、`const/let/var name = (…) => …` / `= function (…)`；名字与 `(` 之间的 `<T,>` 类型参数列表允许存在，被括号或类型断言包一层的箭头（`const f = ((a, b) => c) as T`）按内层参数列表算 | 顶层与嵌套 `def`/`async def`，名字带限定（`Class.method`、`outer.inner`），单行 `def f(): pass` 也计入 |
 | `functions[].lines` | 声明行 → 函数体闭合 `}` | 块体同上；表达式体（`=> expr`）近似取语句结束行 | 声明行 → 缩进块最后一行 |
 | `functions[].depth` | 函数体内达到的最大花括号深度（函数体本身算 1 层） | 同左 | 函数体内相对缩进层数（`def` 自身那层不算） |
 | `functions[].params` | 顶层逗号计数：`(a, b string)`=2、`(opts)`=1、`()`=0、尾逗号不算 | 同上；`Map<string, number>` 这类泛型里的逗号不算 | 同上（`self` 计入） |
 | `maxDepth` | 文件最大花括号嵌套（顶层函数体=1） | 同左 | 文件最大缩进层级 |
-| `ifBlocks` | `if`/`else if`/`else` 各自一条，含起止行数；没有块的单行 `if` 不记 | 同左 | `if`/`elif` → `if`，`else` → `else`；`if x: return` 这类无块单行不记 |
+| `ifBlocks` | `if`/`else if`/`else` 各自一条，含起止行数；**表头是解析出来的，不是猜的**：TS/JS 要求括号条件，取配对的 `)` 之后第一个非空字符，只有 `{` 才算块；Go 无需括号，取同一逻辑行上括号深度 0 的 `{`（`if *flag {`、`if &x != nil {`、`if 1 < 2 {`、`if v := []T{1}; ok {`、`if a &&\n b {` 都能认出），条件里 init 语句的复合字面量不算块。**没有块的单语句 `if` 一行都不记**，所以它绝不会把后面某个无关的 `{` 当成自己的块。单个表头的扫描上界为 **20 行**（真实表头最长的也只有 2–3 行，含换行的复合字面量也够） | 同左 | `if`/`elif` → `if`，`else` → `else`；`if x: return` 这类无块单行不记 |
 | `exports` | 顶层 `func`/`type`/`var`/`const` 首字母大写者（方法也算，`var (`/`const (`/`type (` 分组逐个计） | `export` 声明：`export { a, b }` 计 2，`export const a = 1, b = 2` 计 2，`export *` 计 1，`export default` 计 1 | 顶层不带下划线前缀的名字；有 `__all__` 时**再加上**其中的条目数 |
 | `imports` | `go.mod` 的 module 前缀命中的导入 → 工作区相对**目录** | 只解析 `./`、`../`，按 `.ts/.tsx/.js/.mjs/.cjs`、`/index.*` 依次试探 → 命中**文件** | `from .x import y`（按点数回退目录）与工作区内存在的顶层包 → 目录或 `.py` 文件 |
 | `layers` | 某层文件导入了「不在本层、也不在任何 `mayImport` 前缀下」的工作区路径 → 每条导入一条违规 | 同左 | 同左 |
@@ -107,7 +107,14 @@ const { added, known, fixed } = compareToBaseline(result.violations, parseBaseli
 违规按 `key = rule|path|label` 排序并保证唯一（同一函数里第二个超长 `if` 块的 key 会带 `#L<行号>`）——基线棘轮
 绝不能「接受」一条它没见过的新违规。
 
-边界与保证：遍历直接复用 `scan.ts` 的 `walkWorkspace`——同样的默认忽略目录、`maxFiles`（默认 4000）、
+边界与保证：遍历直接复用 `scan.ts` 的 `walkWorkspace`，忽略目录分两类——
+`node_modules`、`.git`、`.dsh`、`.gocache`、`.cache`、`__pycache__`、`.venv`、`.pnpm-store`、`.gradle`、`.m2`、
+`.next`、`.nuxt`、`.turbo`、`.parcel-cache`、`.pytest_cache`、`.mypy_cache`、`.ruff_cache`、`.tmp`
+这些**工具链 / VCS / 缓存目录在任何深度都忽略**（`.gocache/mod/…` 里那份仓库内 module cache 就是这样挡掉的）；
+而 `dist`、`build`、`coverage`、`target`、`vendor` 这类**「可能是产物、也可能是真源码」的名字只在工作区根目录（深度 1）忽略**：
+`src/build/render.go`、`pkg/coverage/report.go`、`deep/target/gen.go` 都照常被测、也照常出现在 `stats` 里（以前它们被静默跳过，
+项目因此只被查了一半）。代价同样写清楚：monorepo 里 `packages/*/dist/` 这类**每包产物目录会重新被测量**，
+这种仓库应在自己的 standards 里写 `exempt: ['**/dist/**']`。其余边界：`maxFiles`（默认 4000）、
 `maxFileBytes`（默认 256 KiB）、不跟随目录符号链接；超大/不可读文件跳过（不计入 `files`，但计入
 `stats.filesScanned`），畸形文件**尽力测量、绝不抛异常**（参数列表未闭合的 `func`/`def` 直接不产出符号）。
 `exempt` 命中「整条路径」（`**` 可跨目录，`*` 不跨；`vendor` 这种裸目录名不匹配任何文件，要写 `vendor/**`）：
@@ -117,15 +124,18 @@ const { added, known, fixed } = compareToBaseline(result.violations, parseBaseli
 
 不做的事（词法度量，不是编译器）：注释与字符串会被整体屏蔽（含 `//`、`/* */`、Go 反引号原始串、Python 三引号、
 TS 模板串），TS/JS 的正则字面量按「`/` 出现在运算符/开括号/逗号之后」识别并整段屏蔽；但不解析表达式、
-不做类型推断。因此：不计量泛型类型参数、装饰器、匿名函数/箭头（`export default () => {}`、`x => y` 无名字）、
+不做类型推断。因此：不把泛型类型参数计成**值**参数（`function id<T>(v: T)` 是 1 个参数，函数本身照常计入）、
+不计量装饰器、匿名函数/箭头（`export default () => {}`、`x => y` 无名字）、
 对象字面量里的方法、Go 的匿名 `func` 字面量、Python 的 lambda；TS 的 `import { … }` 具名导入与对象字面量
 会计入花括号深度；Python 的续行（括号未闭合或行尾 `\`）不参与嵌套层级计算，单行复合语句只算它自己那一层。
 
 真仓库抽样（2026-09，`maxFileLines 400 / maxFunctionLines 80 / maxDepth 4 / maxIfBlockLines 20`）：
 `~/workspace/golang/im` 测得 113 个 Go 文件（仓库另有 945 个 `.gocache/mod` 内的依赖 `.go`，被默认忽略目录挡掉）、
-1639 个函数、3133 个 `if` 块，违规 maxFileLines 22 / maxFunctionLines 29 / maxDepth 13；
-`~/workspace/golang/spider` 测得 17 个 Go 文件、171 个函数、567 个 `if` 块，违规 4 / 12 / 8 / 3。
+1639 个函数、3138 个 `if` 块、1810 个导出，违规 maxFileLines 22 / maxFunctionLines 29 / maxDepth 13；
+`~/workspace/golang/spider` 测得 17 个 Go 文件、171 个函数、571 个 `if` 块、121 个导出，违规 4 / 12 / 8 / 3。
 抽查 `internal/spider/spider.go`（455 行、12 个函数）与 `Run`（69→153 行 = 85 行）逐一对得上。
+这三个数（`if` 块、导出、函数）都用独立预言机核对过：`go/ast` 逐块比对两个 Go 仓库（571/571 与 3138/3138 完全一致，
+超 20 行的块 3/3 一致），TypeScript 编译器 API 逐符号比对本仓库的 TS 文件。
 
 ## 协作契约（不要改这些名字）
 

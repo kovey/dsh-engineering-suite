@@ -1543,3 +1543,29 @@ test('the drafting child can be routed to a cheaper model (regression)', async (
         'no configured route → no agentOptions, the child uses the session model',
     )
 })
+
+test('the trust root survives a symlink (regression: SECURITY)', async () => {
+    // Found by an adversarial audit: containment was lexical, so
+    // `evil.txt -> .dsh/standards-baseline.json` let a write-class tool land
+    // bytes inside the trust root while the path looked innocent. Everything
+    // under `.dsh/**` decides whether a write is allowed, so this cannot hold.
+    const cwd = tempWorkspace('spec-gate-symlink-')
+    const fake = createFakeHost({ cwd })
+    apply(fake.ctx as never, { logFile: path.join(cwd, 'spec-gate.log') })
+    fs.mkdirSync(path.join(cwd, '.dsh'), { recursive: true })
+    fs.writeFileSync(path.join(cwd, '.dsh', 'standards.json'), '{"languages":{}}\n')
+    fs.symlinkSync(path.join(cwd, '.dsh', 'standards.json'), path.join(cwd, 'evil.json'))
+    fs.mkdirSync(path.join(cwd, 'sub'), { recursive: true })
+    fs.symlinkSync(path.join(cwd, '.dsh'), path.join(cwd, 'sub', 'link'))
+
+    for (const target of ['evil.json', 'sub/link/standards.json', './sub/../evil.json']) {
+        const reason = fake.guardReason({ name: 'write', arguments: { file_path: target }, agent: fake.agent })
+        assert.ok(reason !== undefined, `writing through ${target} must be denied`)
+        assert.match(reason, /工程台账|信任根/)
+    }
+    // The check must not deny everything: an ordinary path is not refused FOR
+    // BEING the trust root (this fixture has no approved spec, so the write is
+    // refused for that separate, expected reason).
+    const ordinary = fake.guardReason({ name: 'write', arguments: { file_path: 'src/ok.ts' }, agent: fake.agent })
+    assert.doesNotMatch(ordinary ?? '', /工程台账|信任根/)
+})

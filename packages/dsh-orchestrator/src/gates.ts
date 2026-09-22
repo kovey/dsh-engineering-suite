@@ -157,40 +157,52 @@ function evaluateFacts(gate: GateSpec, facts: GateFacts): GateOutcome {
         }
         case 'standards-pass': {
             // Structural quality is a separate concern from "the commands pass",
-            // so it is a separate gate: the newest `dsh-standards-gate` record
-            // must be PASS and must not predate this stage entry (a verdict from
-            // an earlier round proves nothing about the code as it stands now).
-            const acceptable = facts.store.lastGate(facts.mission.id, { source: 'dsh-standards-gate', state: 'PASS' })
+            // so it is a separate gate. Two fail-closed rules, both learned from
+            // an audit of the first version:
+            //  * the NEWEST record of this source decides. Picking the newest PASS
+            //    meant PASS@T1 then BLOCK@T2 still opened the gate — a later
+            //    failure has to close it again;
+            //  * a verdict recorded in the SAME millisecond as the stage entry is
+            //    treated as stale (`<=`), exactly like `quality-pass`, because a
+            //    tie cannot prove the verdict covers this round.
             const latest = facts.store.lastGate(facts.mission.id, { source: 'dsh-standards-gate' })
-            if (acceptable === undefined) {
+            if (latest === undefined) {
                 return {
                     ok: false,
-                    state: latest?.state ?? 'BLOCK',
-                    detail:
-                        latest === undefined
-                            ? `mission ${facts.mission.id} 没有任何规范门禁记录（先跑 standards_check）`
-                            : `最近一次规范门禁是 ${latest.state}（${latest.reason}）`,
+                    state: 'BLOCK',
+                    detail: `mission ${facts.mission.id} 没有任何规范门禁记录（先跑 standards_check）`,
                     fix: '调用 standards_check：新增违规要改代码消除；存量债务需要放宽时走人工批准（standards_check({ accept: true })）。',
+                }
+            }
+            if (latest.state !== 'PASS') {
+                return {
+                    ok: false,
+                    state: latest.state,
+                    detail: `最近一次规范门禁是 ${latest.state}（${latest.id} @ ${formatTime(latest.checkedAt)}：${latest.reason}）`,
+                    fix: '调用 standards_check 消除新增/恶化的违规，再推进本阶段。',
                 }
             }
             const enteredAt = facts.current?.enteredAt
             if (enteredAt === undefined) {
                 return {
                     ok: false,
-                    state: acceptable.state,
-                    detail: `无法确认本阶段的进入时间，因此无法证明规范门禁 ${acceptable.id} 覆盖了这一轮的代码`,
+                    state: latest.state,
+                    detail: `无法确认本阶段的进入时间，因此无法证明规范门禁 ${latest.id} 覆盖了这一轮的代码`,
                     fix: '用 orchestrate({ action: "rerun", stageId: "<当前阶段>" }) 重新进入该阶段并重跑 standards_check。',
                 }
             }
-            if (acceptable.checkedAt < enteredAt) {
+            if (latest.checkedAt <= enteredAt) {
                 return {
                     ok: false,
-                    state: acceptable.state,
-                    detail: `规范门禁 ${acceptable.id}（${formatTime(acceptable.checkedAt)}）早于本阶段进入时间（${formatTime(enteredAt)}）：它证明的是上一轮的代码`,
+                    state: latest.state,
+                    detail:
+                        latest.checkedAt === enteredAt
+                            ? `规范门禁 ${latest.id} 与本阶段进入时间记录在同一毫秒（${formatTime(enteredAt)}）：无法证明它覆盖了这一轮的代码，按陈旧处理`
+                            : `规范门禁 ${latest.id}（${formatTime(latest.checkedAt)}）早于本阶段进入时间（${formatTime(enteredAt)}）：它证明的是上一轮的代码`,
                     fix: '重新调用 standards_check 后再推进本阶段。',
                 }
             }
-            return { ok: true, state: 'PASS', detail: `规范门禁 ${acceptable.id} PASS（${formatTime(acceptable.checkedAt)}，晚于本阶段进入时间）` }
+            return { ok: true, state: 'PASS', detail: `规范门禁 ${latest.id} PASS（${formatTime(latest.checkedAt)}，晚于本阶段进入时间）` }
         }
         case 'receipt': {
             const receipts = facts.store.readReceipts(facts.mission.id)

@@ -1,3 +1,4 @@
+import fs from 'node:fs'
 /**
  * Path resolution for the engineering workspace layout.
  *
@@ -153,6 +154,46 @@ export function snapshotDir(layout: Layout, turnKey: string): string {
 export function isInside(root: string, target: string): boolean {
     const relative = path.relative(path.resolve(root), path.resolve(target))
     return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative))
+}
+
+/**
+ * Resolve the REAL path a write would land on, without requiring it to exist.
+ *
+ * `isInside` compares lexical paths, so a symlink inside a workspace pointing at
+ * a protected directory defeats any containment check built on it: `evil.txt ->
+ * .dsh/standards-baseline.json` resolves to a path outside the trust root
+ * lexically while the bytes land inside it. This walks the existing part of the
+ * path through `realpathSync` and appends the unresolved tail, which is the
+ * standard way to answer "where would this write actually go".
+ *
+ * Never throws: an unresolvable component (or a loop) leaves that part as-is, so
+ * the caller's containment check still sees the lexical path.
+ * @param target - absolute or relative path.
+ * @param cwd - base for a relative path.
+ * @returns the real path of the deepest existing ancestor, plus the remainder.
+ */
+export function realTargetOf(target: string, cwd?: string): string {
+    const absolute = resolvePath(target, cwd ?? process.cwd())
+    const parts = absolute.split(path.sep)
+    let resolved = path.isAbsolute(absolute) ? path.sep : ''
+    const rest: string[] = []
+    for (let index = path.isAbsolute(absolute) ? 1 : 0; index < parts.length; index += 1) {
+        const part = parts[index] as string
+        const candidate = resolved === '' ? part : path.join(resolved, part)
+        try {
+            resolved = fs.realpathSync(candidate)
+        } catch {
+            // Not existing yet (a write creates it) or unreadable: keep the
+            // unresolved tail and let the caller compare lexically.
+            rest.push(part)
+        }
+    }
+    return rest.length === 0 ? resolved : path.join(resolved, ...rest)
+}
+
+/** Whether `target` would land inside `root` after resolving symlinks. */
+export function isReallyInside(root: string, target: string, cwd?: string): boolean {
+    return isInside(realTargetOf(root), realTargetOf(target, cwd))
 }
 
 /** Normalise a path or pattern to POSIX form without a leading `./`. */
