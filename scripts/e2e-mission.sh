@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # e2e-mission.sh — run the REAL dsh harness against a SCRIPTED local model and
-# assert that the eight-plugin engineering suite actually produced its
+# assert that the eleven-plugin engineering suite actually produced its
 # artifacts.
 #
 # Why: the suite had never been verified with a live agent loop (no
@@ -49,6 +49,9 @@ PERMISSION_MODE="${E2E_PERMISSION_MODE:-danger-full-access}"
 SUITE=(
   dsh-role-guard
   dsh-standards-gate
+  dsh-impact-gate
+  dsh-coverage-gate
+  dsh-supply-chain-gate
   dsh-spec-gate
   dsh-test-design-gate
   dsh-quality-gate
@@ -176,6 +179,15 @@ cat > "$E2E_HOME/profiles/$PROFILE/cordis.patch.yml" <<YAML
 # `requireStandardsGate` stays false, so the delivery flow is unchanged).
 - id: standards-gate
   config: { logFile: '$LOGS/standards-gate.log' }
+
+# Change impact / test effectiveness / supply chain: mounted so the harness proves
+# they assemble in a live host. None of them acts unless a tool is called.
+- id: impact-gate
+  config: { logFile: '$LOGS/impact-gate.log', testCommandTemplate: 'go test {files}' }
+- id: coverage-gate
+  config: { logFile: '$LOGS/coverage-gate.log' }
+- id: supply-chain-gate
+  config: { logFile: '$LOGS/supply-chain-gate.log' }
 YAML
 
 # Module resolution: the shipped @deepseek-ai packages come from the real
@@ -207,7 +219,7 @@ cat > "$E2E_HOME/script.json" <<'JSON'
       "tool": "spec_create",
       "arguments": {
         "title": "为 scratch 工作区添加 health 模块",
-        "background": "端到端验证：真实 harness + 脚本化模型，证明八个插件在活会话里工作。",
+        "background": "端到端验证：真实 harness + 脚本化模型，证明十一个插件在活会话里工作。",
         "requirements": [
           "src/health.mjs 导出 health()，返回 { status: 'ok' }",
           "test/health.test.mjs 用 node --test 覆盖 health()"
@@ -544,7 +556,7 @@ fi
 # ---------------------------------------------------------------------------
 section "summary"
 if [ "$FAILURES" = "0" ]; then
-  printf '  \033[32mE2E GREEN\033[0m — the eight plugins ran a real mission in a live dsh session.\n'
+  printf '  \033[32mE2E GREEN\033[0m — the eleven plugins ran a real mission in a live dsh session.\n'
   printf '  artifacts: %s\n' "$DOT"
   printf '  logs:      %s\n' "$LOGS"
   exit 0

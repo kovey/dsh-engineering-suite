@@ -1,5 +1,5 @@
 /**
- * End-to-end contract test: all seven plugins mounted in ONE host, walking a
+ * End-to-end contract test: every plugin mounted in ONE host, walking a
  * mission from "spec clarification" to a signed receipt.
  *
  * This is the test that fails when the cross-plugin contract drifts — tool
@@ -14,6 +14,10 @@ import { MissionStoreRegistry } from 'dsh-eng-core'
 import { createFakeHost, runText, tempWorkspace, type FakeHost } from 'dsh-eng-core/testing'
 
 import { apply as applyAudit } from '../packages/dsh-audit-trail/dist/index.js'
+import { apply as applyCoverage } from '../packages/dsh-coverage-gate/dist/index.js'
+import { apply as applyImpact } from '../packages/dsh-impact-gate/dist/index.js'
+import { apply as applyStandards } from '../packages/dsh-standards-gate/dist/index.js'
+import { apply as applySupplyChain } from '../packages/dsh-supply-chain-gate/dist/index.js'
 import { apply as applyEvidence } from '../packages/dsh-evidence-gate/dist/index.js'
 import { apply as applyOrchestrator } from '../packages/dsh-orchestrator/dist/index.js'
 import { apply as applyQuality } from '../packages/dsh-quality-gate/dist/index.js'
@@ -68,6 +72,14 @@ function suite(): Suite {
     applyRoleGuard(fake.ctx as never, { logFile: log('role-guard') })
     applyAudit(fake.ctx as never, { logFile: log('audit-trail') })
     applyOrchestrator(fake.ctx as never, { logFile: log('orchestrator') })
+    // The four newest plugins mount here too: this test is what catches a
+    // cross-package contract drifting (a renamed service, a changed event shape,
+    // a tool list that no longer lines up) — with seven of eleven mounted it
+    // silently stopped covering the rest.
+    applyStandards(fake.ctx as never, { logFile: log('standards-gate') })
+    applyImpact(fake.ctx as never, { logFile: log('impact-gate'), testCommandTemplate: 'go test {files}' })
+    applyCoverage(fake.ctx as never, { logFile: log('coverage-gate') })
+    applySupplyChain(fake.ctx as never, { logFile: log('supply-chain-gate') })
     return { fake, steers, stores: new MissionStoreRegistry().for(cwd) }
 }
 

@@ -1,0 +1,47 @@
+{
+  "name": "dsh-supply-chain-gate",
+  "version": "0.1.0",
+  "description": "Supply-chain and secret gate for DeepSeek Harness: detect committed secrets (regex + entropy, changed lines only by default) and gate new/unreviewed dependencies and known-vulnerable ones, as deterministic PASS/WARN/BLOCK records with redacted evidence.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist/",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "license": "Apache-2.0",
+  "engines": {
+    "node": "^22.19 || >=24"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "plugin",
+    "supply-chain",
+    "secrets",
+    "gate"
+  ],
+  "dependencies": {
+    "dsh-eng-core": "workspace:*"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/dsh-agent": "^0.1.5-rc.2",
+    "@deepseek-ai/dsh-subprocess": "^0.1.5-rc.2",
+    "@deepseek-ai/dsh-tools": "^0.1.5-rc.2"
+  },
+  "dsh": {
+    "runtime": "host",
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

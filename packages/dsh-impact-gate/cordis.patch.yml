@@ -1,0 +1,20 @@
+# dsh-impact-gate bundle patch.
+#
+# `insert` is pure-append and the loader rejects duplicate entry ids, so the row
+# uses the plugin's short id (`impact-gate`) — a profile overrides parameters
+# with a top-level `- id: impact-gate` + `config:` block.
+#
+# `testCommandTemplate` is deliberately EMPTY. Every other plugin in this suite
+# refuses to guess a command it does not own; here the guess would be worst:
+# `go test {files}` in a pnpm repository renders a plausible command that tests
+# nothing. Empty means "the host has not configured a runner", and `impact_tests`
+# then refuses with the exact next step instead of inventing one.
+- insert:
+    - id: impact-gate
+      name: 'dsh-impact-gate'
+      config:
+        enabled: true
+        logFile: '~/.dsh/impact-gate.log'
+        defaultBase: HEAD
+        maxDistance: 6
+        testCommandTemplate: ''

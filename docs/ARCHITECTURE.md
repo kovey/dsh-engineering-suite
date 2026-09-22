@@ -331,6 +331,40 @@ GateRecord(source: dsh-standards-gate) → 交付侧可要求"最新一条 PASS 
 于是流程自动回到 `test_design_review` → `spec_approve`，`spec-approved` 阶段门禁重新生效——
 这就是"按标准流程"在代码里的含义。
 
+### 5.9 变更影响分析（`dsh-impact-gate`）：把"改这里会影响谁"变成事实
+
+模型读代码猜影响面，是不可复核的。改成从**导入图**算：
+
+```
+git diff -U0（或显式 paths）→ 变更文件 + 新增行范围
+      ↓ 反向传递闭包（Go 的包目录 import、TS 相对路径、Python 包）
+受影响文件（按距离，带"经由谁"）+ 测试选择（changed > imports-changed > same-package > name-match）
+      ↓ 风险分级（扇入 ≥8 / 影响面 ≥25 / 导出面 ≥15 → high；无测试覆盖 → high）
+artifact + 证据行（kind=artifact）
+```
+
+真机校准（`golang/im`）：改 `internal/storage/mysql/repos.go` → 1522 条导入边、影响面 9 个文件、
+选中 8 个测试文件（`mysql_test.go`/`config_test.go`/`test/e2e/*`/parity 测试），与 `grep` 对账一致
+（grep 反而会误命中架构测试里的字符串规则表）。**它会明确写出自己看不见什么**：接口分派、依赖注入、
+反射、字符串查表都不是静态可判的——最小回归集是"必要"不是"充分"。
+
+### 5.10 测试有效性（`dsh-coverage-gate`）：覆盖率、增量覆盖率与 flaky
+
+其他门禁问"测试过了吗"，它问"测试有用吗"：解析 lcov / cobertura / go-cover / istanbul-json，
+按阈值判总分与**本次新增行**的覆盖（真机：`golang/spider` 的 `go test -coverprofile` → 205 语句 / 157 命中 = 76.6%，
+增量判定把 45 行新增里的 41 行纳入判定、列出 4 行"未插桩不可判"），以及重复执行检测 flaky
+（按用例名归因，runner 不报名字时如实降级为"运行级"，并按策略 BLOCK/WARN/仅报告）。
+**不判**：报告没插桩的行（单独列出，绝不算 0% 或 100%）、非 git 工作区里的"增量阈值"（直接 BLOCK）、
+把覆盖率当正确性。
+
+### 5.11 供应链与密钥（`dsh-supply-chain-gate`）：能不能上生产的硬门槛
+
+默认只扫**本次改动新增的行**（"这次改动有没有引入"），11 条规则 + 熵检测 + 仓库自有 allowlist；
+清单 diff 找出新增依赖并要求**人工批准**（拒绝/无通道 → BLOCK）；宿主配置的审计命令按 argv 执行、
+按 severity 阻断；孤儿锁文件变更（锁文件动了而声明没动）也 BLOCK。
+严重度分级是**真机逼出来的**：初版"任何命中即阻断"在 `golang/im` 上产生 461 条命中（几乎全是文档里的 base64），
+这种门禁会被立刻关掉——现在只有已知凭据形状阻断，熵检测按上下文降为建议级（复测：阻断级 0 命中）。
+
 ## 6. 为什么这样切分
 
 - **一个关注点一个插件**：门禁可以单独失效（例如先只上 quality-gate），不影响其它环节。

@@ -1,0 +1,24 @@
+# dsh-coverage-gate bundle patch.
+#
+# `insert` is pure-append and the loader rejects duplicate entry ids, so the row
+# uses the plugin's short id (`coverage-gate`) — a profile overrides parameters
+# with a top-level `- id: coverage-gate` + `config:` block.
+#
+# `thresholds` is deliberately EMPTY here: a gate with no threshold has nothing
+# to judge, so `coverage_check` refuses instead of passing on a plugin default.
+# The host sets the numbers, and a repository may refine them through
+# `<repo>/.dsh/coverage-gate.json` — but only which command produces the report
+# and where it lives is really repository-specific. `flakyPolicy` is host-only:
+# "a flaky suite may still deliver" is a host policy, not something a repository
+# grants itself.
+- insert:
+    - id: coverage-gate
+      name: 'dsh-coverage-gate'
+      config:
+        enabled: true
+        logFile: '~/.dsh/coverage-gate.log'
+        reportFormat: auto
+        flakyPolicy: block
+        flakyRepeats: 3
+        commandTimeoutMs: 300000
+        maxOutputBytes: 64000

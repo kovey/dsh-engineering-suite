@@ -1,0 +1,26 @@
+# dsh-supply-chain-gate bundle patch.
+#
+# `insert` is pure-append and the loader rejects duplicate entry ids, so the row
+# uses the plugin's short id (`supply-chain-gate`) — a profile overrides
+# parameters with a top-level `- id: supply-chain-gate` + `config:` block.
+#
+# The secret RULES are code (deterministic, reviewable, shipped with the
+# plugin); the audit COMMANDS are not: only the host knows which auditor a
+# repository's ecosystem has installed. `auditCommands: []` therefore means
+# "audit nothing", which the tool reports as WARN — never as a clean PASS.
+- insert:
+    - id: supply-chain-gate
+      name: 'dsh-supply-chain-gate'
+      config:
+        enabled: true
+        logFile: '~/.dsh/supply-chain-gate.log'
+        secretScan:
+          enabled: true
+          entropyThreshold: 4.0
+          maxFileBytes: 1048576
+          allowlistFile: .dsh/secret-allow.json
+          scanWholeTree: false
+        deps:
+          enabled: true
+          requireApprovalForNewDeps: true
+          auditCommands: []
