@@ -20,6 +20,8 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import {
     ensureDir,
     formatTime,
+    normalizeApprovalReply,
+    type ApprovalLike,
     gitFingerprint,
     measureWorkspace,
     readJson,
@@ -45,15 +47,13 @@ const TEXT_OUTPUT = { type: 'string' } as const
 /** How many file sizes one measurement artifact stores (largest first). */
 const SIZE_SAMPLE_LIMIT = 2_000
 
-/** Minimal structural view of `ctx.approval` (same seam spec-gate uses). */
-export interface ApprovalLike {
-    request(request: {
-        agent?: AgentLike
-        toolName: string
-        reason: string
-        signal?: AbortSignal
-    }): Promise<'allowed-once' | 'rejected' | 'cancelled' | 'unavailable'>
-}
+/**
+ * Minimal structural view of `ctx.approval` — the type is shared with the whole
+ * suite (`dsh-eng-core`), so an IM answerer can report WHO decided and WHICH card
+ * carried the decision, and this plugin records it.
+ */
+export type { ApprovalLike }
+export type ApprovalSeam = ApprovalLike
 
 /** Everything the tools close over. */
 export interface ToolDeps {
@@ -483,13 +483,15 @@ export function registerTools(
                     const approve = async (reason: string): Promise<boolean> => {
                         const seam = deps.approval()
                         if (seam === undefined) return false
-                        const decision = await seam.request({
-                            ...(agent === undefined ? {} : { agent }),
-                            toolName: 'standards_check',
-                            reason,
-                            ...(signalOf(exec) === undefined ? {} : { signal: signalOf(exec) }),
-                        })
-                        return decision === 'allowed-once'
+                        const decision = normalizeApprovalReply(
+                            await seam.request({
+                                ...(agent === undefined ? {} : { agent }),
+                                toolName: 'standards_check',
+                                reason,
+                                ...(signalOf(exec) === undefined ? {} : { signal: signalOf(exec) }),
+                            }),
+                        )
+                        return decision.allowed
                     }
                     if (args.dryRun === true) {
                         return [
@@ -710,7 +712,7 @@ export function registerTools(
                                 '下一步：让宿主装配审批插件（或人工把上面的 JSON 写进 ' + target + '）。',
                         )
                     }
-                    const decision = await seam.request({
+                    const decided = normalizeApprovalReply(await seam.request({
                         ...(agent === undefined ? {} : { agent }),
                         toolName: 'standards_bootstrap',
                         reason: [
@@ -721,9 +723,15 @@ export function registerTools(
                             '```',
                         ].join('\n'),
                         ...(signalOf(exec) === undefined ? {} : { signal: signalOf(exec) }),
-                    })
-                    if (decision !== 'allowed-once') {
-                        return [report, '', '### 未写入', '', '人工审批未通过：规范文件保持不变。'].join('\n')
+                    }))
+                    if (!decided.allowed) {
+                        return [
+                            report,
+                            '',
+                            '### 未写入',
+                            '',
+                            `人工审批未通过（${decided.decision}${decided.by === '' ? '' : `，by ${decided.by}`}${decided.source === '' ? '' : ` via ${decided.source}`}）：规范文件保持不变。`,
+                        ].join('\n')
                     }
                 }
                 ensureDir(path.dirname(target))

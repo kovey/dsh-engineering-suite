@@ -89,6 +89,8 @@ export function apply(ctx: Context, config: unknown = {}): void {
             // checklist through its own .dsh/evidence-gate.json.
             configFor: (cwd: string) => resolveEffectiveConfig(resolved, stores.for(cwd).layout, logger),
             stores,
+
+            approval: () => context.get('approval') as never,
         })
 
         const disposers: (() => void)[] = [...tools.disposers]

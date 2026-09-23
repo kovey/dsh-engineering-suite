@@ -23,6 +23,8 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import {
+    normalizeApprovalReply,
+    type ApprovalLike,
     changedRanges,
     formatTime,
     gitFingerprint,
@@ -85,15 +87,13 @@ const REPORT_FILE_LIMIT = 10
 /** Bound on how many findings one report lists individually. */
 const REPORT_FINDING_LIMIT = 25
 
-/** Minimal structural view of `ctx.approval` (the same seam spec-gate uses). */
-export interface ApprovalLike {
-    request(request: {
-        agent?: AgentLike
-        toolName: string
-        reason: string
-        signal?: AbortSignal
-    }): Promise<'allowed-once' | 'rejected' | 'cancelled' | 'unavailable' | string>
-}
+/**
+ * Minimal structural view of `ctx.approval` — shared with the whole suite
+ * (`dsh-eng-core`), so an IM answerer can report WHO approved each dependency and
+ * WHICH card carried it, and the report/ledger records both.
+ */
+export type { ApprovalLike }
+export type ApprovalSeam = ApprovalLike
 
 /** Everything the tools close over. */
 export interface ToolDeps {
@@ -877,7 +877,9 @@ export function registerTools(
                 if (isAborted(signal)) return abortMessage()
 
                 // --- approval (ONE prompt for every new dependency) ----------
-                let approval: { required: boolean; asked: boolean; outcome: string; reason?: string } | undefined
+                let approval:
+                    | { required: boolean; asked: boolean; outcome: string; reason?: string; by?: string; source?: string; messageId?: string }
+                    | undefined
                 if (newDeps.length > 0) {
                     if (!depsConfig.requireApprovalForNewDeps) {
                         approval = { required: false, asked: false, outcome: 'not-required' }
@@ -892,13 +894,22 @@ export function registerTools(
                             }
                         } else {
                             try {
-                                const outcome = await seam.request({
-                                    ...(agent === undefined ? {} : { agent }),
-                                    toolName: 'dependency_audit',
-                                    reason: renderApprovalPrompt(newDeps, { mission: mission?.id, base }),
-                                    ...(signal === undefined ? {} : { signal }),
-                                })
-                                approval = { required: true, asked: true, outcome: String(outcome) }
+                                const decided = normalizeApprovalReply(
+                                    await seam.request({
+                                        ...(agent === undefined ? {} : { agent }),
+                                        toolName: 'dependency_audit',
+                                        reason: renderApprovalPrompt(newDeps, { mission: mission?.id, base }),
+                                        ...(signal === undefined ? {} : { signal }),
+                                    }),
+                                )
+                                approval = {
+                                    required: true,
+                                    asked: true,
+                                    outcome: decided.decision,
+                                    ...(decided.by === '' ? {} : { by: decided.by }),
+                                    ...(decided.source === '' ? {} : { source: decided.source }),
+                                    ...(decided.messageId === '' ? {} : { messageId: decided.messageId }),
+                                }
                             } catch (error) {
                                 approval = {
                                     required: true,

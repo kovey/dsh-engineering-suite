@@ -365,6 +365,32 @@ artifact + 证据行（kind=artifact）
 严重度分级是**真机逼出来的**：初版"任何命中即阻断"在 `golang/im` 上产生 461 条命中（几乎全是文档里的 base64），
 这种门禁会被立刻关掉——现在只有已知凭据形状阻断，熵检测按上下文降为建议级（复测：阻断级 0 命中）。
 
+### 5.12 审批接缝：同一个接口，任何通道都能回答
+
+套件里所有"需要人点头"的动作——规格审批、交付审核、规范阈值/基线放宽、新增依赖——都走**同一个接缝**
+`ctx.get('approval').request(...)`。这带来一个直接结论：**接 IM 不需要改各个插件**，只需要一个应答者。
+
+接缝的返回被扩展成"旧字符串 + 可选的溯源对象"：
+
+```
+'allowed-once' | 'rejected' | 'cancelled' | 'unavailable'          ← 终端应答者，原样可用
+{ decision, by?, messageId?, at?, source? }                          ← IM 卡片点击：谁、哪张卡、哪个通道
+```
+
+- **一个规范化函数**（`normalizeApprovalReply`）处理两种形态：任何无法识别的返回值一律判为 `unavailable`（fail closed）——
+  从不"猜一个决定"，否则"没人回答"就会变成"已批准"；
+- **溯源落在被批准的那份工件上**：规格审批写 `spec.approvedBy/approvedSource/approvalMessageId`，
+  交付审批进**回执**（`receipt.approval`，且在摘要内——回执不能换个人重新签发）。`mission.approval` 保持它原本的语义
+  （最后一次人工决定，含打回），不被批准记录干扰；
+- **卡片字段随理由一起传**：理由里嵌一段 ```approval-context``` JSON（kind/missionId/revision/artifacts/facts/channelHints）。
+  通道层可以解析成字段渲染成卡片，纯文本应答者只看 prose（`proseOf` 剥掉机器块）；
+- **人工审批在确定性检查之后**：`mission_complete` 的 `requireDeliveryApproval`（默认关）只在清单全绿后才问人——
+  人能批准门禁接受过的交付，不能批准门禁已经拒绝的交付；
+- 没有装配审批通道而宿主又要求人工审批 → **直接失败**（fails closed），不是静默放行。
+
+IM 侧的职责（不在本仓库）：卡片按钮不可伪造且一次性、点击者要在项目级审批人名单里、
+超时返回 `cancelled` 而不是落到别的应答者、每个决定写一条含 `messageId` 的台账。
+
 ## 6. 为什么这样切分
 
 - **一个关注点一个插件**：门禁可以单独失效（例如先只上 quality-gate），不影响其它环节。

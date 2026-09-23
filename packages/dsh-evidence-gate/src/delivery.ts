@@ -485,11 +485,13 @@ export function finalizeDelivery(input: {
     store: MissionStore
     mission: MissionRecord
     evaluation: DeliveryEvaluation
+    /** Human decision that authorised the delivery, when one was required. */
+    approval?: { by: string; source: string; messageId: string }
     /** Workspace root the evaluation ran in (the receipt uses its fingerprint). */
     cwd: string
     overrideNote?: string
 }): DeliveryOutcome {
-    const { store, mission, evaluation, overrideNote } = input
+    const { store, mission, evaluation, overrideNote, approval } = input
     if (overrideNote !== undefined) {
         store.appendEvidence(mission.id, {
             kind: 'manual',
@@ -516,6 +518,7 @@ export function finalizeDelivery(input: {
         evidenceIds,
         git,
         ...(mission.specDigest === undefined ? {} : { specDigest: mission.specDigest }),
+        ...(approval === undefined ? {} : { approval }),
     })
     store.setStatus(mission.id, 'delivered')
     return {
@@ -523,5 +526,6 @@ export function finalizeDelivery(input: {
         evidenceIds,
         ...(evaluation.gate === undefined ? {} : { gate: evaluation.gate }),
         ...(overrideNote === undefined ? {} : { overrideNote }),
+        ...(approval === undefined ? {} : { approval }),
     }
 }

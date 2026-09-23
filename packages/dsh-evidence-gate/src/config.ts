@@ -53,6 +53,16 @@ export interface EvidenceGateConfig {
      */
     requireCleanTree: boolean
     /**
+     * Require a HUMAN decision before a receipt is issued.
+     *
+     * Off by default: delivery is normally a deterministic verdict (gates +
+     * evidence), and adding a person to every delivery would just teach people to
+     * click through. High-risk missions turn it on — and then the decision can
+     * arrive over any surface, including an IM card, in which case the receipt
+     * records WHO approved and WHICH card carried it.
+     */
+    requireDeliveryApproval: boolean
+    /**
      * Whether `mission_complete({ force: true })` may downgrade the
      * required-evidence-kinds check. Off by default: an escape hatch that can
      * turn a red checklist green is only acceptable when the host asked for it.
@@ -145,6 +155,7 @@ function kindList(value: unknown, fallback: readonly EvidenceKind[]): EvidenceKi
 export const PROJECT_OVERRIDABLE_KEYS: readonly string[] = [
     'requiredEvidenceKinds',
     'requireCleanTree',
+    'requireDeliveryApproval',
     'requireGate',
     'requireStandardsGate',
     'standardsGateSource',
@@ -349,6 +360,7 @@ export function resolveEffectiveConfig(
         ...host,
         requiredEvidenceKinds: readKinds(sink, raw, host.requiredEvidenceKinds),
         requireCleanTree: readBool(sink, raw, 'requireCleanTree', host.requireCleanTree),
+        requireDeliveryApproval: readBool(sink, raw, 'requireDeliveryApproval', host.requireDeliveryApproval),
         requireStandardsGate: readBool(sink, raw, 'requireStandardsGate', host.requireStandardsGate),
         standardsGateSource: readNonEmptyString(sink, raw, 'standardsGateSource', host.standardsGateSource),
         requireGate: readBool(sink, raw, 'requireGate', host.requireGate),
@@ -373,6 +385,7 @@ function overrides(host: EvidenceGateConfig, config: EvidenceGateConfig): boolea
     return (
         config.requireGate !== host.requireGate ||
         config.requireCleanTree !== host.requireCleanTree ||
+        config.requireDeliveryApproval !== host.requireDeliveryApproval ||
         config.requireStandardsGate !== host.requireStandardsGate ||
         config.standardsGateSource !== host.standardsGateSource ||
         config.gateSource !== host.gateSource ||
@@ -422,6 +435,7 @@ export function resolveConfig(input: unknown): EvidenceGateConfig {
         requiredEvidenceKinds: kindList(raw['requiredEvidenceKinds'], DEFAULT_REQUIRED_EVIDENCE_KINDS),
         maxOutputTail: maxOutputTail < 0 ? 0 : maxOutputTail,
         requireCleanTree: bool(raw['requireCleanTree'], true),
+        requireDeliveryApproval: bool(raw['requireDeliveryApproval'], false),
         allowForceOverride: bool(raw['allowForceOverride'], false),
         maxGateAgeMinutes: maxGateAgeMinutes > 0 ? maxGateAgeMinutes : 0,
         prompt: {

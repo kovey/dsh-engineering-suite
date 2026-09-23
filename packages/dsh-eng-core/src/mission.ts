@@ -96,6 +96,8 @@ export interface ReceiptInput {
     evidenceIds: string[]
     git?: GitFingerprint
     specDigest?: string
+    /** Human decision that authorised the delivery (see `requireDeliveryApproval`). */
+    approval?: { by: string; source: string; messageId: string }
 }
 
 /** Options for {@link MissionStore}. */
@@ -390,6 +392,10 @@ export class MissionStore {
             evidenceIds: [...input.evidenceIds].sort(),
             ...(input.git === undefined ? {} : { git: input.git }),
             ...(input.specDigest === undefined ? {} : { specDigest: input.specDigest }),
+            // A human decision that authorised the delivery, when one was required.
+            // It is part of the digest on purpose: the receipt must not be
+            // re-issuable with a different approver.
+            ...(input.approval === undefined ? {} : { approval: input.approval }),
         }
         const digest = sha256(JSON.stringify(body))
         const receipt: Receipt = { id: `RCP-${stamp()}-${shortDigest(digest, 8)}`, digest, ...body }

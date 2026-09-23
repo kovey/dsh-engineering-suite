@@ -5,7 +5,16 @@
  */
 
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import { agentIdOf, sessionIdOf, type AgentLike, type MissionStore, type MissionStoreRegistry } from 'dsh-eng-core'
+import {
+    agentIdOf,
+    normalizeApprovalReply,
+    renderApprovalContext,
+    sessionIdOf,
+    type AgentLike,
+    type ApprovalLike,
+    type MissionStore,
+    type MissionStoreRegistry,
+} from 'dsh-eng-core'
 import { RECORDABLE_KINDS, type EffectiveEvidenceGateConfig } from './config.js'
 import { evaluateDelivery, finalizeDelivery, relaxForForce } from './delivery.js'
 import { captureEvidence, confirmationText } from './evidence.js'
@@ -30,6 +39,8 @@ export interface ToolDeps {
      */
     configFor: (cwd: string) => EffectiveEvidenceGateConfig
     stores: MissionStoreRegistry
+    /** The approval seam, read at call time (`ctx.get('approval')`). */
+    approval?: () => ApprovalLike | undefined
 }
 
 interface RecordArgs {
@@ -246,6 +257,59 @@ export function registerTools(
                 const forceRequested = args.force === true && config.allowForceOverride
                 const forceRefused = args.force === true && !config.allowForceOverride
                 const relaxation = relaxForForce(evaluation, forceRequested)
+                let deliveryApproval: { by: string; source: string; messageId: string } | undefined
+                // The human decision comes AFTER the deterministic checklist: a
+                // person may approve a delivery that the gates accepted, never one
+                // they refused. Asking first would invite rubber-stamping of a
+                // delivery that is about to be refused anyway.
+                if (relaxation.failures.length === 0 && config.requireDeliveryApproval) {
+                    const seam = deps.approval?.()
+                    if (seam === undefined) {
+                        throw new Error(
+                            '宿主要求交付前人工审批（requireDeliveryApproval=true），但没有装配审批通道（ctx.get("approval") 为空）：' +
+                                '按 fail closed 拒绝签发回执。下一步：装配审批插件，或把 requireDeliveryApproval 设为 false。',
+                        )
+                    }
+                    const decided = normalizeApprovalReply(
+                        await seam.request({
+                            ...(agent === undefined ? {} : { agent }),
+                            toolName: 'mission_complete',
+                            reason: renderApprovalContext(
+                                [
+                                    `交付审核：mission ${mission.id}（${mission.title}）`,
+                                    '',
+                                    '确定性检查已全部通过，等你决定是否签发回执：',
+                                    ...evaluation.checks.filter((check) => check.ok).map((check) => `- ✅ ${check.label}`),
+                                    '',
+                                    `证据 ${evaluation.evidence.length} 条；门禁 ${evaluation.gate?.id ?? '(无)'}；指纹 ${evaluation.fingerprint.isRepo ? `${evaluation.fingerprint.branch}@${evaluation.fingerprint.head?.slice(0, 8) ?? '?'}` : 'not a git repository'}`,
+                                ].join('\n'),
+                                {
+                                    kind: 'delivery',
+                                    missionId: mission.id,
+                                    title: mission.title,
+                                    facts: {
+                                        证据: evaluation.evidence.length,
+                                        门禁: evaluation.gate?.state ?? '(无)',
+                                        检查项: evaluation.checks.length,
+                                    },
+                                    channelHints: { buttons: ['交付', '打回'], requiresReason: true },
+                                },
+                            ),
+                            ...((exec as { signal?: AbortSignal }).signal === undefined
+                                ? {}
+                                : { signal: (exec as { signal?: AbortSignal }).signal }),
+                        }),
+                    )
+                    if (!decided.allowed) {
+                        return [
+                            `❌ mission ${mission.id} 未交付：人工审批未通过（${decided.decision}${decided.by === '' ? '' : `，by ${decided.by}`}${decided.source === '' ? '' : ` via ${decided.source}`}）。`,
+                            '',
+                            '确定性检查全部通过，只有人的决定拦下了它。下一步：把原因写进规格或证据后重新调用 mission_complete。',
+                        ].join('\n')
+                    }
+                    // Carry the decision into the receipt below.
+                    deliveryApproval = { by: decided.by === '' ? 'approval' : decided.by, source: decided.source, messageId: decided.messageId }
+                }
                 if (relaxation.failures.length > 0) {
                     return [
                         ...(forceRefused
@@ -270,13 +334,24 @@ export function registerTools(
                     evaluation,
                     cwd,
                     ...(relaxation.overrideNote === undefined ? {} : { overrideNote: relaxation.overrideNote }),
+                    // Who approved the delivery rides into the receipt: a receipt
+                    // that cannot name the approver is not an audit trail.
+                    ...(deliveryApproval === undefined ? {} : { approval: deliveryApproval }),
                 })
-                return renderDelivered({
-                    mission,
-                    evaluation,
-                    outcome,
-                    ...(args.summary === undefined ? {} : { summary: args.summary }),
-                })
+                return [
+                    renderDelivered({
+                        mission,
+                        evaluation,
+                        outcome,
+                        ...(args.summary === undefined ? {} : { summary: args.summary }),
+                    }),
+                    ...(deliveryApproval === undefined
+                        ? []
+                        : [
+                              '',
+                              `人工交付审批：by ${deliveryApproval.by}${deliveryApproval.source === '' ? '' : ` via ${deliveryApproval.source}`}${deliveryApproval.messageId === '' ? '' : ` #${deliveryApproval.messageId}`}`,
+                          ]),
+                ].join('\n')
             },
         }),
         'mission_complete',

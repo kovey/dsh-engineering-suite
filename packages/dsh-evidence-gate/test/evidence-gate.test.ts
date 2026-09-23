@@ -1570,3 +1570,74 @@ test('a project that sets the standards keys is reported as the source (regressi
     assert.match(line, /项目级/, `expected the project file to be named, got: ${line}`)
     assert.match(line, /evidence-gate\.json/)
 })
+
+test('an opt-in human approval authorises the delivery and lands in the receipt (regression)', async () => {
+    // Delivery is normally a deterministic verdict. A high-risk mission can
+    // require a person — and when that person answers over IM, the receipt has to
+    // name WHO approved and WHICH card carried it, or it is not an audit trail.
+    const seen: { toolName: string; reason: string }[] = []
+    const { fake, store } = rig({ config: { requireDeliveryApproval: true } })
+    ;(fake.ctx as unknown as { get: (name: string) => unknown }).get = ((name: string) =>
+        name === 'approval'
+            ? {
+                  request: async (request: { toolName: string; reason: string }) => {
+                      seen.push(request)
+                      return { decision: 'allowed-once', by: 'ou_im_user', messageId: 'om_card_1', source: 'im', at: Date.now() }
+                  },
+              }
+            : undefined) as never
+    const missionId = seedMission(store, fake.cwd)
+
+    // The checklist runs FIRST: a person is asked about a delivery the gates
+    // accepted, never about one they already refused.
+    const early = runText(await fake.runTool('mission_complete', { missionId }))
+    assert.match(early, /不能交付/)
+    assert.equal(seen.length, 0, 'no human is asked about a delivery that is already refused')
+
+    await recordProof(fake, missionId)
+    await sleep(5)
+    recordGate(store, missionId)
+    const delivered = await fake.runTool('mission_complete', { missionId })
+    const text = runText(delivered)
+    assert.match(text, /✅ mission M-1 已交付/, text)
+    assert.equal(seen.length, 1, 'exactly one approval is requested')
+    assert.equal(seen[0]?.toolName, 'mission_complete')
+    // The card gets structured fields, not just prose.
+    assert.match(seen[0]?.reason ?? '', /```approval-context/)
+    assert.match(seen[0]?.reason ?? '', /"kind": "delivery"/)
+    assert.match(text, /人工交付审批：by ou_im_user via im #om_card_1/)
+    const receipt = store.readReceipts(missionId).at(-1)
+    assert.equal(receipt?.approval?.by, 'ou_im_user', 'the receipt names the approver')
+    assert.equal(receipt?.approval?.source, 'im')
+    assert.equal(receipt?.approval?.messageId, 'om_card_1')
+})
+
+test('a refused delivery approval blocks the receipt (regression)', async () => {
+    const { fake, store } = rig({ config: { requireDeliveryApproval: true } })
+    ;(fake.ctx as unknown as { get: (name: string) => unknown }).get = ((name: string) =>
+        name === 'approval' ? { request: async () => ({ decision: 'rejected', by: 'ou_boss', source: 'im' }) } : undefined) as never
+    const missionId = seedMission(store, fake.cwd)
+    await recordProof(fake, missionId)
+    await sleep(5)
+    recordGate(store, missionId)
+    const out = runText(await fake.runTool('mission_complete', { missionId }))
+    assert.match(out, /人工审批未通过/)
+    assert.match(out, /ou_boss/)
+    assert.equal(store.readReceipts(missionId).length, 0, 'no receipt without the approval')
+    assert.equal(store.read(missionId)?.status, 'spec-approved', 'the mission is untouched')
+})
+
+test('a missing approval seam fails closed when the delivery approval is required (regression)', async () => {
+    const { fake, store } = rig({ config: { requireDeliveryApproval: true } })
+    // The fake host mounts an approval service by default; this test is about the
+    // host that has NONE, so the seam is removed explicitly.
+    ;(fake.ctx as unknown as { get: (name: string) => unknown }).get = (() => undefined) as never
+    const missionId = seedMission(store, fake.cwd)
+    await recordProof(fake, missionId)
+    await sleep(5)
+    recordGate(store, missionId)
+    const run = await fake.runTool('mission_complete', { missionId })
+    assert.equal(run.isError, true)
+    assert.match(runText(run), /没有装配审批通道/)
+    assert.equal(store.readReceipts(missionId).length, 0)
+})

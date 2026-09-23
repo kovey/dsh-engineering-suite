@@ -112,6 +112,17 @@ export interface SpecRecord {
     /** Who approved it (`approval` = the harness approval seam, `auto` = configured). */
     approvedBy?: string
     /**
+     * Which surface carried the approval (`im` / `tui` / `auto` / `seam`).
+     *
+     * Provenance lives on the SPEC rather than in `mission.approval`, because
+     * that field is "the last human decision" and is also written for rejections:
+     * a card click must be able to say who clicked and which message carried it
+     * without disturbing the rejection bookkeeping.
+     */
+    approvedSource?: string
+    /** Channel-side message id of the card that carried the approval. */
+    approvalMessageId?: string
+    /**
      * Ids removed by earlier revisions. A retired id is never handed out again:
      * reusing it would let an old test-case citation resolve to a new statement.
      */
@@ -208,6 +219,12 @@ export interface Receipt {
     evidenceIds: string[]
     git?: GitFingerprint
     specDigest?: string
+    /**
+     * The human decision that authorised the delivery, when the host required one
+     * (`requireDeliveryApproval`). Part of the digest, so a receipt cannot be
+     * re-issued with a different approver.
+     */
+    approval?: { by: string; source: string; messageId: string }
     /** Relative path of the receipt file inside the mission directory. */
     path?: string
 }
@@ -314,6 +331,13 @@ export interface MissionApproval {
     at: number
     /** Who decided (`approval` = the human through the seam, `auto` = configured auto). */
     by: string
+    /**
+     * Which surface decided (`im` / `tui` / `auto` / `seam`), when the answerer
+     * reported one. An IM decision that cannot name its surface is not auditable.
+     */
+    source?: string
+    /** Channel-side message id of the card that carried the decision. */
+    messageId?: string
     /** The human's note/reason, when they gave one. */
     note?: string
 }

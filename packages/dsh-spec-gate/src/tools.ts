@@ -8,8 +8,13 @@ import path from 'node:path'
 import { tuiReview, type NvimTuiLike, type ReviewArtifacts } from './review.js'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import {
+    approverName,
     ensureDir,
     formatTime,
+    normalizeApprovalReply,
+    type ApprovalOutcome,
+    renderApprovalContext,
+    type ApprovalLike,
     parentSessionIdOf,
     nextStepsAfter,
     scanGaps,
@@ -86,15 +91,13 @@ function renderScanReport(scan: ScanResult, gaps: GapReport, notes?: string): st
     ].join('\n')
 }
 
-/** Minimal structural view of `ctx.approval`. */
-export interface ApprovalLike {
-    request(request: {
-        agent?: AgentLike
-        toolName: string
-        reason?: string
-        signal?: AbortSignal
-    }): Promise<'allowed-once' | 'rejected' | 'unavailable' | 'cancelled' | string>
-}
+/**
+ * The approval seam. The type is shared with every other plugin now
+ * (`dsh-eng-core`'s `ApprovalLike`): a channel answerer may return provenance
+ * (who clicked, which card), and the ledger records it.
+ */
+export type { ApprovalLike }
+export type ApprovalSeam = ApprovalLike
 
 /** Everything the tools close over. */
 export interface ToolDeps {
@@ -512,22 +515,39 @@ export function registerTools(
                     }
                 }
                 const decision = await requestApproval(deps, exec, mission, args.note, effective)
-                if (typeof decision !== 'string') {
+                if ('outcome' in decision) {
                     // Rejected (or cancelled): record the round, keep the human's
                     // note when the review card already collected one, and send the
                     // model back to `spec_create`.
                     return await handleRejection(deps, exec, mission, decision.outcome, decision.note ?? args.note)
                 }
-                const approvedBy = decision
+                // WHO approved matters: an IM click carries a user id and the card
+                // it came from, and the ledger keeps both. A terminal answerer that
+                // reports no identity still records `approval`.
+                const approvedBy = approverName(decision)
                 const approved = store.update(mission.id, (record) => ({
                     status: 'spec-approved',
-                    spec: record.spec === undefined ? undefined : { ...record.spec, approvedAt: Date.now(), approvedBy, updatedAt: Date.now() },
+                    spec:
+                        record.spec === undefined
+                            ? undefined
+                            : {
+                                  ...record.spec,
+                                  approvedAt: Date.now(),
+                                  approvedBy,
+                                  // Provenance rides on the revision that was approved:
+                                  // a card click must name the surface (and the message)
+                                  // without touching the rejection bookkeeping in
+                                  // `mission.approval`.
+                                  ...(decision.source === '' ? {} : { approvedSource: decision.source }),
+                                  ...(decision.messageId === '' ? {} : { approvalMessageId: decision.messageId }),
+                                  updatedAt: Date.now(),
+                              },
                 }))
                 if (approved === undefined) throw new Error(`mission ${mission.id} disappeared while approving`)
                 // Re-render so the artifact carries the approval header.
                 store.writeSpec(mission.id, renderSpec(approved))
                 return [
-                    `规格已审批（mission ${mission.id}，by ${approvedBy}，${formatTime(Date.now())}）。`,
+                    `规格已审批（mission ${mission.id}，by ${approvedBy}${decision.source === '' ? '' : ` via ${decision.source}`}${decision.messageId === '' ? '' : ` #${decision.messageId}`}，${formatTime(Date.now())}）。`,
                     '写操作现已放行。下一步：按规格实现 → evidence_record 登记验证输出 → quality_gate_run 跑门禁 → mission_complete 交付。',
                 ].join('\n')
             },
@@ -1060,8 +1080,10 @@ async function requestApproval(
     mission: MissionRecord,
     note: string | undefined,
     config: SpecGateConfig,
-): Promise<string | { outcome: string; note?: string }> {
-    if (config.approval === 'auto') return 'auto'
+): Promise<ApprovalOutcome | { outcome: string; note?: string; normalized?: ApprovalOutcome }> {
+    if (config.approval === 'auto') {
+        return { decision: 'allowed-once', by: 'auto', messageId: '', source: 'auto', allowed: true }
+    }
     const context = exec as { agent?: AgentLike; signal?: AbortSignal }
     const missionsDir = deps.stores.for(mission.cwd).layout.missionsDir
     const roundForReview = deps.stores.for(mission.cwd).nextApprovalRound(mission.id)
@@ -1081,7 +1103,10 @@ async function requestApproval(
             ...(context.signal === undefined ? {} : { signal: context.signal }),
             timeoutMs: config.reviewTimeoutMs,
         })
-        if (outcome.decision === 'approved') return 'approval'
+        if (outcome.decision === 'approved') {
+            // The TUI review card is a channel too: record it as the surface.
+            return { decision: 'allowed-once', by: 'approval', messageId: '', source: 'tui', allowed: true }
+        }
         if (outcome.decision === 'rejected') return { outcome: 'rejected', ...(outcome.note === undefined ? {} : { note: outcome.note }) }
         if (outcome.decision === 'cancelled') return { outcome: 'cancelled' }
         // `unavailable`: fall through to the generic seam below.
@@ -1099,15 +1124,40 @@ async function requestApproval(
                 `请让人类审批后把 approval 改为 auto，或装配审批插件。（mission ${mission.id}）`,
         )
     }
-    const round = deps.stores.for(mission.cwd).nextApprovalRound(mission.id)
+    const store = deps.stores.for(mission.cwd)
+    const round = store.nextApprovalRound(mission.id)
     const outcome = await approval.request({
         ...(context.agent === undefined ? {} : { agent: context.agent }),
         toolName: 'spec_approve',
         // Multi-line on purpose: the human must be able to READ the two
-        // artifacts (and open them) before deciding, not approve blind.
-        reason: renderApprovalPrompt(mission, round, deps.stores.for(mission.cwd).layout.missionsDir, note),
+        // artifacts (and open them) before deciding, not approve blind. The
+        // fenced context block lets a channel render fields (mission, revision,
+        // artifacts) instead of parsing this prose.
+        reason: renderApprovalContext(renderApprovalPrompt(mission, round, store.layout.missionsDir, note), {
+            kind: 'spec',
+            missionId: mission.id,
+            title: mission.spec?.title ?? mission.title,
+            revision: mission.spec?.revision ?? 0,
+            artifacts: approvalArtifacts(mission, store.layout.missionsDir),
+            facts: {
+                验收标准: mission.spec?.acceptanceCriteria.length ?? 0,
+                测试用例: mission.testDesign?.cases.length ?? 0,
+                未覆盖: mission.testDesign?.uncovered?.length ?? 0,
+                送审轮次: round,
+            },
+            channelHints: { buttons: ['通过', '打回'], requiresReason: true },
+        }),
         ...(context.signal === undefined ? {} : { signal: context.signal }),
     })
-    if (outcome === 'allowed-once') return 'approval'
-    return { outcome } as never
+    const normalized = normalizeApprovalReply(outcome)
+    if (normalized.allowed) return normalized
+    return { outcome: normalized.decision, normalized } as never
+}
+
+/** The artifacts a reviewer should be able to open before deciding. */
+function approvalArtifacts(mission: MissionRecord, missionsDir: string): string[] {
+    return [
+        ...(mission.specPath === undefined ? [] : [mission.specPath]),
+        path.relative(mission.cwd, path.join(missionsDir, mission.id, 'test-design-review.md')),
+    ]
 }
