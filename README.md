@@ -1,5 +1,8 @@
 # dsh-engineering-suite
 
+**v0.1.5** · 兼容基线 `@deepseek-ai/dsh-*` **0.1.7-rc.1**（cordis `~4.0.4`）
+· [变更记录](./CHANGELOG.md) · [升级指南](./UPGRADE.md) · [验证证据](./docs/VERIFICATION.md)
+
 > 把 [docs.md](./docs.md) 描述的「Agent 时代软件工程落地方案」实现为一组可独立挂载的
 > DeepSeek Harness（dsh）插件：**角色 → 规格 → 测试设计 → 实现 → 质量 → 证据 → 审计 →
 > 编排**，每个关注点一个插件，全部通过官方插件契约接入，不改 dsh 核心。
@@ -9,21 +12,32 @@
    │           │            │        │        │          │
 spec-gate  test-design-  spec-gate  role-  quality-   evidence-gate
            gate                     guard  gate       audit-trail
+                                    │        │
+                              规范/影响/覆盖率/供应链（四个新增门禁）
                     └──────── orchestrator（顶层编排）────────┘
 ```
+
+11 个插件各自回答一个可判定的问题：**做的是不是对的**（spec-gate / test-design-gate）、
+**谁在做、权限对不对**（role-guard）、**能不能跑**（quality-gate）、**还可维护吗**（standards-gate）、
+**这次改动碰了什么**（impact-gate）、**测试有没有用**（coverage-gate）、**能不能上生产**
+（supply-chain-gate）、**能不能证明**（evidence-gate / audit-trail）、**按不按流程走**（orchestrator）。
 
 ## 包一览
 
 | 包 | 插件 id | 职责 | 关键工具 |
 |---|---|---|---|
-| `dsh-eng-core` | —（库） | 共享运行时：mission 工件、确定性命令执行、git 指纹、审计 JSONL、日志、fake host 测试夹具 | — |
-| `dsh-role-guard` | `role-guard` | 角色文件（persona/模型/工具白名单）+ 最小权限派发 | `team_delegate`、`role_list` |
-| `dsh-spec-gate` | `spec-gate` | 结构化规格 + 人工审批 + 写操作前置拦截 | `spec_create`、`spec_approve`、`spec_status` |
+| `dsh-eng-core` | —（库） | 共享运行时：mission 工件、确定性命令执行、git 指纹、审计 JSONL、日志、扫描器、代码度量、变更影响、审批契约、fake host 测试夹具 | — |
+| `dsh-role-guard` | `role-guard` | 角色文件（persona/模型/工具/技能白名单）+ 最小权限派发 + 只读评审服务 | `team_delegate`、`role_list` |
+| `dsh-spec-gate` | `spec-gate` | 结构化规格 + 人工审批 + 写操作前置拦截 + 需求增改删 + 存量仓库规格接入 | `spec_create`、`spec_approve`、`spec_amend`、`spec_status`、`spec_bootstrap` |
 | `dsh-test-design-gate` | `test-design-gate` | 把测试设计嵌进规格并自动评审（覆盖度/场景完整性/可执行性） | `test_design_review`、`test_design_template` |
 | `dsh-quality-gate` | `quality-gate` | 宿主配置命令的三态门禁 + 写后 lint 回路 + 收尾阻断 | `quality_gate_run`、`quality_gate_status` |
 | `dsh-evidence-gate` | `evidence-gate` | Mission → Evidence → Gate → Receipt，缺失证据 fail closed | `evidence_record`、`evidence_status`、`mission_complete` |
 | `dsh-audit-trail` | `audit-trail` | 全量工具调用 JSONL 审计 + 写前快照 + 按轮次回滚 | `audit_report`、`audit_rewind` |
-| `dsh-orchestrator` | `orchestrator` | 阶段流水线、能力探测、门禁回退、迭代熔断、断点恢复 | `orchestrate` |
+| `dsh-orchestrator` | `orchestrator` | 阶段流水线、入口/出口门禁、回退、熔断、断点恢复、按难度选模型、阶段自主派发 | `orchestrate` |
+| `dsh-standards-gate` | `standards-gate` | 代码规范门禁：仓库自有阈值、基线棘轮、只读结构评审 | `standards_check`、`standards_bootstrap`、`standards_review`、`standards_status` |
+| `dsh-impact-gate` | `impact-gate` | 变更影响分析：反向依赖闭包、最小回归测试集、风险分级 | `impact_analyze`、`impact_tests`、`impact_status` |
+| `dsh-coverage-gate` | `coverage-gate` | 测试有效性：四种覆盖率报告、增量覆盖率、flaky 检测 | `coverage_check`、`flaky_check`、`coverage_status` |
+| `dsh-supply-chain-gate` | `supply-chain-gate` | 密钥扫描（分级+脱敏）、新增依赖人工审批、依赖审计 | `secret_scan`、`dependency_audit`、`supply_chain_status` |
 
 ## 快速开始
 
@@ -38,7 +52,7 @@ bash scripts/test-all.sh
 bash scripts/install-into-dsh.sh --dry-run     # 先看要改什么
 bash scripts/install-into-dsh.sh
 
-# 4. 重启会话，在 TUI 里 /plugins 应能看到 7 个 bundle
+# 4. 重启会话，在 TUI 里 /plugins 应能看到 11 个 bundle
 ```
 
 正常有 npm registry 时，也可以在每个包的目录里 `pnpm install` 后用
@@ -153,7 +167,9 @@ DSH_ENG_DEBUG=1 <启动 dsh>             # 让插件的文件日志同时镜像�
 ```
 
 各包的 README 说明自己的配置项、工具参数与协作面；`docs/PLUGIN-CONVENTIONS.md` 是新增插件时必须遵守的接口契约；
-[docs/VERIFICATION.md](./docs/VERIFICATION.md) 记录验证证据（130 个测试 + 真机装配）与复现步骤。
+[docs/VERIFICATION.md](./docs/VERIFICATION.md) 记录验证证据与复现步骤，[docs/KNOWN-LIMITS.md](./docs/KNOWN-LIMITS.md)
+逐条列出机制测不到的边界（这比"全都支持"更有用），[UPGRADE.md](./UPGRADE.md) 是升级指南。
 
-当前规模：8 个包、55 个源文件、约 9.8k 行实现 + 3.4k 行测试，**130 个测试全绿**；真机装配已在隔离
-`DSH_HOME` 的 headless profile 上验证（7 个 bundle 全部 `applied`，见验证记录）。
+当前规模（v0.1.5）：**12 个包**（11 个插件 + 1 个共享库）、102 个源文件约 34k 行、17 个测试文件约 14k 行，
+**498 个测试（497 通过 / 0 失败 / 1 如实跳过）**；端到端在真实 harness 上验证——
+**11 个插件全部 `applied` 并跑完一条 mission**（`scripts/e2e-mission.sh`，脚本化模型，无需 API key）。
