@@ -1,7 +1,7 @@
 {
   "name": "dsh-engineering-suite",
   "private": true,
-  "version": "0.1.5",
+  "version": "0.1.0",
   "description": "Engineering suite for DeepSeek Harness: seven plugins covering roles, specifications, test design, quality gates, evidence, audit trail and pipeline orchestration (see docs.md)",
   "type": "module",
   "engines": {

@@ -1,6 +1,6 @@
 {
   "name": "dsh-role-guard",
-  "version": "0.1.5",
+  "version": "0.1.0",
   "description": "Role and permission layer for DeepSeek Harness: one Markdown file per agent role (persona + model + tool whitelist), least-privilege delegation through team_delegate, and a strict write/read-only split.",
   "type": "module",
   "main": "./dist/index.js",

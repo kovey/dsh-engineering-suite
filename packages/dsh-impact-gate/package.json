@@ -1,6 +1,6 @@
 {
   "name": "dsh-impact-gate",
-  "version": "0.1.5",
+  "version": "0.1.0",
   "description": "Change-impact plugin for DeepSeek Harness: answer 'what does this change touch' and 'which tests must therefore run' from the diff and the import graph (file-level reachability, not a call graph), and turn the selection into the minimal regression command the host configured.",
   "type": "module",
   "main": "./dist/index.js",

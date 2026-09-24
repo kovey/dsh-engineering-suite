@@ -1,7 +1,7 @@
 # dsh-engineering-suite
 
-**v0.1.5** · 兼容基线 `@deepseek-ai/dsh-*` **0.1.7-rc.1**（cordis `~4.0.4`）
-· [变更记录](./CHANGELOG.md) · [升级指南](./UPGRADE.md) · [验证证据](./docs/VERIFICATION.md)
+**尚未发版**（开发中，无 tag）· 兼容基线 `@deepseek-ai/dsh-*` **0.1.7-rc.1**（cordis `~4.0.4`）
+· [开发记录](./CHANGELOG.md) · [升级指南](./UPGRADE.md) · [验证证据](./docs/VERIFICATION.md)
 
 > 把 [docs.md](./docs.md) 描述的「Agent 时代软件工程落地方案」实现为一组可独立挂载的
 > DeepSeek Harness（dsh）插件：**角色 → 规格 → 测试设计 → 实现 → 质量 → 证据 → 审计 →
@@ -170,6 +170,6 @@ DSH_ENG_DEBUG=1 <启动 dsh>             # 让插件的文件日志同时镜像�
 [docs/VERIFICATION.md](./docs/VERIFICATION.md) 记录验证证据与复现步骤，[docs/KNOWN-LIMITS.md](./docs/KNOWN-LIMITS.md)
 逐条列出机制测不到的边界（这比"全都支持"更有用），[UPGRADE.md](./UPGRADE.md) 是升级指南。
 
-当前规模（v0.1.5）：**12 个包**（11 个插件 + 1 个共享库）、102 个源文件约 34k 行、17 个测试文件约 14k 行，
+当前规模：**12 个包**（11 个插件 + 1 个共享库）、102 个源文件约 34k 行、17 个测试文件约 14k 行，
 **498 个测试（497 通过 / 0 失败 / 1 如实跳过）**；端到端在真实 harness 上验证——
 **11 个插件全部 `applied` 并跑完一条 mission**（`scripts/e2e-mission.sh`，脚本化模型，无需 API key）。

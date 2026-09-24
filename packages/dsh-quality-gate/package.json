@@ -1,6 +1,6 @@
 {
   "name": "dsh-quality-gate",
-  "version": "0.1.5",
+  "version": "0.1.0",
   "description": "Deterministic quality gate for DeepSeek Harness: host-configured test/typecheck/lint commands, PASS/WARN/BLOCK verdicts, a post-write lint feedback loop and a turn-stop gate that refuses to let an agent declare completion on red.",
   "type": "module",
   "main": "./dist/index.js",

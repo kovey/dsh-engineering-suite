@@ -1,6 +1,6 @@
 {
   "name": "dsh-coverage-gate",
-  "version": "0.1.5",
+  "version": "0.1.0",
   "description": "Test-effectiveness gate for DeepSeek Harness: turn coverage reports and repeated test runs into deterministic PASS/BLOCK verdicts — total coverage, coverage of the lines this change ADDED, and whether any test is flaky.",
   "type": "module",
   "main": "./dist/index.js",

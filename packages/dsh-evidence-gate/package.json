@@ -1,6 +1,6 @@
 {
   "name": "dsh-evidence-gate",
-  "version": "0.1.5",
+  "version": "0.1.0",
   "description": "Evidence and delivery gate for DeepSeek Harness: bind commands, test reports, artifacts and Git fingerprints to a mission, fail closed on missing or stale evidence, and issue an immutable receipt only after a deterministic quality-gate PASS.",
   "type": "module",
   "main": "./dist/index.js",

@@ -1,6 +1,6 @@
 {
   "name": "dsh-supply-chain-gate",
-  "version": "0.1.5",
+  "version": "0.1.0",
   "description": "Supply-chain and secret gate for DeepSeek Harness: detect committed secrets (regex + entropy, changed lines only by default) and gate new/unreviewed dependencies and known-vulnerable ones, as deterministic PASS/WARN/BLOCK records with redacted evidence.",
   "type": "module",
   "main": "./dist/index.js",

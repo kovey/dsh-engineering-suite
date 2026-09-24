@@ -1,6 +1,6 @@
 {
   "name": "dsh-audit-trail",
-  "version": "0.1.5",
+  "version": "0.1.0",
   "description": "Audit and traceability layer for DeepSeek Harness: append every tool call to a structured JSONL trail, keep pre-write snapshots, and rewind the workspace by turn.",
   "type": "module",
   "main": "./dist/index.js",

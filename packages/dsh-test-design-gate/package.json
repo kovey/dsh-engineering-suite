@@ -1,6 +1,6 @@
 {
   "name": "dsh-test-design-gate",
-  "version": "0.1.5",
+  "version": "0.1.0",
   "description": "Test-design gate for DeepSeek Harness: review the specification's structured test design (coverage, scenario completeness, executability) before the specification may be approved.",
   "type": "module",
   "main": "./dist/index.js",

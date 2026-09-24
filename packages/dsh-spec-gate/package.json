@@ -1,6 +1,6 @@
 {
   "name": "dsh-spec-gate",
-  "version": "0.1.5",
+  "version": "0.1.0",
   "description": "Specification gate for DeepSeek Harness: turn a task into an approved, structured specification (acceptance criteria, file boundaries, negative constraints, test design) before any write tool may run.",
   "type": "module",
   "main": "./dist/index.js",
