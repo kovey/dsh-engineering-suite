@@ -266,7 +266,11 @@ test('the turn-stop gate does nothing without a write, and steers on BLOCK', asy
     await turnStop(fake, 1)
     assert.equal(fake.steers.length, 1)
     assert.match(fake.steers[0]?.content[0]?.text ?? '', /质量门禁未通过/)
-    assert.equal(fake.steers[0]?.source.kind, 'plugin')
+    // Own source kind since 0.1.7 (the shared `plugin` kind is gone) + bounded notice.
+    const source = fake.steers[0]?.source as { kind?: string; form?: string; summary?: string } | undefined
+    assert.equal(source?.kind, 'dsh-quality-gate')
+    assert.equal(source?.form, 'notice')
+    assert.ok(String(source?.summary).length <= 120)
     assert.equal(stores.lastGate(mission.id)?.state, 'BLOCK')
 
     // The gate only reruns when something changed again...

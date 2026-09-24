@@ -1,6 +1,6 @@
 {
   "name": "dsh-impact-gate",
-  "version": "0.1.0",
+  "version": "0.1.5",
   "description": "Change-impact plugin for DeepSeek Harness: answer 'what does this change touch' and 'which tests must therefore run' from the diff and the import graph (file-level reachability, not a call graph), and turn the selection into the minimal regression command the host configured.",
   "type": "module",
   "main": "./dist/index.js",
@@ -33,9 +33,9 @@
     "dsh-eng-core": "workspace:*"
   },
   "peerDependencies": {
-    "@deepseek-ai/cordis": "^4.0.2",
-    "@deepseek-ai/dsh-agent": "^0.1.5-rc.2",
-    "@deepseek-ai/dsh-tools": "^0.1.5-rc.2"
+    "@deepseek-ai/cordis": "~4.0.4",
+    "@deepseek-ai/dsh-agent": "0.1.7-rc.1",
+    "@deepseek-ai/dsh-tools": "0.1.7-rc.1"
   },
   "dsh": {
     "runtime": "host",

@@ -1,6 +1,6 @@
 {
   "name": "dsh-orchestrator",
-  "version": "0.1.0",
+  "version": "0.1.5",
   "description": "Pipeline orchestrator for DeepSeek Harness: declare which plugin each engineering stage needs, probe that it is mounted, gate the transitions deterministically and roll back (with circuit breaking) instead of silently skipping.",
   "type": "module",
   "main": "./dist/index.js",
@@ -32,10 +32,10 @@
     "dsh-eng-core": "workspace:*"
   },
   "peerDependencies": {
-    "@deepseek-ai/cordis": "^4.0.2",
-    "@deepseek-ai/dsh-agent": "^0.1.5-rc.2",
-    "@deepseek-ai/dsh-llm": "^0.1.5-rc.2",
-    "@deepseek-ai/dsh-tools": "^0.1.5-rc.2"
+    "@deepseek-ai/cordis": "~4.0.4",
+    "@deepseek-ai/dsh-agent": "0.1.7-rc.1",
+    "@deepseek-ai/dsh-llm": "0.1.7-rc.1",
+    "@deepseek-ai/dsh-tools": "0.1.7-rc.1"
   },
   "dsh": {
     "runtime": "host",

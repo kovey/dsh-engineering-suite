@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * stub-llm.mjs — a dependency-free, scripted stand-in for the DeepSeek
- * chat-completions API.
+ * **Messages** API.
  *
  * WHY: the suite's end-to-end verification needs a *real* harness driving
  * *real* tools, but the verification sandbox has no `DEEPSEEK_API_KEY` and no
@@ -14,24 +14,31 @@
  * path (tool dispatch → hooks → gates → artifacts), never that a model would
  * choose those calls.
  *
- * WIRE CONTRACT (verified against
- * `~/.dsh/profiles/node_modules/@deepseek-ai/dsh-llm-deepseek/lib/index.js`):
- *   - `POST {baseURL}/chat/completions` with `stream: true`,
- *     `stream_options.include_usage: true`, `authorization: Bearer …`.
- *   - the response is SSE: `data: <json>\n\n` frames, terminated by the
- *     literal `data: [DONE]\n\n`. `parseSse` dispatches on the blank-line
- *     terminator and treats EOF before `[DONE]` as a truncated stream.
- *   - `translate()` reads ONLY `choices[].delta{content,reasoning_content,
- *     tool_calls[]}` and `choices[].finish_reason`, plus `usage`;
- *     `id`/`object`/`created`/`model` are NOT read by the adapter. They are
- *     emitted anyway so the frames are byte-compatible with a real gateway.
- *   - tool-call fragments sharing one `index` concatenate; `id`/`name` are
- *     identity (a later empty/`null` value means "unchanged"), `arguments`
- *     accumulates. This stub deliberately SPLITS arguments across two frames
- *     so that concatenation is exercised on every call.
- *   - the terminal `finish_reason` is `tool_calls` for a tool step and `stop`
- *     for text; usage rides a trailing `choices: []` chunk (both the
- *     finish-attached and the trailing shape are accepted by the adapter).
+ * WIRE CONTRACT (verified against `@deepseek-ai/dsh-llm-deepseek@0.1.7-rc.1`,
+ * `lib/index.js`: `parseSse` ~1520, `translate` ~1660, request builder ~1410):
+ *   - `POST {baseURL}/messages` with `stream: true`, `authorization: Bearer …`.
+ *     (0.1.5 spoke `/chat/completions` with OpenAI chunks; 0.1.7 switched the
+ *     provider to the Messages protocol — this stub followed it.)
+ *   - tools travel as `{ name, description, input_schema }`; a tool result is a
+ *     `user` message whose content carries `{ type: 'tool_result',
+ *     tool_use_id, content }`; the assistant's calls are `{ type: 'tool_use',
+ *     id, name, input }` blocks.
+ *   - the response is SSE and EVERY frame's JSON must carry a string `type`,
+ *     equal to the frame's `event:` name when that line is present (0.1.7
+ *     throws `MALFORMED_RESPONSE` otherwise). The vocabulary, in order:
+ *       `message_start` → `content_block_start` → `content_block_delta`* →
+ *       `content_block_stop` (per block) → `message_delta` → `message_stop`.
+ *   - a text block is `{ type: 'text' }` + `delta: { type: 'text_delta', text }`;
+ *     a tool block is `{ type: 'tool_use', id, name, input }` +
+ *     `delta: { type: 'input_json_delta', partial_json }`. This stub SPLITS a
+ *     tool call's JSON across two deltas so fragment concatenation is exercised
+ *     on every call.
+ *   - `message_delta.delta.stop_reason` settles the turn (`end_turn` for text,
+ *     `tool_use` for a call); every block must be closed and the reason present
+ *     before `message_stop`, or the translator reports MALFORMED_RESPONSE.
+ *   - usage rides `message_start.message.usage.input_tokens` and
+ *     `message_delta.usage.output_tokens`; there is NO `data: [DONE]`
+ *     terminator in this protocol (`message_stop` ends the stream).
  *
  * USAGE
  *   STUB_SCRIPT=/path/to/script.json [STUB_PORT=8787] node scripts/stub-llm.mjs
@@ -45,17 +52,17 @@
  *         "expectResultContains": ["尚未审批"] },   // optional: asserts THIS step's
  *                                                  // own tool result, evaluated when
  *                                                  // the harness sends the next
- *                                                  // request (the last `role: "tool"`
- *                                                  // message is this step's result)
- *       { "say": "final assistant text" }           // finish_reason: "stop"
+ *                                                  // request (the newest tool_result
+ *                                                  // block is this step's result)
+ *       { "say": "final assistant text" }           // stop_reason: "end_turn"
  *     ]
  *   }
  *
  * The step index is derived from the REQUEST, never from server state: it is
- * the number of `role: "assistant"` messages the harness replayed, so the stub
- * survives restarts and works across turns. A request that carries no `tools`
- * (a side channel such as session titling) is answered with benign text and
- * does not consume a step.
+ * the number of assistant messages the harness replayed, so the stub survives
+ * restarts and works across turns. A request that carries no `tools` (a side
+ * channel such as session titling) is answered with benign text and does not
+ * consume a step.
  *
  * FAILURE POLICY: loud, never silent. A protocol violation, a step mismatch or
  * an exhausted script is logged as `STUB-FATAL`, answered with a best-effort
@@ -69,12 +76,11 @@ import fs from 'node:fs'
 import http from 'node:http'
 import process from 'node:process'
 
-const DONE = '[DONE]'
 const PORT = Number(process.env.STUB_PORT ?? 8787)
 const SCRIPT_PATH = process.env.STUB_SCRIPT ?? ''
 const STRICT = process.env.STUB_STRICT !== '0'
 
-/** Frames are `data: <json>\n\n`; the blank line is what dispatches them. */
+/** Frames are `event: <type>\ndata: <json>\n\n`; the blank line dispatches them. */
 const FRAME_TERMINATOR = '\n\n'
 
 let served = 0
@@ -152,44 +158,55 @@ if (process.argv.includes('--check')) {
 }
 
 // ---------------------------------------------------------------------------
-// request inspection
+// request inspection (Messages protocol)
 // ---------------------------------------------------------------------------
 
-const CONTENT_KEYS = ['content', 'reasoning_content']
-
-/** Rough token accounting so the harness sees plausible (non-zero) usage. */
-function estimateTokens(messages, text) {
-    const chars = messages.reduce((total, message) => {
-        if (typeof message?.content === 'string') return total + message.content.length
-        if (Array.isArray(message?.content)) return total + JSON.stringify(message.content).length
-        return total
-    }, 0)
-    return { prompt: Math.max(1, Math.ceil(chars / 4)), completion: Math.max(1, Math.ceil(text.length / 4)) }
-}
-
-/** The newest tool result the harness replayed (for `expectResultContains`). */
-function lastToolMessage(messages) {
-    for (let index = messages.length - 1; index >= 0; index -= 1) {
-        if (messages[index]?.role === 'tool') return messages[index]
-    }
-    return undefined
-}
-
-function toolMessageText(message) {
+/** Every block of one message's content, normalising a bare string. */
+function blocksOf(message) {
     const content = message?.content
-    if (typeof content === 'string') return content
-    if (Array.isArray(content)) return JSON.stringify(content)
-    return JSON.stringify(content ?? '')
+    if (typeof content === 'string') return [{ type: 'text', text: content }]
+    if (Array.isArray(content)) return content.filter((block) => block !== null && typeof block === 'object')
+    return []
+}
+
+/** Tool results the harness replayed: `{ toolUseId, text }`, oldest first. */
+function toolResults(messages) {
+    const results = []
+    for (const message of messages) {
+        if (message?.role !== 'user') continue
+        for (const block of blocksOf(message)) {
+            if (block.type !== 'tool_result') continue
+            const inner = block.content
+            const text =
+                typeof inner === 'string'
+                    ? inner
+                    : Array.isArray(inner)
+                      ? inner
+                            .map((entry) => (typeof entry === 'string' ? entry : (entry?.text ?? JSON.stringify(entry))))
+                            .join('\n')
+                      : JSON.stringify(inner ?? '')
+            results.push({ toolUseId: String(block.tool_use_id ?? ''), text })
+        }
+    }
+    return results
 }
 
 /** Names of the tool calls the harness replayed, in order. */
 function replayedToolCalls(messages) {
     const names = []
     for (const message of messages) {
-        if (message?.role !== 'assistant' || !Array.isArray(message.tool_calls)) continue
-        for (const call of message.tool_calls) names.push(call?.function?.name ?? '(anonymous)')
+        if (message?.role !== 'assistant') continue
+        for (const block of blocksOf(message)) {
+            if (block.type === 'tool_use') names.push(block.name ?? '(anonymous)')
+        }
     }
     return names
+}
+
+/** Rough token accounting so the harness sees plausible (non-zero) usage. */
+function estimateTokens(messages, text) {
+    const chars = messages.reduce((total, message) => total + JSON.stringify(message?.content ?? '').length, 0)
+    return { prompt: Math.max(1, Math.ceil(chars / 4)), completion: Math.max(1, Math.ceil(text.length / 4)) }
 }
 
 function describeRequest(body, messages, tools) {
@@ -206,128 +223,110 @@ function describeRequest(body, messages, tools) {
 
 /**
  * Verify the step whose result this request replays: `previous` is the step
- * immediately before the one being decided, and the newest `role: "tool"`
- * message in the request IS that step's result. A missing tool message is a
- * warning, not a failure: some harness paths synthesize the result differently
- * and the run's own artifacts are the authority.
+ * immediately before the one being decided, and the newest `tool_result` block
+ * in the request IS that step's result. A missing result is a warning, not a
+ * failure: some harness paths synthesize the result differently and the run's
+ * own artifacts are the authority.
  */
 function checkExpectation(previous, messages) {
     const expected = previous?.expectResultContains
     if (!Array.isArray(expected) || expected.length === 0) return
-    const tool = lastToolMessage(messages)
-    if (tool === undefined) {
+    const results = toolResults(messages)
+    const last = results[results.length - 1]
+    if (last === undefined) {
         log('WARN', `step ${stepLabel(previous, -1)} expected a tool result but the request replays none`)
         return
     }
-    const text = toolMessageText(tool)
-    const missing = expected.filter((needle) => !text.includes(needle))
+    const missing = expected.filter((needle) => !last.text.includes(needle))
     if (missing.length === 0) {
         log('CHECK', `previous result matches expectResultContains (${expected.length} needle(s))`)
         return
     }
     fatalError(
         `previous tool result does not contain ${JSON.stringify(missing)}`,
-        `  --- tool result (first 2000 bytes) ---\n${text.slice(0, 2000)}\n  --- end ---`,
+        `  --- tool result (first 2000 bytes) ---\n${last.text.slice(0, 2000)}\n  --- end ---`,
     )
 }
 
 // ---------------------------------------------------------------------------
-// SSE frames
+// SSE frames (Messages protocol)
 // ---------------------------------------------------------------------------
 
-function envelope(model, choices, extra = {}) {
+/** One SSE frame: `event:` mirrors the payload's `type`, which 0.1.7 requires. */
+function frame(type, payload = {}) {
     seq += 1
-    return {
-        id: `chatcmpl-stub-${seq}`,
-        object: 'chat.completion.chunk',
-        created: Math.floor(Date.now() / 1000),
-        model,
-        choices,
-        ...extra,
-    }
+    return { event: type, data: { type, ...payload } }
 }
 
-function choice(delta, finishReason = null) {
-    return { index: 0, delta, finish_reason: finishReason }
+function messageStart(model, usage) {
+    return frame('message_start', {
+        message: {
+            id: `msg_stub_${seq}`,
+            type: 'message',
+            role: 'assistant',
+            model,
+            content: [],
+            usage: { input_tokens: usage.prompt, output_tokens: 0 },
+        },
+    })
 }
 
 /** Split a string in two so fragment concatenation is exercised on every call. */
 function splitInTwo(text) {
-    if (text.length < 2) return [text, '']
+    if (text.length < 2) return [text]
     const cut = Math.max(1, Math.floor(text.length / 2))
     return [text.slice(0, cut), text.slice(cut)]
 }
 
-function toolFrames(model, call, usage) {
-    const args = JSON.stringify(call.arguments ?? {})
-    const [first, second] = splitInTwo(args)
-    const frames = [
-        envelope(model, [choice({ role: 'assistant', content: '' })]),
-        envelope(model, [
-            choice({
-                tool_calls: [
-                    {
-                        index: 0,
-                        id: call.id,
-                        type: 'function',
-                        function: { name: call.name, arguments: first },
-                    },
-                ],
-            }),
-        ]),
-    ]
-    if (second !== '') {
-        // Continuation fragment: the wire repeats identity as null; the adapter
-        // must keep the established id/name (acceptIdentity) and append args.
-        frames.push(
-            envelope(model, [
-                choice({
-                    tool_calls: [
-                        {
-                            index: 0,
-                            id: null,
-                            type: 'function',
-                            function: { name: null, arguments: second },
-                        },
-                    ],
-                }),
-            ]),
-        )
+function textBlock(index, text) {
+    const frames = [frame('content_block_start', { index, content_block: { type: 'text', text: '' } })]
+    for (const part of splitInTwo(text)) {
+        frames.push(frame('content_block_delta', { index, delta: { type: 'text_delta', text: part } }))
     }
-    frames.push(envelope(model, [choice({}, 'tool_calls')]))
-    frames.push(usageFrame(model, usage))
+    frames.push(frame('content_block_stop', { index }))
     return frames
 }
 
+function toolBlock(index, call) {
+    const args = JSON.stringify(call.arguments ?? {})
+    const frames = [
+        frame('content_block_start', {
+            index,
+            content_block: { type: 'tool_use', id: call.id, name: call.name, input: {} },
+        }),
+    ]
+    for (const part of splitInTwo(args)) {
+        frames.push(frame('content_block_delta', { index, delta: { type: 'input_json_delta', partial_json: part } }))
+    }
+    frames.push(frame('content_block_stop', { index }))
+    return frames
+}
+
+/** A tool-call turn: one open block, its deltas, its close, then settlement. */
+function toolFrames(model, call, usage) {
+    return [
+        messageStart(model, usage),
+        ...toolBlock(0, call),
+        frame('message_delta', { delta: { stop_reason: 'tool_use' }, usage: { output_tokens: usage.completion } }),
+        frame('message_stop'),
+    ]
+}
+
+/** A text turn. An empty string would be EMPTY_RESPONSE, so say something. */
 function textFrames(model, text, usage) {
-    const parts = text.length > 40 ? [text.slice(0, Math.floor(text.length / 2)), text.slice(Math.floor(text.length / 2))] : [text]
-    const frames = [envelope(model, [choice({ role: 'assistant', content: '' })])]
-    for (const part of parts) frames.push(envelope(model, [choice({ content: part })]))
-    frames.push(envelope(model, [choice({}, 'stop')]))
-    frames.push(usageFrame(model, usage))
-    return frames
-}
-
-function usageFrame(model, usage) {
-    return envelope(
-        model,
-        [],
-        {
-            usage: {
-                prompt_tokens: usage.prompt,
-                completion_tokens: usage.completion,
-                total_tokens: usage.prompt + usage.completion,
-                prompt_cache_hit_tokens: 0,
-                prompt_cache_miss_tokens: usage.prompt,
-                prompt_tokens_details: { cached_tokens: 0 },
-            },
-        },
-    )
+    const body = text === '' ? 'stub: (empty say step)' : text
+    return [
+        messageStart(model, usage),
+        ...textBlock(0, body),
+        frame('message_delta', { delta: { stop_reason: 'end_turn' }, usage: { output_tokens: usage.completion } }),
+        frame('message_stop'),
+    ]
 }
 
 function writeFrames(response, frames) {
-    for (const frame of frames) response.write(`data: ${JSON.stringify(frame)}${FRAME_TERMINATOR}`)
-    response.write(`data: ${DONE}${FRAME_TERMINATOR}`)
+    for (const item of frames) {
+        response.write(`event: ${item.event}\ndata: ${JSON.stringify(item.data)}${FRAME_TERMINATOR}`)
+    }
     response.end()
 }
 
@@ -355,15 +354,13 @@ function decide(body, messages, tools) {
     }
 
     if (assistantCount >= STEPS.length) {
-        // The harness wants more turns than the script declares. Answer with the
-        // last step when it is a text step (so the run can end cleanly) and fail
-        // loudly either way.
         const last = STEPS[STEPS.length - 1]
         fatalError(
             `harness asked for step ${assistantCount} but the script declares ${STEPS.length}`,
             `  replayed tool calls: ${replayed.join(' → ') || '(none)'}`,
         )
-        const frames = last.say !== undefined ? textFrames(model, last.say, usage) : textFrames(model, 'stub: script exhausted.', usage)
+        const frames =
+            last.say !== undefined ? textFrames(model, last.say, usage) : textFrames(model, 'stub: script exhausted.', usage)
         return { kind: 'text', label: 'script-exhausted', frames }
     }
 
@@ -384,7 +381,7 @@ function decide(body, messages, tools) {
     }
 
     if (step.tool !== undefined) {
-        log('DECIDE', `${stepLabel(step, assistantCount)} → tool_calls (arguments ${JSON.stringify(step.arguments).length} bytes)`)
+        log('DECIDE', `${stepLabel(step, assistantCount)} → tool_use (arguments ${JSON.stringify(step.arguments).length} bytes)`)
         return {
             kind: 'tool',
             label: stepLabel(step, assistantCount),
@@ -396,7 +393,7 @@ function decide(body, messages, tools) {
         }
     }
 
-    log('DECIDE', `${stepLabel(step, assistantCount)} → text/stop (${step.say.length} chars)`)
+    log('DECIDE', `${stepLabel(step, assistantCount)} → text/end_turn (${step.say.length} chars)`)
     return {
         kind: 'text',
         label: stepLabel(step, assistantCount),
@@ -409,16 +406,16 @@ function decide(body, messages, tools) {
 // ---------------------------------------------------------------------------
 
 function assertProtocol(body, pathname) {
-    if (!pathname.endsWith('/chat/completions')) log('WARN', `unexpected path ${pathname}`)
+    if (!pathname.endsWith('/messages')) log('WARN', `unexpected path ${pathname} (0.1.7 posts /messages)`)
     if (body.stream !== true) log('WARN', 'request did not set stream: true')
-    if (body.stream_options?.include_usage !== true) log('WARN', 'request did not set stream_options.include_usage')
     if (Array.isArray(body.tools)) {
         for (const tool of body.tools) {
-            if (tool?.type !== 'function') log('WARN', `tools[] entry without type: "function": ${JSON.stringify(tool).slice(0, 120)}`)
+            if (typeof tool?.input_schema !== 'object') {
+                log('WARN', `tools[] entry without input_schema: ${JSON.stringify(tool).slice(0, 120)}`)
+            }
         }
     }
-    const keys = Object.keys(body)
-    log('PROTO', `body keys: ${keys.join(', ')}`)
+    log('PROTO', `body keys: ${Object.keys(body).join(', ')}`)
 }
 
 // ---------------------------------------------------------------------------
@@ -446,7 +443,7 @@ const server = http.createServer((request, response) => {
     if (request.method !== 'POST') {
         log('WARN', `${request.method} ${pathname} → 405`)
         response.writeHead(405, { 'content-type': 'application/json' })
-        response.end('{"error":{"message":"stub-llm only serves POST /chat/completions and GET /health"}}\n')
+        response.end('{"error":{"message":"stub-llm only serves POST /messages and GET /health"}}\n')
         return
     }
 

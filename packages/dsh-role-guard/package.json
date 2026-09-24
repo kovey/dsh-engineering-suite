@@ -1,6 +1,6 @@
 {
   "name": "dsh-role-guard",
-  "version": "0.1.0",
+  "version": "0.1.5",
   "description": "Role and permission layer for DeepSeek Harness: one Markdown file per agent role (persona + model + tool whitelist), least-privilege delegation through team_delegate, and a strict write/read-only split.",
   "type": "module",
   "main": "./dist/index.js",
@@ -33,11 +33,11 @@
     "dsh-eng-core": "workspace:*"
   },
   "peerDependencies": {
-    "@deepseek-ai/cordis": "^4.0.2",
-    "@deepseek-ai/dsh-agent": "^0.1.5-rc.2",
-    "@deepseek-ai/dsh-llm": "^0.1.5-rc.2",
-    "@deepseek-ai/dsh-subagent": "^0.1.5-rc.2",
-    "@deepseek-ai/dsh-tools": "^0.1.5-rc.2"
+    "@deepseek-ai/cordis": "~4.0.4",
+    "@deepseek-ai/dsh-agent": "0.1.7-rc.1",
+    "@deepseek-ai/dsh-llm": "0.1.7-rc.1",
+    "@deepseek-ai/dsh-subagent": "0.1.7-rc.1",
+    "@deepseek-ai/dsh-tools": "0.1.7-rc.1"
   },
   "dsh": {
     "runtime": "host",

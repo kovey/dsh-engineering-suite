@@ -24,6 +24,7 @@
  */
 
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
+import './sources.js'
 import {
     gitFingerprint,
     sessionIdOf,
@@ -420,7 +421,8 @@ async function evaluateTurnStop(deps: HookDeps, payload: TurnStoppingPayload): P
                     ].join('\n'),
                 },
             ],
-            source: { kind: 'plugin', plugin: 'dsh-quality-gate', form: 'notice', summary: `质量门禁 BLOCK：${verdict.reason}`.slice(0, 120) },
+            // Our OWN source kind — see `sources.ts`.
+            source: { kind: 'dsh-quality-gate', form: 'notice', summary: `质量门禁 BLOCK：${verdict.reason}`.slice(0, 120) },
         }),
     )
     logger.warn(`收尾门禁 BLOCK（触发：${trigger}；${gateId ?? '无 mission'}）：${verdict.reason}`)

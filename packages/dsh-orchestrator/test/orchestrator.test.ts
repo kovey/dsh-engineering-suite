@@ -990,7 +990,13 @@ test('auto-advance settles a gated stage whose gate passes and steers the model 
     assert.match(notice, /依据：宿主声明 autoAdvance=true/)
     assert.match(notice, /state: passed/)
     assert.match(notice, /当前阶段：review/)
-    assert.equal(fake.steers[0]?.source.plugin, 'dsh-orchestrator')
+    // 0.1.7 dropped the shared `plugin` source kind: a producer declares its own.
+    // The notice must still say WHERE it came from — and keep the bounded form.
+    const source = fake.steers[0]?.source as { kind?: string; form?: string; summary?: string } | undefined
+    assert.equal(source?.kind, 'dsh-orchestrator')
+    assert.equal(source?.form, 'notice')
+    assert.match(String(source?.summary), /阶段自动推进：impl → review/)
+    assert.ok(String(source?.summary).length <= 120, 'the summary stays within the harness bound')
 
     // The successor is ungated and opted out: a second stop in the same turn
     // moves nothing and says nothing.

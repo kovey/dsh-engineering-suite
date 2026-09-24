@@ -1,6 +1,6 @@
 {
   "name": "dsh-coverage-gate",
-  "version": "0.1.0",
+  "version": "0.1.5",
   "description": "Test-effectiveness gate for DeepSeek Harness: turn coverage reports and repeated test runs into deterministic PASS/BLOCK verdicts — total coverage, coverage of the lines this change ADDED, and whether any test is flaky.",
   "type": "module",
   "main": "./dist/index.js",
@@ -33,9 +33,9 @@
     "dsh-eng-core": "workspace:*"
   },
   "peerDependencies": {
-    "@deepseek-ai/cordis": "^4.0.2",
-    "@deepseek-ai/dsh-agent": "^0.1.5-rc.2",
-    "@deepseek-ai/dsh-tools": "^0.1.5-rc.2"
+    "@deepseek-ai/cordis": "~4.0.4",
+    "@deepseek-ai/dsh-agent": "0.1.7-rc.1",
+    "@deepseek-ai/dsh-tools": "0.1.7-rc.1"
   },
   "dsh": {
     "runtime": "host",

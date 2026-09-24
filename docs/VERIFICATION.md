@@ -1,5 +1,33 @@
 # 验证记录（2026-09-17）
 
+> **兼容基线（本文件全部结论的宿主版本）**：`@deepseek-ai/dsh-*` **0.1.7-rc.1**（`cordis ~4.0.4`）。
+> 11 个插件的 `peerDependencies` 按官方与生态约定**精确锁版**（`0.1.7-rc.1`，cordis `~4.0.4`），
+> 而不是 caret 范围：semver 规定带预发布的 `^0.1.5-rc.2` **不匹配** `0.1.7-rc.1`，
+> 用范围写会导致 `dsh plugin add` 报 peer 不满足。宿主每升一版，锁版随插件版本一起升。
+> 已核实仍存在的接缝：`tools/pre-execute`、`tools/result`、`tools/post-execute`、`agent/turn-stopping`、
+> `agent/disposed`、`approval/request`、`session/title`；子代理在 rc1 由 harness 自动**钉住
+> `approvalPolicy: 'never'`** 并继承 preset/sandbox（`captureDelegatedPolicyOverrides`），
+> 与我们"派出去的子代理不能自己批准什么"的立场一致，无需插件侧改动。
+>
+> **0.1.7-rc.1 适配记录**（三处真实改动，都已验证）：
+> 1. **消息来源词汇表**：`MessageSourceMap` 里**没有**共享的 `plugin` 兜底 kind 了（官方文档原话：each producer declares its own kind），
+>    每个生产者要用 `declare module '@deepseek-ai/dsh-llm'` 声明自己的 kind。我们新增
+>    `dsh-orchestrator/src/sources.ts` 与 `dsh-quality-gate/src/sources.ts`，注入的通知分别标成
+>    `kind: 'dsh-orchestrator'` / `'dsh-quality-gate'`（`form: 'notice'`），测试断言 kind/form/摘要 ≤120 字符。
+> 2. **DeepSeek provider 换成 Messages 协议**：0.1.5 走 `POST /chat/completions` + OpenAI chunk；
+>    0.1.7 走 `POST /messages`，SSE 每一帧的 JSON 必须带 `type`（且与 `event:` 名一致），
+>    顺序为 `message_start → content_block_start → content_block_delta* → content_block_stop → message_delta → message_stop`，
+>    工具结果是 `user` 消息里的 `tool_result` 块，工具用 `input_schema`，**没有 `data: [DONE]`**。
+>    `scripts/stub-llm.mjs` 已按新协议重写（工具参数仍故意拆两个 delta 以持续检验分片拼接）；
+>    在此之前 E2E 会以 `MALFORMED_RESPONSE: SSE event type mismatch` 直接失败——旧 stub 只能证明旧协议下的框架路径。
+> 3. **peer 约定**：官方与生态包（如 `dsh-user-approval`、`dsh-memory`）用**精确锁版**；本仓库 11 个插件统一为
+>    `@deepseek-ai/dsh-*: "0.1.7-rc.1"` + `cordis: "~4.0.4"`。用范围写会导致 `dsh plugin add` 报 peer 不满足
+>    （semver 规定带预发布的 `^0.1.x-rc.y` 不匹配 `0.1.7-rc.1`）。
+>
+> 顺带核实的 rc1 新能力（本套件暂未依赖，记录备查）：`dsh-fs-sandbox` / `dsh-bash-sandbox` / `dsh-pwsh-sandbox`
+> （沙箱策略服务）、`dsh-permission-presets`（权限预设）、`dsh-mcp-client`（MCP 客户端）、
+> `dsh-user-questions` + `dsh-client-ui-*`（问答/审批的客户端面）、子代理委派时自动继承 preset/sandbox 并钉住审批策略。
+
 本文件记录这套插件**实际被验证到什么程度**，以及哪些环节还需要人在真实会话里确认。
 所有命令都可以重跑。
 

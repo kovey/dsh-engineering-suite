@@ -29,6 +29,7 @@
  */
 
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
+import './sources.js'
 import { sessionIdOf, type AgentLike, type MissionRecord, type MissionStore, type StageResult } from 'dsh-eng-core'
 import type { Logger } from 'dsh-eng-core'
 import { evaluateGate } from './gates.js'
@@ -272,9 +273,10 @@ async function evaluateAutoAdvance(deps: AutoAdvanceDeps, payload: TurnStoppingP
     agent.steer(
         createUserMessage({
             content: [{ type: 'text', text: noticeText(mission, stage, outcome.detail, successor) }],
+            // Our OWN source kind (0.1.7 dropped the shared `plugin` kind): the
+            // log now says which gate spoke, not "some plugin".
             source: {
-                kind: 'plugin',
-                plugin: 'dsh-orchestrator',
+                kind: 'dsh-orchestrator',
                 form: 'notice',
                 summary: `阶段自动推进：${stage.id} → ${successor?.id ?? '(结束)'}`.slice(0, 120),
             },

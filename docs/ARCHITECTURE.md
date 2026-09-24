@@ -370,12 +370,18 @@ artifact + 证据行（kind=artifact）
 套件里所有"需要人点头"的动作——规格审批、交付审核、规范阈值/基线放宽、新增依赖——都走**同一个接缝**
 `ctx.get('approval').request(...)`。这带来一个直接结论：**接 IM 不需要改各个插件**，只需要一个应答者。
 
-接缝的返回被扩展成"旧字符串 + 可选的溯源对象"：
+接缝的返回**在套件侧**被扩展成"旧字符串 + 可选的溯源对象"：
 
 ```
-'allowed-once' | 'rejected' | 'cancelled' | 'unavailable'          ← 终端应答者，原样可用
-{ decision, by?, messageId?, at?, source? }                          ← IM 卡片点击：谁、哪张卡、哪个通道
+'allowed-once' | 'rejected' | 'cancelled' | 'unavailable'          ← 唯一的线上形态（见下）
+{ decision, by?, messageId?, at?, source? }                          ← 我们的容忍形态，不是线上契约
 ```
+
+**实测（0.1.7-rc.1）**：harness 的 `dsh-user-approval` 声明的 `ApprovalOutcome` 就是那四个字符串，
+且它的实现是 `OUTCOMES.includes(outcome) ? outcome : 'unavailable'`——应答者返回对象会被**规范化成 `unavailable`（拒绝）**。
+所以：规范化函数保留对象形态只为**向前兼容**（宿主将来放宽时不用改插件），
+**不能把它当成能拿到身份的通路**；`by`/`messageId` 这类溯源今天的正确落点是**通道自己的台账**
+（例如 IM 插件写 `.dsh/<channel>-approvals.jsonl`），套件侧记录的是"经 approval 接缝批准"这一事实。
 
 - **一个规范化函数**（`normalizeApprovalReply`）处理两种形态：任何无法识别的返回值一律判为 `unavailable`（fail closed）——
   从不"猜一个决定"，否则"没人回答"就会变成"已批准"；

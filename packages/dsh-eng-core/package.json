@@ -1,6 +1,6 @@
 {
   "name": "dsh-eng-core",
-  "version": "0.1.0",
+  "version": "0.1.5",
   "description": "Shared runtime for the DeepSeek Harness engineering suite: mission artifacts, deterministic command runner, git fingerprint, audit JSONL and structured logging.",
   "type": "module",
   "main": "./dist/index.js",
