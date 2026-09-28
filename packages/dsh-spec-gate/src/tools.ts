@@ -27,18 +27,42 @@ import {
     type AgentLike,
     type AmendRequest,
     type GapReport,
+    type Layout,
     type MissionRecord,
     type MissionStoreRegistry,
     type ScanResult,
     type SpecChange,
+    type SpecRecord,
 } from 'dsh-eng-core'
 import type { Logger } from 'dsh-eng-core'
 import { buildIndex, checkDraft, parseDraftAnswer, renderBrief, renderDraft } from './bootstrap.js'
 import type { SpecGateConfig } from './config.js'
 import type { WriteGuard } from './guard.js'
 import { describeConstraints } from './constraints.js'
-import { buildSpec, describeMission, parseDraftTestDesign, renderSpec, validateDraft, type SpecDraft } from './spec.js'
+import {
+    buildSpec,
+    describeMission,
+    labelsWithMilestone,
+    milestoneOf,
+    milestoneProblem,
+    parseDraftTestDesign,
+    renderSpec,
+    validateDraft,
+    type SpecDraft,
+} from './spec.js'
 import { amendMissionSpec } from './amend.js'
+import {
+    appendPlanRows,
+    buildPlanReport,
+    describePlanFile,
+    logPlanAppend,
+    NO_MILESTONE_LABEL,
+    planLedgerFile,
+    renderPlanReport,
+    type PlanRow,
+    type PlanRowKind,
+} from './plan-ledger.js'
+import { adrIndexPath, listAdr, recordAdr, renderAdrList } from './adr.js'
 
 const TEXT_OUTPUT = { type: 'string' } as const
 
@@ -150,6 +174,8 @@ interface CreateArgs {
     fileBoundaries: string[]
     negativeConstraints: string[]
     testDesign?: string
+    /** Milestone the requirements belong to (required when `milestoneRequired`). */
+    milestone?: string
     missionId?: string
 }
 
@@ -162,6 +188,12 @@ interface StatusArgs {
     missionId?: string
 }
 
+interface PlanStatusArgs {
+    milestone?: string
+    missionId?: string
+    json?: boolean
+}
+
 interface AmendArgs {
     part: 'requirement' | 'criterion'
     action: 'add' | 'update' | 'remove'
@@ -169,6 +201,22 @@ interface AmendArgs {
     text?: string
     note?: string
     cascade?: boolean
+    /** Milestone to set/change along with this amendment. */
+    milestone?: string
+    missionId?: string
+}
+
+interface AdrRecordArgs {
+    title: string
+    decision: string
+    alternatives?: string
+    consequences?: string
+    missionId?: string
+    supersedes?: number
+}
+
+interface AdrListArgs {
+    query?: string
     missionId?: string
 }
 
@@ -299,6 +347,75 @@ function effectiveFor(deps: ToolDeps, agent: AgentLike | undefined): SpecGateCon
     return cwd === undefined ? deps.config : deps.configFor(cwd).config
 }
 
+/**
+ * Validate the optional `milestone` argument of `spec_create` / `spec_amend`.
+ *
+ * Fail closed BEFORE anything is written: a rejected name must not leave a
+ * half-updated mission behind, and the refusal names both the rule and the fix.
+ * @throws when the value is not a usable milestone name.
+ */
+function milestoneArg(value: unknown): string | undefined {
+    if (value === undefined || value === null) return undefined
+    if (typeof value !== 'string') {
+        throw new Error(`milestone 必须是字符串（收到 ${typeof value}）：例如 milestone: "v1.2"；省略该参数表示不设里程碑。`)
+    }
+    const problem = milestoneProblem(value)
+    if (problem !== undefined) {
+        throw new Error(`${problem}。下一步：改成 ≤64 字符、不含控制字符的短标签（如 "v1.2" / "M3"）后重试，或省略该参数。`)
+    }
+    return value.trim()
+}
+
+/**
+ * One ledger row describing a mission's CURRENT specification revision.
+ *
+ * Every row carries the full id list, which is what makes "the newest row wins"
+ * safe: a later `milestone-changed` row cannot lose the requirements an earlier
+ * `spec-created` row had recorded.
+ */
+function planRowFor(
+    mission: MissionRecord,
+    spec: SpecRecord,
+    kind: PlanRowKind,
+    at: number,
+    summary: string,
+    extra: { milestone?: string; approvedBy?: string; retired?: readonly string[] } = {},
+): PlanRow {
+    return {
+        at,
+        kind,
+        missionId: mission.id,
+        // This suite keys the specification artifact by mission; the column
+        // exists so the two can be decoupled later without rewriting the ledger.
+        specId: mission.id,
+        title: spec.title,
+        ...(extra.milestone === undefined ? {} : { milestone: extra.milestone }),
+        requirementIds: spec.requirements.map((entry) => entry.id),
+        criteriaIds: spec.acceptanceCriteria.map((entry) => entry.id),
+        ...(extra.retired === undefined || extra.retired.length === 0 ? {} : { retiredRequirementIds: [...extra.retired] }),
+        ...(extra.approvedBy === undefined ? {} : { approvedBy: extra.approvedBy }),
+        summary,
+    }
+}
+
+/**
+ * Append the plan ledger's rows for one transition.
+ *
+ * The specification is the authority and the ledger is an index, so this never
+ * throws: a failure is logged and returned as lines the tool appends to its
+ * output, where the model can see that `plan_status` will not know about the
+ * change.
+ */
+function recordPlan(deps: ToolDeps, layout: Layout, config: SpecGateConfig, rows: readonly PlanRow[]): string[] {
+    if (rows.length === 0) return []
+    const file = planLedgerFile(layout, config)
+    const logger = deps.logger.for(layout.cwd)
+    const result = appendPlanRows(file, rows, logger)
+    logPlanAppend(logger, result, file)
+    if (result.warning === undefined) return []
+    return ['', result.warning, `台账文件：${describePlanFile(layout, file)}`]
+}
+
 /** One line of the change history a report shows. */
 function renderChangeLine(change: SpecChange): string {
     const body = change.kind.startsWith('add-')
@@ -370,11 +487,18 @@ export function registerTools(
                     description:
                         'The body of the `## 测试设计` chapter: `### 正向场景` / `### 异常场景` / `### 边界场景`, each a Markdown table with columns 用例ID | 前置条件 | 操作步骤 | 预期结果 | 覆盖验收标准.',
                 },
+                milestone: {
+                    type: 'string',
+                    description:
+                        'Optional planning milestone these requirements belong to (`v1.2`, `M3`; ≤64 chars, no control characters). `plan_status` groups every mission\'s requirements by it. Omitted = keep the mission\'s current milestone unchanged; a mission without one is REFUSED when the workspace sets milestoneRequired.',
+                },
                 missionId: { type: 'string', description: 'Revise an existing mission instead of creating one.' },
             },
             output: { schema: TEXT_OUTPUT, render: (_args, value) => [{ type: 'text', text: value }] },
             async execute(args: CreateArgs = {} as CreateArgs, exec) {
                 const { store, agent, cwd } = storeFor(deps, exec)
+                const effective = effectiveFor(deps, agent)
+                const milestone = milestoneArg(args.milestone)
                 const draft: SpecDraft = {
                     title: args.title ?? '',
                     background: args.background ?? '',
@@ -382,6 +506,7 @@ export function registerTools(
                     acceptanceCriteria: args.acceptanceCriteria ?? [],
                     fileBoundaries: args.fileBoundaries ?? [],
                     negativeConstraints: args.negativeConstraints ?? [],
+                    ...(milestone === undefined ? {} : { milestone }),
                     testDesignMarkdown: args.testDesign ?? '',
                 }
                 const issues = validateDraft(draft)
@@ -402,6 +527,19 @@ export function registerTools(
                     }
                 }
                 const existing = store.resolveForAgent(agent, { ...(args.missionId === undefined ? {} : { explicitId: args.missionId }) })
+                if (milestone === undefined && effective.milestoneRequired && milestoneOf(existing) === undefined) {
+                    // A rewrite of a mission that already HAS a milestone inherits
+                    // it (omitting the argument means "do not change it"), so the
+                    // rule is about the resulting spec, not about the argument.
+                    throw new Error(
+                        [
+                            'spec_create 未写入任何文件：本仓库要求每个规格声明里程碑（milestoneRequired=true），' +
+                                '否则 plan_status 无法把需求归到任何迭代里。',
+                            '下一步：给 spec_create 传 milestone（例如 milestone: "v1.2" / "M3"），' +
+                                '或由宿主或 .dsh/spec-gate.json 把 milestoneRequired 改回 false。',
+                        ].join('\n'),
+                    )
+                }
                 const mission =
                     existing ??
                     store.create({
@@ -412,7 +550,8 @@ export function registerTools(
                 const design = parseDraftTestDesign(draft)
                 const spec = buildSpec(draft, mission.spec)
                 const revised = mission.spec !== undefined
-                const updated = store.update(mission.id, () => ({
+                const previousMilestone = milestoneOf(mission)
+                const updated = store.update(mission.id, (record) => ({
                     title: draft.title.trim(),
                     // A revision always revokes the previous approval, and a
                     // revision that does not carry a fresh test design also
@@ -422,11 +561,34 @@ export function registerTools(
                     status: 'draft',
                     spec,
                     testDesign: design ?? (revised ? undefined : mission.testDesign),
+                    // The milestone rides on the mission's labels (the shared
+                    // record has no planning field, and this plugin does not
+                    // extend the shared contract).
+                    ...(milestone === undefined ? {} : { labels: labelsWithMilestone(record.labels, milestone) }),
                 }))
                 if (updated === undefined) throw new Error(`mission ${mission.id} disappeared while writing the specification`)
                 const markdown = renderSpec(updated)
                 const file = store.writeSpec(mission.id, markdown)
                 if (sessionId !== undefined) store.bindSession(sessionId, mission.id)
+                const now = Date.now()
+                const ledgerRows: PlanRow[] = [
+                    planRowFor(
+                        updated,
+                        spec,
+                        'spec-created',
+                        now,
+                        `${revised ? '重写' : '新建'}规格 revision ${spec.revision}：需求 ${spec.requirements.length} 条、验收标准 ${spec.acceptanceCriteria.length} 条`,
+                        { ...(milestone === undefined ? {} : { milestone }) },
+                    ),
+                ]
+                if (milestone !== undefined && milestone !== previousMilestone) {
+                    // Only the transitions that actually happened are recorded.
+                    ledgerRows.push(
+                        planRowFor(updated, spec, 'milestone-changed', now, `里程碑：${previousMilestone ?? '(无)'} → ${milestone}`, {
+                            milestone,
+                        }),
+                    )
+                }
                 const designNote =
                     design === undefined
                         ? '测试设计章节为空：spec_approve 之前需要补齐并运行 test_design_review。'
@@ -436,9 +598,11 @@ export function registerTools(
                     `规格已写入：${file}`,
                     `mission: ${mission.id}（revision ${spec.revision}，状态 draft）`,
                     `验收标准：${spec.acceptanceCriteria.map((criterion) => criterion.id).join(', ')}`,
+                    ...(milestone === undefined ? [] : [`里程碑：${milestone}`]),
                     designNote,
                     constraintNote,
-                    needsTestDesign(deps, effectiveFor(deps, agent))
+                    ...recordPlan(deps, store.layout, effective, ledgerRows),
+                    needsTestDesign(deps, effective)
                         ? '下一步：调用 test_design_review 通过测试设计门禁，然后调用 spec_approve 取人工审批。'
                         : '下一步：调用 spec_approve 取人工审批。',
                 ].join('\n')
@@ -546,8 +710,23 @@ export function registerTools(
                 if (approved === undefined) throw new Error(`mission ${mission.id} disappeared while approving`)
                 // Re-render so the artifact carries the approval header.
                 store.writeSpec(mission.id, renderSpec(approved))
+                const approvedMilestone = milestoneOf(approved)
+                const approvalRows: PlanRow[] =
+                    approved.spec === undefined
+                        ? []
+                        : [
+                              planRowFor(
+                                  approved,
+                                  approved.spec,
+                                  'spec-approved',
+                                  Date.now(),
+                                  `规格已审批（by ${approvedBy}${decision.source === '' ? '' : ` via ${decision.source}`}）`,
+                                  { ...(approvedMilestone === undefined ? {} : { milestone: approvedMilestone }), approvedBy },
+                              ),
+                          ]
                 return [
                     `规格已审批（mission ${mission.id}，by ${approvedBy}${decision.source === '' ? '' : ` via ${decision.source}`}${decision.messageId === '' ? '' : ` #${decision.messageId}`}，${formatTime(Date.now())}）。`,
+                    ...recordPlan(deps, store.layout, effective, approvalRows),
                     '写操作现已放行。下一步：按规格实现 → evidence_record 登记验证输出 → quality_gate_run 跑门禁 → mission_complete 交付。',
                 ].join('\n')
             },
@@ -580,11 +759,19 @@ export function registerTools(
                     type: 'boolean',
                     description: 'Allow removing a criterion that test cases cover (the cases are dropped too and must be re-reviewed).',
                 },
+                milestone: {
+                    type: 'string',
+                    description:
+                        'Set or change the mission\'s milestone along with this edit (`v1.2`, `M3`; ≤64 chars, no control characters). Omitted = keep the current milestone. A real change is recorded as a `milestone-changed` transition in the plan ledger.',
+                },
                 missionId: { type: 'string', description: 'Mission whose specification is edited (default: the session mission).' },
             },
             output: { schema: TEXT_OUTPUT, render: (_args, value) => [{ type: 'text', text: value }] },
             async execute(args: AmendArgs = {} as AmendArgs, exec) {
                 const { store, agent } = storeFor(deps, exec)
+                // Validated before anything is written: a rejected name must not
+                // leave a half-edited specification behind.
+                const requestedMilestone = milestoneArg(args.milestone)
                 const mission = resolveStrict(deps, exec, args.missionId)
                 if (mission === undefined) {
                     return [
@@ -616,6 +803,44 @@ export function registerTools(
                         ...(outcome.nextSteps === undefined ? [] : ['', '### 下一步', '', outcome.nextSteps]),
                     ].join('\n')
                 }
+                const now = Date.now()
+                // The milestone is applied FIRST, so every row below records the
+                // state after this call: the ledger is an index of what happened,
+                // not a plan.
+                let milestoneNote: string | undefined
+                if (requestedMilestone !== undefined) {
+                    const before = milestoneOf(mission)
+                    if (before !== requestedMilestone) {
+                        store.update(mission.id, (record) => ({ labels: labelsWithMilestone(record.labels, requestedMilestone) }))
+                        milestoneNote = `里程碑：${before ?? '(无)'} → ${requestedMilestone}`
+                    }
+                }
+                const amended = store.read(mission.id) ?? mission
+                const amendedSpec = amended.spec ?? mission.spec
+                const ledgerRows: PlanRow[] = []
+                if (amendedSpec !== undefined) {
+                    const milestone = milestoneOf(amended)
+                    const milestoneField = milestone === undefined ? {} : { milestone }
+                    // Order matters: the later row wins a same-millisecond tie,
+                    // and the retirement must be the newest mention of the id it
+                    // retires (the rows after it no longer list that id).
+                    ledgerRows.push(planRowFor(amended, amendedSpec, 'spec-amended', now, outcome.summary, milestoneField))
+                    if (milestoneNote !== undefined) {
+                        ledgerRows.push(planRowFor(amended, amendedSpec, 'milestone-changed', now, milestoneNote, milestoneField))
+                    }
+                    if (outcome.change.kind.startsWith('remove-')) {
+                        ledgerRows.push(
+                            planRowFor(
+                                amended,
+                                amendedSpec,
+                                'requirement-retired',
+                                now,
+                                `作废 ${outcome.change.target}（原内容：${outcome.change.before ?? ''}），编号不复用`,
+                                { ...milestoneField, retired: [outcome.change.target] },
+                            ),
+                        )
+                    }
+                }
                 const history = (store.read(mission.id)?.spec?.changes ?? []).slice(-5)
                 return [
                     `## 已改动规格（revision ${outcome.revision}）`,
@@ -623,6 +848,8 @@ export function registerTools(
                     outcome.summary,
                     `需求文档：${path.relative(mission.cwd, path.join(store.layout.missionsDir, mission.id, 'spec.md'))}（已重新渲染）`,
                     ...(outcome.removedCases.length === 0 ? [] : [`已移除用例：${outcome.removedCases.join('、')}`]),
+                    ...(requestedMilestone === undefined ? [] : [`里程碑：${requestedMilestone}`]),
+                    ...recordPlan(deps, store.layout, effectiveFor(deps, agent), ledgerRows),
                     '',
                     '### 变更历史（最近 5 条）',
                     '',
@@ -668,6 +895,10 @@ export function registerTools(
                 const gate = store.lastGate(mission.id)
                 const lines = [describeMission(mission)]
                 lines.push(`spec digest: ${mission.specDigest?.slice(0, 16) ?? '(none)'}`)
+                lines.push(
+                    `里程碑: ${milestoneOf(mission) ?? '(未设置——plan_status 会把它归入「无里程碑」)'}` +
+                        `；规划台账: ${describePlanFile(store.layout, planLedgerFile(store.layout, statusConfig))}`,
+                )
                 lines.push(`负面约束：${describeConstraints(mission.spec?.negativeConstraints ?? [])}`)
                 lines.push(...configLines)
                 lines.push(
@@ -921,6 +1152,114 @@ export function registerTools(
             },
         }),
         'spec_bootstrap',
+    )
+
+    register(
+        defineTool({
+            name: 'plan_status',
+            description:
+                'READ-ONLY repository-wide plan view, for the 规划 phase: every requirement the plan ledger has ever recorded, grouped by milestone (with an explicit 无里程碑 group), each with its owner mission, spec status (draft/approved) and delivery state (a delivery receipt exists). It also lists 未交付 and 已作废 (retired ids are never reused) and answers "which mission owns this requirement id" — an id in two missions is reported as a CONFLICT, never merged. Use it BEFORE spec_create to see what already exists in this repository; the specification stays the authority (the ledger is an index that can be rebuilt from specs).',
+            parameters: {
+                milestone: { type: 'string', description: `Only this milestone; pass "${NO_MILESTONE_LABEL}" for the group without one.` },
+                missionId: { type: 'string', description: 'Only requirements this mission mentioned (including conflicting ones).' },
+                json: { type: 'boolean', description: 'Return the report as JSON instead of Markdown (for tooling).' },
+            },
+            output: { schema: TEXT_OUTPUT, render: (_args, value) => [{ type: 'text', text: value }] },
+            async execute(args: PlanStatusArgs = {} as PlanStatusArgs, exec) {
+                const { store, agent } = storeFor(deps, exec)
+                const config = effectiveFor(deps, agent)
+                const report = buildPlanReport({
+                    store,
+                    file: planLedgerFile(store.layout, config),
+                    ...(args.milestone === undefined || args.milestone === '' ? {} : { milestone: args.milestone }),
+                    ...(args.missionId === undefined || args.missionId === '' ? {} : { missionId: args.missionId }),
+                })
+                if (args.json === true) return JSON.stringify(report, undefined, 2)
+                return renderPlanReport(report)
+            },
+        }),
+        'plan_status',
+    )
+
+    register(
+        defineTool({
+            name: 'adr_record',
+            description:
+                'Record an architecture decision (ADR) as a durable artifact: `.dsh/adr/<NNNN>-<slug>.md` plus one index row. Use it when the ALTERNATIVES matter — "we chose X over Y because Z" — not as a diary: a decision that no future reader would question does not need a record. The file is append-only (the next number is max+1, an existing path is refused, never overwritten); `supersedes` names an existing ADR number and appends a `supersededBy` row instead of rewriting the old file. Recording changes no gate verdict: the specification stays the authority. Read them back with adr_list.',
+            parameters: {
+                title: { type: 'string', required: true, description: 'One-line title of the decision (CJK is fine; the filename falls back to a short hash).' },
+                decision: { type: 'string', required: true, description: 'What was decided, in a sentence or two.' },
+                alternatives: {
+                    type: 'string',
+                    description: 'Which alternatives were on the table and why they were not chosen (the part that is lost first).',
+                },
+                consequences: { type: 'string', description: 'What this decision costs, what it makes harder, what must be revisited when.' },
+                missionId: { type: 'string', description: 'Mission this decision belongs to (links the ADR to the spec and evidence).' },
+                supersedes: { type: 'integer', description: 'Number of the ADR this one replaces; must be an existing ADR (adr_list shows numbers).' },
+            },
+            output: { schema: TEXT_OUTPUT, render: (_args, value) => [{ type: 'text', text: value }] },
+            async execute(args: AdrRecordArgs = {} as AdrRecordArgs, exec) {
+                const { store, agent } = storeFor(deps, exec)
+                const config = effectiveFor(deps, agent)
+                const outcome = recordAdr(
+                    { layout: store.layout, config },
+                    {
+                        title: args.title ?? '',
+                        decision: args.decision ?? '',
+                        ...(args.alternatives === undefined ? {} : { alternatives: args.alternatives }),
+                        ...(args.consequences === undefined ? {} : { consequences: args.consequences }),
+                        ...(args.missionId === undefined ? {} : { missionId: args.missionId }),
+                        ...(args.supersedes === undefined ? {} : { supersedes: args.supersedes }),
+                    },
+                )
+                if (!outcome.ok) {
+                    return [
+                        `## 未记录（${(args.title ?? '').trim() || 'adr_record'}）`,
+                        '',
+                        outcome.problem,
+                        ...(outcome.nextSteps === undefined ? [] : ['', '### 下一步', '', outcome.nextSteps]),
+                    ].join('\n')
+                }
+                return [
+                    `## 已记录 ADR ${String(outcome.number).padStart(4, '0')}`,
+                    '',
+                    `文件：${outcome.relativePath}（编号只增不改：下一条是 ${String(outcome.number + 1).padStart(4, '0')}）`,
+                    `标题：${outcome.title}`,
+                    ...(outcome.superseded === undefined ? [] : [`取代：${String(outcome.superseded).padStart(4, '0')}（它的文件不改写，index.jsonl 追加了一行 supersededBy）`]),
+                    `索引：${path.relative(store.layout.cwd, adrIndexPath(store.layout, config)) || adrIndexPath(store.layout, config)}`,
+                    ...outcome.warnings.flatMap((warning) => ['', warning]),
+                    '',
+                    'ADR 是记录、不是门禁：它不改变任何放行判定（规格才是权威）。',
+                    `下一步：\`adr_list\` 查看；要改这条决定时用 \`adr_record({ supersedes: ${outcome.number} })\` 记一条新的，不要改旧文件。`,
+                ].join('\n')
+            },
+        }),
+        'adr_record',
+    )
+
+    register(
+        defineTool({
+            name: 'adr_list',
+            description:
+                'READ-ONLY list of the recorded architecture decisions, newest first, optionally filtered by a case-insensitive query (matched against the title and the 决定 text) or by mission. Shows which records have been superseded. Use it before re-deciding something that was already decided, and to find out why the current shape is what it is.',
+            parameters: {
+                query: { type: 'string', description: 'Case-insensitive substring matched against the title and the decision text.' },
+                missionId: { type: 'string', description: 'Only decisions recorded for this mission.' },
+            },
+            output: { schema: TEXT_OUTPUT, render: (_args, value) => [{ type: 'text', text: value }] },
+            async execute(args: AdrListArgs = {} as AdrListArgs, exec) {
+                const { store, agent } = storeFor(deps, exec)
+                const config = effectiveFor(deps, agent)
+                return renderAdrList(
+                    listAdr(store.layout, config, {
+                        ...(args.query === undefined ? {} : { query: args.query }),
+                        ...(args.missionId === undefined ? {} : { missionId: args.missionId }),
+                    }),
+                    store.layout,
+                )
+            },
+        }),
+        'adr_list',
     )
 
     return { disposers, registered, failed, ...(registrationError === undefined ? {} : { lastError: registrationError }) }

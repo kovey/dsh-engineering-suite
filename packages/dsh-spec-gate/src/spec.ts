@@ -24,6 +24,15 @@ export interface SpecDraft {
     acceptanceCriteria: string[]
     fileBoundaries: string[]
     negativeConstraints: string[]
+    /**
+     * Optional milestone the requirements belong to (`v1.2`, `M3`…).
+     *
+     * A milestone is planning metadata, not a property of the document, so it is
+     * persisted as a mission label (`milestone:<名称>`): `MissionRecord` is the
+     * suite's shared contract and this plugin does not extend it. It is what
+     * groups requirements across missions in `plan_status`.
+     */
+    milestone?: string
     /** The `## 测试设计` chapter body, written as Markdown tables. */
     testDesignMarkdown: string
 }
@@ -38,6 +47,57 @@ const PLACEHOLDERS = /^(\.\.\.|…|tbd|todo|待定|待补充|-+)$/i
 
 function isPlaceholder(value: string): boolean {
     return value.trim() === '' || PLACEHOLDERS.test(value.trim())
+}
+
+/** Longest accepted milestone name. */
+export const MILESTONE_MAX_LENGTH = 64
+
+/** Reserved mission label carrying the milestone (`milestone:<名称>`). */
+export const MILESTONE_LABEL_PREFIX = 'milestone:'
+
+/**
+ * Why a milestone name is unusable, or `undefined` when it is fine.
+ *
+ * Kept next to the draft contract so `spec_create` and `spec_amend` cannot
+ * disagree about what a milestone is; the limit exists because the name is a
+ * single line in a report and in a mission label, not a place for prose.
+ * @param value - the submitted name (already known to be a string).
+ */
+export function milestoneProblem(value: string): string | undefined {
+    const trimmed = value.trim()
+    if (trimmed === '') return 'milestone 不能是空白字符串：省略该参数表示不设里程碑'
+    if (trimmed.length > MILESTONE_MAX_LENGTH) {
+        return `milestone 最长 ${MILESTONE_MAX_LENGTH} 个字符（当前 ${trimmed.length} 个）：请用版本号/迭代名这类短标签`
+    }
+    // eslint-disable-next-line no-control-regex
+    if (/[\u0000-\u001f\u007f]/.test(value)) return 'milestone 不能包含控制字符（换行 / 制表符等）'
+    return undefined
+}
+
+/** The milestone recorded on a mission, or `undefined` when it has none. */
+export function milestoneOf(mission: MissionRecord | undefined): string | undefined {
+    for (const label of mission?.labels ?? []) {
+        if (label.startsWith(MILESTONE_LABEL_PREFIX)) {
+            const name = label.slice(MILESTONE_LABEL_PREFIX.length).trim()
+            if (name !== '') return name
+        }
+    }
+    return undefined
+}
+
+/**
+ * The label list with exactly one milestone label.
+ *
+ * Other labels are preserved (they are the host's, not ours): only the reserved
+ * `milestone:` prefix is rewritten, so setting a milestone cannot drop a label
+ * somebody else put there.
+ * @param labels - current labels.
+ * @param milestone - the new name; `undefined` clears the milestone.
+ */
+export function labelsWithMilestone(labels: readonly string[] | undefined, milestone: string | undefined): string[] {
+    const kept = (labels ?? []).filter((label) => !label.startsWith(MILESTONE_LABEL_PREFIX))
+    const name = milestone?.trim() ?? ''
+    return name === '' ? kept : [...kept, `${MILESTONE_LABEL_PREFIX}${name}`]
 }
 
 /**
@@ -69,6 +129,10 @@ export function validateDraft(draft: SpecDraft): SpecIssue[] {
             field: 'negativeConstraints',
             message: 'declare what must NOT be done (e.g. 不得修改 dsh 核心代码)',
         })
+    }
+    if (draft.milestone !== undefined) {
+        const problem = milestoneProblem(draft.milestone)
+        if (problem !== undefined) issues.push({ field: 'milestone', message: problem })
     }
     return issues
 }

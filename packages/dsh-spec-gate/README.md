@@ -9,7 +9,10 @@
   `.dsh/missions/<mission-id>/mission.json`。
 - `spec_approve`：请求**人工**审批（经 `ctx.approval` seam）；审批通过后 mission 变为
   `spec-approved`，写操作放行。
-- `spec_status`：当前 mission / 规格 revision / 测试设计覆盖 / 最近门禁裁决 / 本会话拦截次数。
+- `spec_status`：当前 mission / 规格 revision / 里程碑 / 测试设计覆盖 / 最近门禁裁决 / 本会话拦截次数。
+- **跨 mission 追溯**：`.dsh/plan.jsonl` 规划台账（append-only 索引）+ 只读的 `plan_status`
+  （按里程碑分组的全部编号、未交付、已作废、编号 → mission 反查与冲突）。
+- **架构决策记录（ADR）**：`adr_record` / `adr_list` —— `.dsh/adr/<NNNN>-<slug>.md`，编号只增不改，`supersedes` 取代。
 - **写操作前置拦截**：`ctx.tools.guard()` 注册单调守卫 —— 规格未审批时 `write` / `edit` 直接被拒绝，
   拒绝理由里带下一步该调用什么工具（理由写给模型看）。
 - **提示注入**：把规格契约与表格格式（`SPEC_FORMAT_HINT`）写进系统提示。
@@ -115,6 +118,98 @@ mission <id> · rev <n> · 摘要 <digest>
 
 两个键都是 host-only 之外的可覆盖项：`<repo>/.dsh/spec-gate.json` 可以写 `reviewChannel` / `reviewTimeoutMs`。
 
+## 跨 mission 追溯：规划台账（`plan_status`）
+
+规格编号只在**一个 mission 内**稳定。仓库里出现第二个 mission 之后，"这条需求在哪次改动里、
+属于哪个里程碑、交了没有"就没有答案了 —— 台账补上这一层。
+
+- **台账**：`<rootDir>/plan.jsonl`（默认 `.dsh/plan.jsonl`，append-only JSONL；键 `planFile`）。
+  `spec_create` / `spec_approve` / `spec_amend` 各追加**实际发生**的转换行：
+
+  | kind | 何时写 |
+  |---|---|
+  | `spec-created` | `spec_create` 写入规格（新建或整篇重写） |
+  | `spec-approved` | 人工审批通过（带 `approvedBy` / 来源） |
+  | `spec-amended` | `spec_amend` 成功改动一条需求或验收标准 |
+  | `requirement-retired` | 该次改动**删除**了条目（`retiredRequirementIds`，编号不复用） |
+  | `milestone-changed` | 里程碑发生实际变化（含 `spec_create` 首次设置） |
+
+  行形状：`{at, kind, missionId, specId, title, milestone?, requirementIds[], criteriaIds[], retiredRequirementIds?, approvedBy?, summary}`。
+  `specId` 目前等于 `missionId`（本套件的规格工件按 mission 命名），单列是为了将来解耦时不用重写台账。
+
+- **台账写失败绝不阻断规格操作**：日志记一条，工具输出里追加
+  `⚠️ 规划台账写入失败（…，已写入 i/n 行）` + "规格本身已保存"。**规格是权威，台账只是索引**
+  （可以从 `.dsh/specs/*.md` 与 `mission.json` 重建）。
+- **同一编号出现在多行时，最新的行胜出**（先比 `at`，同毫秒比行序）；每行都带该 revision 的
+  **完整编号列表**，所以后面的 `milestone-changed` 不会丢掉前面 `spec-created` 记下的需求。
+- **读取容忍截断尾行**：崩溃留下的半行会跳过并在报告里计数（`另有 N 行无法解析`）。
+
+`plan_status({ milestone?, missionId?, json? })` 只读，把台账与 mission 存储 join 起来回答：
+
+- 需求按**里程碑**分组（另有显式的 `无里程碑` 组），每条带 owner mission、规格状态（draft/approved）、
+  交付状态（该 mission 有回执 = 已交付，回执由 `dsh-evidence-gate` 签发）；
+- 显式的 **未交付** 与 **已作废** 列表；
+- **编号 → mission 反查**；同一个编号被两个 mission 使用时进 **冲突** 区：**只报告，不合并**
+  （编号在每个 mission 都从 `R-001`/`AC-001` 开始，所以仓库里有两个 mission 后重号是常态 ——
+  这正是"引用编号必须带 mission"的原因）；
+- 台账不存在时直接回答 `本仓库还没有规划台账（第一条 spec_create 会创建）`，不会假装一切正常。
+- 身份是 `(mission, 编号)`：两个 mission 的 `AC-001` 是**两条需求**，不会被算成一条；
+  一个 mission 内"创建 → 修改 → 换里程碑"才按"最新行胜出"折叠成一条。
+
+### 里程碑（`milestone`）
+
+`spec_create` / `spec_amend` 可以带 `milestone`（≤64 字符、无控制字符；`milestoneRequired: true` 时
+`spec_create` 不带就直接拒绝并给出下一步）。里程碑存在 mission 的 label `milestone:<名称>` 上 ——
+`MissionRecord` 是套件的共享契约，本包不扩展它 —— `spec_status` 显示当前值，`plan_status` 用它分组。
+
+## 架构决策记录（`adr_record` / `adr_list`）
+
+"选了 X 而不是 Y，因为 Z"以前只活在对话里，会话一结束就丢了。ADR 把它落成工件：
+
+- `adr_record({ title, decision, alternatives?, consequences?, missionId?, supersedes? })`
+  写 `<rootDir>/adr/<NNNN>-<slug>.md`：
+  - 编号 = 现有最大编号 + 1（首条 `0001`；**不填空号、不复用**），目标路径已存在就**拒绝**
+    （`writeOnce`：绝不覆盖一份已有记录）；
+  - slug 取标题里的 ASCII 字母/数字/连字符（≤48），标题没有可用字符时（**CJK 标题是常态**）
+    退化成 `adr-<8 位短哈希>`；
+  - 正文是 Markdown，六章固定：`状态` / `背景` / `决定` / `备选方案与为什么不选` / `后果` / `证据链接`；
+    文件头是一个 **fenced JSON 块**（`number` / `slug` / `title` / `recordedAt` / `missionId?` / `supersedes?`）；
+  - 同时向 `<rootDir>/adr/index.jsonl` 追加一行 `{at, number, slug, path, title, missionId?, supersedes?}`。
+- `supersedes` 必须指向**已存在**的编号（否则拒绝并列出已有编号）。被取代的一方**不改写**：
+  只追加一行 `{…原记录的 number/slug/path/title…, supersededBy: 新编号}`。
+  `adr_list` 同时读 index 的 `supersededBy` 行**和**取代方的 `supersedes` 字段，索引丢了也能从文件恢复取代关系。
+- `adr_list({ query?, missionId? })` 只读，最新编号在前；`query` 大小写不敏感地匹配**标题与「决定」正文**。
+- ADR **不是门禁**：不改变任何放行判定（规格才是权威）；也不是日记 —— 没有备选、以后不会有人再问的
+  琐碎选择不要记。索引写失败只告警（决策文件是记录，index 只是索引）。
+
+## 运行时（请忽略）与受评审（请提交）
+
+`dsh-eng-core` 的 doctor 有一条 `ledger.gitignore` 检查：**运行时**目录/台账必须被 git 忽略，
+否则每次运行都会弄脏工作区，交付时 `requireCleanTree` 会报"与门禁观测的指纹不一致"。
+
+| 路径 | 性质 | 建议 |
+|---|---|---|
+| `.dsh/plan.jsonl` | **运行时**：每次规格转换都追加 | 加进 `.gitignore`（doctor 检查**根级**已存在的 `*.jsonl`） |
+| `.dsh/missions/**`、`.dsh/state/**`、`.dsh/specs/**`、`.dsh/audit/**` | 运行时（既有约定） | 忽略 |
+| `.dsh/adr/*.md` | **受评审记录**：写下就不再修改 | **提交**并评审 —— 它就是要给人看的 |
+| `.dsh/adr/index.jsonl` | 索引，可从 `adr/*.md` 重建 | 提交或忽略都可以（doctor 只检查根级 `*.jsonl`）；写失败只告警 |
+| `.dsh/spec-gate.json` | 信任根配置 | **提交**（doctor 的 `ledger.config-tracked` 检查） |
+
+`.dsh/adr/` 与 `.dsh/plan.jsonl` 都在信任根里：**写类工具改不了它们**（guard 拒绝 `.dsh/**`），
+只有 `adr_record` 与规格转换（插件自己，通过 store / fs）能写 —— 模型无法用 `write` 伪造一条决策记录，
+也无法用 `write` 抹掉一条作废记录。ADR 与台账都不是门禁裁决，改它们不影响任何放行判定。
+
+### 诚实边界
+
+- 台账是**索引**，不是权威：写失败只告警、不阻断（`plan_status` 因此会少一次变更，工具输出里已说明）。
+- 冲突**只报告、不自动解决**：编号在 mission 内稳定、跨 mission 不唯一，台账不会替你合并两条同名编号，
+  也不会猜哪个是权威。
+- "已交付"＝该 mission 有回执，不等于"每条验收标准都被验证过"；具体证据要读 mission 的
+  `evidence.jsonl` 与回执。
+- ADR 的 `状态` 章写的是**记录时**的状态；被取代后不回写旧文件（只增不改），
+  是否被取代以 `adr_list` / index 的 `supersededBy` 为准。
+- `plan_status` / `adr_list` 只读且不落盘（测试用 `.dsh` 的前后快照守住这一点）。
+
 ## 项目级配置（同一个 dsh 进程服务多个仓库）
 
 profile 是上限，每个仓库可以用 `.dsh/spec-gate.json` 决定**自己**被管多严：
@@ -125,7 +220,7 @@ profile 是上限，每个仓库可以用 `.dsh/spec-gate.json` 决定**自己**
 { "writeTools": ["write", "edit", "multi_edit"] }       // 这个仓库的写类工具集
 ```
 
-- 可覆盖键：`enforce`、`enforceBoundaries`、`writeTools`、`shellTools`、`shellPolicy`、`boundaryExemptPaths`、`requireTestDesign`、`approval`。
+- 可覆盖键：`enforce`、`enforceBoundaries`、`writeTools`、`shellTools`、`shellPolicy`、`boundaryExemptPaths`、`requireTestDesign`、`approval`、`reviewChannel`、`reviewTimeoutMs`、`bootstrap`、`planFile`、`adrDir`、`adrIndexFile`、`milestoneRequired`。
 - **不可覆盖**：`enabled`、`logFile`、`rootDir`/`specsDir`/`missionsDir`（宿主决策），写了会被忽略并记日志。
 - 文件本身在信任根里（`.dsh/**` 只允许派生的 `specs/*.md` 被写类工具改写），所以模型不能用 `write` 把自己的门禁关掉。
 - `spec_status` 会显示 `配置来源：项目级 …/profile` 与 `enforce / 边界 / 审批模式`。
@@ -134,10 +229,13 @@ profile 是上限，每个仓库可以用 `.dsh/spec-gate.json` 决定**自己**
 
 | 工具 | 参数 | 说明 |
 |---|---|---|
-| `spec_create` | `title`(必填) `background` `requirements[]`(必填) `acceptanceCriteria[]`(必填) `fileBoundaries[]`(必填) `negativeConstraints[]`(必填) `testDesign` `missionId` | 新建或修订规格；缺项直接报错且**不写任何文件** |
+| `spec_create` | `title`(必填) `background` `requirements[]`(必填) `acceptanceCriteria[]`(必填) `fileBoundaries[]`(必填) `negativeConstraints[]`(必填) `testDesign` `milestone` `missionId` | 新建或修订规格；缺项直接报错且**不写任何文件**；`milestoneRequired` 时缺 `milestone` 同样拒绝 |
 | `spec_approve` | `missionId` `note` | 走审批 seam；被拒绝/通道缺失时 fail closed |
-| `spec_status` | `missionId` | 只读汇总 |
-| `spec_amend` | **增 / 改 / 删单条需求或验收标准**：编号稳定（改写不改号、插入不打乱、删除后作废不复用）、删除被用例引用的验收标准会被拒绝（除非 `cascade: true` 连同用例移除）、变更记入历史并渲染进审批文档、**修订即撤销审批**（回到 test_design_review → spec_approve 的标准流程） |
+| `spec_status` | `missionId` | 只读汇总（含里程碑与台账路径） |
+| `spec_amend` | **增 / 改 / 删单条需求或验收标准**：编号稳定（改写不改号、插入不打乱、删除后作废不复用）、删除被用例引用的验收标准会被拒绝（除非 `cascade: true` 连同用例移除）、变更记入历史并渲染进审批文档、**修订即撤销审批**（回到 test_design_review → spec_approve 的标准流程）；可选 `milestone` 同时改里程碑 |
+| `plan_status` | `milestone`（`无里程碑` 表示空里程碑组） `missionId` `json` | **只读**跨 mission 规划视图：按里程碑分组的编号（owner mission / 规格状态 / 交付状态）、未交付、已作废、编号→mission 反查与冲突；台账缺失时如实说明 |
+| `adr_record` | `title`(必填) `decision`(必填) `alternatives` `consequences` `missionId` `supersedes` | 记录一条架构决策（追加 `adr/<NNNN>-<slug>.md` + index 行）；编号只增不改，已存在的路径拒绝，`supersedes` 必须指向已有编号 |
+| `adr_list` | `query` `missionId` | **只读**列出决策（最新在前），`query` 匹配标题与「决定」正文（大小写不敏感） |
 
 ## 配置
 
@@ -153,6 +251,10 @@ profile 是上限，每个仓库可以用 `.dsh/spec-gate.json` 决定**自己**
 | `writeTools` | `['write','edit']` | 被视为“写”的工具名 |
 | `exemptTools` | `[]` | 永不检查的工具 |
 | `requireTestDesign` | `'auto'` | `auto` = 只有挂了 `dsh-test-design-gate` 才要求测试设计已通过 |
+| `planFile` | `.dsh/plan.jsonl` | 规划台账（append-only JSONL）。默认**跟随 `rootDir`**（`rootDir` 改了就跟着走）；显式配置则相对工作区解析 |
+| `adrDir` | `.dsh/adr` | 决策记录目录（默认跟随 `rootDir`） |
+| `adrIndexFile` | `<adrDir>/index.jsonl` | 决策索引（append-only JSONL） |
+| `milestoneRequired` | `false` | `true` 时 `spec_create` 必须带 `milestone`，否则拒绝并给出下一步 |
 | `approval` | `'seam'` | `seam` 走人工审批；`auto` 记录即通过（CI 用） |
 | `rootDir` / `specsDir` / `missionsDir` | `.dsh` … | 工件布局 |
 | `prompt.enabled` / `prompt.order` | `true` / `620` | 系统提示段 |
@@ -179,6 +281,10 @@ profile 是上限，每个仓库可以用 `.dsh/spec-gate.json` 决定**自己**
   （分别禁止路径、工具、shell 命令子串、任意工具参数正则），其余散文约束保持提示级并在
   `spec_status` 里单列（`可机器校验 N 条；仅提示级 M 条`）。
 - **写类工具没有声明路径时**仍然 fail closed（拒绝），除非宿主把它放进 `exemptTools`。
+- **台账写入永远不阻断规格操作**：`.dsh` 只读、磁盘满、台账路径被占成目录……规格照样写入，
+  只在工具输出里追加一条 `⚠️ 规划台账写入失败`（已写 i/n 行）+ 台账文件路径。规格是权威，台账是索引。
+- **台账与 ADR 都不参与放行判定**：它们是记录；`mission.json` / `state/**` / `roles/**` 才是信任根。
+  模型可以用 `adr_record` 记一条决策，但改不了任何门禁结论。
 - **修订即失效**：重新 `spec_create` 会把状态打回 `draft`，旧审批同时作废（人审批的是另一份文档）。
 - **子 Agent 继承**：被派发的子会话通过 `session.header.parentSession` 继承父会话的 mission，
   所以实现者不会因为“没有规格”被误拒。
@@ -187,5 +293,9 @@ profile 是上限，每个仓库可以用 `.dsh/spec-gate.json` 决定**自己**
 ## 与其它插件的协作
 
 - 上游：`dsh-test-design-gate` 通过 `mission.testDesign.passed` 决定能否审批。
-- 下游：`dsh-quality-gate` / `dsh-evidence-gate` 读 `mission.spec` 与 `approvedAt` 做交付判定。
+- 下游：`dsh-quality-gate` / `dsh-evidence-gate` 读 `mission.spec` 与 `approvedAt` 做交付判定；
+  `plan_status` 的"已交付"就是读 `dsh-evidence-gate` 签发的回执（`receipts/*.json`）。
 - 编排：`dsh-orchestrator` 的 `spec-clarify` / `spec-approve` 阶段由本插件提供能力。
+- `dsh-suite-doctor`：本插件新增的 `plan_status` / `adr_record` / `adr_list` 不在 doctor 的
+  `PLUGIN_SIGNATURES['spec-gate'].tools`（挂载证据）列表里 —— 那是签名工具清单，不是完整工具清单，
+  新增工具不需要它改名；宿主若想让 doctor 也把它们算作挂载证据，需要单独改 `dsh-suite-doctor`。

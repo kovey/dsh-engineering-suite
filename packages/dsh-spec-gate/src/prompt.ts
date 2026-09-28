@@ -69,6 +69,20 @@ export function sectionText(config: SpecGateConfig, projectFile?: string): strin
         '因此不会像以前那样"插入一条就整体重编号"。',
         '无论哪条路径，**旧审批都会失效**（人批准的是上一版文档），必须重新 `test_design_review` → `spec_approve`。',
         '',
+        '**规划台账（跨 mission 追溯）**：规划不是一次性的——`spec_create` / `spec_approve` / `spec_amend` 会往',
+        `仓库级台账 \`${config.planFile}\` 追加一行（编号、里程碑、审批人）；台账写失败只在工具输出里告警，绝不阻断规格操作。`,
+        '**动手规划前先 `plan_status`**（只读）：仓库里已有哪些需求（按里程碑分组，含「无里程碑」组）、哪些未交付、',
+        '哪些编号已作废，以及"某个编号属于哪个 mission"的反查。同一个编号出现在两个 mission 里会作为**冲突**报出来，',
+        '**不会自动合并**——先与用户确认哪个是权威，再决定改哪一边。台账只是索引（可从规格重建），规格才是权威。',
+        config.milestoneRequired
+            ? '本仓库 `milestoneRequired=true`：`spec_create` 必须带 `milestone`（≤64 字符），否则直接拒绝。'
+            : '规格可选带 `milestone`（≤64 字符，如 `v1.2` / `M3`）：`plan_status` 用它分组跨 mission 的需求。',
+        '',
+        '**架构决策（ADR）**：当"选了 X 而不是 Y"以后还会被问起时，用 `adr_record` 记一条（标题 + 决定；',
+        '`alternatives`（为什么不选别的）是最容易丢失的部分，务必写）。文件落 `.dsh/adr/<NNNN>-<slug>.md`，编号只增不改；',
+        '改主意时用 `supersedes` 指向旧编号（旧文件不改写，取代关系记在索引里）。`adr_list` 可查询（标题与决定正文，大小写不敏感）。',
+        'ADR 是**记录**、不是日记、也不是门禁：它不改变任何放行判定；没有备选、或没人会再问的琐碎选择不要记。',
+        '',
         SPEC_FORMAT_HINT,
     ].join('\n')
 }

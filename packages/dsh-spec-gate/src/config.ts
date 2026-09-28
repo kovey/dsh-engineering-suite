@@ -5,6 +5,8 @@
  */
 
 import { loadProjectConfig, type Layout, type LayoutOptions, type Logger } from 'dsh-eng-core'
+import { DEFAULT_ADR_DIR, DEFAULT_ADR_INDEX_FILE } from './adr.js'
+import { DEFAULT_PLAN_FILE } from './plan-ledger.js'
 
 /** Whether an unapproved specification blocks writes. */
 export type EnforceMode = boolean
@@ -82,11 +84,30 @@ export interface SpecGateConfig {
     shellPolicy: 'targets' | 'strict' | 'off'
     /** Tool names never inspected (escape hatch for host tooling). */
     exemptTools: readonly string[]
-    /**
-     * `auto` requires a passing test design only when `dsh-test-design-gate` is
+    /** `auto` requires a passing test design only when `dsh-test-design-gate` is
      * mounted (probed through its `test_design_review` tool).
      */
     requireTestDesign: boolean | 'auto'
+    /**
+     * The cross-mission plan ledger (append-only JSONL).
+     *
+     * `spec_create` / `spec_approve` / `spec_amend` append one row per transition;
+     * `plan_status` reads it. Default `.dsh/plan.jsonl` — the resolved path
+     * follows `rootDir` (see `planLedgerFile`), and an explicit value is
+     * workspace-relative.
+     */
+    planFile: string
+    /** Architecture-decision directory (default `.dsh/adr`, following `rootDir`). */
+    adrDir: string
+    /** ADR index (append-only JSONL; default `<adrDir>/index.jsonl`). */
+    adrIndexFile: string
+    /**
+     * When true, `spec_create` without a `milestone` is refused.
+     *
+     * Off by default: a milestone groups requirements across missions, which is
+     * useful for a product repo and noise for a one-off script.
+     */
+    milestoneRequired: boolean
     /** `seam` asks the human through `ctx.approval`; `auto` approves on record. */
     approval: ApprovalMode
     prompt: {
@@ -119,10 +140,12 @@ function strList(value: unknown, fallback: readonly string[]): string[] {
 /**
  * Keys a project file may override (`.dsh/spec-gate.json` inside the workspace).
  *
- * The profile stays the ceiling for *where* things live and whether the plugin
- * runs at all; a project may decide how strictly ITS repository is gated —
- * a scratch repo can set `enforce: false`, a controlled one can narrow the
- * write tools. The file lives in the trust root, so the model cannot rewrite it
+ * The profile stays the ceiling for *where the mission store lives* and whether
+ * the plugin runs at all; a project may decide how strictly ITS repository is
+ * gated — a scratch repo can set `enforce: false`, a controlled one can narrow
+ * the write tools — and it may relocate the two artifacts that are records
+ * *about that repository* (`planFile`, `adrDir`/`adrIndexFile`). The file lives
+ * in the trust root, so the model cannot rewrite it
  * with the write tools (only the derived `specs/*.md` is writable there).
  */
 export const PROJECT_OVERRIDABLE_KEYS: readonly string[] = [
@@ -137,6 +160,10 @@ export const PROJECT_OVERRIDABLE_KEYS: readonly string[] = [
     'reviewChannel',
     'reviewTimeoutMs',
     'bootstrap',
+    'planFile',
+    'adrDir',
+    'adrIndexFile',
+    'milestoneRequired',
 ]
 
 /** The resolved configuration plus where it came from. */
@@ -189,6 +216,10 @@ export function resolveEffectiveConfig(host: SpecGateConfig, layout: Layout, log
                 : host.reviewChannel,
         reviewTimeoutMs: Math.max(1_000, Math.floor(num(raw['reviewTimeoutMs'], host.reviewTimeoutMs))),
         bootstrap: mergeBootstrap(raw['bootstrap'], host.bootstrap),
+        planFile: str(raw['planFile'], host.planFile),
+        adrDir: str(raw['adrDir'], host.adrDir),
+        adrIndexFile: str(raw['adrIndexFile'], host.adrIndexFile),
+        milestoneRequired: bool(raw['milestoneRequired'], host.milestoneRequired),
     }
     logger?.info(
         `spec-gate: 使用项目级配置 ${file.file}（enforce=${config.enforce}; boundaries=${config.enforceBoundaries}; shellPolicy=${config.shellPolicy}; approval=${config.approval}）`,
@@ -266,6 +297,10 @@ export function resolveConfig(input: unknown): SpecGateConfig {
         exemptTools: strList(raw['exemptTools'], []),
         requireTestDesign:
             typeof raw['requireTestDesign'] === 'boolean' ? raw['requireTestDesign'] : 'auto',
+        planFile: str(raw['planFile'], DEFAULT_PLAN_FILE),
+        adrDir: str(raw['adrDir'], DEFAULT_ADR_DIR),
+        adrIndexFile: str(raw['adrIndexFile'], DEFAULT_ADR_INDEX_FILE),
+        milestoneRequired: bool(raw['milestoneRequired'], false),
         approval: raw['approval'] === 'auto' ? 'auto' : 'seam',
         prompt: {
             enabled: bool(prompt['enabled'], true),

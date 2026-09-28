@@ -65,7 +65,7 @@ test('apply() registers the tool surface, the guard and the prompt section', () 
     const fake = host()
     assert.deepEqual(
         [...fake.tools.keys()].sort(),
-        ['spec_amend', 'spec_approve', 'spec_bootstrap', 'spec_create', 'spec_status'],
+        ['adr_list', 'adr_record', 'plan_status', 'spec_amend', 'spec_approve', 'spec_bootstrap', 'spec_create', 'spec_status'],
     )
     assert.equal(fake.guards.length, 1)
     assert.deepEqual(
