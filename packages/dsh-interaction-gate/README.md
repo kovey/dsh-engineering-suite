@@ -102,7 +102,7 @@ profile（宿主上限）与 `<repo>/.dsh/interaction-gate.json`（项目只能�
 | `approversFile` / `ledgerFile` | 这个仓库的名单与台账放在哪，是仓库知识（同 `standardsFile`） |
 | `preferredChannels` | 这个仓库的卡片走哪个通道（例如每个仓库一个群） |
 | `notifyLevels` | 这个仓库想被通知到什么程度 |
-| `redactPatterns` | 额外拒绝规则只会**收紧**（内置凭据规则无法从这里删掉） |
+| `redactPatterns` | 额外拒绝规则只会**收紧**：与 profile 的规则**取并集**（内置凭据规则无法从这里删掉，host 的规则也不会被项目列表替换掉；非法正则逐项忽略，全非法时 host 的规则原样保留） |
 
 **宿主所有（项目文件写了也会被拒绝并记问题）**：`enabled`、`logFile`、`logFileTemplate`、`layout`、`prompt`、
 `maxPayloadChars`，以及两个"不能自我豁免"的键：
@@ -127,7 +127,10 @@ profile（宿主上限）与 `<repo>/.dsh/interaction-gate.json`（项目只能�
   所以"崩溃时正在等的提问"在台账里是看得见的 pending 行，而不是消失；`interaction_status` 与服务的
   `pending()` 把**没有决定、且没有被同令牌的决定行取代**的提问列出来（带年龄）。
 - `notify` / `progress` 每个通道各一行，`channel` + `messageId` 指向一条具体的消息。
-- `decision` 是封闭词汇：套件四词之一 / 声明的选项 / 自由文本答案 / `refused:<原因>` /
+- **自由文本答案会被限界**：答案原文可能很长，落账与回显都截断到该仓库生效的 `maxPayloadChars`（并写明“已截断、
+  原文 N 字符”）——台账是事实记录，不是聊天记录；要留长文本就写进文件，卡片里只放链接。读取端（`interaction_status`）
+  对已经落在磁盘上的超长行同样限界渲染。
+- `decision` 是封闭词汇：套件四词之一 / 声明的选项 / 自由文本答案（限量） / `refused:<原因>` /
   `notified` / `notify-failed` / `progress` / `filtered`。`refused:` 的原因有：
   `no-channel`、`channel-unusable`、`approvers-missing`、`timeout`、`cancelled`、`unauthorized`、
   `unknown-answer`、`secret`、`send-failed`、`token-lost`、`ledger-unwritable`、`bad-request`。

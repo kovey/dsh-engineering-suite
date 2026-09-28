@@ -17,36 +17,118 @@
  *   node scripts/archive-missions.mjs --dry-run            # 只报告会搬什么
  *   node scripts/archive-missions.mjs --keep 20 --days 90  # 真正归档
  *   node scripts/archive-missions.mjs --workspace ~/repo --include-undelivered
- *   node scripts/archive-missions.mjs --json
+ *   node scripts/archive-missions.mjs --dry-run --json    # 只看不动 + 机器可读
  *
- * exit: 0 = 完成（含 dry-run）；1 = 归档失败（例如目标冲突）；2 = 用法错误
+ * exit: 0 = 完成（含 dry-run）；1 = 归档失败（例如目标冲突、台账逃出工作区）；2 = 用法错误
+ *
+ * 参数解析是**严格**的（2026-09 对抗式审计 C4）：无法识别的参数、缺值的参数、
+ * 以及 "--keep --json" 这种"值本身就是下一个开关"的写法，一律打印用法并 exit 2。
+ * 原实现用 `args.includes('--dry-run')` 逐个嗅探：`--dryrun`（少一个连字符）被
+ * 静默忽略，于是本来"只看不动"的命令真的把 mission 搬出了 missions/、写了索引、
+ * 退出码 0 —— 一个拼写错误造成的静默数据移动。危险命令不允许有"猜你的意思"。
+ *
+ * 台账的位置同样是**保守**的（审计 C5）：归档会 **移动** 证据，所以只有当
+ * `.dsh/missions` 的真实路径确实落在工作区内时才动手。`missions` 是指向共享/
+ * 外部台账的符号链接时，`rename` 会把外部的 mission 搬进本仓库的 archive/（实测
+ * 外部目录被搬空）—— 这种情况拒绝执行并同时打印两个路径；工作区里根本没有
+ * `.dsh/missions` 时，明确报"这个仓库还没有台账"并 exit 1，而不是含糊的"0 个"。
  */
 
+import fs from 'node:fs'
 import path from 'node:path'
 import process from 'node:process'
-import { archiveMissions, readArchiveIndex, resolveLayout } from '../packages/dsh-eng-core/dist/index.js'
+import { archiveMissions, isReallyInside, readArchiveIndex, realTargetOf, resolveLayout } from '../packages/dsh-eng-core/dist/index.js'
 
-const args = process.argv.slice(2)
-const json = args.includes('--json')
-const dryRun = args.includes('--dry-run')
-const includeUndelivered = args.includes('--include-undelivered')
-const numeric = (flag, fallback) => {
-    const index = args.indexOf(flag)
-    if (index < 0) return fallback
-    const value = Number(args[index + 1])
-    if (!Number.isFinite(value) || value < 0) {
-        process.stderr.write(`${flag} 需要一个非负数字\n`)
-        process.exit(2)
-    }
+const USAGE = `usage: node scripts/archive-missions.mjs [--dry-run] [--json] [--include-undelivered]
+                                       [--keep N] [--days N] [--workspace <repo>]
+
+  --dry-run               只报告会搬什么（默认：真正执行）
+  --json                  机器可读输出（只换输出格式：要"只看不动"请加 --dry-run）
+  --include-undelivered   未交付的 mission 也归档（默认不动：可能还在途）
+  --keep N                保留最新 N 个（默认 20，0 = 只按其它规则）
+  --days N                只归档 N 天前的（默认 0 = 不限）
+  --workspace <repo>      目标仓库（默认当前目录；也可写成唯一的位置参数）
+  -h, --help              打印本用法
+`
+
+/** Print the usage and exit 2: an unrecognised argument must never be ignored. */
+function usageError(message) {
+    process.stderr.write(`archive-missions: ${message}\n\n${USAGE}`)
+    process.exit(2)
+}
+
+const argv = process.argv.slice(2)
+let json = false
+let dryRun = false
+let includeUndelivered = false
+let keep = 20
+let days = 0
+let workspace
+
+/** The value of a flag: required, and never another flag. */
+function valueOf(index, flag) {
+    const value = argv[index + 1]
+    if (value === undefined) usageError(`${flag} 需要一个值`)
+    if (value.startsWith('-')) usageError(`${flag} 需要一个值，但拿到的是开关 ${JSON.stringify(value)}`)
     return value
 }
-const keep = numeric('--keep', 20)
-const days = numeric('--days', 0)
-const wsIndex = args.indexOf('--workspace')
-const positional = args.filter((arg, index) => !arg.startsWith('--') && args[index - 1] !== '--keep' && args[index - 1] !== '--days' && args[index - 1] !== '--workspace')
-const cwd = path.resolve(wsIndex >= 0 ? args[wsIndex + 1] : (positional[0] ?? process.cwd()))
 
+function numberOf(raw, flag) {
+    const value = Number(raw)
+    if (!Number.isFinite(value) || value < 0) usageError(`${flag} 需要一个非负数字（拿到 ${JSON.stringify(raw)}）`)
+    return value
+}
+
+for (let index = 0; index < argv.length; ) {
+    const arg = argv[index]
+    if (arg === '--dry-run') { dryRun = true; index += 1; continue }
+    if (arg === '--json') { json = true; index += 1; continue }
+    if (arg === '--include-undelivered') { includeUndelivered = true; index += 1; continue }
+    if (arg === '--keep') { keep = numberOf(valueOf(index, arg), arg); index += 2; continue }
+    if (arg === '--days') { days = numberOf(valueOf(index, arg), arg); index += 2; continue }
+    if (arg === '--workspace') {
+        if (workspace !== undefined) usageError(`只能指定一个工作区（已有 ${JSON.stringify(workspace)}）`)
+        workspace = valueOf(index, arg)
+        index += 2
+        continue
+    }
+    if (arg.startsWith('--workspace=')) {
+        if (workspace !== undefined) usageError(`只能指定一个工作区（已有 ${JSON.stringify(workspace)}）`)
+        workspace = arg.slice('--workspace='.length)
+        if (workspace === '') usageError('--workspace= 需要一个路径')
+        index += 1
+        continue
+    }
+    if (arg === '-h' || arg === '--help') { process.stdout.write(USAGE); process.exit(0) }
+    if (arg.startsWith('-')) usageError(`无法识别的参数 ${JSON.stringify(arg)}`)
+    if (workspace !== undefined) usageError(`只能指定一个工作区（已有 ${JSON.stringify(workspace)}，又给了 ${JSON.stringify(arg)}）`)
+    workspace = arg
+    index += 1
+}
+
+const cwd = path.resolve(workspace ?? process.cwd())
 const layout = resolveLayout(cwd)
+
+// Containment first, mutation never (audit C5). Both checks run before anything
+// is planned or read, so a refusal cannot have moved a byte.
+if (!fs.existsSync(layout.missionsDir)) {
+    process.stderr.write(
+        `archive-missions: ${cwd} 还没有台账：${layout.missionsDir} 不存在。\n` +
+            `  这不是"0 个可归档"——是这个仓库还没有 mission（先跑一次工程套件）。\n`,
+    )
+    process.exit(1)
+}
+if (!isReallyInside(cwd, layout.missionsDir)) {
+    process.stderr.write(
+        `archive-missions: 拒绝执行 —— missions 台账不在工作区内：\n` +
+            `  工作区      : ${realTargetOf(cwd)}\n` +
+            `  台账真实路径: ${realTargetOf(layout.missionsDir)}\n` +
+            `归档会把台账里的 mission **移出**它的真实目录（共享/外部台账会被搬空）。\n` +
+            `请直接在那个目录所在的工作区里运行本命令。\n`,
+    )
+    process.exit(1)
+}
+
 const before = readArchiveIndex(layout).length
 
 let result

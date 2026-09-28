@@ -297,6 +297,10 @@ profile 是上限，每个仓库可以用 `.dsh/spec-gate.json` 决定**自己**
 | `planFile` | `.dsh/plan.jsonl` | 规划台账（append-only JSONL）。默认**跟随 `rootDir`**（`rootDir` 改了就跟着走）；显式配置则相对工作区解析 |
 | `adrDir` | `.dsh/adr` | 决策记录目录（默认跟随 `rootDir`） |
 | `adrIndexFile` | `<adrDir>/index.jsonl` | 决策索引（append-only JSONL） |
+
+> 这三个键在**项目级配置**（`<repo>/.dsh/spec-gate.json`）里只能把记录挪到工作区**内**的别处：
+> `../`、绝对路径、指向外面的符号链接都会被拒绝并报为问题（继续使用 profile 的值）——台账与决策记录是本仓库的工件，
+> 挪到工作区外等于让审阅它的人看不到，而且会写进别的目录。profile（宿主）不受这条限制。
 | `milestoneRequired` | `false` | `true` 时 `spec_create` 必须带 `milestone`，否则拒绝并给出下一步 |
 | `approval` | `'seam'` | `seam` 走人工审批；`auto` 记录即通过（CI 用） |
 | `rootDir` / `specsDir` / `missionsDir` | `.dsh` … | 工件布局 |

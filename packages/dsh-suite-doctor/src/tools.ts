@@ -96,6 +96,24 @@ function declaredCwdOf(agent: AgentLike | undefined): string {
 }
 
 /**
+ * A workspace-scoped logger, tolerating a logger without the scoping method.
+ *
+ * `Logger.for` is how a multi-repository profile keeps its log files apart, but
+ * it is optional in the suite's own logger contract: `dsh-eng-core`'s exported
+ * `silentLogger` has no `for`, so calling it unguarded threw a TypeError AFTER
+ * the whole report had been built — a self-check that crashes on its last line
+ * reports nothing. Losing a log line must never break a verdict.
+ */
+function loggerFor(logger: Logger, workspace: string): Logger {
+    try {
+        const scoped = typeof logger.for === 'function' ? logger.for(workspace) : undefined
+        return scoped ?? logger
+    } catch {
+        return logger
+    }
+}
+
+/**
  * Build the merged report.
  *
  * Exported for tests and for callers that want the object instead of the text.
@@ -126,10 +144,12 @@ export async function buildReport(deps: ToolDeps, agent: AgentLike | undefined, 
     // blocker/advice recomputation sees them: a runtime-only blocker (a mounted
     // but unusable core plugin) must reach the top of the report.
     const merged = withRuntime({ ...offline, checks: [...offline.checks, ...probe.checks] }, probe.facts)
-    deps.logger?.for(cwd).info(
-        `suite_status: ${merged.blockers.length} blocker(s), ${merged.advice.length} advice, ` +
-            `${probe.facts.mountedPlugins?.length ?? 0}/${config.expectedPlugins.length} plugin(s) usable`,
-    )
+    if (deps.logger !== undefined) {
+        loggerFor(deps.logger, cwd).info(
+            `suite_status: ${merged.blockers.length} blocker(s), ${merged.advice.length} advice, ` +
+                `${probe.facts.mountedPlugins?.length ?? 0}/${config.expectedPlugins.length} plugin(s) usable`,
+        )
+    }
     return merged
 }
 

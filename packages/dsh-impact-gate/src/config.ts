@@ -19,7 +19,7 @@
  * @module dsh-impact-gate/config
  */
 
-import { loadProjectConfig, type Layout, type LayoutOptions, type Logger } from 'dsh-eng-core'
+import { containedPath, loadProjectConfig, type Layout, type LayoutOptions, type Logger } from 'dsh-eng-core'
 import {
     compileSignatures,
     DEFAULT_QUARANTINE_MAX_DAYS,
@@ -348,8 +348,17 @@ export function resolveEffectiveConfig(
                 const quarantineFile = optionalString(rawFlaky['quarantineFile'])
                 if (quarantineFile === undefined) note(`${file.file}: flaky.quarantineFile 必须是非空字符串，已忽略（继续使用 profile 的值）`)
                 else {
-                    nextFlaky.quarantineFile = quarantineFile
-                    applied += 1
+                    // The quarantine ledger is a record about THIS repository and
+                    // the printed command APPENDS to it: a project may keep it
+                    // elsewhere in the workspace, never outside it (an absolute
+                    // path or `../../` would write into a directory the workspace
+                    // does not own). A violating value keeps the profile's value.
+                    const contained = containedPath(layout.cwd, quarantineFile, 'flaky.quarantineFile')
+                    if (!contained.ok) note(`${file.file}: ${contained.problem}（继续使用 profile 的值）`)
+                    else {
+                        nextFlaky.quarantineFile = quarantineFile
+                        applied += 1
+                    }
                 }
             }
             // The two numbers are POLICY, and the profile is the ceiling: a

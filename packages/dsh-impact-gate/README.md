@@ -63,11 +63,14 @@
   （`at`/`expiresAt` 是 epoch ms，读取时也接受 ISO-8601 字符串）。同一用例多行时**最新一行生效**。
   没有 owner、没有到期时间、或 JSON 坏掉的行**不算隔离**，会在 `flaky_status` 里被点名为"无法使用的行"。
 - **过期的隔离是升级项**：`flaky_plan` 与 `flaky_status` 都会报"这条隔离已过期：要么修，要么删，不能继续挂着"。
-- 计划里渲染的写入命令（`printf … >> .dsh/flaky-quarantine.json`）**只能由宿主/人执行**——本插件没有 shell 执行能力，
-  也不该替人决定"让哪条用例闭嘴"。
+- 计划里渲染的写入命令（`node -e … <base64 路径> <base64 行>`，把一行 JSON 追加进 `.dsh/flaky-quarantine.json`）
+  **只能由宿主/人执行**——本插件没有 shell 执行能力，也不该替人决定"让哪条用例闭嘴"。命令里的路径与行都做了 base64 编码，
+  因此用例名里带 `'`、路径里带空格也照样是**一条可以直接粘贴执行**的正确命令（旧版的 `printf '…' >> 路径` 在两种情况下都会拼坏，甚至可注入）。
 - **覆盖静默消失**：被隔离的用例之后被删除/改名/跳过，测试套件依然全绿，而它覆盖的东西再也没人检查。
   `flaky_status` 用最新计划产物的逐次运行点名结果回答："最近 N 次运行都没出现过"（`unseenRunsBeforeWarn`，默认 3；
-  运行次数不足阈值时明说"暂不判定"，不猜）。
+  运行次数不足阈值时明说"暂不判定"，不猜）。报告模式下每次运行只带退出码、没有逐用例点名，此时**用例计数就是"观察到"的证据**：
+  计数量覆盖了观察窗口的隔离用例不会被指控"覆盖正在消失"，只有报告里**完全没有出现**（或只在部分运行里出现）的用例才会被点名，
+  并且会同时渲染报告自身的"无法判定"说明——数据读不懂不等于用例消失了。
 
 报告文件的形状：认 `flaky_check` 写出的 `{ flakyTests, stableTests, inconclusiveTests, runs }`（每项 `{name, passed, failed, opaque}`），
 也认 `{ tests: [{ name, runs, failures, firstFailingRun?, output?, times? }] }`（`times` 可以是次数，也可以是逐次结果数组
@@ -116,7 +119,9 @@ profile（宿主上限）与 `<repo>/.dsh/impact-gate.json`（项目只能细化
 
 `flaky` 里的键可以逐项细化：`owner` 与 `quarantineFile` 是仓库事实（谁负责、台账放哪）；`signatures` **整体替换**内置签名
 （一个仓库的失败词汇表是仓库知识，`[]` 表示"不做签名分类"）；`quarantineMaxDays` 与 `unseenRunsBeforeWarn` 是**政策**，
-**只能收紧**（比 profile 更宽松的值会被忽略并记问题）——否则"项目里把隔离期限改成一年"就能悄悄绕开隔离的到期日。**拒绝并记日志**：`enabled`（项目不能把插件关掉）、`logFile`/`logFileTemplate`/`layout`、
+**只能收紧**（比 profile 更宽松的值会被忽略并记问题）——否则"项目里把隔离期限改成一年"就能悄悄绕开隔离的到期日。`quarantineFile`
+还必须是**工作区内**的路径（`../`、绝对路径、指向外面的符号链接都会保留 profile 的值并报为问题）：台账是仓库的工件，
+项目把它挪出去等于把隔离记录写进别人的目录。**拒绝并记日志**：`enabled`（项目不能把插件关掉）、`logFile`/`logFileTemplate`/`layout`、
 `prompt`、`reviewDispatch`（开它会花子代理与模型调用，属**升级**，只有宿主能决定）。
 值不做猜测：类型不对的键逐条记问题并**保留 profile 的值**（不是回落到插件默认值——那会悄悄放宽宿主设定的预算）。
 

@@ -21,6 +21,7 @@ import test, { after } from 'node:test'
 import { MissionStoreRegistry, resolveLayout } from 'dsh-eng-core'
 import { createFakeHost, runText, tempWorkspace, type FakeHost } from 'dsh-eng-core/testing'
 import { apply, inject, name, resolveConfig, resolveEffectiveConfig } from '../dist/index.js'
+import { registerTools } from '../dist/tools.js'
 
 const hosts: FakeHost[] = []
 
@@ -511,4 +512,31 @@ test('the project file may only tighten: expectedPlugins is unioned, unusable va
     assert.ok(problems.some((problem) => /并集/.test(problem)), JSON.stringify(problems))
     assert.ok(problems.some((problem) => /probeTimeoutMs/.test(problem)), JSON.stringify(problems))
     assert.ok(problems.some((problem) => /layout/.test(problem)), JSON.stringify(problems))
+})
+
+// --- adversarial-audit regression -------------------------------------------
+
+test('a logger without for() must not break the report (eng-core\u2019s silentLogger has none)', async () => {
+    // Repro a7.mjs: `deps.logger?.for(cwd)` assumed `for` exists, so the tool
+    // threw a TypeError AFTER the whole report had been built.
+    const cwd = repo()
+    configure(cwd)
+    fs.writeFileSync(path.join(cwd, '.gitignore'), '.dsh/\n')
+    const fake = createFakeHost({ cwd, services: {} })
+    hosts.push(fake)
+    const bare = { info: () => undefined, warn: () => undefined, error: () => undefined, debug: () => undefined } as never
+    const config = resolveConfig({ logFile: logFileFor() })
+    const registered = registerTools(fake.ctx as never, {
+        config,
+        configFor: () => config,
+        stores: new MissionStoreRegistry(),
+        ctx: () => fake.ctx as never,
+        logger: bare,
+    })
+    assert.deepEqual(registered.failed, [])
+    const run = await fake.runTool('suite_status', {})
+    assert.equal(run.isError, false)
+    const text = runText(run)
+    assert.match(text, /# 套件自检（suite_status）/)
+    assert.ok(text.length > 100, 'the whole report must be produced, not a TypeError')
 })

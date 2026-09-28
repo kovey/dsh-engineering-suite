@@ -1295,10 +1295,17 @@ export function registerTools(
 
                 // --- verdict ------------------------------------------------
                 const judged = judgeMutation({ run, thresholds: mutation.thresholds, changed })
+                // A file that matched the selection but could not be mutated
+                // (unreadable, over the size cap, not valid UTF-8, a symlink, a real
+                // path outside the workspace or inside the exclusion floor) is
+                // coverage this run cannot claim: "every planned file was mutated"
+                // would be a lie, so `full` is false and the report names them.
+                const unmutable = collected.skipped.filter((entry) => entry.unusable === true)
                 const full =
                     run.stopped === 'complete' &&
                     run.counts.runError === 0 &&
                     !plan.truncated &&
+                    unmutable.length === 0 &&
                     !operatorsOverridden &&
                     !capFromCall &&
                     !budgetFromCall
@@ -1382,7 +1389,7 @@ export function registerTools(
                 lines.push(
                     `范围：${changed ? `只变异本次改动（baseRef=${mutation.baseRef}）` : '全部源码'}；源文件 ${collected.files.length} 个（globs：${collected.sourceGlobs.join(', ')}），参与变异 ${plan.files.length} 个${
                         collected.skipped.length === 0 ? '' : `，跳过 ${collected.skipped.length} 个`
-                    }`,
+                    }${unmutable.length === 0 ? '' : `（其中 ${unmutable.length} 个本该参与变异却无法改写，见下）`}`,
                 )
                 lines.push(
                     `变异体：可用 ${plan.available} 个，本次计划 ${plan.mutants.length} 个${
@@ -1440,7 +1447,17 @@ export function registerTools(
                     if (operatorsOverridden) why.push('操作符由调用参数提供（非宿主配置）')
                     if (capFromCall) why.push(`maxMutants 比宿主配置更窄（${maxMutants} < ${mutation.maxMutants}）`)
                     if (budgetFromCall) why.push('timeBudgetMs 比宿主配置更窄')
+                    if (unmutable.length > 0) why.push(`${unmutable.length} 个本该参与变异的源码文件没有被变异（跳过 = 未覆盖）`)
                     lines.push(`  scope.full=false 的原因：${why.join('；')}`)
+                }
+                if (unmutable.length > 0) {
+                    lines.push('')
+                    lines.push(
+                        `没有被变异的源码文件（${unmutable.length} 个：它们匹配 sourceGlobs，却无法被改写——跳过不等于"干净"，这些文件在本裁决里是**未覆盖**）：`,
+                    )
+                    for (const entry of unmutable.slice(0, 10)) lines.push(`  - ${entry.path}：${entry.reason}`)
+                    if (unmutable.length > 10) lines.push(`  - …（另有 ${unmutable.length - 10} 个，完整清单见工件 plan.skipped）`)
+                    lines.push('  下一步：让这些文件可被改写（真实文件、去掉符号链接、调整 mutation.maxFileBytes），或在 sourceGlobs 里明确排除它们。')
                 }
                 const allNotes = [...notes, ...collected.notes, ...judged.notes]
                 if (allNotes.length > 0) lines.push(renderNotes(allNotes))

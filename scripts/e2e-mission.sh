@@ -10,10 +10,30 @@
 # everything else real: the harness boot, tool dispatch, plugin hooks, the
 # quality gate's subprocess, the mission store, the audit trail.
 #
-# usage: bash scripts/e2e-mission.sh [--no-build] [--keep] [--timeout SECONDS]
+# usage: bash scripts/e2e-mission.sh [--no-build] [--keep] [--timeout SECONDS] [--selftest]
 #   --no-build   reuse the existing packages/*/dist (default: build first)
-#   --keep       do not wipe /tmp/dsh-e2e before writing the profile
+#   --keep       keep the logs and DSH_HOME under /tmp/dsh-e2e; the WORKSPACE is
+#                ALWAYS wiped (see the C2 note below) and the profile is rewritten
 #   --timeout    watchdog for the dsh run in seconds (default 300)
+#   --selftest   do not run dsh at all: exercise this script's own assertions
+#                against synthetic inputs (the three false-green classes below),
+#                then run scripts/selftest-ops.sh (the same for the ops scripts),
+#                and exit non-zero if any of them stops biting
+#
+# WHY THESE ASSERTIONS LOOK PARANOID — 2026-09 adversarial audit, findings C1-C3,
+# every one of them reproduced with a GREEN run:
+#   * the readiness probe accepted ANY listener on $PORT. With a foreign process
+#     (or a leftover stub from an earlier run) holding the port, our own stub
+#     died of EADDRINUSE while the run printed "PASS stub-llm healthy" and the
+#     suite's own model server served ZERO requests.
+#   * under --keep the previous run's workspace survived, so `ls -t … | head -1`
+#     returned the OLD mission/spec/audit and a model that did nothing at all
+#     still satisfied every artifact assertion.
+#   * `grep -q 'applied ('` also matches a plugin's own partial-failure line
+#     ("applied (tools: …; failed: …)"), and every plugin wraps apply() in
+#     `catch { log.error('apply failed:') }` without rethrowing — so a
+#     HALF-MOUNTED plugin counted as mounted.
+# The fixes are assertions, not extra log lines: --selftest proves they bite.
 #
 # SANDBOX: the run sets DSH_PERMISSION_MODE=danger-full-access for the child
 # `dsh` unless $E2E_PERMISSION_MODE says otherwise. The verification sandbox is
@@ -42,6 +62,7 @@ DSH_LOG="$LOGS/dsh.log"
 TIMEOUT_SECONDS=300
 DO_BUILD=1
 KEEP=0
+SELFTEST=0
 PERMISSION_MODE="${E2E_PERMISSION_MODE:-danger-full-access}"
 
 # Every plugin under verification (dsh-eng-core is a library dependency, linked
@@ -69,7 +90,8 @@ while [ $# -gt 0 ]; do
     --no-build) DO_BUILD=0; shift ;;
     --keep) KEEP=1; shift ;;
     --timeout) TIMEOUT_SECONDS="${2:-300}"; shift 2 ;;
-    -h|--help) sed -n '2,22p' "$0"; exit 0 ;;
+    --selftest) SELFTEST=1; shift ;;
+    -h|--help) sed -n '2,/^set -euo pipefail/p' "$0" | sed '$d'; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -79,6 +101,151 @@ pass() { printf '  \033[32mPASS\033[0m %s\n' "$*"; }
 fail() { printf '  \033[31mFAIL\033[0m %s\n' "$*"; FAILURES=$((FAILURES + 1)); }
 info() { printf '  ---- %s\n' "$*"; }
 section() { printf '\n=== %s\n' "$*"; }
+
+# ---------------------------------------------------------------------------
+# judgement helpers — one place per false-green class, used by the run AND by
+# --selftest (a check that is never exercised against a known-bad input is how
+# this script liked a foreign listener for its own stub).
+# ---------------------------------------------------------------------------
+
+# Whether a plugin log proves a COMPLETE mount: its own `applied (…)` line, with
+# no failed tool in it and no `apply failed:` anywhere (audit C3). The plugins
+# catch their own apply() errors, so "the file exists" and even "applied (" both
+# survive a plugin that registered nothing. `failed to register` covers the other
+# half of the class: plugins that print no `failed:` segment in their mount line
+# (coverage-gate, deploy-gate, …) still log one line per tool they could not
+# register, and a healthy mount never logs it.
+mount_ok() { # mount_ok <plugin-log>
+  local log="$1"
+  [ -f "$log" ] || return 1
+  grep -q 'applied (' "$log" 2>/dev/null || return 1
+  grep -q 'applied (.*failed:' "$log" 2>/dev/null && return 1
+  grep -q 'apply failed:' "$log" 2>/dev/null && return 1
+  grep -q 'failed to register' "$log" 2>/dev/null && return 1
+  return 0
+}
+
+# Whether the listener on a port is OUR stub: the process is alive AND its own
+# log says it bound that port (audit C1 — a probe that only asks "does something
+# answer /health?" says yes to any stranger).
+stub_owns_port() { # stub_owns_port <pid> <log> <port>
+  local pid="$1" log="$2" port="$3"
+  [ -n "$pid" ] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  [ -f "$log" ] || return 1
+  grep -Fq "listening on http://127.0.0.1:${port}" "$log" 2>/dev/null || return 1
+  return 0
+}
+
+# A file written by the CURRENT run (audit C2: `ls -t | head -1` returns the
+# previous run's artifact just as happily).
+postdates() { # postdates <file> <sentinel created at/just before the run>
+  local file="$1" sentinel="$2"
+  [ -f "$file" ] || return 1
+  [ -f "$sentinel" ] || return 0
+  [ "$file" -nt "$sentinel" ]
+}
+
+# Every run starts from an EMPTY workspace. `--keep` may keep the logs and the
+# DSH_HOME (that is what makes a failed run debuggable), but artifacts must never
+# survive: under `--keep` the previous workspace's mission/spec/audit satisfied
+# every artifact assertion below, so "a model that does nothing" was GREEN.
+reset_workspace() { # reset_workspace <dir>
+  local ws="$1"
+  rm -rf "$ws"
+  mkdir -p "$ws"
+  if [ -e "$ws/.dsh" ] || [ -n "$(ls -A "$ws" 2>/dev/null)" ]; then
+    printf 'reset_workspace: %s is still not empty after the reset\n' "$ws" >&2
+    return 1
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# --selftest: drive the three helpers above with inputs that MUST be refused.
+# No dsh, no profile, no workspace — a few hundred milliseconds.
+# ---------------------------------------------------------------------------
+selftest() {
+  local free_port real_port foreign_pid stub_pid probe
+  # Global on purpose: the EXIT trap below runs after this function returned, and
+  # a `local` is unset by then (set -u would make the trap itself fail the run).
+  SELFTEST_TMP="$(mktemp -d)"
+  tmp="$SELFTEST_TMP"
+  trap 'rm -rf "$SELFTEST_TMP"' EXIT
+
+  section "selftest 1/4 — the mount needle rejects a half-mounted plugin (C3)"
+  printf 'INFO applied (tools: bash, write; enforce=true; approval=auto)\n' > "$tmp/clean.log"
+  printf 'INFO applied (tools: bash, write; failed: evidence_record; enforce=true)\n' > "$tmp/partial.log"
+  printf 'ERROR apply failed: Error: boom\n' > "$tmp/apply-failed.log"
+  printf 'INFO applied (tools: coverage_check; thresholds: 80%%)\nWARN tools that failed to register: mutation_check\n' > "$tmp/unregistered.log"
+  printf 'INFO nothing to see here\n' > "$tmp/empty.log"
+  if mount_ok "$tmp/clean.log"; then pass "accepts a complete 'applied (…)' line"; else fail "refused a complete mount line"; fi
+  if mount_ok "$tmp/partial.log"; then fail "accepted 'applied (…; failed: tool)' — a half-mounted plugin"; else pass "refuses the partial-failure mount line"; fi
+  if mount_ok "$tmp/apply-failed.log"; then fail "accepted 'apply failed:' — apply() threw"; else pass "refuses a log whose apply() threw"; fi
+  if mount_ok "$tmp/unregistered.log"; then fail "accepted a plugin with a tool that 'failed to register'"; else pass "refuses a plugin with an unregistered tool"; fi
+  if mount_ok "$tmp/empty.log"; then fail "accepted a log with no mount line at all"; else pass "refuses a log with no mount line"; fi
+
+  section "selftest 2/4 — a foreign listener is not our stub (C1)"
+  free_port="$(node -e 'const s=require("node:net").createServer();s.listen(0,"127.0.0.1",()=>{process.stdout.write(String(s.address().port));s.close()})')"
+  real_port="$(node -e 'const s=require("node:net").createServer();s.listen(0,"127.0.0.1",()=>{process.stdout.write(String(s.address().port));s.close()})')"
+  printf '{"steps":[{"say":"selftest"}]}\n' > "$tmp/script.json"
+  node -e 'require("node:http").createServer((_q,s)=>{s.writeHead(200,{"content-type":"application/json"});s.end("{\"ok\":true}")}).listen(Number(process.argv[1]),"127.0.0.1")' "$free_port" >"$tmp/foreign.log" 2>&1 &
+  foreign_pid=$!
+  sleep 0.4
+  probe=1
+  node -e "fetch('http://127.0.0.1:${free_port}/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))" 2>/dev/null || probe=0
+  if [ "$probe" = "1" ]; then pass "the health probe alone is fooled by the foreign listener (so the extra checks are load-bearing)"; else fail "the foreign listener did not answer /health"; fi
+  STUB_SCRIPT="$tmp/script.json" STUB_PORT="$free_port" node "$ROOT/scripts/stub-llm.mjs" >"$tmp/stub.log" 2>&1 &
+  stub_pid=$!
+  sleep 1
+  if stub_owns_port "$stub_pid" "$tmp/stub.log" "$free_port"; then
+    fail "took the foreign listener on $free_port for our own stub"
+  else
+    pass "refuses the foreign listener: our stub is dead / never logged the port (EADDRINUSE)"
+  fi
+  kill "$stub_pid" 2>/dev/null || true; wait "$stub_pid" 2>/dev/null || true
+  kill "$foreign_pid" 2>/dev/null || true; wait "$foreign_pid" 2>/dev/null || true
+
+  section "selftest 3/4 — our own stub on a free port is accepted (the check is not vacuous)"
+  STUB_SCRIPT="$tmp/script.json" STUB_PORT="$real_port" node "$ROOT/scripts/stub-llm.mjs" >"$tmp/real.log" 2>&1 &
+  stub_pid=$!
+  probe=0
+  for _ in $(seq 1 30); do
+    if stub_owns_port "$stub_pid" "$tmp/real.log" "$real_port"; then probe=1; break; fi
+    sleep 0.2
+  done
+  if [ "$probe" = "1" ]; then pass "accepts our own stub (pid $stub_pid) on 127.0.0.1:$real_port"; else fail "did not recognise our own stub on a free port"; fi
+  kill "$stub_pid" 2>/dev/null || true; wait "$stub_pid" 2>/dev/null || true
+
+  section "selftest 4/4 — stale artifacts and a stale workspace (C2)"
+  mkdir -p "$tmp/ws/.dsh/missions/M-stale" "$tmp/ws/.dsh/specs"
+  printf '{}\n' > "$tmp/ws/.dsh/missions/M-stale/mission.json"
+  if reset_workspace "$tmp/ws" && [ ! -e "$tmp/ws/.dsh" ]; then pass "reset_workspace removes a previous run's ledger"; else fail "reset_workspace left artifacts behind"; fi
+  printf '{}\n' > "$tmp/old.json"
+  touch -t 202001010000 "$tmp/old.json"
+  : > "$tmp/sentinel"
+  if postdates "$tmp/old.json" "$tmp/sentinel"; then fail "accepted an artifact from a previous run"; else pass "refuses an artifact that does not postdate the run start"; fi
+  if postdates "$tmp/sentinel" "$tmp/old.json"; then pass "accepts a file written after the run start"; else fail "refused a fresh file"; fi
+
+  section "selftest summary"
+  if [ "$FAILURES" = "0" ]; then
+    printf '  \033[32mSELFTEST GREEN\033[0m — every assertion above rejects its known-bad input.\n'
+  else
+    printf '  \033[31mSELFTEST RED\033[0m — %s check(s) failed: the E2E would report a false GREEN.\n' "$FAILURES"
+    return 1
+  fi
+
+  # The ops scripts (archive/doctor/project-config/install/build-all) are the
+  # other half of "is the tooling trustworthy": their own regressions are checked
+  # by scripts/selftest-ops.sh, which is cheap and needs no dsh session.
+  bash "$ROOT/scripts/selftest-ops.sh" || return 1
+  return 0
+}
+
+if [ "$SELFTEST" = "1" ]; then
+  selftest
+  exit $?
+fi
 
 # ---------------------------------------------------------------------------
 # 1. build the suite
@@ -95,11 +262,15 @@ fi
 # ---------------------------------------------------------------------------
 section "2/6 isolated profile under $E2E_HOME"
 if [ "$KEEP" = "1" ]; then
-  info "--keep: not wiping $E2E_HOME"
+  info "--keep: keeping $E2E_HOME/logs and DSH_HOME (the WORKSPACE is still wiped)"
 else
   rm -rf "$E2E_HOME"
 fi
-mkdir -p "$E2E_HOME/profiles/$PROFILE" "$E2E_HOME/profiles/node_modules" "$LOGS" "$WS"
+mkdir -p "$E2E_HOME/profiles/$PROFILE" "$E2E_HOME/profiles/node_modules" "$LOGS"
+# The workspace is reset on EVERY run, --keep included: stale `.dsh/missions`,
+# `.dsh/specs` and `.dsh/audit` from an earlier run satisfy the `ls -t … | head -1`
+# assertions below, which is what let a no-op model report GREEN (audit C2).
+reset_workspace "$WS" || { fail "could not reset the scratch workspace $WS"; exit 1; }
 
 # The launcher rewrites this file on every boot; it only anchors the loader.
 printf '[]\n' > "$E2E_HOME/profiles/$PROFILE/cordis.yml"
@@ -332,18 +503,35 @@ STUB_PID=$!
 
 ready=0
 for _ in $(seq 1 50); do
-  if node -e "fetch('http://127.0.0.1:${PORT}/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))" 2>/dev/null; then
+  # Our stub is gone (EADDRINUSE, a bad script, a crash): stop waiting for a port
+  # that some OTHER process is answering.
+  if ! kill -0 "$STUB_PID" 2>/dev/null; then
+    break
+  fi
+  # Readiness needs all three: our pid alive, OUR OWN log naming this port, and
+  # the port answering. The fetch alone says yes to any listener (audit C1).
+  if stub_owns_port "$STUB_PID" "$STUB_LOG" "$PORT" &&
+    node -e "fetch('http://127.0.0.1:${PORT}/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))" 2>/dev/null; then
     ready=1
     break
   fi
   sleep 0.2
 done
 if [ "$ready" != "1" ]; then
-  fail "stub-llm did not become healthy on 127.0.0.1:$PORT"
+  fail "stub-llm is NOT the listener on 127.0.0.1:$PORT (our own log never said 'listening on http://127.0.0.1:$PORT', pid $STUB_PID)"
+  if grep -qi 'EADDRINUSE' "$STUB_LOG" 2>/dev/null; then
+    printf '  ---- port %s is already taken by a foreign process: something answered /health, but it is not the stub of this run\n' "$PORT" >&2
+  fi
   sed -n '1,40p' "$STUB_LOG" >&2 || true
   exit 1
 fi
-pass "stub-llm healthy on 127.0.0.1:$PORT (pid $STUB_PID)"
+pass "stub-llm healthy on 127.0.0.1:$PORT (pid $STUB_PID; our own log confirms the listener)"
+
+# Start of the run, for the "did THIS run write this artifact?" assertions.
+# `ls -t … | head -1` and `find … | head -1` return an older file just as
+# happily as a fresh one (audit C2).
+RUN_START="$E2E_HOME/.run-start"
+: > "$RUN_START"
 
 # ---------------------------------------------------------------------------
 # 4. scratch workspace (git — the quality/evidence gates take the git path)
@@ -413,7 +601,23 @@ if [ "$STUB_FATALS" = "0" ]; then
 else
   fail "stub reported $STUB_FATALS STUB-FATAL line(s) — see $STUB_LOG"
 fi
-info "stub decisions: $(grep -c 'DECIDE' "$STUB_LOG" || true) (expected 14)"
+
+# The decision count used to be an informational line, which is exactly what made
+# the port clash silent: the run reported a delivered mission while the suite's
+# own model server had served ZERO requests (audit C1). Count the steps from the
+# script itself — never a literal — and require this stub to have served them.
+# `< steps` (not `!= steps`) so a legitimately extra harness request is not a
+# false RED, while "stopped early" and "someone else served the model" both fail.
+STEPS_TOTAL="$(node -e 'process.stdout.write(String((require(process.argv[1]).steps ?? []).length))' "$E2E_HOME/script.json" 2>/dev/null || echo 0)"
+DECISIONS="$(grep -c 'DECIDE' "$STUB_LOG" || true)"
+if [ "$DECISIONS" -gt 0 ]; then
+  pass "our own stub served the scripted model: $DECISIONS decision(s)"
+else
+  fail "our own stub served 0 decisions (the plan has $STEPS_TOTAL steps) — the agent never reached THIS model server"
+fi
+if [ "$DECISIONS" -lt "$STEPS_TOTAL" ]; then
+  fail "the plan has $STEPS_TOTAL steps but the stub decided only $DECISIONS time(s): the flow stopped early (see $STUB_LOG)"
+fi
 
 if [ "$DSH_RC" = "0" ]; then
   pass "dsh exited 0"
@@ -430,6 +634,17 @@ if [ -n "$MISSION_JSON" ]; then
 else
   MISSION_ID=""
   fail "no .dsh/missions/*/mission.json"
+fi
+
+# Every other artifact assertion hangs off the id picked above, and `ls -t`
+# returns a PREVIOUS run's mission when this run wrote none (audit C2). The
+# record must therefore postdate $RUN_START.
+if [ -n "$MISSION_JSON" ]; then
+  if postdates "$MISSION_JSON" "$RUN_START"; then
+    pass "the mission record was written by THIS run (postdates $RUN_START)"
+  else
+    fail "the newest mission record predates this run: $MISSION_JSON — a stale artifact, not evidence of this run"
+  fi
 fi
 
 read_field() { # read_field <file> <js-expression over `m`>
@@ -533,16 +748,24 @@ for file in src/health.mjs test/health.test.mjs; do
 done
 
 MOUNTED=0
+MOUNT_MISSING=""
 for pkg in "${SUITE[@]}"; do
   # The profile overrides name each log by its entry id, which is the short
-  # name (dsh-spec-gate → spec-gate.log). "applied (" is the plugin's own
-  # mount line — a file that merely exists proves nothing.
-  if grep -q 'applied (' "$LOGS/${pkg#dsh-}.log" 2>/dev/null; then MOUNTED=$((MOUNTED + 1)); fi
+  # name (dsh-spec-gate → spec-gate.log). "applied (" is the plugin's own mount
+  # line — a file that merely exists proves nothing, and a HALF-mounted plugin
+  # logs `applied (tools: …; failed: tool)` / `apply failed:` yet still matched
+  # the plain grep (audit C3). mount_ok() is the single judge here, and
+  # --selftest proves it rejects both of those logs.
+  if mount_ok "$LOGS/${pkg#dsh-}.log"; then
+    MOUNTED=$((MOUNTED + 1))
+  else
+    MOUNT_MISSING="$MOUNT_MISSING ${pkg#dsh-}"
+  fi
 done
 if [ "$MOUNTED" = "${#SUITE[@]}" ]; then
-  pass "all ${#SUITE[@]} plugins logged their own 'applied (' mount line under $LOGS"
+  pass "all ${#SUITE[@]} plugins logged their own COMPLETE 'applied (' mount line under $LOGS"
 else
-  fail "only $MOUNTED/${#SUITE[@]} plugins logged an 'applied (' mount line under $LOGS"
+  fail "only $MOUNTED/${#SUITE[@]} plugins mounted completely (missing or half-mounted:$MOUNT_MISSING)"
 fi
 
 # ---------------------------------------------------------------------------

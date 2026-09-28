@@ -496,3 +496,72 @@ test('budgets: a project file replaces the list; forbidden keys and broken entri
         path.join(cwd, 'baselines', 'b.json'),
     )
 })
+
+// --- adversarial-audit regressions: the baseline file is never someone else's ---
+
+test('budgets: a project-level baselineFile outside the workspace is refused and keeps the default', () => {
+    const cwd = tempWorkspace('budget-escape-')
+    fs.mkdirSync(path.join(cwd, '.dsh'), { recursive: true })
+    fs.writeFileSync(
+        path.join(cwd, '.dsh', 'quality-gate.json'),
+        JSON.stringify({
+            budgets: [
+                { id: 'outside', metric: 'number', command: 'node size.mjs', regex: 'n=(\\d+)', max: 10, baselineFile: '../other-project/budgets.json' },
+                { id: 'local', metric: 'number', command: 'node size.mjs', regex: 'n=(\\d+)', max: 10, baselineFile: 'baselines/b.json' },
+            ],
+        }),
+    )
+    const hostConfig = resolveConfig(budget({ budgets: [{ id: 'profile', metric: 'durationMs', command: 'x' }] }))
+    const store = new MissionStoreRegistry().for(cwd)
+    const effective = resolveEffectiveConfig(hostConfig, store.layout)
+    assert.match(effective.problems.join('\n'), /预算 "outside" 的 baselineFile 必须指向工作区内的路径/)
+    assert.equal(effective.config.budgets.find((entry) => entry.id === 'outside')?.baselineFile, undefined, 'the escaping value is dropped, not honoured')
+    assert.equal(
+        baselineFileFor(effective.config.budgets.find((entry) => entry.id === 'outside') as BudgetConfig, { cwd, rootDir: store.layout.rootDir }),
+        path.join(store.layout.rootDir, 'budgets.json'),
+    )
+    assert.equal(effective.config.budgets.find((entry) => entry.id === 'local')?.baselineFile, 'baselines/b.json', 'a workspace-relative relocation stays allowed')
+})
+
+test('budgets: a run refuses a baselineFile outside the workspace and writes nothing there', async () => {
+    const root = tempWorkspace('budget-escape-run-')
+    const cwd = path.join(root, 'repo')
+    const victim = path.join(root, 'other-project', 'budgets.json')
+    fs.mkdirSync(cwd, { recursive: true })
+    fs.mkdirSync(path.dirname(victim), { recursive: true })
+    const owned = '{ "note": "another tool owns this file" }\n'
+    fs.writeFileSync(victim, owned)
+    const config = resolveConfig(
+        budget({
+            budgets: [{ id: 'size', name: 'size', metric: 'number', command: 'node -e "console.log(42)"', regex: '([0-9]+)', max: 100, baselineFile: victim }],
+        }),
+    )
+    const runner = stubRunner([{ exitCode: 0, stdout: '42' }])
+    const run = await runBudgets({ cwd, config, rootDir: path.join(cwd, '.dsh'), runner: runner.runner, now: () => CLOCK })
+    assert.equal(run.ok, false)
+    assert.match(run.ok === false ? run.problem : '', /必须指向工作区内的路径/)
+    assert.match(run.ok === false ? run.problem : '', /没有跑任何命令，也没有写入基线/)
+    assert.equal(runner.specs.length, 0, 'nothing is executed once the write target is refused')
+    assert.equal(fs.readFileSync(victim, 'utf8'), owned, 'the other project\'s file is untouched')
+})
+
+test('budgets: a foreign JSON document is not "no history", and appending never replaces it', () => {
+    const file = path.join(tempWorkspace('budget-foreign-'), 'someone-elses.json')
+    const foreign = JSON.stringify({ keep: 'this matters', other: { a: 1 } }, null, 2) + '\n'
+    fs.writeFileSync(file, foreign)
+    const read = readBaseline(file, 'b')
+    assert.deepEqual(read.entries, [])
+    assert.match(read.problem ?? '', /不是本门禁的基线文档/)
+    assert.match(read.problem ?? '', /keep, other/)
+    assert.throws(
+        () => appendBaseline(file, 'b', { at: CLOCK, value: 5, metric: 'number', unit: 'count', command: 'x', exitCode: 0 }),
+        /拒绝写入基线文件/,
+    )
+    assert.equal(fs.readFileSync(file, 'utf8'), foreign, 'the document is left exactly as it was')
+    // An empty-but-shaped baseline document is still usable.
+    const shaped = path.join(path.dirname(file), 'budgets.json')
+    fs.writeFileSync(shaped, '{ "version": 1, "budgets": {} }\n')
+    assert.deepEqual(readBaseline(shaped, 'b'), { entries: [] })
+    appendBaseline(shaped, 'b', { at: CLOCK, value: 5, metric: 'number', unit: 'count', command: 'x', exitCode: 0 })
+    assert.deepEqual(readBaseline(shaped, 'b').entries.map((entry) => entry.value), [5])
+})

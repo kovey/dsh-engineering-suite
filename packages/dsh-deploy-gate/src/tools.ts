@@ -22,6 +22,7 @@
  */
 
 import path from 'node:path'
+import { randomBytes } from 'node:crypto'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import {
     approverName,
@@ -67,6 +68,8 @@ import {
     appendLedgerRow,
     deploymentId,
     findDeployment,
+    lastRowOf,
+    ledgerWritable,
     liveDeployment,
     readLedger,
     rollbackTargetOf,
@@ -129,19 +132,57 @@ export interface InteractionAsk {
  * Both halves are optional and both are called defensively: a channel that
  * cannot answer, or a hub that cannot list its pending questions, must degrade
  * to "unavailable" (fail closed) rather than break a deployment verdict.
+ *
+ * `ask` is one accepted shape, but the suite's OWN interaction layer does not
+ * provide it (it offers a channel registry: `list`/`describeAll`, `send`, `arm`,
+ * `awaitAnswer`, `pending`). Both surfaces are driven here, because a documented
+ * path that only exists in tests is a path that does not exist.
  */
 export interface InteractionLike {
     ask?: (request: InteractionAsk) => Promise<unknown>
     pendingAsks?: () => unknown
     pending?: () => unknown
     listPending?: () => unknown
+    /** Ledgers this process has observed (`pending()` reads only those). */
+    ledgers?: () => unknown
+    /** The channel registry surface (see `dsh-interaction-gate`). */
+    list?: () => unknown
+    describeAll?: () => unknown
+    get?: (name: string) => unknown
+    send?: (name: string, message: unknown) => Promise<unknown>
+    arm?: (questionId: string) => unknown
+    retire?: (questionId: string) => unknown
+    awaitAnswer?: (questionId: string, timeoutMs: number, options?: unknown) => Promise<unknown>
 }
+
+/** Most asks a channel's bare count is allowed to stand for in one report. */
+export const MAX_REPORTED_ASKS = 1_000
 
 /** Values that mean "yes" when a channel answers with a word instead of a decision. */
 export const ACCEPT_VALUES: readonly string[] = ['yes', 'y', 'ok', 'allow', 'approved', 'approve', 'allowed-once']
 
 /** Values that mean "no". Everything else is `unavailable` (fail closed). */
 export const REJECT_VALUES: readonly string[] = ['no', 'n', 'deny', 'denied', 'reject', 'rejected', 'cancel', 'cancelled']
+
+/**
+ * An unpredictable one-shot token for a question asked through a channel.
+ *
+ * The same convention `dsh-interaction-gate` uses (128 random bits, hex): never
+ * derived from a clock or a counter, so an answer can only ever belong to the
+ * question it claims.
+ */
+export function newQuestionToken(): string {
+    return `q-${randomBytes(16).toString('hex')}`
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+    return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+/** An approval outcome that means "nobody decided". */
+function unavailableOutcome(by = '', source = 'unknown'): ApprovalOutcome {
+    return { decision: 'unavailable', by, messageId: '', source, allowed: false }
+}
 
 function decisionFrom(value: unknown): ApprovalOutcome | undefined {
     if (typeof value !== 'string') return undefined
@@ -198,6 +239,29 @@ function pendingAskOf(value: unknown): PendingAsk | undefined {
 }
 
 /**
+ * Whether the service has observed a ledger in THIS process.
+ *
+ * `pending()` (the interaction gate) is derived from the ledgers the service has
+ * touched in this process, so an empty list is ambiguous: "nobody is waiting"
+ * and "this process has not read that workspace's ledger yet" both produce `[]`.
+ * `ledgers()` is the discriminator the interaction gate documents and
+ * `dsh-suite-doctor` implements; without it there is nothing to tell them apart
+ * and the empty list is kept as-is.
+ * @param interaction - the service.
+ * @returns `false` only when the service says it has observed NO ledger.
+ */
+function observedAnyLedger(interaction: InteractionLike): boolean {
+    const ledgers = interaction.ledgers
+    if (typeof ledgers !== 'function') return true
+    try {
+        const value = (ledgers as () => unknown).call(interaction)
+        return !Array.isArray(value) || value.length > 0
+    } catch {
+        return true
+    }
+}
+
+/**
  * The questions a human still has to answer.
  * @param interaction - the optional service.
  * @returns the asks, and whether they could actually be queried (an unqueried
@@ -208,26 +272,41 @@ export function pendingAsksOf(interaction: InteractionLike | undefined): { asks:
     for (const method of ['pendingAsks', 'pending', 'listPending'] as const) {
         const candidate = interaction[method]
         if (typeof candidate !== 'function') continue
+        let raw: unknown
         try {
-            const raw = (candidate as () => unknown).call(interaction)
-            const list = Array.isArray(raw)
-                ? raw
-                : typeof raw === 'object' && raw !== null
-                  ? ((raw as Record<string, unknown>)['asks'] ?? (raw as Record<string, unknown>)['pending'] ?? (raw as Record<string, unknown>)['items'])
-                  : typeof raw === 'number'
-                    ? new Array(raw).fill({ title: '(通道只报告了数量，没有标题)' })
-                    : undefined
-            if (list === undefined) return { asks: [], queryable: true }
-            if (!Array.isArray(list)) return { asks: [], queryable: false }
-            const asks: PendingAsk[] = []
-            for (const entry of list) {
-                const ask = pendingAskOf(entry)
-                if (ask !== undefined) asks.push(ask)
-            }
-            return { asks, queryable: true }
+            raw = (candidate as () => unknown).call(interaction)
         } catch {
             return { asks: [], queryable: false }
         }
+        // A bare NUMBER is a count, not a list: materialising it (`new Array(n)`)
+        // is an unbounded allocation (`pending: () => 20_000_000` killed the
+        // process), and a positive count IS somebody waiting. So it becomes ONE
+        // synthetic ask that says how many there are — clamped, never expanded.
+        if (typeof raw === 'number') {
+            if (!Number.isFinite(raw)) return { asks: [], queryable: false }
+            const count = Math.max(0, Math.floor(raw))
+            if (count === 0) return { asks: [], queryable: true }
+            return {
+                asks: [{ title: `通道只报告了数量：${count > MAX_REPORTED_ASKS ? `超过 ${MAX_REPORTED_ASKS} 个` : `${count} 个`}提问在等人回答（通道没有给出标题）` }],
+                queryable: true,
+            }
+        }
+        // Anything that is not an array (an empty object, a string, `undefined`)
+        // is UNREADABLE: `{asks: []}` and "we could not read it" must never look
+        // the same, or "nobody is waiting" becomes an unverified claim.
+        const list = Array.isArray(raw)
+            ? raw
+            : typeof raw === 'object' && raw !== null
+              ? ((raw as Record<string, unknown>)['asks'] ?? (raw as Record<string, unknown>)['pending'] ?? (raw as Record<string, unknown>)['items'])
+              : undefined
+        if (!Array.isArray(list)) return { asks: [], queryable: false }
+        const asks: PendingAsk[] = []
+        for (const entry of list) {
+            const ask = pendingAskOf(entry)
+            if (ask !== undefined) asks.push(ask)
+        }
+        if (asks.length === 0 && !observedAnyLedger(interaction)) return { asks: [], queryable: false }
+        return { asks, queryable: true }
     }
     return { asks: [], queryable: false }
 }
@@ -522,6 +601,14 @@ async function runSequence(
     commands: readonly string[],
     options: {
         kind: 'deploy' | 'verify' | 'rollback' | 'canary'
+        /**
+         * Prefix of every result id in this call. Defaults to `kind`, so a
+         * single-call sequence keeps its readable ids — but a caller that runs
+         * several sequences inside one tool call (canary steps, verify attempts)
+         * MUST pass a distinct one: the counter restarts per call, and duplicate
+         * ids make "which command produced this" unanswerable in the gate record.
+         */
+        idPrefix?: string
         vars: TemplateVars
         cwd: string
         timeoutMs: number
@@ -531,6 +618,7 @@ async function runSequence(
         logger: Logger
     },
 ): Promise<SequenceResult> {
+    const prefix = options.idPrefix ?? options.kind
     const runs: SequenceRun[] = []
     for (const [index, template] of commands.entries()) {
         const resolved = resolveCommands([template], options.vars)[0]
@@ -551,7 +639,7 @@ async function runSequence(
             options.subprocess as SubprocessLike | undefined,
         )
         const run: SequenceRun = {
-            id: `${options.kind}-${index + 1}`,
+            id: `${prefix}-${index + 1}`,
             template,
             argv: resolved.argv,
             outcome,
@@ -659,6 +747,9 @@ async function askHuman(input: {
     signal?: AbortSignal
 }): Promise<ApprovalAttempt> {
     const { deps, environment } = input
+    // Host-only ceiling: a deadline is a refusal, and a repository may not extend
+    // how long a deploy turn hangs on a person.
+    const timeoutMs = deps.config.approvalTimeoutMs
     const prose = [
         input.action === 'deploy'
             ? `部署审批：把 ${input.revision} 部署到环境 "${environment.name}"（kind=${environment.kind}）。`
@@ -708,12 +799,144 @@ async function askHuman(input: {
         }
         return { kind: 'allowed', outcome, reason: '' }
     }
+    const titleOf = (): string => (input.action === 'deploy' ? `部署到 ${environment.name}` : `回滚 ${environment.name}`)
+
+    /**
+     * Ask through the channel registry the interaction layer actually provides.
+     *
+     * The answer is mapped through the SAME normaliser as the `ask()` path and
+     * then through {@link finish}, so the approver list is enforced identically.
+     * @returns the attempt, or `undefined` when the service exposes no registry.
+     */
+    const askThroughChannels = async (service: InteractionLike): Promise<ApprovalAttempt | undefined> => {
+        const list = service.list ?? service.describeAll
+        if (list === undefined) return undefined
+        if (typeof service.arm !== 'function' || typeof service.send !== 'function' || typeof service.awaitAnswer !== 'function') {
+            return {
+                kind: 'no-channel',
+                reason:
+                    'interaction 服务暴露了通道列表，却没有提供提问所需的 arm/send/awaitAnswer：无法把卡片发出去并等一个对得上令牌的答案（fail closed）。' +
+                    '下一步：升级/修正该 interaction 服务（`dsh-interaction-gate` 提供 register/send/arm/awaitAnswer），或让宿主装配审批通道。',
+            }
+        }
+        let raw: unknown
+        try {
+            raw = list.call(service)
+        } catch (error) {
+            return {
+                kind: 'no-channel',
+                reason: `interaction 服务列出通道时抛错（${error instanceof Error ? error.message : String(error)}）：无法知道有哪些通道，按 fail closed 拒绝。`,
+            }
+        }
+        const channels = (Array.isArray(raw) ? raw : []).filter(isRecord)
+        const usable = channels.filter((entry) => entry['canAsk'] === true && typeof entry['name'] === 'string' && entry['name'] !== '')
+        if (usable.length === 0) {
+            return {
+                kind: 'no-channel',
+                reason: [
+                    `interaction 服务注册了 ${channels.length} 个通道，但没有一个能提问（canAsk=false）：通道必须实现 wait() 才收得到答案。`,
+                    ...(channels.length === 0
+                        ? ['（一个通道都没有注册：让宿主/IM 插件向 interaction 服务注册一个通道）']
+                        : channels.map((entry) => `  - ${String(entry['name'] ?? '(无名)')}：canAsk=false${typeof entry['reason'] === 'string' && entry['reason'] !== '' ? `（${entry['reason']}）` : ''}`)),
+                    '下一步（任选其一）：让该通道实现 wait()（收不到答案的通道不能用来批准部署）；换一个能提问的通道；或由人把该环境的 requiresApproval 设为 false（宿主的决定，模型改不了 `.dsh/**` 里的配置）。',
+                ].join('\n'),
+            }
+        }
+        const failures: string[] = []
+        for (const candidate of usable) {
+            const name = candidate['name'] as string
+            const questionId = newQuestionToken()
+            let armed: unknown = false
+            try {
+                armed = (service.arm as (id: string) => unknown).call(service, questionId)
+            } catch (error) {
+                failures.push(`- ${name}：arm() 抛错（${error instanceof Error ? error.message : String(error)}）`)
+                continue
+            }
+            if (armed !== true) {
+                failures.push(`- ${name}：一次性令牌无法登记（arm() 返回 ${JSON.stringify(armed)}）`)
+                continue
+            }
+            let sent: unknown
+            try {
+                sent = await (service.send as (channel: string, message: unknown) => Promise<unknown>).call(service, name, {
+                    kind: 'ask',
+                    title: titleOf(),
+                    body: reason,
+                    questionId,
+                    buttons: [
+                        { value: 'yes', label: input.action === 'deploy' ? '批准部署' : '批准回滚' },
+                        { value: 'no', label: '拒绝' },
+                    ],
+                })
+            } catch (error) {
+                sent = { ok: false, error: error instanceof Error ? error.message : String(error) }
+            }
+            if (!isRecord(sent) || sent['ok'] !== true) {
+                if (typeof service.retire === 'function') (service.retire as (id: string) => void).call(service, questionId)
+                failures.push(`- ${name}：卡片发不出去（${isRecord(sent) && typeof sent['error'] === 'string' ? sent['error'] : '通道未说明原因'}）`)
+                continue
+            }
+            const implementation = typeof service.get === 'function' ? service.get(name) : undefined
+            const wait =
+                isRecord(implementation) && typeof implementation['wait'] === 'function'
+                    ? (implementation['wait'] as (id: string, ms: number, signal?: AbortSignal) => Promise<unknown>).bind(implementation)
+                    : undefined
+            let awaited: unknown
+            try {
+                awaited = await (service.awaitAnswer as (id: string, ms: number, options?: unknown) => Promise<unknown>).call(service, questionId, timeoutMs, {
+                    ...(wait === undefined ? {} : { wait }),
+                    ...(input.signal === undefined ? {} : { signal: input.signal }),
+                })
+            } catch (error) {
+                awaited = { outcome: 'unreadable', error: error instanceof Error ? error.message : String(error) }
+            }
+            const outcome = isRecord(awaited) && typeof awaited['outcome'] === 'string' ? awaited['outcome'] : 'unreadable'
+            if (outcome === 'answered') {
+                const answer = isRecord(awaited) ? awaited['answer'] : undefined
+                if (!isRecord(answer) || typeof answer['value'] !== 'string') {
+                    return {
+                        kind: 'denied',
+                        outcome: unavailableOutcome('', name),
+                        reason: `通道 "${name}" 报告已回答，但答案读不出来（没有 value）：按"没有决定"处理（fail closed），本次不执行任何命令。`,
+                    }
+                }
+                return finish(
+                    normalizeInteractionReply({
+                        value: answer['value'],
+                        ...(typeof answer['by'] === 'string' ? { by: answer['by'] } : {}),
+                        ...(typeof answer['messageId'] === 'string' ? { messageId: answer['messageId'] } : {}),
+                        source: name,
+                    }),
+                )
+            }
+            if (outcome === 'timeout') {
+                return {
+                    kind: 'denied',
+                    outcome: unavailableOutcome('', name),
+                    reason:
+                        `等待人工批准的截止时间（${timeoutMs}ms，配置 approvalTimeoutMs）到了：通道 "${name}" 没有在期限内给出答案。` +
+                        '超时**不是**拒绝、也**不是**同意——没有人作出决定，本次不执行任何命令。',
+                }
+            }
+            if (outcome === 'cancelled') {
+                return { kind: 'denied', outcome: { decision: 'cancelled', by: '', messageId: '', source: name, allowed: false }, reason: `等待人工批准被取消（通道 "${name}" 或调用方中止）：没有人作出决定，本次不执行任何命令。` }
+            }
+            failures.push(
+                `- ${name}：${outcome === 'unknown-token' ? '一次性令牌在等待期间失效（同一令牌只能被回答一次）' : `等待结果读不出来（outcome=${outcome}）`}`,
+            )
+        }
+        return {
+            kind: 'no-channel',
+            reason: [`interaction 服务的通道都没能完成这次提问（${failures.length} 个）：`, ...failures].join('\n'),
+        }
+    }
 
     const interaction = deps.interaction()
     if (interaction !== undefined && typeof interaction.ask === 'function') {
         try {
             const reply = await interaction.ask({
-                title: input.action === 'deploy' ? `部署到 ${environment.name}` : `回滚 ${environment.name}`,
+                title: titleOf(),
                 question: reason,
                 options: [
                     { value: 'yes', label: input.action === 'deploy' ? '批准部署' : '批准回滚' },
@@ -732,13 +955,29 @@ async function askHuman(input: {
         }
     }
 
+    // The suite's own interaction layer provides a CHANNEL REGISTRY, not `ask()`.
+    // Driving it is the difference between a documented path and a path that
+    // only works in tests: pick a channel that can ask, arm a fresh one-shot
+    // token, send the card, and wait for the answer on that token.
+    let registryRefusal: string | undefined
+    if (interaction !== undefined && (typeof interaction.list === 'function' || typeof interaction.describeAll === 'function')) {
+        const driven = await askThroughChannels(interaction)
+        if (driven !== undefined) {
+            if (driven.kind !== 'no-channel' || deps.approval() === undefined) return driven
+            // No usable channel, but the host may still have the approval seam:
+            // report both when neither can produce a decision.
+            registryRefusal = driven.reason
+        }
+    }
+
     const seam = deps.approval()
     if (seam === undefined) {
         return {
             kind: 'no-channel',
             reason: [
-                `环境 "${environment.name}"（kind=${environment.kind}）需要人工批准，但宿主既没有装配 interaction 服务，也没有审批通道（ctx.approval）：没有人可以批准，按 fail closed 拒绝。`,
-                '下一步（任选其一）：让宿主装配审批插件或交互通道；或由人把该环境的 requiresApproval 设为 false（这是宿主的决定，模型改不了 `.dsh/**` 里的配置）。',
+                `环境 "${environment.name}"（kind=${environment.kind}）需要人工批准，但宿主既没有装配可用的 interaction 服务，也没有审批通道（ctx.approval）：没有人可以批准，按 fail closed 拒绝。`,
+                ...(registryRefusal === undefined ? [] : ['interaction 服务的情况：', registryRefusal]),
+                '下一步（任选其一）：让宿主装配审批插件或交互通道（IM 通道必须实现 wait() 才能收到答案）；或由人把该环境的 requiresApproval 设为 false（这是宿主的决定，模型改不了 `.dsh/**` 里的配置）。',
             ].join('\n'),
         }
     }
@@ -807,6 +1046,119 @@ function recordLedgerRow(
 /** One-line description of a ledger row for a report. */
 function describeRow(row: LedgerRow): string {
     return `${row.id} ${row.state} @ ${formatTime(row.at)}（${row.revision}${row.approvedBy === undefined ? '' : `，审批 ${row.approvedBy}`}${row.gateId === undefined ? '' : `，门禁 ${row.gateId}`}）`
+}
+
+/** One-line summary of what a sequence did, for a partial-success report. */
+function summarizeRuns(runs: readonly SequenceRun[]): string {
+    if (runs.length === 0) return '(没有命令执行)'
+    return runs.map((run) => `${run.id} \`${run.argv.join(' ')}\` exit=${run.outcome.exitCode ?? 'null'}${run.outcome.timedOut ? '(超时)' : ''}`).join('；')
+}
+
+/**
+ * Everything an executed attempt records: the gate, then its ledger row.
+ *
+ * The gate goes first because the row carries its id (the row → gate link an
+ * audit reads). The row write is therefore GUARDED: if it fails, a BLOCK is
+ * recorded immediately, so the newest record of this source is never a PASS
+ * whose ledger row does not exist — and the caller reports the partial success
+ * instead of a bare filesystem error. An unwritable ledger is normally caught
+ * BEFORE anything runs ({@link ledgerWritable}); this is the belt for a race
+ * (the path turns into a directory, the disk fills up) after the commands ran.
+ */
+interface ExecutionRecording {
+    gate?: GateRecord
+    /** Present when the row landed. */
+    row?: LedgerRow
+    /** Present when the row could not be written (the commands HAD run). */
+    ledgerProblem?: string
+    /** The BLOCK recorded in place of the missing row. */
+    blockGate?: GateRecord
+}
+
+function recordExecution(input: {
+    store: MissionStore
+    mission: MissionRecord | undefined
+    ledgerFile: string
+    environment: EnvironmentConfig
+    revision: string
+    deployer: string
+    now: number
+    state: GateState
+    reason: string
+    results: GateCommandResult[]
+    scope: GateScope
+    fingerprint: GitFingerprint
+    row: Omit<LedgerRow, 'id' | 'gateId'>
+}): ExecutionRecording {
+    const gate = recordGate(input.store, input.mission, {
+        state: input.state,
+        reason: input.reason,
+        results: input.results,
+        scope: input.scope,
+        fingerprint: input.fingerprint,
+    })
+    try {
+        const row = recordLedgerRow(input.ledgerFile, {
+            ...input.row,
+            ...(gate === undefined ? {} : { gateId: gate.id }),
+        })
+        return { ...(gate === undefined ? {} : { gate }), row }
+    } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error)
+        const blockGate = recordGate(input.store, input.mission, {
+            state: 'BLOCK',
+            reason: `台账行写不进去（${reason}）：${input.reason}——这次动作没有可对账的台账行，按未记录处理`,
+            results: input.results,
+            scope: input.scope,
+            fingerprint: input.fingerprint,
+        })
+        return { ...(gate === undefined ? {} : { gate }), ...(blockGate === undefined ? {} : { blockGate }), ledgerProblem: reason }
+    }
+}
+
+/** The error for "the commands ran, but their ledger row could not be written". */
+function ledgerRowFailure(input: {
+    action: string
+    environment: EnvironmentConfig
+    ledgerFile: string
+    reason: string
+    outcomeLine: string
+    runs: readonly SequenceRun[]
+    blockGate?: GateRecord
+}): Error {
+    return new Error(
+        [
+            `${input.action}的命令**已经执行完了**（${input.outcomeLine}），但部署台账行写不进去：${input.reason}`,
+            `- 台账：${input.ledgerFile}`,
+            `- 已执行：${summarizeRuns(input.runs)}`,
+            input.blockGate === undefined
+                ? '- ⚠️ 没有 mission：这次动作连门禁记录都没有，台账是它唯一的痕迹，而它没写进去。'
+                : `- 已记录：门禁 ${input.blockGate.id}（BLOCK）——最新一条 dsh-deploy-gate 记录是 BLOCK，不是 PASS：一条没有台账行的 PASS 会给下一次上线背书，所以它必须被覆盖。`,
+            '下一步：修好台账路径（它必须是可写的文件，而不是目录/只读文件/满盘的挂载点）后重新执行——命令会再跑一遍，' +
+                `请先用 deploy_status 确认环境当前的真实状态（它读的也是台账）。`,
+        ].join('\n'),
+    )
+}
+
+/** The error for "refused before anything ran, because the ledger cannot be written". */
+function ledgerPreflightFailure(input: {
+    action: string
+    environment: EnvironmentConfig
+    ledgerFile: string
+    reason: string
+    blockGate?: GateRecord
+}): Error {
+    return new Error(
+        [
+            `${input.action}未执行：部署台账不可写（${input.reason}）：${input.ledgerFile}`,
+            `环境 "${input.environment.name}"（kind=${input.environment.kind}）未被触碰。`,
+            input.blockGate === undefined
+                ? '- ⚠️ 这次尝试连门禁记录都写不了（没有 mission 时本来也不写门禁），台账是它唯一的痕迹。'
+                : `- 已记录：门禁 ${input.blockGate.id}（BLOCK）。`,
+            '说明：没有台账行就没有这次动作的记录（谁批的、上了哪个 revision 都无处可查），所以本插件在执行**任何命令之前**拒绝。',
+            '下一步：让台账路径可写（目录存在、进程有写权限、路径指向文件而不是目录），然后重新执行。',
+        ].join('\n'),
+    )
 }
 
 /**
@@ -1002,6 +1354,41 @@ export function registerTools(
             ].join('\n'),
         )
 
+    /**
+     * Refuse BEFORE anything runs when the ledger cannot record the outcome.
+     *
+     * The ledger is the only place "who approved what, and how it ended" is
+     * written for a workspace. Discovering it is unwritable AFTER the deploy
+     * commands ran leaves the newest `dsh-deploy-gate` record a PASS with no row
+     * — exactly the state an orchestrator must never read as success.
+     */
+    const assertLedgerWritable = (context: ReturnType<typeof prepare>, mission: MissionRecord | undefined, action: string): void => {
+        const writable = ledgerWritable(context.ledgerFile)
+        if (writable.ok) return
+        const blockGate = recordGate(context.store, mission, {
+            state: 'BLOCK',
+            reason: `${action}未执行：部署台账不可写（${writable.reason}）`,
+            results: refusalResults([
+                {
+                    id: 'ledger-writable',
+                    ok: false,
+                    label: '部署台账可写（否则这次动作没有可审计的记录）',
+                    detail: `台账 ${context.ledgerFile} 不可写：${writable.reason}`,
+                    fix: '让台账路径可写（目录存在、进程有写权限、路径指向文件而不是目录）后重试',
+                },
+            ]),
+            scope: { selected: [], total: 1, full: false },
+            fingerprint: context.fingerprint,
+        })
+        throw ledgerPreflightFailure({
+            action,
+            environment: context.environment,
+            ledgerFile: context.ledgerFile,
+            reason: writable.reason,
+            ...(blockGate === undefined ? {} : { blockGate }),
+        })
+    }
+
     /** Render the plan section, including the shared header lines. */
     const planBlock = (
         context: ReturnType<typeof prepare>,
@@ -1149,7 +1536,7 @@ export function registerTools(
         defineTool({
             name: 'deploy_run',
             description:
-                'Deploy the current revision to one declared environment, as a gated process: re-evaluate the go/no-go checklist (refusing and naming every failing check), ask a human for approval when the environment requires it (via the interaction service when mounted, else the harness approval seam — no channel means refusal, never a silent assumption of consent), then execute the environment\'s deployCommands in order as argv (never a shell). A non-zero exit stops the sequence immediately and is reported with the captured output tail; a canary configuration runs its steps in order with their waits and verifications. Records a gate (source dsh-deploy-gate, with scope + workspace fingerprint) and one append-only ledger row carrying the revision, the approver and the approval message id. dryRun prints exactly what would happen and writes nothing.',
+                'Deploy the current revision to one declared environment, as a gated process: re-evaluate the go/no-go checklist (refusing and naming every failing check), refuse when the deployment ledger cannot be written (nothing may run while its outcome cannot be recorded), ask a human for approval when the environment requires it (through the interaction service — its `ask()` seam or its channel registry — else the harness approval seam — no channel means refusal, never a silent assumption of consent), re-observe the workspace and the checks after the approval (a revision or dirty state that moved while the card was open is refused and named), then execute the environment\'s deployCommands in order as argv (never a shell). A non-zero exit stops the sequence immediately and is reported with the captured output tail; a canary configuration runs its steps in order with their waits and verifications. Records a gate (source dsh-deploy-gate, with scope + workspace fingerprint) and one append-only ledger row carrying the revision, the approver and the approval message id; if that row cannot be written, a BLOCK is recorded immediately instead of leaving a PASS without its row. dryRun prints exactly what would happen and writes nothing.',
             parameters: {
                 environment: { type: 'string', required: true, description: 'Declared environment name to deploy to.' },
                 missionId: { type: 'string', description: 'Mission being deployed (default: the mission bound to this session). Required in practice: a deployment must belong to a delivery.' },
@@ -1213,6 +1600,8 @@ export function registerTools(
                 if (signal?.aborted === true) {
                     throw new Error('调用已被取消（signal 已中止）：未执行任何命令，环境未被触碰。')
                 }
+                // Nothing may run while its outcome cannot be recorded.
+                assertLedgerWritable(context, mission, '部署')
 
                 const vars = { ...context.vars, target: '' }
                 let approval: ApprovalOutcome | undefined
@@ -1256,6 +1645,64 @@ export function registerTools(
                     approval = attempt.outcome
                 }
 
+                // The card was open for a while, and a workspace is not frozen
+                // while a human reads it. Everything the verdict was computed from
+                // is re-observed HERE, right before the first command: a revision
+                // (or a dirty state, or a go/no-go fact) that moved during the
+                // approval is refused and named, instead of being deployed under
+                // the old revision and an old, now-false "clean tree" claim.
+                const observed = fingerprintOf(context.cwd, context.store, context.ledgerFile)
+                const observedVars = templateVars(context.cwd, context.environment, observed.isRepo ? (observed.head ?? 'HEAD') : '', '')
+                const rechecked = checksFor({ ...context, fingerprint: observed, revision: revisionOf(observed), vars: observedVars }, mission, observedVars)
+                const drift: PlanCheck[] = []
+                const revisionMoved = revisionOf(observed) !== context.revision
+                if (revisionMoved) {
+                    drift.push({
+                        id: 'revision-moved',
+                        ok: false,
+                        label: '审批期间 revision 没有变化',
+                        detail: `审批前 ${context.revision}，批准后 ${revisionOf(observed)}`,
+                        fix: '重新 deploy_plan/deploy_run，让这次审批针对当前这个 revision',
+                    })
+                }
+                if (observed.changedFiles !== context.fingerprint.changedFiles) {
+                    drift.push({
+                        id: 'dirty-state-moved',
+                        ok: false,
+                        label: '审批期间未提交改动数没有变化',
+                        detail: `审批前 ${context.fingerprint.changedFiles} 个文件未提交，批准后 ${observed.changedFiles} 个`,
+                        fix: '提交（或撤销）这些改动后重新走一遍流程——审批针对的是审批时看到的那个 revision',
+                    })
+                }
+                if (drift.length > 0 || !rechecked.ok) {
+                    const failures = [...drift, ...rechecked.failures]
+                    const recording = recordRefusal({
+                        store: context.store,
+                        mission,
+                        ledgerFile: context.ledgerFile,
+                        environment: context.environment,
+                        revision: context.revision,
+                        deployer,
+                        now: deps.now(),
+                        reason: `部署被拒绝（审批期间工作区/检查发生变化）：${failures.map((check) => check.label).join('；')}`,
+                        note: `审批期间漂移：${failures.map((check) => check.id).join(', ')}`,
+                        failures,
+                        fingerprint: observed,
+                        ...(approval === undefined || approval.by === '' ? {} : { approvedBy: approval.by }),
+                        ...(approval === undefined || approval.messageId === '' ? {} : { approvalMessageId: approval.messageId }),
+                    })
+                    throw new Error(
+                        [
+                            `审批已经通过，但批准之后工作区/检查变了（${failures.length} 项）：`,
+                            describeFailures(failures),
+                            '',
+                            '未执行任何命令，环境未被触碰。',
+                            `已记录：台账 ${recording.row.id}（state=refused）${recording.gate === undefined ? '；无 mission：仅记台账，未写门禁记录' : `；门禁 ${recording.gate.id}（BLOCK）`}。`,
+                            '下一步：重新 deploy_plan/deploy_run（审批针对的是审批当时的那个 revision）；要部署新的改动，就先让它被门禁与回执覆盖。',
+                        ].join('\n'),
+                    )
+                }
+
                 const logger = loggerFor(deps.logger, context.cwd)
                 const deploy = await runSequence(context.environment.deployCommands, {
                     kind: 'deploy',
@@ -1275,6 +1722,7 @@ export function registerTools(
                     for (const [index, step] of canarySteps.entries()) {
                         const stepResult = await runSequence([step.command], {
                             kind: 'canary',
+                            idPrefix: `canary-${index + 1}`,
                             vars,
                             cwd: context.cwd,
                             timeoutMs: context.config.commandTimeoutMs,
@@ -1297,6 +1745,7 @@ export function registerTools(
                         if ((step.verifyCommands?.length ?? 0) > 0) {
                             const verifyResult = await runSequence(step.verifyCommands as string[], {
                                 kind: 'canary',
+                                idPrefix: `canary-${index + 1}-verify`,
                                 vars,
                                 cwd: context.cwd,
                                 timeoutMs: context.config.commandTimeoutMs,
@@ -1316,7 +1765,15 @@ export function registerTools(
                 const failedRun = deploy.failed ?? canaryFailed
                 const refusedRun = deploy.refused ?? canaryRefused
                 const allRuns = [...deploy.runs, ...canaryRuns]
-                const totalCommands = context.environment.deployCommands.length + canarySteps.length
+                // EVERY command the environment declared for this rollout counts —
+                // including each canary step's own verifyCommands. Counting only the
+                // steps made `scope.full` unreachable (`allRuns.length` could never
+                // meet `total`), so a fully successful rollout recorded `full: false`
+                // and the documented authorising predicate never held on a canary
+                // environment.
+                const totalCommands =
+                    context.environment.deployCommands.length +
+                    canarySteps.reduce((sum, step) => sum + 1 + (step.verifyCommands?.length ?? 0), 0)
                 const state: GateState = failedRun === undefined && refusedRun === undefined ? 'PASS' : 'BLOCK'
                 const reason =
                     state === 'PASS'
@@ -1324,7 +1781,14 @@ export function registerTools(
                         : refusedRun !== undefined
                           ? `部署到 ${context.environment.name} 未执行：命令 \`${refusedRun.template}\` 被拒绝（${refusedRun.error}）`
                           : `部署到 ${context.environment.name} 失败：命令 \`${failedRun?.template ?? ''}\` 退出码 ${failedRun?.outcome.exitCode ?? 'null'}`
-                const gate = recordGate(context.store, mission, {
+                const recorded = recordExecution({
+                    store: context.store,
+                    mission,
+                    ledgerFile: context.ledgerFile,
+                    environment: context.environment,
+                    revision: context.revision,
+                    deployer,
+                    now: deps.now(),
                     state,
                     reason,
                     results: gateResultsOf(allRuns),
@@ -1334,18 +1798,30 @@ export function registerTools(
                         full: failedRun === undefined && refusedRun === undefined && allRuns.length === totalCommands,
                     },
                     fingerprint: context.fingerprint,
+                    row: {
+                        at: deps.now(),
+                        environment: context.environment.name,
+                        revision: context.revision,
+                        deployer,
+                        state: state === 'PASS' ? 'deployed' : 'failed',
+                        plan: { checks: evaluated.checks.length },
+                        ...(canarySteps.length === 0 ? {} : { canary: { steps: canarySteps.length } }),
+                        ...(approval === undefined ? {} : { approvedBy: approverName(approval), approvalMessageId: approval.messageId }),
+                    },
                 })
-                const row = recordLedgerRow(context.ledgerFile, {
-                    at: deps.now(),
-                    environment: context.environment.name,
-                    revision: context.revision,
-                    deployer,
-                    state: state === 'PASS' ? 'deployed' : 'failed',
-                    plan: { checks: evaluated.checks.length },
-                    ...(canarySteps.length === 0 ? {} : { canary: { steps: canarySteps.length } }),
-                    ...(approval === undefined ? {} : { approvedBy: approverName(approval), approvalMessageId: approval.messageId }),
-                    ...(gate === undefined ? {} : { gateId: gate.id }),
-                })
+                if (recorded.ledgerProblem !== undefined) {
+                    throw ledgerRowFailure({
+                        action: '部署',
+                        environment: context.environment,
+                        ledgerFile: context.ledgerFile,
+                        reason: recorded.ledgerProblem,
+                        outcomeLine: `${allRuns.length}/${Math.max(1, totalCommands)} 条命令已执行，${state === 'PASS' ? '全部退出码 0' : '有命令失败'}`,
+                        runs: allRuns,
+                        ...(recorded.blockGate === undefined ? {} : { blockGate: recorded.blockGate }),
+                    })
+                }
+                const gate = recorded.gate
+                const row = recorded.row as LedgerRow
                 logger.info(`deploy_run: ${context.environment.name} → ${row.state}（${row.id}）；gate ${gate?.id ?? '(未记录)'}`)
 
                 lines.push('', `### 部署执行：${state === 'PASS' ? '成功' : '失败'}`, '')
@@ -1394,7 +1870,7 @@ export function registerTools(
         defineTool({
             name: 'deploy_verify',
             description:
-                'Run the environment\'s verifyCommands against the freshly deployed revision, with a bounded number of attempts and a backoff between them (both from configuration). Records a PASS gate when an attempt fully succeeds and a BLOCK gate when the attempts are exhausted; on exhaustion the report surfaces the environment\'s rollback commands verbatim, so the next step is executable rather than a discussion. Refuses when the environment declares no verification commands — a deploy nothing checks is not a verified deploy.',
+                'Run the environment\'s verifyCommands against the freshly deployed revision, with a bounded number of attempts and a backoff between them (both from configuration). Refuses unless the ledger shows a successful deployment of THIS revision that is still live (a verify-only PASS would otherwise be read by an orchestrator as "deployed and verified"), and refuses when the environment declares no verification commands — a deploy nothing checks is not a verified deploy. Records a PASS gate when an attempt fully succeeds and a BLOCK gate when the attempts are exhausted; on exhaustion the report surfaces the environment\'s rollback commands verbatim, so the next step is executable rather than a discussion.',
             parameters: {
                 environment: { type: 'string', required: true, description: 'Declared environment name to verify.' },
                 missionId: { type: 'string', description: 'Mission the verification belongs to (default: the mission bound to this session).' },
@@ -1418,12 +1894,80 @@ export function registerTools(
                 const signal = signalOf(exec)
                 if (signal?.aborted === true) throw new Error('调用已被取消（signal 已中止）：未执行任何验证命令。')
 
+                // A verify-only PASS must never become the newest record an
+                // orchestrator reads as "部署已执行且通过": verification is evidence
+                // ABOUT a deployment, so it needs one — a successful deploy of the
+                // revision that is in the workspace now, still live in the ledger.
+                //
+                // (Only enforced when a mission exists, because that is exactly when
+                // a gate record — the thing an orchestrator reads — is written. With
+                // no mission the ledger row is the only trace and nothing can be
+                // mistaken for an authorised deployment.)
+                const ledger = readLedger(context.ledgerFile)
+                if (mission !== undefined) {
+                    const live = liveDeployment(ledger.rows, context.environment.name)
+                    const newest = lastRowOf(ledger.rows, context.environment.name)
+                    const foundInstead =
+                        newest === undefined
+                            ? `台账 ${context.ledgerFile} 里没有环境 "${context.environment.name}" 的任何记录`
+                            : `最近一行是 ${describeRow(newest)}`
+                    const problems: PlanCheck[] = []
+                    if (live === undefined) {
+                        problems.push({
+                            id: 'verify-requires-deploy',
+                            ok: false,
+                            label: '本环境有一次成功且仍然上线的部署（deploy_verify 只能验证真的发生过的部署）',
+                            detail: `${foundInstead}。没有一次成功的部署，这次验证的 PASS 会被编排器读成"部署已执行且通过"——而实际上什么都没上`,
+                            fix: '先 deploy_run（走完 go/no-go 与审批）把这次交付真正部署上去，再跑 deploy_verify',
+                        })
+                    } else if (live.revision !== context.revision) {
+                        problems.push({
+                            id: 'verify-revision-matches',
+                            ok: false,
+                            label: '台账里上线的那个 revision 就是当前工作区的 revision',
+                            detail: `台账上线的是 ${live.revision}（${live.id}），当前工作区是 ${context.revision}：验证必须针对被部署的那个 revision`,
+                            fix: '部署当前 revision（deploy_run）后再验证；或回滚到台账里那个版本再验证它',
+                        })
+                    }
+                    if (problems.length > 0) {
+                        const recording = recordRefusal({
+                            store: context.store,
+                            mission,
+                            ledgerFile: context.ledgerFile,
+                            environment: context.environment,
+                            revision: context.revision,
+                            deployer: deployerOf(agent),
+                            now: deps.now(),
+                            reason: `部署后验证被拒绝：${problems.map((check) => check.label).join('；')}`,
+                            note: `验证前置条件未满足：${problems.map((check) => check.id).join(', ')}`,
+                            failures: problems,
+                            fingerprint: context.fingerprint,
+                        })
+                        throw new Error(
+                            [
+                                `部署后验证未执行（${problems.length} 项前置条件未满足）：`,
+                                describeFailures(problems),
+                                '',
+                                '未执行任何验证命令，环境未被触碰。',
+                                `已记录：台账 ${recording.row.id}（state=refused）${recording.gate === undefined ? '；无 mission：仅记台账，未写门禁记录' : `；门禁 ${recording.gate.id}（BLOCK）`}。`,
+                                '下一步：先部署（deploy_run）再验证；一次没有部署的"验证通过"不证明任何东西。',
+                            ].join('\n'),
+                        )
+                    }
+                }
+                // Nothing may run while its outcome cannot be recorded.
+                assertLedgerWritable(context, mission, '部署后验证')
+
                 const logger = loggerFor(deps.logger, context.cwd)
                 const attempts: { runs: SequenceRun[]; failed?: SequenceRun }[] = []
                 const maxAttempts = Math.max(1, context.config.verifyRetries)
                 for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
                     const result = await runSequence(verifyCommands, {
                         kind: 'verify',
+                        // One attempt = one sequence: without its own prefix the
+                        // retries would all be `verify-1` and the gate record could
+                        // not say which attempt a command belonged to.
+                        idPrefix: `verify-${attempt}`,
                         vars: context.vars,
                         cwd: context.cwd,
                         timeoutMs: context.config.commandTimeoutMs,
@@ -1446,23 +1990,41 @@ export function registerTools(
                 const reason = ok
                     ? `部署后验证通过（${attempts.length}/${maxAttempts} 次尝试）：${verifyCommands.length} 条验证命令全部退出码 0`
                     : `部署后验证失败：${attempts.length} 次尝试后仍未通过（最后一次失败于 \`${last?.failed?.argv.join(' ') ?? '(未知)'}\`，退出码 ${last?.failed?.outcome.exitCode ?? 'null'}）`
-                const gate = recordGate(context.store, mission, {
+                const recorded = recordExecution({
+                    store: context.store,
+                    mission,
+                    ledgerFile: context.ledgerFile,
+                    environment: context.environment,
+                    revision: context.revision,
+                    deployer: deployerOf(agent),
+                    now: deps.now(),
                     state,
                     reason,
                     results: gateResultsOf(runs),
                     scope: { selected: runs.map((run) => run.id), total: verifyCommands.length * attempts.length, full: ok },
                     fingerprint: context.fingerprint,
+                    row: {
+                        at: deps.now(),
+                        environment: context.environment.name,
+                        revision: context.revision,
+                        deployer: deployerOf(agent),
+                        state: ok ? 'verified' : 'verify-failed',
+                        verify: { attempts: attempts.length, ok },
+                    },
                 })
-                const deployer = deployerOf(agent)
-                const row = recordLedgerRow(context.ledgerFile, {
-                    at: deps.now(),
-                    environment: context.environment.name,
-                    revision: context.revision,
-                    deployer,
-                    state: ok ? 'verified' : 'verify-failed',
-                    verify: { attempts: attempts.length, ok },
-                    ...(gate === undefined ? {} : { gateId: gate.id }),
-                })
+                if (recorded.ledgerProblem !== undefined) {
+                    throw ledgerRowFailure({
+                        action: '部署后验证',
+                        environment: context.environment,
+                        ledgerFile: context.ledgerFile,
+                        reason: recorded.ledgerProblem,
+                        outcomeLine: `${runs.length} 条验证命令已执行，${ok ? '全部退出码 0' : '未通过'}`,
+                        runs,
+                        ...(recorded.blockGate === undefined ? {} : { blockGate: recorded.blockGate }),
+                    })
+                }
+                const gate = recorded.gate
+                const row = recorded.row as LedgerRow
                 logger.info(`deploy_verify: ${context.environment.name} → ${row.state}（${attempts.length} 次尝试）；gate ${gate?.id ?? '(未记录)'}`)
 
                 const lines: string[] = []
@@ -1487,7 +2049,7 @@ export function registerTools(
                     } else {
                         for (const line of renderCommands('回滚命令', rollback, context.vars).slice(1)) lines.push(line)
                     }
-                    const auto = await maybeAutoRollback({ context, mission, vars: context.vars, deployer, ...(signal === undefined ? {} : { signal }) })
+                    const auto = await maybeAutoRollback({ context, mission, vars: context.vars, deployer: deployerOf(agent), ...(signal === undefined ? {} : { signal }) })
                     lines.push('', ...auto.lines)
                     lines.push(
                         '',
@@ -1563,6 +2125,8 @@ export function registerTools(
                 lines.push(
                     `审批：${context.environment.requiresApproval ? `需要人工批准${context.environment.approversFile === undefined ? '' : `（按名单 ${context.environment.approversFile} 核对审批人身份）`}` : '无需人工批准'}`,
                 )
+                // Nothing may run while its outcome cannot be recorded.
+                assertLedgerWritable(context, mission, '回滚')
 
                 let approval: ApprovalOutcome | undefined
                 if (context.environment.requiresApproval) {
@@ -1612,7 +2176,15 @@ export function registerTools(
                 })
                 const ok = result.failed === undefined
                 const state: DeployState = ok ? 'rolled-back' : 'rollback-failed'
-                const gate = recordGate(context.store, mission, {
+                const note = typeof args.note === 'string' && args.note.trim() !== '' ? args.note.trim() : undefined
+                const recorded = recordExecution({
+                    store: context.store,
+                    mission,
+                    ledgerFile: context.ledgerFile,
+                    environment: context.environment,
+                    revision,
+                    deployer,
+                    now: deps.now(),
                     state: ok ? 'PASS' : 'BLOCK',
                     reason: ok
                         ? `回滚到 ${revision} 成功：${rollbackCommands.length} 条回滚命令全部退出码 0`
@@ -1620,19 +2192,30 @@ export function registerTools(
                     results: gateResultsOf(result.runs),
                     scope: { selected: result.runs.map((run) => run.id), total: rollbackCommands.length, full: ok },
                     fingerprint: context.fingerprint,
+                    row: {
+                        at: deps.now(),
+                        environment: context.environment.name,
+                        revision,
+                        deployer,
+                        state,
+                        ...(note === undefined ? {} : { note }),
+                        ...(target === undefined ? {} : { rollbackOf: target.id }),
+                        ...(approval === undefined ? {} : { approvedBy: approverName(approval), approvalMessageId: approval.messageId }),
+                    },
                 })
-                const note = typeof args.note === 'string' && args.note.trim() !== '' ? args.note.trim() : undefined
-                const row = recordLedgerRow(context.ledgerFile, {
-                    at: deps.now(),
-                    environment: context.environment.name,
-                    revision,
-                    deployer,
-                    state,
-                    ...(note === undefined ? {} : { note }),
-                    ...(target === undefined ? {} : { rollbackOf: target.id }),
-                    ...(approval === undefined ? {} : { approvedBy: approverName(approval), approvalMessageId: approval.messageId }),
-                    ...(gate === undefined ? {} : { gateId: gate.id }),
-                })
+                if (recorded.ledgerProblem !== undefined) {
+                    throw ledgerRowFailure({
+                        action: '回滚',
+                        environment: context.environment,
+                        ledgerFile: context.ledgerFile,
+                        reason: recorded.ledgerProblem,
+                        outcomeLine: `${result.runs.length}/${rollbackCommands.length} 条回滚命令已执行，${ok ? '全部退出码 0' : '有命令失败'}`,
+                        runs: result.runs,
+                        ...(recorded.blockGate === undefined ? {} : { blockGate: recorded.blockGate }),
+                    })
+                }
+                const gate = recorded.gate
+                const row = recorded.row as LedgerRow
                 loggerFor(deps.logger, context.cwd).info(`deploy_rollback: ${context.environment.name} → ${state}（${row.id}）${target === undefined ? '' : ` rollbackOf=${target.id}`}`)
 
                 lines.push('', `### 回滚执行：${ok ? '成功' : '失败'}`, '')
@@ -1776,7 +2359,7 @@ export function registerTools(
                 }
                 lines.push('')
                 lines.push(
-                    `挂起的提问：${asks.queryable ? `${asks.asks.length} 个${asks.asks.length === 0 ? '' : `（${asks.asks.map((ask) => ask.title).join('；')}）`}` : '无法查询（未装配 interaction 服务）'}`,
+                    `挂起的提问：${asks.queryable ? `${asks.asks.length} 个${asks.asks.length === 0 ? '' : `（${asks.asks.map((ask) => ask.title).join('；')}）`}` : '无法确定（没有可查询的 interaction 服务，或服务还没读到本工作区的台账——“读不到”不等于“没有人在等回答”）'}`,
                 )
                 lines.push('')
                 lines.push(

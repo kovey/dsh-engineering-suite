@@ -128,6 +128,12 @@ interface HarnessOptions {
     services?: Record<string, unknown>
     sleep?: (ms: number) => Promise<void>
     now?: () => number
+    /**
+     * Resolve the effective configuration through the workspace's own
+     * `.dsh/deploy-gate.json` (the profile-ceiling overlay) instead of using the
+     * profile row verbatim — needed by the tests that exercise the overlay.
+     */
+    resolveProject?: boolean
 }
 
 interface Harness {
@@ -150,7 +156,10 @@ function harnessFor(cwd: string, options: HarnessOptions = {}): Harness {
     const config = resolveConfig({ ...rawConfig(), ...(options.config ?? {}) })
     const deps: ToolDeps = {
         config,
-        configFor: () => ({ config, source: 'profile', file: '', problems: [] }),
+        configFor:
+            options.resolveProject === true
+                ? () => resolveEffectiveConfig(config, stores.for(cwd).layout, silentLogger)
+                : () => ({ config, source: 'profile', file: '', problems: [] }),
         stores,
         approval: () => (host.ctx as CtxLike).get('approval') as never,
         interaction: () => (host.ctx as CtxLike).get('interaction') as never,
@@ -775,7 +784,7 @@ test('production requires approval: approved runs, refused does not, no channel 
     deliveredMission(h3.stores, noChannel.cwd)
     const refused = await h3.run('deploy_run', { environment: 'production' })
     assert.equal(refused.isError, true)
-    assert.match(String(refused.content), /既没有装配 interaction 服务，也没有审批通道/)
+    assert.match(String(refused.content), /既没有装配可用的 interaction 服务，也没有审批通道/)
     assert.deepEqual(callsOf(noChannel.calls), [])
 })
 
@@ -885,6 +894,9 @@ test('deploy_verify retries, then BLOCKs — and the report carries the rollback
     const config = { environments: [stagingEnvironment({ verifyCommands: ['node scripts/badverify.mjs'] })], verifyRetries: 3, verifyBackoffMs: 25 }
     const h = harnessFor(cwd, { config, sleep: async (ms) => void sleeps.push(ms) })
     const { store, missionId } = deliveredMission(h.stores, cwd)
+    // A verification verifies a DEPLOYMENT: without one the tool refuses (the PASS
+    // gate is what an orchestrator reads as "deployed and verified").
+    await h.text('deploy_run', { environment: 'staging' })
     const text = await h.text('deploy_verify', { environment: 'staging' })
     assert.match(text, /⛔ 裁决：BLOCK/)
     assert.match(text, /实际尝试 3 次/)
@@ -892,7 +904,7 @@ test('deploy_verify retries, then BLOCKs — and the report carries the rollback
     assert.match(text, /node scripts\/rollback\.mjs/)
     assert.match(text, /下一步：deploy_rollback/)
     assert.deepEqual(sleeps, [25, 25], 'backoff between attempts only, never after the last one')
-    assert.deepEqual(callsOf(calls), [], 'verification commands write nothing here')
+    assert.deepEqual(callsOf(calls), ['deploy'], 'the verification commands write nothing here')
     assert.equal(store.lastGate(missionId, { source: 'dsh-deploy-gate' })?.state, 'BLOCK')
     const row = readLedger(path.join(cwd, '.dsh', 'deployments.jsonl')).rows.at(-1)
     assert.equal(row?.state, 'verify-failed')
@@ -923,6 +935,7 @@ test('deploy_verify passes on a later attempt (injected sleep, no waiting)', asy
     const config = { environments: [stagingEnvironment({ verifyCommands: ['node scripts/flakyverify.mjs'] })], verifyRetries: 3, verifyBackoffMs: 10 }
     const h = harnessFor(cwd, { config, sleep: async (ms) => void sleeps.push(ms) })
     const { store, missionId } = deliveredMission(h.stores, cwd)
+    await h.text('deploy_run', { environment: 'staging' })
     const text = await h.text('deploy_verify', { environment: 'staging' })
     assert.match(text, /✅ 裁决：PASS/)
     assert.match(text, /实际尝试 2 次/)
@@ -1050,7 +1063,7 @@ test('deploy_status summarises a ledger whose last line is truncated', async () 
     assert.match(text, /回滚目标：DPL-/)
     assert.match(text, /最近一条部署门禁（source=dsh-deploy-gate，编排器读的就是这一条）：GATE-.* PASS/)
     assert.match(text, new RegExp(missionId))
-    assert.match(text, /挂起的提问：无法查询（未装配 interaction 服务）/)
+    assert.match(text, /挂起的提问：无法确定/)
     assert.match(text, /下一步：deploy_plan/)
     assert.match(text, /revision：main@/)
 })
@@ -1112,9 +1125,17 @@ test('interaction replies are normalised fail-closed, and pending asks degrade s
     assert.deepEqual(pendingAsksOf({ ask: async () => 'yes' }), { asks: [], queryable: false })
     assert.deepEqual(pendingAsksOf({ pendingAsks: () => [{ title: 'x', ageMs: 5 }] }), { asks: [{ title: 'x', ageMs: 5 }], queryable: true })
     assert.deepEqual(pendingAsksOf({ pendingAsks: () => ({ asks: ['y'] }) }), { asks: [{ title: 'y' }], queryable: true })
-    assert.equal(pendingAsksOf({ pendingAsks: () => 2 }).asks.length, 2)
+    // A bare count is ONE synthetic ask naming the count — never `new Array(n)`.
+    assert.deepEqual(pendingAsksOf({ pendingAsks: () => 2 }).asks, [{ title: '通道只报告了数量：2 个提问在等人回答（通道没有给出标题）' }])
+    assert.equal(pendingAsksOf({ pendingAsks: () => 0 }).queryable, true)
     assert.deepEqual(pendingAsksOf({ pendingAsks: () => { throw new Error('hub down') } }), { asks: [], queryable: false })
-    assert.deepEqual(pendingAsksOf({ pending: () => 'weird' }), { asks: [], queryable: true })
+    // A non-array answer is UNREADABLE, not a verified empty list.
+    assert.deepEqual(pendingAsksOf({ pending: () => 'weird' }), { asks: [], queryable: false })
+    assert.deepEqual(pendingAsksOf({ pending: () => undefined }), { asks: [], queryable: false })
+    assert.deepEqual(pendingAsksOf({ pending: () => ({}) }), { asks: [], queryable: false })
+    // ...but a service that HAS observed a ledger can say "nobody is waiting".
+    assert.deepEqual(pendingAsksOf({ pending: () => [], ledgers: () => ['/repo/.dsh/interaction/decisions.jsonl'] }), { asks: [], queryable: true })
+    assert.deepEqual(pendingAsksOf({ pending: () => [], ledgers: () => [] }), { asks: [], queryable: false })
 })
 
 test('the prompt section reports the effective environments and the honest limits', () => {
@@ -1196,4 +1217,327 @@ test('the report never invents a command: only configured templates are shown', 
     const configured = ['node scripts/deploy.mjs', 'node scripts/verify.mjs', 'node scripts/rollback.mjs']
     for (const command of configured) assert.ok(text.includes(command), `${command} must appear verbatim`)
     assert.match(text, /来自配置，未经模型改写/)
+})
+
+// --- adversarial-audit regressions ------------------------------------------
+//
+// One test per finding of the adversarial audit (each finding was reproduced
+// against the built `dist/` first; the repro is named in the test).
+
+test('a project environment entry inherits the profile keys it does not declare (approversFile survives)', async () => {
+    // Repro a3.mjs: the project file re-declares `production` without
+    // `approversFile`, and an approval by a stranger was accepted.
+    const { cwd, calls } = scriptRepo()
+    fs.mkdirSync(path.join(cwd, '.dsh'), { recursive: true })
+    fs.writeFileSync(path.join(cwd, '.dsh', 'deploy-approvers.txt'), 'alice\n')
+    fs.writeFileSync(
+        path.join(cwd, '.dsh', 'deploy-gate.json'),
+        JSON.stringify({
+            environments: [
+                {
+                    name: 'production',
+                    kind: 'production',
+                    deployCommands: ['node scripts/deploy.mjs'],
+                    verifyCommands: ['node scripts/verify.mjs'],
+                    rollbackCommands: ['node scripts/rollback.mjs'],
+                },
+            ],
+        }),
+    )
+    execFileSync('git', ['add', '-A'], { cwd })
+    execFileSync('git', ['commit', '-qm', 'project config'], { cwd })
+    const h = harnessFor(cwd, {
+        config: { environments: [productionEnvironment({ approversFile: '.dsh/deploy-approvers.txt' })] },
+        resolveProject: true,
+        withApproval: false,
+        services: { interaction: { ask: async () => ({ decision: 'allowed-once', by: 'stranger', messageId: 'msg-1' }) } },
+    })
+    const { store, missionId } = deliveredMission(h.stores, cwd)
+    const effective = resolveEffectiveConfig(h.config, h.stores.for(cwd).layout)
+    assert.equal(effective.source, 'project')
+    assert.equal(effective.config.environments[0]?.approversFile, '.dsh/deploy-approvers.txt', 'the profile key is inherited, not dropped')
+    assert.equal(effective.config.environments[0]?.requiresApproval, true)
+
+    const text = await h.text('deploy_run', { environment: 'production' })
+    assert.match(text, /审批人 "stranger" 不在名单/)
+    assert.deepEqual(callsOf(calls), [], 'an unlisted approver must not run anything')
+    assert.equal(store.lastGate(missionId, { source: 'dsh-deploy-gate' })?.state, 'BLOCK')
+})
+
+test('a project entry may ADD an approver list but never replace the host one (monotone)', () => {
+    const cwd = tempWorkspace('deploy-gate-approvers-')
+    fs.mkdirSync(path.join(cwd, '.dsh'), { recursive: true })
+    const host = resolveConfig({ environments: [productionEnvironment({ approversFile: '.dsh/host-approvers.txt' })] })
+
+    fs.writeFileSync(path.join(cwd, '.dsh', 'deploy-gate.json'), JSON.stringify({ environments: [{ name: 'production', approversFile: 'mine.txt' }] }))
+    const replaced = resolveEffectiveConfig(host, resolveLayout(cwd))
+    assert.equal(replaced.config.environments[0]?.approversFile, '.dsh/host-approvers.txt', 'the host list stays authoritative')
+    assert.ok(replaced.problems.some((problem) => /不能替换 profile 声明的名单/.test(problem)), JSON.stringify(replaced.problems))
+
+    fs.writeFileSync(path.join(cwd, '.dsh', 'deploy-gate.json'), JSON.stringify({ environments: [{ name: 'staging', approversFile: 'mine.txt' }] }))
+    const added = resolveEffectiveConfig(host, resolveLayout(cwd))
+    const staging = added.config.environments.find((environment) => environment.name === 'staging')
+    assert.equal(staging?.approversFile, 'mine.txt', 'an environment the profile does not declare may bring its own list')
+})
+
+test('an unobservable interaction ledger is reported as unverified, never as "no pending asks"', async () => {
+    // Repro a16.mjs: the service's `pending()` reads only the ledgers THIS
+    // process has observed, so `[]` cannot be read as "nobody is waiting".
+    const unobserved = scriptRepo()
+    const h = harnessFor(unobserved.cwd, { services: { interaction: { pending: () => [], ledgers: () => [] } } })
+    deliveredMission(h.stores, unobserved.cwd)
+    const text = await h.text('deploy_plan', { environment: 'staging' })
+    assert.match(text, /⚠️ 没有等待人工回答的提问/)
+    assert.match(text, /本项未实际核对，不计为已验证/)
+    assert.doesNotMatch(text, /✅ 没有等待人工回答的提问/)
+
+    const observed = scriptRepo()
+    const h2 = harnessFor(observed.cwd, { services: { interaction: { pending: () => [], ledgers: () => ['/repo/.dsh/interaction/decisions.jsonl'] } } })
+    deliveredMission(h2.stores, observed.cwd)
+    const empty = await h2.text('deploy_plan', { environment: 'staging' })
+    assert.match(empty, /✅ 没有等待人工回答的提问/, 'a service that HAS read a ledger may report a verified empty list')
+
+    const waiting = scriptRepo()
+    const h3 = harnessFor(waiting.cwd, {
+        services: { interaction: { pending: () => [{ title: '确认回滚窗口', ageMs: 600_000 }], ledgers: () => ['/repo/.dsh/interaction/decisions.jsonl'] } },
+    })
+    deliveredMission(h3.stores, waiting.cwd)
+    const blocked = await h3.text('deploy_plan', { environment: 'staging' })
+    assert.match(blocked, /⛔ 没有等待人工回答的提问/)
+    assert.match(blocked, /⛔ 裁决：不可部署/)
+})
+
+test('a numeric pending() return is a count, never an allocation', () => {
+    // Repro a2.mjs: `new Array(20_000_000)` killed the process (heap OOM).
+    const started = Date.now()
+    const huge = pendingAsksOf({ pending: () => 20_000_000 })
+    assert.equal(huge.queryable, true)
+    assert.equal(huge.asks.length, 1, 'a count is ONE synthetic ask, never N entries')
+    assert.match(huge.asks[0]?.title ?? '', /超过 1000 个提问在等人回答/)
+    assert.ok(Date.now() - started < 500, 'a count must not be materialised')
+    assert.equal(pendingAsksOf({ pending: () => 3 }).asks[0]?.title, '通道只报告了数量：3 个提问在等人回答（通道没有给出标题）')
+    assert.deepEqual(pendingAsksOf({ pending: () => 0 }), { asks: [], queryable: true })
+    assert.equal(pendingAsksOf({ pending: () => Number.NaN }).queryable, false)
+})
+
+test('an unwritable ledger refuses BEFORE anything runs, and leaves no PASS', async () => {
+    // Repro a6.mjs: the commands ran, the ledger row threw, and the newest
+    // `dsh-deploy-gate` record stayed a PASS with no row behind it.
+    const { cwd, calls } = scriptRepo()
+    const h = harnessFor(cwd)
+    const { store, missionId } = deliveredMission(h.stores, cwd)
+    fs.mkdirSync(path.join(cwd, '.dsh', 'deployments.jsonl'), { recursive: true }) // the ledger path is a DIRECTORY
+    const result = await h.run('deploy_run', { environment: 'staging' })
+    assert.equal(result.isError, true)
+    assert.match(String(result.content), /部署台账不可写/)
+    assert.match(String(result.content), /未被触碰/)
+    assert.deepEqual(callsOf(calls), [], 'nothing may run while its outcome cannot be recorded')
+    const gate = store.lastGate(missionId, { source: 'dsh-deploy-gate' })
+    assert.equal(gate?.state, 'BLOCK')
+    assert.equal(gate?.results[0]?.id, 'check:ledger-writable')
+})
+
+test('a ledger that breaks WHILE the commands run still never leaves a PASS without its row', async () => {
+    // The pre-flight cannot cover a race, so the row write is guarded: the PASS
+    // is immediately covered by a BLOCK naming what happened.
+    const { cwd } = scriptRepo()
+    const ledger = path.join(cwd, '.dsh', 'deployments.jsonl')
+    fs.writeFileSync(
+        path.join(cwd, 'scripts', 'sabotage.mjs'),
+        `import fs from 'node:fs'\nfs.rmSync(${JSON.stringify(ledger)}, { recursive: true, force: true })\nfs.mkdirSync(${JSON.stringify(ledger)}, { recursive: true })\n`,
+    )
+    execFileSync('git', ['add', '-A'], { cwd })
+    execFileSync('git', ['commit', '-qm', 'sabotage'], { cwd })
+    const h = harnessFor(cwd, { config: { environments: [stagingEnvironment({ deployCommands: ['node scripts/sabotage.mjs'] })] } })
+    const { store, missionId } = deliveredMission(h.stores, cwd)
+    const result = await h.run('deploy_run', { environment: 'staging' })
+    assert.equal(result.isError, true)
+    assert.match(String(result.content), /已经执行完了/)
+    assert.match(String(result.content), /台账行写不进去/)
+    const gates = store.readGates(missionId).filter((entry) => entry.source === 'dsh-deploy-gate')
+    assert.equal(gates.at(-1)?.state, 'BLOCK', 'the newest record must be the BLOCK, never the rowless PASS')
+    assert.match(gates.at(-1)?.reason ?? '', /台账行写不进去/)
+})
+
+test('deploy_verify refuses unless a successful deployment of THIS revision is live', async () => {
+    // Repro a11.mjs(1): a verify-only PASS satisfied the orchestrator's
+    // "部署已执行且通过" predicate.
+    const { cwd, calls } = scriptRepo()
+    const h = harnessFor(cwd)
+    const { store, missionId } = deliveredMission(h.stores, cwd)
+    const refused = await h.run('deploy_verify', { environment: 'staging' })
+    assert.equal(refused.isError, true)
+    assert.match(String(refused.content), /没有环境 "staging" 的任何记录/)
+    assert.match(String(refused.content), /deploy_verify 只能验证真的发生过的部署/)
+    assert.deepEqual(callsOf(calls), [], 'a verification without a deployment must not run commands')
+    assert.equal(store.lastGate(missionId, { source: 'dsh-deploy-gate' })?.state, 'BLOCK')
+    assert.deepEqual(readLedger(path.join(cwd, '.dsh', 'deployments.jsonl')).rows.map((row) => row.state), ['refused'])
+
+    // Once something IS deployed, verification runs — and its retries carry
+    // unique result ids. (A fresh repo: the flaky script must exist BEFORE the
+    // delivery, or the receipt would bind a different revision.)
+    const retries = scriptRepo({
+        'scripts/flaky.mjs': `import fs from 'node:fs'\nconst marker = ${JSON.stringify(path.join('.dsh', 'v.txt'))}\nconst seen = fs.existsSync(marker) ? 1 : 0\nfs.writeFileSync(marker, 'x')\nprocess.exit(seen === 0 ? 1 : 0)\n`,
+    })
+    const after = harnessFor(retries.cwd, {
+        config: { environments: [stagingEnvironment({ verifyCommands: ['node scripts/flaky.mjs'] })], verifyRetries: 2, verifyBackoffMs: 1 },
+    })
+    deliveredMission(after.stores, retries.cwd)
+    const deployed = await after.text('deploy_run', { environment: 'staging' })
+    assert.match(deployed, /### 部署执行：成功/)
+    const verified = await after.text('deploy_verify', { environment: 'staging' })
+    assert.match(verified, /✅ 裁决：PASS/)
+    assert.match(verified, /实际尝试 2 次/)
+    const verifiedGate = after.stores.for(retries.cwd).list()[0]
+    const gate = verifiedGate === undefined ? undefined : after.stores.for(retries.cwd).lastGate(verifiedGate.id, { source: 'dsh-deploy-gate' })
+    const ids = (gate?.results ?? []).map((entry) => entry.id)
+    assert.equal(ids.length, 2)
+    assert.equal(new Set(ids).size, ids.length, `result ids must be unique, got ${JSON.stringify(ids)}`)
+
+    // A deployment the ledger no longer believes is live cannot be verified.
+    const stale = scriptRepo()
+    const h3 = harnessFor(stale.cwd)
+    const fixture = deliveredMission(h3.stores, stale.cwd)
+    await h3.text('deploy_run', { environment: 'staging' })
+    await h3.text('deploy_rollback', { environment: 'staging' })
+    const afterRollback = await h3.run('deploy_verify', { environment: 'staging' })
+    assert.equal(afterRollback.isError, true)
+    assert.match(String(afterRollback.content), /deploy_verify 只能验证真的发生过的部署/)
+    assert.equal(fixture.missionId.length > 0, true)
+})
+
+test('a successful canary rollout records scope.full=true and unique result ids', async () => {
+    // Repro a5.mjs: the canary `total` ignored the steps' verifyCommands (so
+    // `full` was unreachable) and every sequence restarted its id counter.
+    const { cwd, calls } = scriptRepo()
+    const config = {
+        environments: [
+            stagingEnvironment({
+                canary: {
+                    steps: [
+                        { percent: 10, command: 'node scripts/canary1.mjs', waitMs: 0, verifyCommands: ['node scripts/verify.mjs'] },
+                        { percent: 50, command: 'node scripts/canary2.mjs', waitMs: 0 },
+                    ],
+                },
+            }),
+        ],
+    }
+    const h = harnessFor(cwd, { config })
+    const { store, missionId } = deliveredMission(h.stores, cwd)
+    const text = await h.text('deploy_run', { environment: 'staging' })
+    assert.match(text, /### 部署执行：成功/)
+    assert.deepEqual(callsOf(calls), ['deploy', 'canary1', 'verify', 'canary2'])
+    const gate = store.lastGate(missionId, { source: 'dsh-deploy-gate' })
+    assert.equal(gate?.state, 'PASS')
+    assert.equal(gate?.scope?.full, true, 'a fully successful rollout is a full rollout')
+    assert.equal(gate?.scope?.total, 4, 'deploy + step1 + step1 verify + step2')
+    assert.deepEqual(gate?.scope?.selected, ['deploy-1', 'canary-1-1', 'canary-1-verify-1', 'canary-2-1'])
+    const ids = (gate?.results ?? []).map((entry) => entry.id)
+    assert.equal(new Set(ids).size, ids.length, `result ids must be unique, got ${JSON.stringify(ids)}`)
+})
+
+test('a workspace that moves while the approval card is open is refused, naming both observations', async () => {
+    // Repro a4.mjs: the go/no-go verdict and the fingerprint were captured before
+    // the approval, so the rewritten script ran under the old revision.
+    const { cwd, calls } = scriptRepo()
+    const h = harnessFor(cwd, {
+        config: { environments: [productionEnvironment({ deployCommands: ['node scripts/deploy.mjs {revision}'] })] },
+        withApproval: false,
+        services: {
+            interaction: {
+                ask: async () => {
+                    fs.writeFileSync(path.join(cwd, 'late-change.txt'), 'someone kept working\n')
+                    return { decision: 'allowed-once', by: 'alice', messageId: 'om_1' }
+                },
+            },
+        },
+    })
+    const { store, missionId } = deliveredMission(h.stores, cwd)
+    const result = await h.run('deploy_run', { environment: 'production' })
+    assert.equal(result.isError, true)
+    const message = String(result.content)
+    assert.match(message, /审批已经通过，但批准之后工作区\/检查变了/)
+    assert.match(message, /审批期间 revision 没有变化/)
+    assert.match(message, /审批期间未提交改动数没有变化/)
+    assert.deepEqual(callsOf(calls), [], 'the revision that was approved is the only one that may run')
+    assert.equal(store.lastGate(missionId, { source: 'dsh-deploy-gate' })?.state, 'BLOCK')
+    assert.deepEqual(readLedger(path.join(cwd, '.dsh', 'deployments.jsonl')).rows.map((row) => row.state), ['refused'])
+})
+
+test('approval is driven through a mounted interaction channel registry (not just ask())', async () => {
+    // Repro a10.mjs: the suite's own interaction layer provides register/send/
+    // arm/awaitAnswer, NOT ask(), so production deploys refused while a working
+    // IM channel was mounted.
+    const { cwd, calls } = scriptRepo()
+    const cards: Record<string, unknown>[] = []
+    const armed: string[] = []
+    const channel = { name: 'im', send: async () => ({ ok: true, messageId: 'card-1' }), wait: async () => null, describe: () => ({ canAsk: true, canNotify: true }) }
+    const registry = {
+        list: () => [{ name: 'im', canAsk: true, canNotify: true, reason: '', order: 0 }],
+        get: (name: string) => (name === 'im' ? channel : undefined),
+        arm: (questionId: string) => {
+            armed.push(questionId)
+            return true
+        },
+        retire: () => undefined,
+        send: async (_name: string, message: Record<string, unknown>) => {
+            cards.push(message)
+            return { ok: true, messageId: 'card-1' }
+        },
+        awaitAnswer: async () => ({ outcome: 'answered', answer: { value: 'yes', by: 'alice', messageId: 'card-1' } }),
+        pending: () => [],
+        ledgers: () => ['/repo/.dsh/interaction/decisions.jsonl'],
+    }
+    const h = harnessFor(cwd, { config: { environments: [productionEnvironment()] }, withApproval: false, services: { interaction: registry } })
+    const { missionId } = deliveredMission(h.stores, cwd)
+    const text = await h.text('deploy_run', { environment: 'production' })
+    assert.match(text, /### 部署执行：成功/)
+    assert.match(text, /审批：alice/)
+    assert.deepEqual(callsOf(calls), ['deploy'])
+    assert.equal(cards.length, 1, 'the card must reach the channel')
+    assert.equal(cards[0]?.['questionId'], armed[0])
+    assert.match(String(cards[0]?.['body']), /部署审批/)
+    const row = readLedger(path.join(cwd, '.dsh', 'deployments.jsonl')).rows.at(-1)
+    assert.equal(row?.approvedBy, 'alice')
+    assert.equal(row?.approvalMessageId, 'card-1')
+    assert.equal(h.stores.for(cwd).lastGate(missionId, { source: 'dsh-deploy-gate' })?.state, 'PASS')
+})
+
+test('a mounted interaction service with no usable channel refuses loudly, naming what it tried', async () => {
+    const { cwd, calls } = scriptRepo()
+    const registry = {
+        list: () => [{ name: 'im', canAsk: false, canNotify: true, reason: '未实现 wait()，只能推送不能收答案', order: 0 }],
+        arm: () => true,
+        send: async () => ({ ok: true }),
+        awaitAnswer: async () => ({ outcome: 'timeout', answer: null }),
+    }
+    const h = harnessFor(cwd, { config: { environments: [productionEnvironment()] }, withApproval: false, services: { interaction: registry } })
+    deliveredMission(h.stores, cwd)
+    const result = await h.run('deploy_run', { environment: 'production' })
+    assert.equal(result.isError, true)
+    const message = String(result.content)
+    assert.match(message, /interaction 服务注册了 1 个通道，但没有一个能提问/)
+    assert.match(message, /canAsk=false/)
+    assert.match(message, /未实现 wait\(\)/)
+    assert.match(message, /下一步（任选其一）：让该通道实现 wait\(\)/)
+    assert.deepEqual(callsOf(calls), [], 'no usable channel means no command may run')
+})
+
+test('an approval timeout through the channel registry is a REFUSAL, never a consent', async () => {
+    const { cwd, calls } = scriptRepo()
+    const registry = {
+        list: () => [{ name: 'im', canAsk: true, canNotify: true, reason: '', order: 0 }],
+        get: () => undefined,
+        arm: () => true,
+        send: async () => ({ ok: true, messageId: 'card-7' }),
+        awaitAnswer: async () => ({ outcome: 'timeout', answer: null }),
+    }
+    const h = harnessFor(cwd, { config: { environments: [productionEnvironment()] }, withApproval: false, services: { interaction: registry } })
+    const { store, missionId } = deliveredMission(h.stores, cwd)
+    const text = await h.text('deploy_run', { environment: 'production' })
+    assert.match(text, /### 未执行部署/)
+    assert.match(text, /超时\*\*不是\*\*拒绝、也\*\*不是\*\*同意/)
+    assert.deepEqual(callsOf(calls), [])
+    assert.equal(store.lastGate(missionId, { source: 'dsh-deploy-gate' })?.state, 'BLOCK')
+    assert.deepEqual(readLedger(path.join(cwd, '.dsh', 'deployments.jsonl')).rows.map((row) => row.state), ['refused'])
 })

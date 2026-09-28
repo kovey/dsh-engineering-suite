@@ -227,7 +227,7 @@ contracts:
 | `commands[].env` | — | 追加环境变量 |
 | `budgets[]` | `[]` | 回归预算表；`id`/`name`/`metric`（`durationMs`/`number`/`bytes`）+ `command` 或 `commandId` + `regex`（非 durationMs 必填）+ `max`/`min`/`maxRegressionPercent` + `unit`/`baselineFile`。**与规格里声明的预算同 id 时，这里的定义生效**（部署上限），差别会作为冲突报出来 |
 | `requireSpecBudgets` | `false` | 宿主 opt-in：`true` 时，规格声明了非功能预算而本次 `budget_check` 一条都没覆盖 → **拒绝执行**。它是**宿主键**（不可被项目级配置覆盖），因为项目可以声明自己的预算，但不能把宿主的合规要求关掉 |
-| `budgets[].baselineFile` | `<rootDir>/budgets.json` | 该预算的基线历史文件（相对路径按会话工作区解析；默认文件是所有预算共享的一份，每个 id 一条历史） |
+| `budgets[].baselineFile` | `<rootDir>/budgets.json` | 该预算的基线历史文件（相对路径按会话工作区解析；默认文件是所有预算共享的一份，每个 id 一条历史）。项目级配置里的取值**必须落在工作区内**（`../`、绝对路径、指向外面的符号链接都会被拒绝并报为问题，这条预算回落到默认文件）；文件存在但不是 `{ "version": 1, "budgets": { … } }` 形状时**拒绝判定**（不当作"没有历史"，也绝不覆盖它） |
 | `contracts[]` | `[]` | 契约表；`id`/`name`/`kind`（`cli`/`http`/`schema`/`command`）+ `command` + `expect`（`exitCode`/`stdoutContains`/`stdoutNotContains`/`jsonPaths`） |
 | `defaultTimeoutMs` | `300000` | 未声明 `timeoutMs` 时的超时（超时按失败处理） |
 | `maxOutputBytes` | `64000` | 单命令输出上限（保留尾部） |

@@ -681,3 +681,68 @@ test('dispose 之后无残留：工具、提示词段与服务都被撤下', () 
     assert.equal(fake.tools.size, 0)
     assert.equal(fake.sections.length, 0)
 })
+
+// --- adversarial-audit regressions ------------------------------------------
+
+test('项目级 redactPatterns 与宿主取并集：加规则只会收紧，绝不清空宿主的规则', async () => {
+    // Repro a1.mjs(C): a project list REPLACED the host's, and an all-invalid list
+    // produced an effective `[]` while still counting as "applied".
+    const cwd = tempWorkspace('interaction-gate-redact-')
+    fs.mkdirSync(path.join(cwd, '.dsh'), { recursive: true })
+    const hostConfig = resolveConfig({ redactPatterns: ['ACME-SECRET-[0-9]{4}'] }, () => undefined)
+
+    fs.writeFileSync(path.join(cwd, '.dsh', 'interaction-gate.json'), JSON.stringify({ redactPatterns: ['ACME-PROJECT-[0-9]{4}'] }))
+    const union = resolveEffectiveConfig(hostConfig, resolveLayout(cwd, {}), undefined)
+    assert.deepEqual(union.config.redactPatterns, ['ACME-SECRET-[0-9]{4}', 'ACME-PROJECT-[0-9]{4}'], 'host rules first, project rules appended (deduplicated)')
+
+    fs.writeFileSync(path.join(cwd, '.dsh', 'interaction-gate.json'), JSON.stringify({ redactPatterns: ['[', '(?<'] }))
+    const allInvalid = resolveEffectiveConfig(hostConfig, resolveLayout(cwd, {}), undefined)
+    assert.deepEqual(allInvalid.config.redactPatterns, ['ACME-SECRET-[0-9]{4}'], 'an all-invalid list must not empty the host rules')
+    assert.equal(allInvalid.source, 'profile', 'a list that adds nothing must not claim the project file applied')
+    assert.ok(allInvalid.problems.some((problem) => /不是合法正则/.test(problem)), JSON.stringify(allInvalid.problems))
+
+    // End to end: with a project file present, the HOST rule still refuses a payload.
+    const fake = host(cwd, { redactPatterns: ['ACME-SECRET-[0-9]{4}'] })
+    fake.registry.register(scriptedChannel('im').channel)
+    const refused = await fake.runTool('interaction_ask', { question: '密钥 ACME-SECRET-1234 可以发吗？' })
+    assert.equal(refused.isError, true)
+    assert.ok(runText(refused).includes('refused:secret'), runText(refused))
+    assert.ok(runText(refused).includes('ACME-SECRET-[0-9]{4}'), runText(refused))
+})
+
+test('自由文本答案落账与回显都被 maxPayloadChars 限界，并说明已截断', async () => {
+    // Repro a15.mjs: a 2 MB answer was stored verbatim and echoed by both
+    // `interaction_ask` and `interaction_status`.
+    const cwd = tempWorkspace('interaction-gate-biganswer-')
+    const fake = host(cwd, { maxPayloadChars: 500 })
+    const huge = 'y'.repeat(2_000_000)
+    const im = scriptedChannel('im', { onWait: (_questionId, resolve) => resolve({ value: huge, by: 'user-9' }) })
+    fake.registry.register(im.channel)
+
+    const run = await fake.runTool('interaction_ask', { question: '随便说点什么' })
+    assert.equal(run.isError, false)
+    const text = runText(run)
+    assert.ok(text.length < 5_000, `the answer must be bounded, got ${text.length} chars`)
+    assert.ok(text.includes('已截断'), text.slice(-600))
+    assert.ok(text.includes('原文 2000000 字符'), text.slice(-600))
+
+    const ledgerBytes = fs.statSync(path.join(cwd, LEDGER)).size
+    assert.ok(ledgerBytes < 5_000, `the ledger row must be bounded, got ${ledgerBytes} bytes`)
+    const decided = rowsOf(cwd).at(-1)
+    assert.equal(decided.decision.length, 500, 'stored bounded to exactly maxPayloadChars')
+
+    const status = await fake.runTool('interaction_status', {})
+    const statusText = runText(status)
+    assert.ok(statusText.length < 10_000, `interaction_status must stay bounded, got ${statusText.length} chars`)
+
+    // A row an OLDER version wrote (unbounded) is also rendered bounded.
+    appendLedgerRow(path.join(cwd, LEDGER), {
+        at: Date.now(),
+        id: newRowId(),
+        kind: 'ask',
+        title: '旧版本的超长回答',
+        decision: 'z'.repeat(2_000_000),
+    })
+    const again = await fake.runTool('interaction_status', {})
+    assert.ok(runText(again).length < 10_000, 'rendering must bound what is already on disk')
+})

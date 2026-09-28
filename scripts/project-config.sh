@@ -259,6 +259,16 @@ if [ "$GITIGNORE" = "1" ] && [ -d "$WS/.git" ]; then
   fi
   if [ "${#ADDED[@]}" -gt 0 ]; then
     if [ ! -f "$WS/.gitignore" ]; then printf '' > "$WS/.gitignore"; fi
+    # Append-only, and only onto a COMPLETE line (2026-09 adversarial audit C7):
+    # a human's `.gitignore` whose last line has no trailing newline used to be
+    # concatenated with our first pattern — `node_modules` became
+    # `node_modules.dsh/missions/`, which both destroyed their pattern and
+    # silently failed to ignore the runtime ledger. `printf '%s\n'` supplies the
+    # newline AFTER our line, never before it.
+    if [ -s "$WS/.gitignore" ]; then
+      last_byte="$(tail -c 1 "$WS/.gitignore" | od -An -t u1 | tr -d ' \n')"
+      if [ "$last_byte" != "10" ]; then printf '\n' >> "$WS/.gitignore"; fi
+    fi
     printf '%s\n' "${ADDED[@]}" >> "$WS/.gitignore"
     echo "已补 .gitignore 运行时忽略：${ADDED[*]}"
     echo "（配置类文件不会被忽略：它们是信任根，请提交评审。加 --no-gitignore 可跳过本步骤。）"

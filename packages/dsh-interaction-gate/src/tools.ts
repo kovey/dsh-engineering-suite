@@ -390,12 +390,17 @@ function headline(text: string, maxChars = 80): string {
     return line.length <= maxChars ? line : `${line.slice(0, maxChars - 1)}…`
 }
 
+/** Bounded text for a report line (a free-text answer may be megabytes long). */
+function bounded(text: string, maxChars: number): string {
+    return truncate(text, maxChars).text
+}
+
 /** Render one ledger row, bounded, for the status report. */
-function describeRow(row: LedgerRow): string {
+function describeRow(row: LedgerRow, maxChars: number = DEFAULT_MAX_PAYLOAD_CHARS): string {
     const parts = [
         formatTime(row.at),
         row.kind,
-        row.decision ?? '(未决定)',
+        row.decision === undefined ? '(未决定)' : bounded(row.decision, maxChars),
         row.channel ?? '(无通道)',
         ...(row.userId === undefined ? [] : [`回答者 ${row.userId}`]),
         ...(row.questionId === undefined ? [] : [row.questionId]),
@@ -405,9 +410,9 @@ function describeRow(row: LedgerRow): string {
     return `- ${parts.join(' | ')}`
 }
 
-function countLines(counts: Record<string, number>, empty = '（无）'): string {
+function countLines(counts: Record<string, number>, empty = '（无）', maxChars: number = DEFAULT_MAX_PAYLOAD_CHARS): string {
     const entries = Object.entries(counts).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
-    return entries.length === 0 ? empty : entries.map(([key, value]) => `${key}=${value}`).join('，')
+    return entries.length === 0 ? empty : entries.map(([key, value]) => `${bounded(key, maxChars)}=${value}`).join('，')
 }
 
 /**
@@ -796,6 +801,15 @@ export function registerTools(
                     }
                     const normalized = normalizeDecision(mapped, by, answer.messageId ?? send.messageId, candidate.name)
                     const carrier = answer.messageId ?? send.messageId
+                    // A free-text answer is stored verbatim as the decision, so it
+                    // is bounded HERE: an unbounded answer would grow the ledger
+                    // (and every report that renders it) without limit. The bound
+                    // is the same host-owned `maxPayloadChars` an outgoing payload
+                    // gets, and the truncation is stated, never silent.
+                    const withinSuiteVocabulary = SUITE_DECISIONS.includes(normalized.decision)
+                    const boundedDecision = truncate(normalized.decision, config.maxPayloadChars)
+                    const storedDecision = withinSuiteVocabulary ? normalized.decision : boundedDecision.text
+                    const decisionTruncated = !withinSuiteVocabulary && boundedDecision.truncated
                     const row: LedgerRow = {
                         at: deps.now(),
                         id: newRowId(),
@@ -803,7 +817,7 @@ export function registerTools(
                         title: titleOut.text,
                         questionId,
                         channel: candidate.name,
-                        decision: normalized.decision,
+                        decision: storedDecision,
                         durationMs,
                         ...(normalized.userId === '' ? {} : { userId: normalized.userId }),
                         ...(carrier === undefined ? {} : { messageId: carrier }),
@@ -825,13 +839,19 @@ export function registerTools(
                     if (contextInput.problems.length > 0) notes.push(...contextInput.problems.map((problem) => `- ⚠️ ${problem}`))
                     if (body.truncated) notes.push(`- ⚠️ 正文超过 maxPayloadChars=${config.maxPayloadChars}，已截断后发送`)
                     if (titleOut.truncated) notes.push('- ⚠️ 标题过长，已截断后发送')
+                    if (decisionTruncated) {
+                        notes.push(
+                            `- ⚠️ 回答超过 maxPayloadChars=${config.maxPayloadChars} 字符，落账与回显都已截断（原文 ${answer.value.length} 字符）：` +
+                                '台账是事实记录，不是聊天记录——需要完整内容就让人把长文本写进文件，卡片里只放链接。',
+                        )
+                    }
                     if (compiled.problems.length > 0) notes.push(...compiled.problems.map((problem) => `- ⚠️ ${problem}`))
                     if (failures.length > 0) notes.push('- 先尝试失败的通道：', ...failures)
                     if (missionId !== undefined) notes.push(`- mission：${missionId}`)
                     return [
                         'interaction_ask：已决定',
                         `- 问题：${headline(prose, 120)}`,
-                        `- 决定：${normalized.decision}${declared.length === 0 ? '（自由文本回答）' : '（声明选项之一）'}`,
+                        `- 决定：${storedDecision}${declared.length === 0 ? '（自由文本回答）' : '（声明选项之一）'}`,
                         `- 回答者：${by === '' ? '（通道未提供身份）' : by}${config.requireApproverList ? `（项目审批人名单：${approvers.ids.length} 个 id）` : '（未启用审批人名单：通道内的任何参与者都可回答）'}`,
                         `- 通道：${candidate.name}${(answer.messageId ?? send.messageId) === undefined ? '' : `（消息 ${answer.messageId ?? send.messageId}）`}`,
                         `- 一次性令牌：${questionId}（一次性，已作废）`,
@@ -1207,8 +1227,8 @@ export function registerTools(
                 lines.push('', `台账统计（${only === undefined ? '全部记录' : `mission ${only}`}，可用行 ${summary.total}）：`)
                 lines.push(`- 分行数：提问 ${summary.byKind.ask}，通知 ${summary.byKind.notify}，进度 ${summary.byKind.progress}`)
                 lines.push(`- 已决定的提问：${summary.answered}；被拒绝的交互：${summary.refused}；没有决定的行程：${summary.undecided}`)
-                lines.push(`- 按决定计数：${countLines(summary.byDecision)}`)
-                lines.push(`- 拒绝原因：${countLines(summary.refusedReasons)}`)
+                lines.push(`- 按决定计数：${countLines(summary.byDecision, '（无）', config.maxPayloadChars)}`)
+                lines.push(`- 拒绝原因：${countLines(summary.refusedReasons, '（无）', config.maxPayloadChars)}`)
                 lines.push(`- 通知失败行：${summary.notifyFailed}`)
                 lines.push('', `未决定的提问（按年龄，共 ${summary.pending.length} 个）：`)
                 if (summary.pending.length === 0) lines.push('  （无）')
@@ -1220,7 +1240,7 @@ export function registerTools(
                 }
                 if (summary.last !== undefined) {
                     lines.push('', `最近记录（最多 ${STATUS_RECENT_ROWS} 行，最新在前）：`)
-                    for (const row of [...selected].reverse().slice(0, STATUS_RECENT_ROWS)) lines.push(describeRow(row))
+                    for (const row of [...selected].reverse().slice(0, STATUS_RECENT_ROWS)) lines.push(describeRow(row, config.maxPayloadChars))
                 }
                 lines.push(
                     '',

@@ -343,8 +343,27 @@ export function resolveEffectiveConfig(
                     reject(`${file.file}: redactPatterns 里的 ${JSON.stringify(pattern)} 不是合法正则，已忽略该项（语法错误不能变成"少拦一条"）`)
                 }
             }
-            next.redactPatterns = kept
-            applied += 1
+            // UNION, never replacement: "extra rules only tighten" is the promise,
+            // and replacing the host's list with a project one — even a valid,
+            // non-empty one — would REMOVE rules the host declared. An all-invalid
+            // project list must therefore leave the host's rules intact instead of
+            // yielding an empty effective list.
+            const merged = [...host.redactPatterns]
+            for (const pattern of kept) if (!merged.includes(pattern)) merged.push(pattern)
+            if (merged.length > MAX_REDACT_PATTERNS) {
+                reject(
+                    `${file.file}: redactPatterns 与 profile 的规则合计 ${merged.length} 条，超过上限 ${MAX_REDACT_PATTERNS}：` +
+                        `已保留前 ${MAX_REDACT_PATTERNS} 条（profile 的规则在前，不会被项目的规则挤掉）`,
+                )
+                merged.length = MAX_REDACT_PATTERNS
+            }
+            // Only a real change counts as "the project file applied": a list that
+            // adds nothing must not turn the provenance into "项目级" nor hide the
+            // profile's value behind a no-op overlay.
+            if (merged.length !== host.redactPatterns.length || merged.some((pattern, index) => pattern !== host.redactPatterns[index])) {
+                next.redactPatterns = merged
+                applied += 1
+            }
         }
     }
     takePath('approversFile')

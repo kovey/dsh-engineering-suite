@@ -15,7 +15,7 @@ import { MissionStoreRegistry, resolveLayout } from 'dsh-eng-core'
 import { createFakeHost, fakeAgent, runText, tempWorkspace, type FakeHost } from 'dsh-eng-core/testing'
 import { apply } from '../dist/index.js'
 import { DEFAULT_PLAN_FILE, planLedgerFile, readPlanLedger } from '../dist/plan-ledger.js'
-import { adrIndexPath, adrSlug, listAdrRecords } from '../dist/adr.js'
+import { adrIndexPath, adrSlug, listAdrRecords, recordAdr } from '../dist/adr.js'
 import { resolveConfig } from '../dist/config.js'
 import { milestoneProblem } from '../dist/spec.js'
 
@@ -539,4 +539,160 @@ test('the ledger and ADR defaults follow rootDir, overrides are workspace-relati
     const overridden = resolveConfig({ logFile: 'x.log', planFile: 'plan/all.jsonl', adrDir: 'decisions' })
     assert.equal(planLedgerFile(resolveLayout(cwd, {}), overridden), path.join(cwd, 'plan', 'all.jsonl'))
     assert.equal(adrIndexPath(resolveLayout(cwd, {}), overridden), path.join(cwd, 'decisions', 'index.jsonl'))
+})
+
+// --- adversarial-audit regressions: project paths stay inside, writes are exclusive ---
+
+test('a project file may not relocate the ledger or the ADR records outside the workspace (regression)', async () => {
+    const cwd = tempWorkspace('spec-plan-escape-')
+    const outside = tempWorkspace('spec-plan-outside-')
+    fs.mkdirSync(path.join(cwd, '.dsh'), { recursive: true })
+    fs.writeFileSync(
+        path.join(cwd, '.dsh', 'spec-gate.json'),
+        JSON.stringify({
+            planFile: path.join(outside, 'plan.jsonl'),
+            adrDir: path.join(outside, 'adr'),
+            adrIndexFile: path.join(outside, 'adr', 'index.jsonl'),
+        }),
+    )
+    const fake = host({ cwd })
+    const created = await fake.runTool('spec_create', { ...DRAFT, milestone: 'v1.0' })
+    assert.equal(created.isError, false, String(created.content))
+    const adr = await fake.runTool('adr_record', { title: 'Keep it inside', decision: 'Records belong to this repository.' })
+    assert.equal(adr.isError, false, String(adr.content))
+
+    assert.deepEqual(fs.readdirSync(outside), [], 'nothing is written outside the workspace')
+    assert.ok(fs.existsSync(path.join(cwd, '.dsh', 'adr', '0001-keep-it-inside.md')), 'the ADR falls back to the profile layout')
+    assert.ok(fs.existsSync(path.join(cwd, '.dsh', 'adr', 'index.jsonl')), 'the index follows the ADR directory')
+    assert.ok(fs.existsSync(path.join(cwd, '.dsh', 'plan.jsonl')), 'the ledger falls back to the profile layout')
+    const effective = resolveConfig({ logFile: 'x.log' })
+    assert.equal(effective.adrDir, '.dsh/adr', 'the profile value is the one in force')
+})
+
+test('two concurrent adr_record calls with one title never lose a decision document (race, regression)', async () => {
+    // The number is `max(numbers) + 1`, read from the directory and then written:
+    // two calls that both compute the same number must not both succeed, and the
+    // second must never rename over the first. Two worker threads are released
+    // from an `Atomics` barrier so they really run at the same moment.
+    const { Worker } = await import('node:worker_threads')
+    const root = tempWorkspace('spec-adr-race-')
+    const distDir = new URL('../dist/', import.meta.url).href
+    const workerFile = path.join(root, 'record-adr.mjs')
+    fs.writeFileSync(
+        workerFile,
+        [
+            "import { parentPort, workerData } from 'node:worker_threads'",
+            `import { recordAdr } from ${JSON.stringify(`${distDir}adr.js`)}`,
+            `import { resolveConfig } from ${JSON.stringify(`${distDir}config.js`)}`,
+            '',
+            'const flag = new Int32Array(workerData.barrier)',
+            'Atomics.add(flag, 1, 1)',
+            'Atomics.wait(flag, 0, 0)',
+            "const layout = { cwd: workerData.cwd, rootDir: workerData.rootDir, specsDir: '', missionsDir: '', auditDir: '', stateDir: '', rolesDir: '' }",
+            'const outcome = recordAdr(',
+            "    { layout, config: resolveConfig({ logFile: 'x.log' }), now: 1_000 + workerData.index },",
+            '    { title: workerData.title, decision: workerData.decision },',
+            ')',
+            'parentPort.postMessage(',
+            "    outcome.ok ? { ok: true, number: outcome.number, relativePath: outcome.relativePath } : { ok: false, problem: outcome.problem, nextSteps: outcome.nextSteps ?? '' },",
+            ')',
+            '',
+        ].join('\n'),
+    )
+    interface RaceOutcome {
+        ok: boolean
+        number?: number
+        relativePath?: string
+        problem?: string
+        nextSteps?: string
+    }
+    const runPair = async (label: string): Promise<{ cwd: string; results: RaceOutcome[] }> => {
+        const cwd = path.join(root, label)
+        fs.mkdirSync(cwd, { recursive: true })
+        const barrier = new SharedArrayBuffer(2 * Int32Array.BYTES_PER_ELEMENT)
+        const flag = new Int32Array(barrier)
+        const workers = [0, 1].map(
+            (index) =>
+                new Worker(workerFile, {
+                    workerData: { cwd, rootDir: path.join(cwd, '.dsh'), barrier, index, title: 'Use SQLite for the local store', decision: `decision ${index}` },
+                }),
+        )
+        const results: RaceOutcome[] = []
+        const finished = Promise.all(
+            workers.map(
+                (worker) =>
+                    new Promise<void>((resolve, reject) => {
+                        worker.on('message', (message: RaceOutcome) => results.push(message))
+                        worker.on('error', reject)
+                        worker.on('exit', () => resolve())
+                    }),
+            ),
+        )
+        // Release both threads only once BOTH are parked on the barrier, so they
+        // enter `recordAdr` within microseconds of each other.
+        const deadline = Date.now() + 10_000
+        while (Atomics.load(flag, 1) < 2) {
+            if (Date.now() > deadline) throw new Error('the race workers never reached the barrier')
+            await new Promise((resolve) => setTimeout(resolve, 1))
+        }
+        Atomics.store(flag, 0, 1)
+        Atomics.notify(flag, 0, 2)
+        await finished
+        return { cwd, results }
+    }
+    for (let round = 0; round < 3; round += 1) {
+        const { cwd, results } = await runPair(`round-${round}`)
+        const winners = results.filter((result) => result.ok)
+        assert.equal(results.length, 2)
+        assert.ok(winners.length >= 1, 'at least one call records the decision')
+        assert.equal(
+            new Set(winners.map((winner) => winner.number)).size,
+            winners.length,
+            `round ${round}: two calls must never claim the same ADR number`,
+        )
+        for (const loser of results.filter((result) => !result.ok)) {
+            assert.match(loser.problem ?? '', /被另一条 adr_record 占用/)
+            assert.match(loser.nextSteps ?? '', /重试会重新读取目录里的编号/)
+        }
+        // One document per successful call, and no temporary file left behind:
+        // with one shared title the pre-fix code renamed the loser's document
+        // over the winner's, so two winners left ONE file.
+        const adrDir = path.join(cwd, '.dsh', 'adr')
+        const written = fs.readdirSync(adrDir)
+        assert.equal(written.filter((name) => name.endsWith('.md')).length, winners.length, `round ${round}: every winner owns exactly one document`)
+        assert.deepEqual(written.filter((name) => name.includes('.tmp-')), [], 'the exclusive write leaves no temporary file behind')
+        for (const winner of winners) {
+            const body = fs.readFileSync(path.join(cwd, winner.relativePath as string), 'utf8')
+            assert.match(body, /Use SQLite for the local store/)
+        }
+    }
+})
+
+test('an ADR number taken between the scan and the write is refused with a retry, never overwritten (regression)', () => {
+    const cwd = tempWorkspace('spec-adr-taken-')
+    const layout = resolveLayout(cwd, {})
+    const config = resolveConfig({ logFile: 'x.log' })
+    const dir = path.join(cwd, '.dsh', 'adr')
+    fs.mkdirSync(dir, { recursive: true })
+    const title = 'Use SQLite for the local store'
+    const target = path.join(dir, `0001-${adrSlug(title)}.md`)
+    const foreign = '# the document the concurrent call wrote first\n'
+    let reads = 0
+    const request = {
+        title,
+        get decision(): string {
+            reads += 1
+            // Read once to validate the request and again when the document is
+            // rendered — i.e. AFTER the number was scanned. The concurrent writer
+            // wins the number in exactly that window.
+            if (reads === 2) fs.writeFileSync(target, foreign)
+            return 'we will use SQLite'
+        },
+    }
+    const outcome = recordAdr({ layout, config, now: 1_000 }, request)
+    assert.equal(outcome.ok, false)
+    assert.match(outcome.ok === false ? outcome.problem : '', /被另一条 adr_record 占用/)
+    assert.match(outcome.ok === false ? (outcome.nextSteps ?? '') : '', /重试会重新读取目录里的编号/)
+    assert.equal(fs.readFileSync(target, 'utf8'), foreign, 'the document that was written first is never overwritten')
+    assert.deepEqual(fs.readdirSync(dir).filter((name) => name.includes('.tmp-')), [], 'no temporary file is left behind')
 })

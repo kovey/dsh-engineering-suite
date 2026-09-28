@@ -38,6 +38,15 @@ export const DEFAULT_VERIFY_RETRIES = 3
 /** Hard ceiling for `verifyBackoffMs` (10 minutes). */
 export const MAX_VERIFY_BACKOFF_MS = 600_000
 
+/** Default deadline for one approval question (15 minutes, the interaction layer's own ceiling). */
+export const DEFAULT_APPROVAL_TIMEOUT_MS = 900_000
+
+/** Shortest approval deadline a profile may set (a sub-second approval cannot reach a person). */
+export const MIN_APPROVAL_TIMEOUT_MS = 1_000
+
+/** Longest approval deadline a profile may set (24h: a deploy must eventually fail closed). */
+export const MAX_APPROVAL_TIMEOUT_MS = 24 * 60 * 60 * 1_000
+
 /** One canary step: roll out `percent`, wait, then verify. */
 export interface CanaryStep {
     /** Traffic/instance share this step moves to the new revision (`0 < percent <= 100`). */
@@ -104,6 +113,12 @@ export interface DeployGateConfig {
     verifyBackoffMs: number
     /** Deadline for one configured command. */
     commandTimeoutMs: number
+    /**
+     * Deadline for one approval question asked through a chat/IM channel
+     * (host-only). A deadline is a REFUSAL, never a consent — so this bounds how
+     * long a deploy turn may hang, it never widens what may be deployed.
+     */
+    approvalTimeoutMs: number
     goNoGo: GoNoGoConfig
     /** Whether a failed deploy runs the environment's own rollback commands. */
     autoRollbackOnFailure: boolean
@@ -415,6 +430,14 @@ export function resolveConfig(input: unknown, warn: (message: string) => void = 
     const retries = takeProfileNumber(raw, 'verifyRetries', DEFAULT_VERIFY_RETRIES, 1, MAX_VERIFY_RETRIES, warn)
     const backoff = takeProfileNumber(raw, 'verifyBackoffMs', 5_000, 0, MAX_VERIFY_BACKOFF_MS, warn)
     const timeout = takeProfileNumber(raw, 'commandTimeoutMs', 600_000, 1_000, Number.MAX_SAFE_INTEGER, warn)
+    const approvalTimeout = takeProfileNumber(
+        raw,
+        'approvalTimeoutMs',
+        DEFAULT_APPROVAL_TIMEOUT_MS,
+        MIN_APPROVAL_TIMEOUT_MS,
+        MAX_APPROVAL_TIMEOUT_MS,
+        warn,
+    )
 
     return {
         enabled: bool(raw['enabled'], true),
@@ -431,6 +454,7 @@ export function resolveConfig(input: unknown, warn: (message: string) => void = 
         verifyRetries: retries,
         verifyBackoffMs: backoff,
         commandTimeoutMs: timeout,
+        approvalTimeoutMs: approvalTimeout,
         goNoGo: parseGoNoGo(raw['goNoGo'], 'profile 配置', warn),
         autoRollbackOnFailure: bool(raw['autoRollbackOnFailure'], false),
         environments: environments.environments,
@@ -439,6 +463,50 @@ export function resolveConfig(input: unknown, warn: (message: string) => void = 
             order: num(prompt['order'], 650),
         },
     }
+}
+
+/**
+ * A parsed environment as a raw entry — the same keys, so it can serve as the
+ * base a project entry is overlaid onto.
+ *
+ * Key-by-key onto the PARSED profile environment (never re-resolved from the raw
+ * profile row): a key the project entry does not declare keeps the profile's
+ * value, which is exactly what makes `approversFile` impossible to lose.
+ */
+function rawEnvironment(environment: EnvironmentConfig): Raw {
+    return {
+        name: environment.name,
+        kind: environment.kind,
+        deployCommands: [...environment.deployCommands],
+        ...(environment.verifyCommands === undefined ? {} : { verifyCommands: [...environment.verifyCommands] }),
+        ...(environment.rollbackCommands === undefined ? {} : { rollbackCommands: [...environment.rollbackCommands] }),
+        requiresApproval: environment.requiresApproval,
+        ...(environment.approversFile === undefined ? {} : { approversFile: environment.approversFile }),
+        ...(environment.canary === undefined
+            ? {}
+            : { canary: { steps: environment.canary.steps.map((step) => ({ ...step })) } }),
+    }
+}
+
+/**
+ * Overlay one project-declared environment onto the profile's entry of the same
+ * name.
+ *
+ * Only the keys the project entry DECLARES win; every other key is inherited
+ * from the profile entry. Whole-entry replacement was the old rule and it was a
+ * silent bypass: re-declaring `production` with an empty object dropped the
+ * host's `approversFile`, so an approval by a stranger was accepted (an audit
+ * reproduced it end to end). Inheriting is also the monotone direction for the
+ * profile's own rollout policy (`canary`), which a project entry no longer
+ * erases by omission.
+ */
+function overlayOnProfile(entry: unknown, profile: readonly EnvironmentConfig[]): unknown {
+    if (!isRecord(entry)) return entry
+    const name = typeof entry['name'] === 'string' ? entry['name'].trim() : ''
+    if (name === '') return entry
+    const previous = profile.find((candidate) => candidate.name === name)
+    if (previous === undefined) return entry
+    return { ...rawEnvironment(previous), ...entry }
 }
 
 /** One resolved configuration plus where it came from. */
@@ -495,7 +563,9 @@ export function resolveEffectiveConfig(
             // because clearing them would silently disable every deploy here.
             reject(`${file.file}: environments=null 不被接受（清空环境等于禁止部署）：已忽略，继续使用 profile 声明的环境`)
         } else {
-            const parsed = parseEnvironments(raw['environments'], file.file, reject)
+            const declared = raw['environments']
+            const input = Array.isArray(declared) ? declared.map((entry) => overlayOnProfile(entry, host.environments)) : declared
+            const parsed = parseEnvironments(input, file.file, reject)
             for (const environment of parsed.environments) {
                 const previous = host.environments.find((entry) => entry.name === environment.name)
                 // The approval ceiling is monotone: a repository may add it, never
@@ -506,7 +576,26 @@ export function resolveEffectiveConfig(
                     )
                 }
                 const requiresApproval = environment.requiresApproval || previous?.requiresApproval === true
-                const merged: EnvironmentConfig = { ...environment, requiresApproval }
+                // The approver allowlist is monotone for the same reason: the host's
+                // list is the requirement, so a project entry may add one (when the
+                // profile declared none) but may never drop or replace the host's —
+                // a different list would silently widen who may approve.
+                let approversFile = environment.approversFile
+                if (previous?.approversFile !== undefined) {
+                    if (approversFile !== undefined && approversFile !== previous.approversFile) {
+                        reject(
+                            `${file.file}: 环境 "${environment.name}" 的 approversFile 不能替换 profile 声明的名单` +
+                                `（profile ${previous.approversFile}，项目级 ${approversFile}）：审批人名单是单调的——项目级可以补一份，` +
+                                '不能把宿主的要求换掉。已保持 profile 的名单',
+                        )
+                    }
+                    approversFile = previous.approversFile
+                }
+                const merged: EnvironmentConfig = {
+                    ...environment,
+                    requiresApproval,
+                    ...(approversFile === undefined ? {} : { approversFile }),
+                }
                 const index = next.environments.findIndex((entry) => entry.name === merged.name)
                 if (index >= 0) next.environments[index] = merged
                 else next.environments.push(merged)

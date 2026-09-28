@@ -23,9 +23,12 @@
  * @module dsh-spec-gate/adr
  */
 
+import { randomUUID } from 'node:crypto'
+import fs from 'node:fs'
 import path from 'node:path'
 import {
     appendJsonl,
+    ensureDir,
     exists,
     formatTime,
     listDir,
@@ -33,7 +36,6 @@ import {
     resolvePath,
     shortDigest,
     slugify,
-    writeOnce,
     type Layout,
 } from 'dsh-eng-core'
 import type { SpecGateConfig } from './config.js'
@@ -117,6 +119,50 @@ export function adrSlug(title: string): string {
 /** 4-digit zero-padded number (`0007`). */
 export function adrNumber(number: number): string {
     return String(number).padStart(4, '0')
+}
+
+/**
+ * Create `file` with `text` only if nothing is there — EXCLUSIVELY.
+ *
+ * `existsSync` + temp + rename is not enough: `rename` overwrites, so two
+ * `adr_record` calls that both computed `max(numbers) + 1` (the number is read
+ * from the directory, then the file is written) would both "succeed" and the
+ * second rename would silently replace the first decision document. The last
+ * step here is `linkSync`, which fails with `EEXIST` when the target appeared in
+ * between: the loser loses loudly and retries, and the retry recomputes the
+ * number (the directory now has the winner's file).
+ *
+ * The temporary file is always removed; a hard link is only used inside the ADR
+ * directory, so this needs nothing beyond a POSIX filesystem — the same
+ * assumption `appendJsonl` already makes.
+ * @param file - the target path (never overwritten).
+ * @param text - the document body.
+ * @returns `true` when this call created the file; `false` when it already existed.
+ */
+function writeAdrOnceExclusive(file: string, text: string): boolean {
+    ensureDir(path.dirname(file))
+    // The temp name must be unique per CALL, not per process-and-millisecond:
+    // two concurrent calls in one process share both the pid and (often) the
+    // millisecond, so a shared temp path lets one call's cleanup delete the
+    // other's file — the loser then fails with a confusing ENOENT from link()
+    // instead of the intended "number taken, retry" refusal. Caught by the
+    // frozen verification run, not by the happy path.
+    const temporary = `${file}.tmp-${process.pid}-${Date.now()}-${randomUUID()}`
+    fs.writeFileSync(temporary, text)
+    try {
+        fs.linkSync(temporary, file)
+        return true
+    } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'EEXIST') return false
+        throw error
+    } finally {
+        try {
+            fs.rmSync(temporary, { force: true })
+        } catch {
+            // The document is already in place; a leftover temp file is not worth
+            // failing the call over.
+        }
+    }
 }
 
 /** Read the index; malformed/truncated lines are counted, never thrown. */
@@ -410,6 +456,14 @@ export function recordAdr(deps: AdrDeps, request: AdrRequest): AdrOutcome {
         problem: `目标文件已存在：${relativePath}（ADR 只增不改，绝不覆盖）。`,
         nextSteps: '下一步：adr_list 看现有编号；要改决定就记一条新的并写 supersedes；确认编号被占用就删掉那个空文件或换个标题。',
     })
+    /** The number was free when it was read and taken by a concurrent call. */
+    const refuseTaken = (): AdrOutcome => ({
+        ok: false,
+        problem:
+            `编号 ${adrNumber(number)} 在本次调用计算出来之后被另一条 adr_record 占用了（${relativePath} 已经存在）：` +
+            'ADR 只增不改，绝不覆盖，因此本次没有写入任何决策。',
+        nextSteps: '下一步：直接重试——重试会重新读取目录里的编号，用下一个空闲编号记录这条决策（不需要换标题）。',
+    })
     if (exists(file)) return refuseExisting()
 
     const markdown = renderAdr({
@@ -424,9 +478,10 @@ export function recordAdr(deps: AdrDeps, request: AdrRequest): AdrOutcome {
         at: now,
         planFile: deps.config.planFile,
     })
-    // `writeOnce` is the write that actually decides: the existence check above
-    // is only there to produce a better message.
-    if (!writeOnce(file, markdown)) return refuseExisting()
+    // The exclusive create is the write that actually decides: the existence
+    // check above is only there to produce a better message, and two concurrent
+    // calls that computed the same number must not clobber each other.
+    if (!writeAdrOnceExclusive(file, markdown)) return refuseTaken()
 
     const warnings: string[] = []
     const missionId = request.missionId === undefined || request.missionId.trim() === '' ? undefined : request.missionId.trim()

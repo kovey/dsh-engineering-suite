@@ -685,9 +685,27 @@ export interface BuildPlanOptions {
     notes?: readonly string[]
 }
 
-/** The host-side command that appends one quarantine row (never run by this plugin). */
+/**
+ * The host-side command that appends one quarantine row (never run by this plugin).
+ *
+ * Both the row and the path are base64-encoded before they are put on a command
+ * line: the printed command is the ONLY way a quarantine gets recorded (a human
+ * copies it), so it has to be correct for every test name and every path. The
+ * naive `printf '%s\n' '<json>' >> <file>` broke on a name containing a single
+ * quote and on a path containing a space — a broken command that a human pastes
+ * is worse than no command, and the raw interpolation was injectable.
+ * Base64 output is `[A-Za-z0-9+/=]`, so it is safe inside single quotes.
+ * @param file - the ledger path to append to.
+ * @param row - the row to append.
+ */
 export function quarantineCommandFor(file: string, row: QuarantineRow): string {
-    return `printf '%s\\n' '${JSON.stringify(row)}' >> ${file}`
+    const payload = Buffer.from(`${JSON.stringify(row)}\n`, 'utf8').toString('base64')
+    const target = Buffer.from(file, 'utf8').toString('base64')
+    return (
+        `node -e 'const f=require("node:fs");const a=process.argv;` +
+        `f.appendFileSync(Buffer.from(a[1],"base64").toString("utf8"),Buffer.from(a[2],"base64").toString("utf8"))' ` +
+        `${target} ${payload}`
+    )
 }
 
 /** Build the plan (pure: the caller passes the clock and the data). */
@@ -856,6 +874,15 @@ export interface FlakyPlanSummary {
     quarantine?: number
     /** Runs the plan observed, with the names each one saw. */
     runs: ObservedRun[]
+    /**
+     * The per-test counts the plan was built from (report mode).
+     *
+     * In report mode no run names anything, so these counts are the only
+     * evidence that a quarantined test is still being executed at all.
+     */
+    observedTests?: { name: string; runs: number }[]
+    /** The plan's own caveats ("this report carries no per-test names", …). */
+    notes?: string[]
     summary?: FlakyPlan['summary']
     /** Set when the file exists but cannot be read as JSON. */
     problem?: string
@@ -870,11 +897,19 @@ export function listFlakyPlans(dir: string): FlakyPlanSummary[] {
             const file = path.join(dir, name)
             const raw = readJson<Partial<FlakyPlan>>(file)
             if (raw === undefined) return { file, relative: `flaky/${name}`, runs: [], problem: `${file} 不是合法 JSON：无法读取这次计划` }
+            const observedTests = Array.isArray(raw.tests)
+                ? raw.tests
+                      .filter((entry): entry is FlakyPlanEntry => typeof entry === 'object' && entry !== null && typeof entry.name === 'string')
+                      .map((entry) => ({ name: entry.name, runs: typeof entry.runs === 'number' && entry.runs > 0 ? entry.runs : 0 }))
+                : undefined
+            const notes = Array.isArray(raw.notes) ? raw.notes.filter((note): note is string => typeof note === 'string') : undefined
             return {
                 file,
                 relative: `flaky/${name}`,
                 ...(typeof raw.generatedAt === 'string' ? { generatedAt: raw.generatedAt } : {}),
                 ...(Array.isArray(raw.tests) ? { tests: raw.tests.length } : {}),
+                ...(observedTests === undefined ? {} : { observedTests }),
+                ...(notes === undefined ? {} : { notes }),
                 ...(raw.summary === undefined ? {} : { quarantine: raw.summary.quarantine }),
                 ...(raw.summary === undefined ? {} : { summary: raw.summary }),
                 runs: Array.isArray(raw.runs) ? [...raw.runs] : [],
@@ -945,13 +980,27 @@ export function renderStatus(input: StatusInput): string {
                 `  分类：稳定 ${input.newest.summary.stable}、隔离 ${input.newest.summary.quarantine}、查根因 ${input.newest.summary.investigate}、疑似仪器/环境 ${input.newest.summary.suspectInstrumentation}`,
             )
         }
+        // The plan's own caveats are the difference between "this test is gone"
+        // and "this report cannot say": dropping them would turn a limitation of
+        // the data into an accusation.
+        for (const note of input.newest.notes ?? []) lines.push(`  说明：${note}`)
         const runs = input.newest.runs
         const threshold = input.settings.unseenRunsBeforeWarn
-        if (runs.length === 0) {
-            lines.push(`  该计划没有携带逐次运行的点名结果：无法判断"最近 ${threshold} 次运行没出现"。`)
-        } else if (runs.length < threshold) {
-            lines.push(`  该计划只有 ${runs.length} 次运行（少于阈值 ${threshold}）：暂不判定"消失"，先积累运行记录。`)
-        } else {
+        // Report mode carries per-test TALLIES, not per-run names. Reading a
+        // nameless run as "nothing was observed" accused every quarantined test —
+        // including the ones the same report proves ran in every run. The tallies
+        // ARE the observed set in that mode; a nameless run alone proves nothing.
+        const tallies = input.newest.observedTests ?? []
+        const namedRuns = runs.filter((run) => run.named.length > 0)
+        const tallyWindow = tallies.reduce((max, tally) => Math.max(max, tally.runs), 0)
+        const window = namedRuns.length > 0 ? runs.length : Math.max(runs.length, tallyWindow)
+        if (window < threshold) {
+            lines.push(
+                runs.length === 0 && tallyWindow === 0
+                    ? `  该计划没有携带逐用例结果（报告只有运行级退出码）：无法判断"最近 ${threshold} 次运行没出现"——**不能**因此说覆盖正在消失。`
+                    : `  该计划只有 ${window} 次运行（少于阈值 ${threshold}）：暂不判定"消失"，先积累运行记录。`,
+            )
+        } else if (namedRuns.length > 0) {
             const unseen = unseenQuarantines(input.quarantined, runs, threshold)
             if (unseen.length === 0) {
                 lines.push(`  "最近 ${threshold} 次运行没出现"检查：通过（所有隔离用例都还在被点名）。`)
@@ -960,6 +1009,28 @@ export function renderStatus(input: StatusInput): string {
                 for (const row of unseen) {
                     lines.push(
                         `    - ${row.test}（owner=${row.owner}）：隔离后被删除/改名/跳过了？覆盖正在静默消失——要么恢复它，要么把隔离条目一起删掉。`,
+                    )
+                }
+            }
+        } else {
+            // No run named anything, but the report did count cases: judge with
+            // the counts it gave, and say exactly which number is being used.
+            const observed = new Set(tallies.filter((tally) => tally.runs >= window).map((tally) => tally.name))
+            const unseen = input.quarantined.filter((row) => !observed.has(row.test)).sort((left, right) => left.test.localeCompare(right.test))
+            if (unseen.length === 0) {
+                lines.push(
+                    `  "最近 ${threshold} 次运行没出现"检查：通过（报告没有逐次点名，但 ${tallies.length} 条用例计数的观察窗口是 ${window} 次运行，每一条隔离用例都在里面）。`,
+                )
+            } else {
+                lines.push(`  ⚠️ 隔离用例在报告的用例计数里没有覆盖全部 ${window} 次运行（报告模式只有计数，没有逐次点名）：`)
+                for (const row of unseen) {
+                    const tally = tallies.find((candidate) => candidate.name === row.test)
+                    lines.push(
+                        `    - ${row.test}（owner=${row.owner}）：${
+                            tally === undefined
+                                ? `报告的 ${window} 次运行里完全没有它——隔离后被删除/改名/跳过了？覆盖正在静默消失：要么恢复它，要么把隔离条目一起删掉`
+                                : `报告里只在 ${tally.runs}/${window} 次运行里被点名（其他运行没有它：可能被跳过或条件执行）`
+                        }。`,
                     )
                 }
             }

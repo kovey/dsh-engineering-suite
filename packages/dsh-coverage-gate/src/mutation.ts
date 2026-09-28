@@ -46,10 +46,12 @@ import fs from 'node:fs'
 import path from 'node:path'
 import {
     changedRanges,
+    isReallyInside,
     isTestPath,
     languageOf,
     pathMatchesPattern,
     readCapped,
+    realTargetOf,
     runCommand,
     sha256,
     tail,
@@ -874,14 +876,65 @@ export interface CollectOptions {
 /** What {@link collectSourceFiles} found. */
 export interface CollectedSources {
     files: SourceFile[]
-    /** Files that matched but were not planned, with the reason. */
-    skipped: { path: string; reason: string }[]
+    /**
+     * Files that matched but were not planned, with the reason.
+     *
+     * `unusable: true` marks a file that WOULD have been mutated (it is a real
+     * source file, not excluded and not a test) but could not be: it is
+     * unreadable, over the size cap, not valid UTF-8, not a regular file, or its
+     * real path leaves the workspace. Such a file is coverage this run cannot
+     * claim, so it forces `scope.full = false` — a skipped file must never
+     * silently count as mutated.
+     */
+    skipped: { path: string; reason: string; unusable?: true }[]
     /** The globs actually used (detected when the host configured none). */
     sourceGlobs: string[]
     /** Honest caveats about the selection. */
     notes: string[]
     /** Set when the changed-file diff could not be read. */
     problem?: string
+}
+
+/**
+ * Why one planned file must NOT be rewritten by a mutation run, or `undefined`.
+ *
+ * A mutation run rewrites the file it plans, so the target must be:
+ *
+ *  1. a regular file — never a symlink. `writeFileSync` follows links, so a
+ *     `src/linked.ts -> ../../other-repo/lib.ts` would have this gate rewrite a
+ *     file OUTSIDE the workspace and then "restore" it through the same link
+ *     (the recovery advice `git checkout -- src/linked.ts` repairs the link, not
+ *     the target);
+ *  2. inside the workspace after resolving symlinks (`realpath`) — a symlinked
+ *     *directory* on the path escapes just as well;
+ *  3. outside the exclusion floor judged on the REAL path — otherwise a link
+ *     into `.dsh/**` or `node_modules/**` smuggles the trust root back in.
+ *
+ * Judgement is on `lstat` + `realpath`, never on the lexical path alone.
+ * @param cwd - the workspace root.
+ * @param file - the workspace-relative path a mutant plans to rewrite.
+ * @param excludeGlobs - the exclusion floor in force for this run.
+ */
+export function mutationTargetProblem(cwd: string, file: string, excludeGlobs: readonly string[]): string | undefined {
+    const absolute = path.join(cwd, file)
+    let stats: fs.Stats
+    try {
+        stats = fs.lstatSync(absolute)
+    } catch {
+        return '文件不存在或无法读取（lstat 失败）'
+    }
+    if (stats.isSymbolicLink()) {
+        return `是符号链接（指向 ${realTargetOf(absolute)}）：变异会跟随链接改写到工作区外，本工具只改写普通文件`
+    }
+    if (!stats.isFile()) return '不是普通文件（目录 / 管道 / 设备等）：变异只能改写普通文件'
+    if (!isReallyInside(cwd, absolute)) {
+        return `真实路径落在工作区外（${realTargetOf(absolute)}）：变异测试只改写工作区内的文件`
+    }
+    const realRelative = path.relative(realTargetOf(cwd), realTargetOf(absolute)).split(path.sep).join('/')
+    if (isExcludedPath(realRelative, excludeGlobs)) {
+        return `真实路径 ${realRelative} 命中排除 glob（台账/依赖/构建产物/生成文件不参与变异）`
+    }
+    return undefined
 }
 
 /** Whether a path is excluded by the hard list and the configured globs. */
@@ -916,7 +969,7 @@ export function detectSourceGlobs(cwd: string, maxFiles: number): { globs: strin
 export async function collectSourceFiles(options: CollectOptions): Promise<CollectedSources> {
     const cwd = options.cwd
     const notes: string[] = []
-    const skipped: { path: string; reason: string }[] = []
+    const skipped: { path: string; reason: string; unusable?: true }[] = []
     const maxFiles = options.maxFiles ?? DEFAULT_MAX_FILES
     const maxFileBytes = options.maxFileBytes ?? DEFAULT_MAX_FILE_BYTES
     const excludeGlobs = [...DEFAULT_EXCLUDE_GLOBS, ...(options.excludeGlobs ?? [])]
@@ -971,13 +1024,21 @@ export async function collectSourceFiles(options: CollectOptions): Promise<Colle
             skipped.push({ path: file, reason: '是测试文件：变异测试文件等于测试"测试自己"，不参与变异' })
             continue
         }
+        // Nothing below may follow a link: the run rewrites this path, so a
+        // symlink (or a symlinked parent directory) would move the write outside
+        // the workspace — and, worse, the exclusion floor with it.
+        const refused = mutationTargetProblem(cwd, file, excludeGlobs)
+        if (refused !== undefined) {
+            skipped.push({ path: file, reason: `${refused}（不会被变异，因此本次不能算"全覆盖"）`, unusable: true })
+            continue
+        }
         const text = readCapped(path.join(cwd, file), maxFileBytes, options.logger ?? SILENT_LOGGER)
         if (text === undefined) {
-            skipped.push({ path: file, reason: `文件超过 ${maxFileBytes} 字节或不可读` })
+            skipped.push({ path: file, reason: `文件超过 ${maxFileBytes} 字节或不可读`, unusable: true })
             continue
         }
         if (!Buffer.from(text, 'utf8').equals(fs.readFileSync(path.join(cwd, file)))) {
-            skipped.push({ path: file, reason: '不是合法 UTF-8：文本变异会破坏字节，无法保证还原，已跳过' })
+            skipped.push({ path: file, reason: '不是合法 UTF-8：文本变异会破坏字节，无法保证还原，已跳过', unusable: true })
             continue
         }
         files.push({ path: file, text })
@@ -1068,6 +1129,18 @@ interface Snapshot {
     dirtyVsHead: boolean
 }
 
+/**
+ * What is on disk right now, in one printable line.
+ *
+ * Used when a file this run was holding does not hold our bytes any more: the
+ * report has to say WHAT was observed instead, because "someone else changed it"
+ * without the actual content is not reviewable.
+ */
+function describeObserved(bytes: Buffer | undefined): string {
+    if (bytes === undefined) return '文件不存在/不可读'
+    return `${bytes.length} 字节，尾部 ${JSON.stringify(tail(bytes.toString('utf8'), 120))}`
+}
+
 /** Files among `paths` that differ from HEAD (modified, staged or untracked). */
 async function dirtyVsHead(cwd: string, paths: readonly string[]): Promise<Set<string>> {
     const dirty = new Set<string>()
@@ -1104,6 +1177,23 @@ export async function runMutationPlan(plan: MutationPlan, options: MutationRunOp
     const results: MutantResult[] = []
     const notes = [...plan.notes]
     const paths = [...new Set(plan.mutants.map((mutant) => mutant.file))].sort()
+    // Refuse BEFORE the first write. A planned file this gate may not rewrite
+    // (a symlink, a non-regular file, a real path outside the workspace, a real
+    // path inside the exclusion floor) is a refusal naming the fix — never a
+    // mutant with a verdict, and never "skipped silently".
+    for (const file of paths) {
+        const refused = mutationTargetProblem(options.cwd, file, DEFAULT_EXCLUDE_GLOBS)
+        if (refused !== undefined) {
+            throw new Error(
+                [
+                    `${file} 不能作为变异目标：${refused}。`,
+                    '本门禁会改写计划里的每一个文件：跟随符号链接会把变异写到工作区外（别人的仓库/系统文件），而"还原"也会还原到错误的地方；',
+                    '写入被排除的目录则等于让门禁改自己的台账/依赖。因此只改写工作区内的普通文件。',
+                    '下一步：改用真实文件的路径重跑，或把该条目从 mutation.sourceGlobs 里排除（排除它不会算作"已覆盖"）；本次没有改写任何文件。',
+                ].join('\n'),
+            )
+        }
+    }
     const snapshots = new Map<string, Snapshot>()
     for (const file of paths) {
         const absolute = path.join(options.cwd, file)
@@ -1141,6 +1231,19 @@ export async function runMutationPlan(plan: MutationPlan, options: MutationRunOp
     const cancelled = (): boolean => options.signal?.aborted === true
 
     let stopped: MutationRun['stopped'] = 'complete'
+    /**
+     * The mutant bytes this run wrote for a file and has not restored yet.
+     *
+     * Only bytes WE wrote, and that are still expected on disk, are ours to put
+     * back. A file whose content is no longer these bytes belongs to whoever
+     * wrote it last: restoring our pre-run snapshot over their work would destroy
+     * it — and the raised error would claim the opposite. Such a file is left
+     * exactly as found and reported; `verify()` then refuses to give a verdict on
+     * a workspace that was not restored.
+     */
+    const mutantBytesHeld = new Map<string, Buffer>()
+    /** Files an external writer changed under this run, with what was observed. */
+    const interference: string[] = []
     try {
         for (const mutant of plan.mutants) {
             if (cancelled()) {
@@ -1158,11 +1261,23 @@ export async function runMutationPlan(plan: MutationPlan, options: MutationRunOp
                 break
             }
             const absolute = path.join(options.cwd, mutant.file)
+            // The file could have been replaced (by a symlink, say) since it was
+            // collected: re-judge the real target immediately before writing.
+            const swapped = mutationTargetProblem(options.cwd, mutant.file, DEFAULT_EXCLUDE_GLOBS)
+            if (swapped !== undefined) {
+                throw new MutationRestoreError(
+                    [
+                        `${mutant.file} 在本次运行期间不再是可变异的目标：${swapped}。`,
+                        '本门禁只改写工作区内的普通文件，已停止（它自己的字节没有被本工具改动）。',
+                        '下一步：确认没有别的进程/代理在替换这个文件，改用真实文件路径后重跑 mutation_check。',
+                    ].join('\n'),
+                )
+            }
             const current = fs.readFileSync(absolute)
             if (!current.equals(snapshot.bytes)) {
                 throw new MutationRestoreError(
                     [
-                        `${mutant.file} 在本次运行期间被外部改动（既不是运行前的快照，也不是本工具写下的内容）：为了避免覆盖别人的改动，变异测试已停止。`,
+                        `${mutant.file} 在本次运行期间被外部改动（既不是运行前的快照，也不是本工具写下的内容）：为了避免覆盖别人的改动，变异测试已停止，这个文件保持现状（本工具没有写它）。`,
                         '下一步：确认没有别的进程/代理在写这个文件，恢复到你期望的版本后重跑 mutation_check。',
                     ].join('\n'),
                 )
@@ -1172,9 +1287,10 @@ export async function runMutationPlan(plan: MutationPlan, options: MutationRunOp
             const before = now()
             let outcome: MutantCommandOutcome
             /** Set when the file no longer holds what this tool wrote (external writer). */
-            let interference: string | undefined
+            let interferedWith: string | undefined
             try {
                 fs.writeFileSync(absolute, mutated, 'utf8')
+                mutantBytesHeld.set(mutant.file, Buffer.from(mutated, 'utf8'))
                 if (options.run === undefined) {
                     const raw = await runCommand(
                         {
@@ -1198,25 +1314,35 @@ export async function runMutationPlan(plan: MutationPlan, options: MutationRunOp
                 }
             } finally {
                 // The whole point: on failure, timeout and abort alike, the
-                // ORIGINAL BYTES go back before anything else happens. Before
-                // overwriting, note whether the file still holds what we wrote:
-                // if it does not, someone else edited it mid-run, and silently
-                // restoring over their work would be the wrong kind of tidy.
+                // ORIGINAL BYTES go back before anything else happens — but only
+                // when the file still holds exactly what this run wrote. If it
+                // does not, someone else edited it mid-run, and restoring over
+                // their work would destroy it (see `mutantBytesHeld`).
+                const held = mutantBytesHeld.get(mutant.file)
                 let afterRun: Buffer | undefined
                 try {
                     afterRun = fs.readFileSync(absolute)
                 } catch {
                     afterRun = undefined
                 }
-                if (afterRun === undefined || !afterRun.equals(Buffer.from(mutated, 'utf8'))) interference = mutant.id
-                fs.writeFileSync(absolute, snapshot.bytes)
+                if (held !== undefined && afterRun !== undefined && afterRun.equals(held)) {
+                    fs.writeFileSync(absolute, snapshot.bytes)
+                    mutantBytesHeld.delete(mutant.file)
+                } else if (held !== undefined) {
+                    mutantBytesHeld.delete(mutant.file)
+                    interferedWith = mutant.id
+                    interference.push(`${mutant.file}（磁盘上现在是 ${describeObserved(afterRun)}）`)
+                }
+                // `held === undefined` means the mutant write itself failed: the
+                // file was not changed by this run, so there is nothing to put
+                // back (the write error propagates and names the cause).
             }
-            if (interference !== undefined) {
+            if (interferedWith !== undefined) {
                 throw new MutationRestoreError(
                     [
-                        `${mutant.file} 在变异体 ${interference} 运行期间被外部改动：它既不是本工具写下的内容，也不是运行前的快照。`,
-                        '为避免覆盖别人的改动，变异测试已停止；该文件已按运行前的字节快照还原，其余文件不受影响。',
-                        '下一步：确认没有别的进程/代理在写这个文件，取得期望的版本后重跑 mutation_check。',
+                        `${mutant.file} 在变异体 ${interferedWith} 运行期间被外部改动：它既不是本工具写下的内容，也不是运行前的快照。`,
+                        '为避免覆盖别人的改动，变异测试已停止；这个文件保持外部写入的现状（本工具没有还原它），其余文件已按运行前的字节快照还原。',
+                        '下一步：确认没有别的进程/代理在写这个文件，取得期望的版本后重跑 mutation_check —— 在没有逐字节还原的工作区上本门禁不给出任何裁决。',
                     ].join('\n'),
                 )
             }
@@ -1262,13 +1388,31 @@ export async function runMutationPlan(plan: MutationPlan, options: MutationRunOp
             }
         }
     } finally {
-        // Never leave a mutated byte behind — including on an exception above.
-        for (const snapshot of snapshots.values()) {
-            const absolute = path.join(options.cwd, snapshot.file)
+        // Never leave a mutated byte behind — including on an exception above —
+        // but ONLY the bytes this run wrote are ours to put back. A file that no
+        // longer holds them (or that this run never wrote) is left exactly as
+        // found and reported: overwriting an external writer's content from our
+        // pre-run snapshot would destroy their work, and the error that follows
+        // would claim the opposite. `verify()` still fails closed on any file that
+        // is not byte-identical to the pre-run snapshot.
+        for (const [file, written] of [...mutantBytesHeld]) {
+            const absolute = path.join(options.cwd, file)
+            let current: Buffer | undefined
             try {
-                if (!fs.readFileSync(absolute).equals(snapshot.bytes)) fs.writeFileSync(absolute, snapshot.bytes)
+                current = fs.readFileSync(absolute)
+            } catch {
+                current = undefined
+            }
+            if (current === undefined || !current.equals(written)) {
+                mutantBytesHeld.delete(file)
+                interference.push(`${file}（磁盘上现在是 ${describeObserved(current)}）`)
+                continue
+            }
+            try {
+                fs.writeFileSync(absolute, (snapshots.get(file) as Snapshot).bytes)
+                mutantBytesHeld.delete(file)
             } catch (error) {
-                logger?.warn(`mutation: 还原 ${snapshot.file} 失败`, error)
+                logger?.warn(`mutation: 还原 ${file} 失败`, error)
             }
         }
     }
@@ -1279,6 +1423,12 @@ export async function runMutationPlan(plan: MutationPlan, options: MutationRunOp
             [
                 `变异测试结束后，这些文件与运行前的字节快照不一致：${mismatch}。`,
                 '本门禁会改写源码文件，因此"结束后工作区与运行前逐字节一致"是硬性要求；不满足时不给出任何裁决。',
+                ...(interference.length === 0
+                    ? []
+                    : [
+                          `这些文件在运行期间被外部改动（本工具没有覆盖它们，保持现状）：${interference.join('；')}`,
+                          '下一步：先确认这些改动是谁写的，再决定保留还是回退——本门禁不会替你做这个决定。',
+                      ]),
                 `下一步：先恢复这些文件（git checkout -- ${mismatch.split(', ').join(' ')}），确认没有别的进程在写它们，再重跑 mutation_check。`,
             ].join('\n'),
         )

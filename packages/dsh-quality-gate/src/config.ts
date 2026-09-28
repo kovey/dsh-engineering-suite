@@ -4,7 +4,7 @@
  * @module dsh-quality-gate/config
  */
 
-import { loadProjectConfig, type Layout, type LayoutOptions, type Logger } from 'dsh-eng-core'
+import { containedPath, loadProjectConfig, type Layout, type LayoutOptions, type Logger } from 'dsh-eng-core'
 import { parseBudget, type BudgetConfig } from './budget.js'
 import { parseContract, type ContractConfig } from './contract.js'
 
@@ -226,7 +226,16 @@ export function resolveEffectiveConfig(host: QualityGateConfig, layout: Layout, 
     // The list keys are parsed before the scalar ones so that a project file
     // replacing `budgets`/`contracts` is reported in file order.
     if (Object.prototype.hasOwnProperty.call(raw, 'budgets')) {
-        const parsed = parseBudgetList(raw['budgets'], { file: file.file, report: (problem) => { problems.push(problem); logger?.warn(problem) } })
+        const parsed = parseBudgetList(raw['budgets'], {
+            file: file.file,
+            report: (problem) => {
+                problems.push(problem)
+                logger?.warn(problem)
+            },
+            // A project file may relocate a budget's baseline INSIDE the workspace
+            // and never outside it (see `parseBudgetList`).
+            cwd: layout.cwd,
+        })
         if (parsed === undefined) {
             const problem = `${file.file}: budgets 必须是数组，已忽略项目级预算（继续使用 profile 的预算）`
             problems.push(problem)
@@ -359,11 +368,22 @@ export function parseCommand(
  * are not the host's. A malformed entry is reported AND kept — the check refuses
  * it later with its own message, which is better than a rule that quietly
  * stopped existing.
+ *
+ * `baselineFile` is the one entry that names a WRITE target, so when the caller
+ * passes the workspace (`cwd`) the value must stay inside it: a project may keep
+ * its baseline history somewhere else in the repository, never in another
+ * repository or an absolute path of its choosing. A violating value is reported
+ * and DROPPED, which keeps this budget on the default `<rootDir>/budgets.json`
+ * (the same rule as every other project-overridable path in the suite: an
+ * unusable value keeps the host's value and is never silent).
  * @param value - the untrusted list.
- * @param options - provenance label and problem sink.
+ * @param options - provenance label, problem sink and (for project files) the workspace.
  * @returns the parsed budgets, or `undefined` when the value is not an array.
  */
-export function parseBudgetList(value: unknown, options: { file: string; report: (problem: string) => void }): BudgetConfig[] | undefined {
+export function parseBudgetList(
+    value: unknown,
+    options: { file: string; report: (problem: string) => void; cwd?: string },
+): BudgetConfig[] | undefined {
     if (!Array.isArray(value)) return undefined
     const parsed: BudgetConfig[] = []
     const seen = new Set<string>()
@@ -375,6 +395,13 @@ export function parseBudgetList(value: unknown, options: { file: string; report:
             continue
         }
         seen.add(result.budget.id)
+        if (options.cwd !== undefined && result.budget.baselineFile !== undefined) {
+            const contained = containedPath(options.cwd, result.budget.baselineFile, `预算 "${result.budget.id}" 的 baselineFile`)
+            if (!contained.ok) {
+                options.report(`${options.file}: ${contained.problem}（这条预算改用默认的 <rootDir>/budgets.json）`)
+                delete result.budget.baselineFile
+            }
+        }
         parsed.push(result.budget)
     }
     return parsed

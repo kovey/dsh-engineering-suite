@@ -7,6 +7,7 @@
  * `ctx.subprocess`, so the observed "runs" are exactly the ones this file wrote.
  */
 import assert from 'node:assert/strict'
+import { execFileSync } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -328,7 +329,21 @@ test('flaky: a plan refuses to quarantine an unowned test, and escalates an expi
         evidencePath: 'flaky/20260928-120000-plan.json',
     })
     assert.equal(entry?.quarantineCommand, quarantineCommandFor(file, entry.quarantineRow as QuarantineRow))
-    assert.match(entry?.quarantineCommand ?? '', /^printf '%s\\n' '\{.*\}' >> /)
+    assert.match(entry?.quarantineCommand ?? '', /^node -e /)
+    // The printed command is what a human pastes, so it must be correct for
+    // arbitrary test names and paths — run it, with both made hostile.
+    const hostile = path.join(cwd, 'led ger with space.jsonl')
+    const hostileRow: QuarantineRow = {
+        at: 7,
+        test: `Test with 'quote' and $(echo nope) and "double"`,
+        owner: 'platform-team',
+        expiresAt: 9,
+        reason: "reason with 'quotes'",
+        evidencePath: 'flaky/x.json',
+    }
+    execFileSync('bash', ['-c', quarantineCommandFor(hostile, hostileRow)], { cwd })
+    const rows = fs.readFileSync(hostile, 'utf8').trim().split('\n').map((line) => JSON.parse(line) as QuarantineRow)
+    assert.deepEqual(rows, [hostileRow], 'the command appends exactly this row, whatever the name contains')
     assert.equal(withOwner.summary.refused, 0)
 })
 
@@ -562,4 +577,83 @@ test('flaky: the plugin declares its name and injects the two services it uses',
     assert.match(section, /隔离是向未来借的债，不是修复/)
     assert.match(section, /不能继续挂着/)
     assert.match(section, /owner=team-a/)
+})
+
+// --- adversarial-audit regressions: report mode, path containment, injection ---
+
+test('flaky_status: a report that only carries tallies never accuses a quarantine it proves ran (regression)', async () => {
+    const cwd = tempWorkspace('flaky-status-report-')
+    // Exactly the shape dsh-coverage-gate's flaky_check writes: tallies DO name
+    // the tests, the runs carry only exit codes.
+    fs.writeFileSync(
+        path.join(cwd, 'flaky.json'),
+        JSON.stringify({
+            runs: [
+                { index: 1, exitCode: 0, timedOut: false, outcome: 'pass' },
+                { index: 2, exitCode: 1, timedOut: false, outcome: 'fail' },
+                { index: 3, exitCode: 0, timedOut: false, outcome: 'pass' },
+            ],
+            flakyTests: [{ name: 'TestRan', passed: 2, failed: 1, times: [true, false, true] }],
+            stableTests: [{ name: 'TestOther', passed: 3, failed: 0 }],
+            inconclusiveTests: [],
+        }),
+    )
+    const fake = host(cwd, { flaky: { owner: 'team-a' } })
+    const stores = bindMission(cwd)
+    assert.equal((await fake.runTool('flaky_plan', { report: 'flaky.json' })).isError, false)
+    // A human quarantined the test the report counts — this is the row the plan
+    // told them to write.
+    const ledger = path.join(cwd, '.dsh', 'flaky-quarantine.json')
+    const days = 10 * 24 * 60 * 60 * 1_000
+    const rows: QuarantineRow[] = [
+        { at: 1, test: 'TestRan', owner: 'team-a', expiresAt: Date.now() + days, reason: 'flaky', evidencePath: 'flaky/x.json' },
+        { at: 2, test: 'TestVanished', owner: 'team-a', expiresAt: Date.now() + days, reason: 'flaky', evidencePath: 'flaky/y.json' },
+    ]
+    fs.writeFileSync(ledger, rows.map((row) => JSON.stringify(row)).join('\n') + '\n')
+
+    const text = runText(await fake.runTool('flaky_status', { missionId: 'm1' }))
+    // The report's own caveat is rendered (it was dropped before), and the check
+    // uses the tallies as the observed set instead of "no name = not seen".
+    assert.match(text, /说明：报告只带运行级结果/)
+    assert.match(text, /报告的用例计数里没有覆盖全部 3 次运行/)
+    // The accusation is reserved for the test the report really never names.
+    assert.match(text, /TestVanished/)
+    assert.match(text, /报告的 3 次运行里完全没有它/)
+    const accused = text.split('\n').filter((line) => line.includes('覆盖正在静默消失'))
+    assert.equal(accused.length, 1, 'exactly one quarantine is reported as silently disappearing')
+    assert.match(accused[0] ?? '', /TestVanished/)
+    assert.equal(/TestRan.*覆盖正在静默消失/.test(text), false, 'a test the tallies prove ran is never accused')
+    assert.deepEqual(stores.for(cwd).readEvidence('m1').length > 0, true)
+
+    // With only the covered test quarantined the check PASSES — the case the audit
+    // found accusing every quarantine of "覆盖正在静默消失".
+    fs.writeFileSync(ledger, `${JSON.stringify(rows[0])}\n`)
+    const covered = runText(await fake.runTool('flaky_status', { missionId: 'm1' }))
+    assert.match(covered, /"最近 3 次运行没出现"检查：通过（报告没有逐次点名/)
+    assert.equal(/覆盖正在静默消失/.test(covered), false, 'nothing is accused when the counts cover every quarantine')
+})
+
+test('a project file may not point the quarantine ledger outside the workspace (regression)', () => {
+    const cwd = tempWorkspace('flaky-quarantine-escape-')
+    const outside = tempWorkspace('flaky-quarantine-outside-')
+    fs.mkdirSync(path.join(cwd, '.dsh'), { recursive: true })
+    fs.writeFileSync(
+        path.join(cwd, '.dsh', 'impact-gate.json'),
+        JSON.stringify({ flaky: { quarantineFile: path.join(outside, 'ledger.jsonl') } }),
+    )
+    clearProjectConfigCache()
+    const stores = new MissionStoreRegistry([])
+    const hostConfig = resolveConfig({ logFile: 'impact-gate.log' })
+    const effective = resolveEffectiveConfig(hostConfig, stores.for(cwd).layout)
+    assert.match(effective.problems.join('\n'), /flaky\.quarantineFile 必须指向工作区内的路径/)
+    assert.equal(effective.config.flaky.quarantineFile, undefined, 'the escaping value keeps the profile value')
+    assert.equal(effective.source, 'profile', 'a refused key is not "applied"')
+    // A workspace-relative relocation is still allowed.
+    fs.writeFileSync(
+        path.join(cwd, '.dsh', 'impact-gate.json'),
+        JSON.stringify({ flaky: { quarantineFile: '.dsh/q.json' } }),
+    )
+    clearProjectConfigCache()
+    const relocated = resolveEffectiveConfig(hostConfig, stores.for(cwd).layout)
+    assert.equal(relocated.config.flaky.quarantineFile, '.dsh/q.json')
 })

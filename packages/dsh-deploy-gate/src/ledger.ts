@@ -18,7 +18,9 @@
  * @module dsh-deploy-gate/ledger
  */
 
-import { appendJsonl, readText, shortDigest, stamp } from 'dsh-eng-core'
+import { appendJsonl, ensureDir, readText, shortDigest, stamp } from 'dsh-eng-core'
+import fs from 'node:fs'
+import path from 'node:path'
 
 /**
  * How one deployment attempt ended.
@@ -136,6 +138,29 @@ export function readLedger(file: string): LedgerRead {
 /** Append one row (single line, create the file when missing). */
 export function appendLedgerRow(file: string, row: LedgerRow): void {
     appendJsonl(file, row)
+}
+
+/**
+ * Whether the ledger can be appended to AT ALL (a directory in the path, a
+ * read-only file, a missing permission).
+ *
+ * `appendLedgerRow` throws on every one of those — and by the time it does, the
+ * deployment commands have already run against the environment. So the
+ * writability is probed BEFORE anything executes: a ledger that cannot record
+ * the deployment is a configuration failure, not something to discover after
+ * touching production. The probe opens the file for append (creating it exactly
+ * like the first row would) and closes it without writing a byte.
+ * @param file - absolute ledger path.
+ * @returns `ok`, or the reason the ledger cannot be written.
+ */
+export function ledgerWritable(file: string): { ok: true } | { ok: false; reason: string } {
+    try {
+        ensureDir(path.dirname(file))
+        fs.closeSync(fs.openSync(file, 'a'))
+        return { ok: true }
+    } catch (error) {
+        return { ok: false, reason: error instanceof Error ? error.message : String(error) }
+    }
 }
 
 /** A readable, collision-free deployment id. */

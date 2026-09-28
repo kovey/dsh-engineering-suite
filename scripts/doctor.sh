@@ -9,7 +9,7 @@
 #   bash scripts/doctor.sh ~/workspace/repo # 检查指定仓库
 #   bash scripts/doctor.sh --json           # 机器可读
 #
-# exit: 0 = 必需项全部就绪；1 = 有必需项未就绪
+# exit: 0 = 必需项全部就绪；1 = 有必需项未就绪；2 = 用法错误（缺值/不认识的参数）
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 

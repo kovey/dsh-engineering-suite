@@ -34,7 +34,7 @@ import { spawnSync } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
 import { appendJsonl, readJson, readJsonl } from './io.js'
-import type { Layout } from './paths.js'
+import { isReallyInside, realTargetOf, type Layout } from './paths.js'
 
 /** One mission considered for archiving. */
 export interface ArchiveCandidate {
@@ -95,6 +95,28 @@ function receiptsOf(layout: Layout, missionId: string): number {
     }
 }
 
+/**
+ * Refuse to plan or perform an archive when the missions directory is not
+ * really inside the workspace.
+ *
+ * Archiving is the one operation in this suite that MOVES evidence, so it is
+ * also the one that must not trust a path: `isInside` alone compares lexical
+ * paths, and `.dsh/missions` may be a symlink to a shared/external store — the
+ * move then empties that store into this repository's archive directory (a
+ * reproduced data-loss report). The containment root is the workspace itself
+ * (`layout.cwd`), because "move it into <root>/archive" only makes sense for a
+ * trail that belongs to this repository.
+ * @param layout - the layout the archive would operate on.
+ * @throws when the real missions directory escapes the real workspace.
+ */
+export function assertMissionsInsideWorkspace(layout: Layout): void {
+    if (isReallyInside(layout.cwd, layout.missionsDir)) return
+    throw new Error(
+        `missions 台账逃出了工作区：${realTargetOf(layout.missionsDir)} 不在 ${realTargetOf(layout.cwd)} 内 —— ` +
+            `归档会把 mission 移出它的真实目录（共享/外部台账会被搬空），拒绝执行`,
+    )
+}
+
 /** Directory size in bytes, bounded so a huge trail cannot stall planning. */
 function sizeOf(dir: string, budgetMs = 1_000): number {
     const started = Date.now()
@@ -140,6 +162,7 @@ function readMissionMeta(layout: Layout, missionId: string): { title: string; cr
  * @param options - layout, keep/age/undelivered rules, clock.
  */
 export function planArchive(options: ArchiveOptions): ArchivePlan {
+    assertMissionsInsideWorkspace(options.layout)
     const keep = Math.max(0, options.keep ?? 20)
     const now = options.now ?? Date.now()
     const cutoff = (options.olderThanDays ?? 0) > 0 ? now - (options.olderThanDays ?? 0) * 86_400_000 : undefined
@@ -219,6 +242,9 @@ export function archiveIndexFile(layout: Layout): string {
  * @param options - same rules as the plan, plus `dryRun`.
  */
 export function archiveMissions(options: ArchiveOptions & { dryRun?: boolean }): ArchiveResult {
+    // Belt and braces: planArchive already checks, but the MOVING path must be
+    // unable to run without the check even if the planning path changes.
+    assertMissionsInsideWorkspace(options.layout)
     const plan = planArchive(options)
     const archiveDir = archiveDirOf(options.layout)
     const dryRun = options.dryRun === true

@@ -35,6 +35,7 @@
 
 import path from 'node:path'
 import {
+    containedPath,
     exists,
     formatTime,
     outputDigestOf,
@@ -743,6 +744,32 @@ export function baselineFileFor(budget: BudgetConfig, options: { cwd: string; ro
     return path.isAbsolute(budget.baselineFile) ? budget.baselineFile : path.resolve(options.cwd, budget.baselineFile)
 }
 
+/**
+ * Refuse a baseline file that a budget points outside the workspace.
+ *
+ * The baseline is a record ABOUT this repository, and `budget_check` both reads
+ * and WRITES it, so an escaping path is not a layout preference: it read-modify-
+ * writes a file some other project (or tool) owns — the audit that found this
+ * rewrote another project's `budgets.json` while reporting PASS. Only an
+ * EXPLICIT `baselineFile` is judged: the default follows the host-owned
+ * `rootDir`, which the profile may legitimately place anywhere.
+ * @param budgets - the budgets this run selected.
+ * @param cwd - the workspace root.
+ */
+export function baselinePathProblems(budgets: readonly BudgetConfig[], cwd: string): string[] {
+    const problems: string[] = []
+    for (const budget of budgets) {
+        if (budget.baselineFile === undefined) continue
+        const contained = containedPath(cwd, budget.baselineFile, `预算 "${budget.id}" 的 baselineFile`)
+        if (contained.ok) continue
+        problems.push(
+            `${contained.problem}。下一步：把这个 budget 的 baselineFile 写成工作区内的相对路径（或删掉它，用默认的 <rootDir>/budgets.json）；` +
+                '基线要跟被测仓库放在一起，否则回归护栏记录在别人的文件里。',
+        )
+    }
+    return problems
+}
+
 /** One budget's history, or the reason it cannot be read. */
 export interface BaselineRead {
     entries: BaselineEntry[]
@@ -756,7 +783,11 @@ export interface BaselineRead {
  * A MISSING file is "no history yet" (the first run legitimately has none). A
  * file that exists but cannot be parsed is a REFUSAL: reading it as "no
  * history" would silently drop the regression guard and turn this run into a
- * green first run.
+ * green first run. A file that parses but is NOT a baseline document (`{
+ * budgets: { … } }`) is refused for the same reason — and a stronger one: the
+ * write side would otherwise REPLACE the whole document, destroying whatever
+ * the file really was (a hand-kept ledger, another tool's data), so "I did not
+ * recognise this" must never be read as "it is empty".
  */
 export function readBaseline(file: string, budgetId: string): BaselineRead {
     if (!exists(file)) return { entries: [] }
@@ -770,13 +801,17 @@ export function readBaseline(file: string, budgetId: string): BaselineRead {
         }
     }
     const budgets = (parsed as { budgets?: unknown }).budgets
-    if (budgets !== undefined && !isRecord(budgets)) {
+    if (!isRecord(budgets)) {
         return {
             entries: [],
-            problem: `基线文件 ${file} 的 "budgets" 字段必须是对象（每个预算 id 一个历史数组）。下一步：修复该文件，或删掉它重新记录基线。`,
+            problem:
+                `基线文件 ${file} 不是本门禁的基线文档（期望 { "version": 1, "budgets": { "<预算 id>": [ … ] } }，` +
+                `实际顶层键：${Object.keys(parsed as object).join(', ') || '(无)'}）。` +
+                `按 fail closed 拒绝判定：把它当成"没有历史"会悄悄丢掉回归护栏，而且下一次测量会把这份文件整个覆盖掉。` +
+                `下一步：确认这个文件是谁的——属于别的工具就换一个路径（ budgets[].baselineFile ），是本门禁的就修好它或删掉它重新记录基线。`,
         }
     }
-    const entries = isRecord(budgets) ? budgets[budgetId] : undefined
+    const entries = budgets[budgetId]
     if (entries === undefined) return { entries: [] }
     if (!Array.isArray(entries)) {
         return {
@@ -800,15 +835,34 @@ export function readBaseline(file: string, budgetId: string): BaselineRead {
     return { entries: usable }
 }
 
-/** Append one measurement to a budget's history (read-modify-write, atomic). */
+/**
+ * Append one measurement to a budget's history (read-modify-write, atomic).
+ *
+ * Fail closed on a document this function does not recognise: the write
+ * REPLACES the whole file, so "I could not parse it" (or "it has no `budgets`
+ * object") must never be treated as "it is empty" — that is what turned another
+ * project's JSON into a single budget row. The caller has already read the file
+ * with {@link readBaseline}, which refuses the same shapes with a fix.
+ */
 export function appendBaseline(file: string, budgetId: string, entry: BaselineEntry): void {
-    const current = readJson<BudgetBaselineFile>(file)
-    const previous = isRecord(current?.budgets) ? (current?.budgets as Record<string, BaselineEntry[]>) : {}
-    const history = Array.isArray(previous[budgetId]) ? (previous[budgetId] as BaselineEntry[]) : []
-    writeJsonAtomic(file, {
-        version: 1,
-        budgets: { ...previous, [budgetId]: [...history, entry] },
-    } satisfies BudgetBaselineFile)
+    if (exists(file)) {
+        const current = readJson<BudgetBaselineFile>(file)
+        if (current === undefined || !isRecord((current as { budgets?: unknown }).budgets)) {
+            throw new Error(
+                `拒绝写入基线文件 ${file}：它存在，但不是本门禁的基线文档（期望 { "version": 1, "budgets": { … } }）。` +
+                    `追加会整份覆盖它，所以按 fail closed 停下。` +
+                    `下一步：确认这个路径属于谁（ budgets[].baselineFile ），换一个路径，或把它修好/删掉后重新记录基线。`,
+            )
+        }
+        const previous = (current as { budgets: Record<string, BaselineEntry[]> }).budgets
+        const history = Array.isArray(previous[budgetId]) ? (previous[budgetId] as BaselineEntry[]) : []
+        writeJsonAtomic(file, {
+            version: 1,
+            budgets: { ...previous, [budgetId]: [...history, entry] },
+        } satisfies BudgetBaselineFile)
+        return
+    }
+    writeJsonAtomic(file, { version: 1, budgets: { [budgetId]: [entry] } } satisfies BudgetBaselineFile)
 }
 
 /** The number a `regex` extracted from a command's output. */
@@ -1196,7 +1250,7 @@ export async function runBudgets(options: BudgetRunOptions): Promise<BudgetRun> 
             ].join('\n'),
         }
     }
-    const problems = preflightBudgets(budgets, config, options.cwd)
+    const problems = [...preflightBudgets(budgets, config, options.cwd), ...baselinePathProblems(budgets, options.cwd)]
     if (problems.length > 0) {
         return {
             ok: false,

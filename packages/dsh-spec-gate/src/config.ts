@@ -4,7 +4,7 @@
  * @module dsh-spec-gate/config
  */
 
-import { loadProjectConfig, type Layout, type LayoutOptions, type Logger } from 'dsh-eng-core'
+import { containedPath, loadProjectConfig, type Layout, type LayoutOptions, type Logger } from 'dsh-eng-core'
 import { DEFAULT_ADR_DIR, DEFAULT_ADR_INDEX_FILE } from './adr.js'
 import { DEFAULT_PLAN_FILE } from './plan-ledger.js'
 
@@ -193,9 +193,41 @@ export function resolveEffectiveConfig(host: SpecGateConfig, layout: Layout, log
             logger?.warn(problem)
         }
     }
+    // The three path keys are WRITE targets (the plan ledger, the ADR directory
+    // and its index). A project may relocate those records INSIDE its own
+    // workspace and never outside it: `adrDir: "/tmp/…"` (or `../../…`) would
+    // hide the record from the people reviewing this repository and drop files
+    // into a directory the workspace does not own. A violating value keeps the
+    // profile's value (never a plugin default that silently widens the layout)
+    // and is reported as a problem; a refused key is not "applied".
+    const refusedKeys = new Set<string>()
+    const projectPath = (key: 'planFile' | 'adrDir' | 'adrIndexFile'): string | undefined => {
+        if (!Object.prototype.hasOwnProperty.call(raw, key)) return undefined
+        const value = raw[key]
+        if (typeof value !== 'string' || value.trim() === '') {
+            const problem = `${file.file}: ${key} 必须是非空字符串（收到 ${JSON.stringify(value)}），已忽略该项目级取值（继续使用 profile 配置）`
+            problems.push(problem)
+            logger?.warn(problem)
+            refusedKeys.add(key)
+            return undefined
+        }
+        const contained = containedPath(layout.cwd, value, key)
+        if (!contained.ok) {
+            const problem = `${file.file}: ${contained.problem}（继续使用 profile 配置的 ${key}=${host[key]}）`
+            problems.push(problem)
+            logger?.warn(problem)
+            refusedKeys.add(key)
+            return undefined
+        }
+        return value
+    }
+    const planFile = projectPath('planFile')
+    const adrDir = projectPath('adrDir')
+    const adrIndexFile = projectPath('adrIndexFile')
+
     // Same provenance rule as `dsh-quality-gate`/`dsh-evidence-gate`: report
     // 'project' only when the file really changed something.
-    const appliedKeys = Object.keys(raw).filter((key) => PROJECT_OVERRIDABLE_KEYS.includes(key))
+    const appliedKeys = Object.keys(raw).filter((key) => PROJECT_OVERRIDABLE_KEYS.includes(key) && !refusedKeys.has(key))
     if (appliedKeys.length === 0) return { config: host, source: 'profile', file: file.file, problems }
 
     const requireTestDesignRaw = raw['requireTestDesign']
@@ -216,9 +248,9 @@ export function resolveEffectiveConfig(host: SpecGateConfig, layout: Layout, log
                 : host.reviewChannel,
         reviewTimeoutMs: Math.max(1_000, Math.floor(num(raw['reviewTimeoutMs'], host.reviewTimeoutMs))),
         bootstrap: mergeBootstrap(raw['bootstrap'], host.bootstrap),
-        planFile: str(raw['planFile'], host.planFile),
-        adrDir: str(raw['adrDir'], host.adrDir),
-        adrIndexFile: str(raw['adrIndexFile'], host.adrIndexFile),
+        planFile: planFile ?? host.planFile,
+        adrDir: adrDir ?? host.adrDir,
+        adrIndexFile: adrIndexFile ?? host.adrIndexFile,
         milestoneRequired: bool(raw['milestoneRequired'], host.milestoneRequired),
     }
     logger?.info(

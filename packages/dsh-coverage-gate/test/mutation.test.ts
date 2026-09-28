@@ -460,10 +460,14 @@ test('mutation: an external edit during the run is a refusal, not a silent overw
             assert.ok(error instanceof MutationRestoreError)
             assert.match(error.message, /在变异体 .* 运行期间被外部改动/)
             assert.match(error.message, /下一步：确认没有别的进程/)
+            assert.match(error.message, /本工具没有还原它/)
             return true
         },
     )
-    assert.equal(fs.readFileSync(file, 'utf8'), SOURCE, 'the pre-run bytes are restored before the refusal is raised')
+    // The other writer's bytes stay exactly as written: putting our pre-run
+    // snapshot back over them would destroy work, and the refusal would claim
+    // the opposite ("为了避免覆盖别人的改动" while overwriting it).
+    assert.equal(fs.readFileSync(file, 'utf8'), 'const someoneElse = 9\n', 'an external edit is left as the external writer wrote it')
 })
 
 test('mutation: the time budget stops the run, and the partial result says it is partial', async () => {
@@ -876,4 +880,124 @@ test('mutation_check: a hung suite stops the plan inside the time budget and rep
     const executed = Number.parseInt(/跑过 (\d+) 个/.exec(text)?.[1] ?? '0', 10)
     assert.ok(executed > 0 && executed < 10, `the run is partial, not extrapolated (executed=${executed})`)
     assert.equal(MUTATION_OPERATORS.length, 16, 'the operator table is the documented set')
+})
+
+// --- adversarial-audit regressions (data loss, path escape, wrong verdict) ---
+
+test('mutation: a symlink is never a mutation target, so nothing outside the workspace is written', async () => {
+    const root = tempWorkspace('mut-symlink-')
+    const cwd = path.join(root, 'repo')
+    const outside = path.join(root, 'other-repo')
+    fs.mkdirSync(path.join(cwd, 'src'), { recursive: true })
+    fs.mkdirSync(outside, { recursive: true })
+    write(cwd, 'src/ok.ts', SMALL)
+    const victim = write(outside, 'lib.ts', 'export const limit = 10 > 3\nexport const flag = true\n')
+    fs.symlinkSync(victim, path.join(cwd, 'src', 'linked.ts'))
+    fs.symlinkSync(outside, path.join(cwd, 'src', 'elsewhere'))
+
+    const collected = await collectSourceFiles({ cwd, sourceGlobs: ['**/*.ts'] })
+    assert.deepEqual(collected.files.map((file) => file.path), ['src/ok.ts'], 'a symlink to a file is not a source file this gate may rewrite')
+    const linked = collected.skipped.find((entry) => entry.path === 'src/linked.ts')
+    assert.match(linked?.reason ?? '', /是符号链接/)
+    assert.equal(linked?.unusable, true, 'a file that could have been mutated but was skipped is not coverage')
+
+    // A hand-made plan that bypasses the selection is refused too — before any write.
+    const plan = planMutants({ files: [{ path: 'src/linked.ts', text: 'export const limit = 10 > 3\n' }] })
+    await assert.rejects(
+        runMutationPlan(plan, { cwd, argv: ['node', '-e', '0'], timeoutMs: 1_000, timeBudgetMs: 60_000, run: async () => ({ exitCode: 0 }) }),
+        (error: unknown) => {
+            assert.match(String((error as Error).message), /不能作为变异目标：是符号链接/)
+            assert.match(String((error as Error).message), /本次没有改写任何文件/)
+            return true
+        },
+    )
+    assert.equal(fs.readFileSync(victim, 'utf8'), 'export const limit = 10 > 3\nexport const flag = true\n', 'the file outside the workspace is untouched')
+})
+
+test('mutation: a file this run did not write keeps an external change instead of being restored over it', async () => {
+    const cwd = tempWorkspace('mut-interfere-')
+    const other = write(cwd, 'src/b.ts', SMALL)
+    write(cwd, 'src/a.ts', SMALL)
+    const files = ['src/a.ts', 'src/b.ts'].map((file) => ({ path: file, text: SMALL }))
+    const plan = planMutants({ files })
+    assert.equal(plan.mutants[0]?.file, 'src/a.ts', 'the plan runs file by file, a.ts first')
+    const external = 'const someoneElse = 9\n'
+    await assert.rejects(
+        runMutationPlan(plan, {
+            cwd,
+            argv: ['node', '-e', '0'],
+            timeoutMs: 1_000,
+            timeBudgetMs: 60_000,
+            run: async () => {
+                // An external writer touches a file THIS RUN HAS NOT MUTATED YET.
+                fs.writeFileSync(other, external)
+                return { exitCode: 0, durationMs: 1 }
+            },
+        }),
+        (error: unknown) => {
+            assert.ok(error instanceof MutationRestoreError)
+            assert.match(error.message, /src\/b\.ts 在本次运行期间被外部改动/)
+            assert.match(error.message, /本工具没有写它/)
+            return true
+        },
+    )
+    assert.equal(fs.readFileSync(other, 'utf8'), external, 'the external content is the current work: it is never replaced by our snapshot')
+})
+
+test('mutation: an external change to an unmutated file fails the end-of-run check closed', async () => {
+    const cwd = tempWorkspace('mut-interfere2-')
+    const other = write(cwd, 'src/b.ts', SMALL)
+    write(cwd, 'src/a.ts', SMALL)
+    const files = ['src/a.ts', 'src/b.ts'].map((file) => ({ path: file, text: SMALL }))
+    // The budget ends the run after a.ts, so the loop never reaches b.ts: only
+    // the end-of-run comparison can notice — and it must refuse to give a verdict
+    // instead of reporting on a workspace that was not restored.
+    const plan = planMutants({ files })
+    let clock = 0
+    await assert.rejects(
+        runMutationPlan(plan, {
+            cwd,
+            argv: ['node', '-e', '0'],
+            timeoutMs: 1_000,
+            timeBudgetMs: 60_000,
+            now: () => clock,
+            run: async () => {
+                clock += 60_000
+                fs.writeFileSync(other, 'const someoneElse = 9\n')
+                return { exitCode: 0, durationMs: 1 }
+            },
+        }),
+        (error: unknown) => {
+            assert.ok(error instanceof MutationRestoreError)
+            assert.match(error.message, /src\/b\.ts/)
+            assert.match(error.message, /与运行前的字节快照不一致/)
+            assert.match(error.message, /没有给出任何裁决|不给出任何裁决/)
+            return true
+        },
+    )
+    assert.equal(fs.readFileSync(other, 'utf8'), 'const someoneElse = 9\n')
+})
+
+test('mutation_check: a source file that could not be mutated makes the verdict partial and is named', async () => {
+    const cwd = gitWorkspace('mut-skip-tool-')
+    write(cwd, 'src/ok.ts', 'export const below = (x: number) => x < 10\n')
+    // Not valid UTF-8: text mutation could not guarantee a byte-exact restore,
+    // so the file is skipped — and "every file was mutated" would be a lie.
+    fs.writeFileSync(path.join(cwd, 'src', 'bad.ts'), Buffer.from([0x65, 0x78, 0x70, 0xff, 0xfe, 0x0a]))
+    execFileSync('git', ['add', '-A'], { cwd, stdio: 'ignore' })
+    execFileSync('git', ['commit', '-qm', 'init'], { cwd, stdio: 'ignore' })
+    const { id } = bindMission(cwd, '跳过文件')
+    const fake = host(cwd, {
+        mutation: { enabled: true, testCommand: 'node --test test/suite.ts', thresholds: { mutationScore: 0 } },
+    })
+    provideSubprocess(fake, scriptedSubprocess(() => ({ exitCode: 0 })))
+    const text = runText(await fake.runTool('mutation_check', { missionId: id }))
+    assert.match(text, /变异测试（mutation）：PASS/)
+    assert.match(text, /覆盖范围：部分/)
+    assert.match(text, /scope\.full=false 的原因：.*1 个本该参与变异的源码文件没有被变异/)
+    assert.match(text, /没有被变异的源码文件（1 个/)
+    assert.match(text, /src\/bad\.ts：不是合法 UTF-8/)
+    const gate = new MissionStoreRegistry().for(cwd).lastGate(id, { source: 'dsh-coverage-gate' })
+    assert.equal(gate?.scope?.full, false, 'a skipped source file is not covered')
+    assert.deepEqual(gate?.scope?.selected, ['src/ok.ts'])
 })
