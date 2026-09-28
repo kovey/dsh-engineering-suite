@@ -31,7 +31,7 @@ spec-gate  test-design-  spec-gate  role-  quality-   evidence-gate
 |---|---|---|
 | 规划 | spec-gate（需求/验收标准/边界/负面约束/增改删/里程碑/跨 mission 台账/ADR）、test-design-gate、impact-gate | `spec-approved`、`test-design` |
 | 实现 | role-guard（权限/模型/派发）、standards-gate（规范棘轮）、quality-gate（写后 lint）、supply-chain-gate、audit-trail | `standards-pass`（可选） |
-| 测试 | quality-gate（跑命令）、coverage-gate（覆盖率/增量/flaky）、impact-gate（最小回归集）、test-design-gate | `quality-pass` |
+| 测试 | quality-gate（跑命令 + 指标预算 + 契约冒烟）、coverage-gate（覆盖率/增量/flaky/变异）、impact-gate（最小回归集 + flaky 隔离计划）、test-design-gate | `quality-pass` |
 | 交互 | interaction-gate（ask/notify/progress + 通道注册 + 决定台账）、宿主的 approval 接缝 | 横切，无阶段门禁 |
 | 交付 | evidence-gate（证据→门禁→回执/发布台账）、audit-trail、orchestrator（回执门禁） | `receipt` |
 | 部署 | deploy-gate（环境清单 → go/no-go → 人工批准 → 执行 → 上线后验证 → 回滚） | `deploy-go`、`deploy-verified` |
@@ -48,7 +48,7 @@ spec-gate  test-design-  spec-gate  role-  quality-   evidence-gate
 | `dsh-role-guard` | `role-guard` | 角色文件（persona/模型/工具/技能白名单）+ 最小权限派发 + 只读评审服务 | `team_delegate`、`role_list` |
 | `dsh-spec-gate` | `spec-gate` | 结构化规格 + 人工审批 + 写操作前置拦截 + 需求增改删 + 存量仓库规格接入 | `spec_create`、`spec_approve`、`spec_amend`、`spec_status`、`spec_bootstrap` |
 | `dsh-test-design-gate` | `test-design-gate` | 把测试设计嵌进规格并自动评审（覆盖度/场景完整性/可执行性） | `test_design_review`、`test_design_template` |
-| `dsh-quality-gate` | `quality-gate` | 宿主配置命令的三态门禁 + 写后 lint 回路 + 收尾阻断 | `quality_gate_run`、`quality_gate_status` |
+| `dsh-quality-gate` | `quality-gate` | 宿主配置命令的三态门禁 + 写后 lint 回路 + 收尾阻断 + **指标预算与契约冒烟** | `quality_gate_run`、`quality_gate_status`、`budget_check`、`contract_check` |
 | `dsh-evidence-gate` | `evidence-gate` | Mission → Evidence → Gate → Receipt，缺失证据 fail closed | `evidence_record`、`evidence_status`、`mission_complete` |
 | `dsh-audit-trail` | `audit-trail` | 全量工具调用 JSONL 审计 + 写前快照 + 按轮次回滚 | `audit_report`、`audit_rewind` |
 | `dsh-orchestrator` | `orchestrator` | 阶段流水线、入口/出口门禁、回退、熔断、断点恢复、按难度选模型、阶段自主派发 | `orchestrate` |
@@ -56,8 +56,8 @@ spec-gate  test-design-  spec-gate  role-  quality-   evidence-gate
 | `dsh-suite-doctor` | `suite-doctor` | 统一入口与自检：阶段、门禁配置、缺失项、待审批、台账规模（离线判定 + 运行时事实） | `suite_status` |
 | `dsh-deploy-gate` | `deploy-gate` | 部署层：环境清单、go/no-go、人工批准、灰度/回滚、上线后验证、部署台账 | `deploy_plan`、`deploy_run`、`deploy_verify`、`deploy_rollback`、`deploy_status` |
 | `dsh-standards-gate` | `standards-gate` | 代码规范门禁：仓库自有阈值、基线棘轮、只读结构评审 | `standards_check`、`standards_bootstrap`、`standards_review`、`standards_status` |
-| `dsh-impact-gate` | `impact-gate` | 变更影响分析：反向依赖闭包、最小回归测试集、风险分级 | `impact_analyze`、`impact_tests`、`impact_status` |
-| `dsh-coverage-gate` | `coverage-gate` | 测试有效性：四种覆盖率报告、增量覆盖率、flaky 检测 | `coverage_check`、`flaky_check`、`coverage_status` |
+| `dsh-impact-gate` | `impact-gate` | 变更影响分析：反向依赖闭包、最小回归测试集、风险分级、**flaky 隔离计划（带 owner 与到期）** | `impact_analyze`、`impact_tests`、`impact_status`、`flaky_plan`、`flaky_status` |
+| `dsh-coverage-gate` | `coverage-gate` | 测试有效性：覆盖率（含增量）、flaky 检测、**变异测试**（存活变异体逐条列出） | `coverage_check`、`flaky_check`、`coverage_status`、`mutation_check` |
 | `dsh-supply-chain-gate` | `supply-chain-gate` | 密钥扫描（分级+脱敏）、新增依赖人工审批、依赖审计 | `secret_scan`、`dependency_audit`、`supply_chain_status` |
 
 ## 快速开始

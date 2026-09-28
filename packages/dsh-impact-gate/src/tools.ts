@@ -47,6 +47,22 @@ import {
     type SelectedTest,
 } from 'dsh-eng-core'
 import { TEMPLATE_EXAMPLES, type EffectiveConfig, type ImpactGateConfig } from './config.js'
+import {
+    buildPlan,
+    clampRuns,
+    currentQuarantines,
+    DEFAULT_UNSEEN_RUNS,
+    listFlakyPlans,
+    observeRuns,
+    quarantineFileFor,
+    readQuarantine,
+    readReport,
+    renderPlan,
+    renderStatus as renderFlakyStatus,
+    repeatCommand,
+    tallyRuns,
+    type FlakyPlan,
+} from './flaky.js'
 import { runImpactReview, selectReviewTargets, type ReviewOutcome, type SubagentsLike } from './review.js'
 
 const TEXT_OUTPUT = { type: 'string' } as const
@@ -91,6 +107,8 @@ export interface ToolDeps {
     stores: MissionStoreRegistry
     /** `ctx.get('subagents')`, used only when `reviewDispatch.enabled`. */
     subagents: () => SubagentsLike | undefined
+    /** `ctx.get('subprocess')`, used by `flaky_plan`'s repeated-run mode. */
+    subprocess: () => unknown
     logger?: Logger
 }
 
@@ -109,6 +127,19 @@ interface TestsArgs extends AnalyzeArgs {
 
 /** Arguments of `impact_status`. */
 interface StatusArgs {
+    missionId?: string
+}
+
+/** Arguments of `flaky_plan`. */
+interface FlakyPlanArgs {
+    missionId?: string
+    report?: string
+    runs?: number
+    command?: string
+}
+
+/** Arguments of `flaky_status`. */
+interface FlakyStatusArgs {
     missionId?: string
 }
 
@@ -1144,6 +1175,176 @@ export function registerTools(
             },
         }),
         'impact_status',
+    )
+
+    register(
+        defineTool({
+            name: 'flaky_plan',
+            description:
+                'Turn flakiness data into a PLAN, deterministically: classify every unstable test as stable / quarantine / investigate / suspect-instrumentation, and say what to DO. Input is either a report file (the JSON dsh-coverage-gate\'s flaky_check writes) or this plugin\'s own repeated run of a configured command (`fullTestCommand`, or `command`); it never imports the other plugin. A quarantine is a LOAN: it needs an owner (`flaky.owner`; without one the plan REFUSES to quarantine) and an expiry (`flaky.quarantineMaxDays`, default 14 days), and an expired quarantine is reported as an escalation. Writes the plan to flaky/<stamp>-plan.json on the mission plus an artifact evidence row, and renders per test: the classification, the evidence, the suggested action, and the exact host command that would record the quarantine — which this plugin NEVER executes.',
+            parameters: {
+                missionId: { type: 'string', description: 'Mission that stores the plan artifact (default: the session mission).' },
+                report: {
+                    type: 'string',
+                    description: 'Path to a flakiness report (workspace-relative or absolute) to classify instead of running anything. Omit it to repeat the configured command yourself.',
+                },
+                runs: {
+                    type: 'number',
+                    description: 'How many times to repeat the command when no report is given (default 3, clamped to 2–10; one run proves nothing).',
+                },
+                command: {
+                    type: 'string',
+                    description: 'Command to repeat (argv form, no shell) instead of the host-configured fullTestCommand.',
+                },
+            },
+            output: { schema: TEXT_OUTPUT, render: (_args, value) => [{ type: 'text', text: value }] },
+            async execute(args: FlakyPlanArgs = {} as FlakyPlanArgs, exec) {
+                const { agent, cwd, config } = preamble(exec)
+                const store = deps.stores.for(cwd)
+                const mission = resolveMission(store, agent, args.missionId)
+                const settings = config.flaky
+                const quarantineFile = quarantineFileFor(settings, { cwd, rootDir: store.layout.rootDir })
+                const now = Date.now()
+                const ledger = readQuarantine(quarantineFile)
+
+                const report = typeof args.report === 'string' ? args.report.trim() : ''
+                let tallies
+                let runs
+                let source: FlakyPlan['source']
+                let notes: string[] = []
+                if (report !== '') {
+                    // Report mode never runs a command: another plugin already
+                    // paid for the runs, and repeating them would be a second
+                    // (possibly different) observation.
+                    const file = path.isAbsolute(report) ? report : path.resolve(cwd, report)
+                    const parsed = readReport(file)
+                    if ('problem' in parsed) {
+                        throw new Error(
+                            `${parsed.problem}\n下一步：给出 flaky_check 产出的报告路径（例如 .dsh/missions/<id>/artifacts/flaky.json），或省略 report 让本插件重复运行已配置的命令。`,
+                        )
+                    }
+                    tallies = parsed.tallies
+                    runs = parsed.runs
+                    notes = parsed.notes
+                    source = { mode: 'report', report: file, observed: parsed.runs.length > 0 ? parsed.runs.length : parsed.tallies.length }
+                } else {
+                    const command = (typeof args.command === 'string' ? args.command.trim() : '') || config.fullTestCommand || ''
+                    if (command === '') {
+                        throw new Error(
+                            [
+                                '没有可重复运行的命令：report 没给，宿主也没有配置 fullTestCommand。',
+                                '',
+                                '下一步二选一：',
+                                '- 传 report 指向 flaky_check 产出的报告（`flaky_plan({ report: ".dsh/missions/<id>/artifacts/flaky.json" })`）；',
+                                "- 让宿主配置 fullTestCommand（整个测试套件的命令，例如 `go test ./...`），或在调用时传 command（argv 形式，不经过 shell）。",
+                            ].join('\n'),
+                        )
+                    }
+                    const planned = clampRuns(args.runs, DEFAULT_UNSEEN_RUNS)
+                    if (args.runs !== undefined && Math.floor(args.runs) < 2) {
+                        throw new Error(
+                            `runs=${args.runs} 无法判定 flaky：至少需要 ${2} 次运行。下一步：传 2–10 之间的次数，或省略它使用默认 ${DEFAULT_UNSEEN_RUNS} 次。`,
+                        )
+                    }
+                    const repeated = await repeatCommand({
+                        command,
+                        cwd,
+                        runs: planned,
+                        service: deps.subprocess(),
+                        ...(signalOf(exec) === undefined ? {} : { signal: signalOf(exec) }),
+                    })
+                    const observed = observeRuns(repeated.outcomes)
+                    tallies = tallyRuns(observed.runs, observed.failureOutput)
+                    runs = observed.runs
+                    notes = [...repeated.notes, ...observed.notes]
+                    source = { mode: 'runs', command, planned, observed: repeated.outcomes.length }
+                    const passed = observed.runs.filter((run) => run.outcome === 'pass').length
+                    if (tallies.length === 0 && passed > 0 && passed < observed.runs.length) {
+                        notes.push('运行级不稳定（每次运行的退出码不一致），但 runner 没有点名任何用例：无法按用例分类，先让 runner 输出用例名（verbose/TAP）再重跑。')
+                    }
+                }
+                if (tallies.length === 0 && notes.length === 0) {
+                    notes.push('数据里没有任何用例计数：无法分类（读不懂的数据不会被当成"没有不稳定用例"）。')
+                }
+
+                const evidencePath = `flaky/${stamp(now)}-plan.json`
+                const plan = buildPlan({
+                    cwd,
+                    settings,
+                    quarantineFile,
+                    now,
+                    source,
+                    tallies,
+                    runs,
+                    quarantined: currentQuarantines(ledger.rows),
+                    ...(ledger.problems.length === 0 ? {} : { ledgerProblems: ledger.problems }),
+                    evidencePath,
+                    notes,
+                })
+                let recorded: { relative: string; evidenceId: string } | undefined
+                let recordProblem: string | undefined
+                if (mission !== undefined) {
+                    try {
+                        store.writeArtifact(mission.id, evidencePath, `${JSON.stringify(plan, null, 2)}\n`)
+                        const evidence = store.appendEvidence(mission.id, {
+                            kind: 'artifact',
+                            summary: `flaky 计划：${plan.tests.length} 个用例（稳定 ${plan.summary.stable}、隔离 ${plan.summary.quarantine}、查根因 ${plan.summary.investigate}、疑似仪器 ${plan.summary.suspectInstrumentation}）`,
+                            recordedBy: 'dsh-impact-gate',
+                            artifactPath: evidencePath,
+                            data: { artifact: evidencePath, kind: 'flaky-plan', summary: plan.summary },
+                        })
+                        recorded = { relative: evidencePath, evidenceId: evidence.id }
+                        deps.logger
+                            ?.for(cwd)
+                            .info(`impact-gate: flaky 计划 ${evidencePath}（不稳定 ${plan.summary.quarantine + plan.summary.investigate + plan.summary.suspectInstrumentation}，升级 ${plan.escalations.length}）`)
+                    } catch (error) {
+                        recordProblem = error instanceof Error ? error.message : String(error)
+                        deps.logger?.for(cwd).error('impact-gate: flaky 计划写入失败:', error)
+                    }
+                }
+                return renderPlan(plan, {
+                    ...(recorded === undefined ? {} : { recorded }),
+                    ...(recordProblem === undefined ? {} : { artifactProblem: recordProblem }),
+                    ...(mission === undefined ? {} : { missionId: mission.id }),
+                })
+            },
+        }),
+        'flaky_plan',
+    )
+
+    register(
+        defineTool({
+            name: 'flaky_status',
+            description:
+                'Read-only: the flakiness policy in force (owner, quarantine deadline, unseen-run threshold, signature count), the current quarantine ledger (<rootDir>/flaky-quarantine.json, append-only rows {at, test, owner, expiresAt, reason, evidencePath}), which quarantines are EXPIRED (fix it or delete it — an expired quarantine may not hang there), ledger rows that cannot be used, and which quarantined tests have NOT been named by the last N runs (a test quarantined and then deleted is coverage silently lost). Writes nothing, and never records a quarantine itself.',
+            parameters: {
+                missionId: { type: 'string', description: 'Mission whose newest flaky plan artifact supplies the observed runs (default: the session mission).' },
+            },
+            output: { schema: TEXT_OUTPUT, render: (_args, value) => [{ type: 'text', text: value }] },
+            async execute(args: FlakyStatusArgs = {} as FlakyStatusArgs, exec) {
+                const { agent, cwd, config } = preamble(exec)
+                const store = deps.stores.for(cwd)
+                const mission = resolveMission(store, agent, args.missionId)
+                const settings = config.flaky
+                const quarantineFile = quarantineFileFor(settings, { cwd, rootDir: store.layout.rootDir })
+                const ledger = readQuarantine(quarantineFile)
+                const plans = mission === undefined ? [] : listFlakyPlans(store.artifactPath(mission.id, 'flaky'))
+                const newest = plans[plans.length - 1]
+                return renderFlakyStatus({
+                    cwd,
+                    settings,
+                    quarantineFile,
+                    now: Date.now(),
+                    quarantined: currentQuarantines(ledger.rows),
+                    ledgerProblems: ledger.problems,
+                    ...(newest === undefined ? {} : { newest }),
+                    plansSeen: plans.length,
+                    ...(mission === undefined ? {} : { missionId: mission.id }),
+                    ...(config.fullTestCommand === undefined ? {} : { flakyCommand: config.fullTestCommand }),
+                })
+            },
+        }),
+        'flaky_status',
     )
 
     return { disposers, registered, failed }

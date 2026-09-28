@@ -12,16 +12,22 @@
  *    no report instruments (they cannot be judged, and are neither 0% nor 100%);
  *  - **flakiness** — the same command repeated up to `flakyRepeats` times, with
  *    per-test attribution when the runner names its tests and a run-level verdict
- *    when it does not.
+ *    when it does not;
+ *  - **mutation score** (opt-in) — the source is deliberately broken, mutant by
+ *    mutant, and the suite is asked whether it noticed. Coverage says a line ran;
+ *    mutation says an assertion would have failed. A mutant whose command could
+ *    not run is `run-error`, never a kill.
  *
  * Responsibilities:
- *  - register `coverage_check` / `flaky_check` / `coverage_status`;
+ *  - register `coverage_check` / `flaky_check` / `mutation_check` / `coverage_status`;
  *  - obtain the numbers from host-configured commands (argv only, no shell) or
  *    from the report the host pointed at, and parse them with PURE functions;
  *  - record a `GateRecord` (`source: dsh-coverage-gate`, with `scope` and a git
  *    fingerprint) so a delivery can require it exactly like a quality gate;
  *  - refuse — never pass — when a threshold, a report source or a readable report
- *    is missing, and `BLOCK` when a report cannot be parsed.
+ *    is missing, and `BLOCK` when a report cannot be parsed;
+ *  - mutate source files ONLY inside `mutation_check`, always restoring the
+ *    pre-run bytes (verified), and refuse when the workspace cannot be restored.
  *
  * Extension points used here (verified against the installed packages):
  *  - ctx.tools.register(defineTool(...))   @deepseek-ai/dsh-tools
@@ -133,20 +139,89 @@ export function apply(ctx: Context, config: unknown = {}): void {
         log.info(
             `applied (tools: ${tools.registered.join(', ') || 'none'}; thresholds: ${
                 Object.keys(resolved.thresholds).join(', ') || 'none'
-            }; report=${resolved.reportFile ?? 'none'}; flakyPolicy=${resolved.flakyPolicy}; repeats=${resolved.flakyRepeats})`,
+            }; report=${resolved.reportFile ?? 'none'}; flakyPolicy=${resolved.flakyPolicy}; repeats=${resolved.flakyRepeats}; mutation=${
+                resolved.mutation.enabled ? `on (maxMutants=${resolved.mutation.maxMutants}, thresholds: ${Object.keys(resolved.mutation.thresholds).join(', ') || 'none'})` : 'off'
+            })`,
         )
         if (Object.keys(resolved.thresholds).length === 0) {
             log.warn('no coverage threshold configured — coverage_check will refuse until the host sets thresholds')
+        }
+        if (resolved.mutation.enabled && Object.keys(resolved.mutation.thresholds).length === 0) {
+            log.warn('mutation is enabled but has no threshold — mutation_check will refuse until mutation.thresholds is set')
         }
     } catch (error) {
         log.error('apply failed:', error)
     }
 }
 
-export { resolveConfig, resolveEffectiveConfig, PROJECT_OVERRIDABLE_KEYS, MAX_FLAKY_REPEATS } from './config.js'
-export type { CoverageGateConfig, CoverageThresholds, FlakyPolicy, ReportFormat } from './config.js'
+export {
+    resolveConfig,
+    resolveEffectiveConfig,
+    PROJECT_OVERRIDABLE_KEYS,
+    MAX_FLAKY_REPEATS,
+    MAX_MUTANTS_CEILING,
+    DEFAULT_MAX_MUTANTS,
+    DEFAULT_MUTATION_TIME_BUDGET_MS,
+    describeMutation,
+    describeMutationThresholds,
+    parseMutationThresholds,
+} from './config.js'
+export type {
+    CoverageGateConfig,
+    CoverageThresholds,
+    FlakyPolicy,
+    MutationConfig,
+    ReportFormat,
+} from './config.js'
 export { parseCoverage, incrementalCoverage, worstFiles } from './coverage.js'
 export type { CoverageReport, IncrementalCoverage, CoverageParseResult } from './coverage.js'
 export { classifyRuns, compareRuns, detectFlakiness, parseTestNames } from './flaky.js'
 export type { RunResult, FlakinessVerdict } from './flaky.js'
 export { tokenizeTemplate, SHELL_METACHARACTERS } from './command.js'
+export {
+    applyMutant,
+    classifyMutantOutcome,
+    collectSourceFiles,
+    detectSourceGlobs,
+    formatMutationPercent,
+    judgeMutation,
+    maskDocument,
+    maskLine,
+    mutantsInFile,
+    mutationScoreOf,
+    planMutants,
+    resolveOperators,
+    runMutationPlan,
+    scoreThresholdFor,
+    stripCoverageDecorations,
+    MutationRestoreError,
+    ALL_SOURCE_GLOBS,
+    DEFAULT_EXCLUDE_GLOBS,
+    LANGUAGE_SOURCE_GLOBS,
+    MUTATION_OPERATORS,
+    MUTATION_OPERATOR_GROUPS,
+    MUTATION_OPERATOR_IDS,
+    SNIPPET_WIDTH,
+} from './mutation.js'
+export type {
+    CollectedSources,
+    JudgeMutationInput,
+    LexicalState,
+    Mutant,
+    MutantCommandOutcome,
+    MutantCommandRunner,
+    MutantCommandSpec,
+    MutantResult,
+    MutantVerdict,
+    MutationCheck,
+    MutationCounts,
+    MutationJudgement,
+    MutationOperator,
+    MutationOperatorGroup,
+    MutationPlan,
+    MutationRun,
+    MutationRunOptions,
+    MutationThresholds,
+    PlanOptions,
+    SourceFile,
+} from './mutation.js'

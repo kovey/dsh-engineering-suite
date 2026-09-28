@@ -4,12 +4,24 @@
  */
 
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import { formatTime, gitFingerprint, sessionCwd, type AgentLike, type GateRecord, type MissionStoreRegistry } from 'dsh-eng-core'
+import {
+    formatTime,
+    gitFingerprint,
+    isSafeId,
+    sessionCwd,
+    sessionIdOf,
+    type AgentLike,
+    type GateRecord,
+    type MissionRecord,
+    type MissionStore,
+    type MissionStoreRegistry,
+} from 'dsh-eng-core'
 import type { Logger } from 'dsh-eng-core'
-import type { QualityGateConfig } from './config.js'
+import { EXAMPLE_BUDGETS, EXAMPLE_CONTRACTS, type QualityGateConfig } from './config.js'
+import { renderBudgets, runBudgets } from './budget.js'
+import { renderContracts, runContracts } from './contract.js'
 import { describeScope, renderVerdict, runGate, selectCommands } from './gate.js'
 import { declaredCwdOf, type GateSessions } from './hooks.js'
-import { sessionIdOf } from 'dsh-eng-core'
 
 const TEXT_OUTPUT = { type: 'string' } as const
 
@@ -55,6 +67,40 @@ interface RunArgs {
 
 interface StatusArgs {
     missionId?: string
+}
+
+interface BudgetArgs {
+    missionId?: string
+    only?: string[]
+}
+
+interface ContractArgs {
+    missionId?: string
+}
+
+/**
+ * Resolve the mission the new gate tools record against, fail closed.
+ *
+ * `quality_gate_run` tolerates an unknown id (it still returns a verdict about
+ * the workspace); a budget/contract call must not, because the interesting half
+ * of its output is the ledger row: running the commands and then silently
+ * recording nothing would look like a recorded verdict.
+ */
+function missionOrRefusal(store: MissionStore, agent: AgentLike | undefined, explicitId: string | undefined): MissionRecord | undefined {
+    const id = typeof explicitId === 'string' ? explicitId.trim() : ''
+    if (id === '') return store.resolveForAgent(agent)
+    if (!isSafeId(id)) {
+        throw new Error(`mission id 不合法（${JSON.stringify(id)}）：id 是单个路径段。下一步：用 spec_status 取一个正确的 missionId。`)
+    }
+    const mission = store.read(id)
+    if (mission === undefined) {
+        const known = store.list().map((entry) => entry.id)
+        throw new Error(
+            `未知 mission "${id}"：按 fail closed 拒绝（否则这次裁决不会落到任何 mission 上）。` +
+                `可用 mission：${known.join('、') || '(无)'}。下一步：用 spec_status 看当前任务的 id，或省略 missionId 用本会话绑定的任务。`,
+        )
+    }
+    return mission
 }
 
 /** Register the quality-gate tools. */
@@ -240,6 +286,142 @@ export function registerTools(
             },
         }),
         'quality_gate_status',
+    )
+
+    register(
+        defineTool({
+            name: 'budget_check',
+            description:
+                'Measure the host-configured regression budgets and answer "did this get worse", which a PASS/BLOCK test verdict cannot: a duration, a bundle size, a count. Each budget runs its configured command (or a configured gate command via commandId) and compares the measured number against its absolute bounds (max/min) and against the BEST value ever recorded in the append-only baseline (<rootDir>/budgets.json) within maxRegressionPercent. The first measurement records the baseline and says so (that is "no data yet", not a pass). A command that did not succeed BLOCKs its own budget and records no measurement; a regex that matches nothing, or a capture that does not parse, is a REFUSAL that writes nothing at all — never a silent pass. Records a gate row on the mission with scope.full=false: a budget run is not the host gate command set and never authorises a delivery.',
+            parameters: {
+                missionId: { type: 'string', description: 'Mission to record the budget verdict against (default: the session mission).' },
+                only: { type: 'array', items: { type: 'string' }, description: 'Measure only these budget ids (must exist).' },
+            },
+            output: { schema: TEXT_OUTPUT, render: (_args, value) => [{ type: 'text', text: value }] },
+            async execute(args: BudgetArgs = {} as BudgetArgs, exec) {
+                const agent = (exec as { agent?: AgentLike }).agent
+                const cwd = declaredCwdOrThrow(agent)
+                const store = deps.stores.for(cwd)
+                const logger = deps.logger.for(cwd)
+                const effective = deps.configFor(cwd)
+                const mission = missionOrRefusal(store, agent, args.missionId)
+                const run = await runBudgets({
+                    cwd,
+                    config: effective.config,
+                    rootDir: store.layout.rootDir,
+                    ...(args.only === undefined ? {} : { only: args.only }),
+                    service: deps.subprocess(),
+                    ...((exec as { signal?: AbortSignal }).signal === undefined ? {} : { signal: (exec as { signal?: AbortSignal }).signal }),
+                })
+                if (!run.ok) {
+                    // A refusal writes NOTHING: no baseline entry, no gate row.
+                    logger.warn(`budget_check 拒绝执行：${run.problem}`)
+                    throw new Error(
+                        [
+                            run.problem,
+                            '',
+                            '（预算里没有配置项时的写法示例：）',
+                            '```yaml',
+                            EXAMPLE_BUDGETS,
+                            '```',
+                        ].join('\n'),
+                    )
+                }
+                const fingerprint = gitFingerprint(cwd, { excludePaths: [store.layout.rootDir] })
+                let gateId: string | undefined
+                if (mission !== undefined) {
+                    gateId = store.recordGate(mission.id, {
+                        source: 'dsh-quality-gate',
+                        state: run.state,
+                        reason: `${run.reason}（预算裁决；scope.full=false，不构成交付依据）`,
+                        results: run.results,
+                        scope: run.scope,
+                        fingerprint,
+                    }).id
+                }
+                logger.info(
+                    `budget_check: ${run.state} — ${run.reason}；预算 ${run.evaluations
+                        .map((evaluation) => `${evaluation.id}=${evaluation.value ?? 'null'}`)
+                        .join(', ')}；基线追加 ${run.recorded} 条；mission ${mission === undefined ? '(无)' : mission.id}；来源 ${
+                        effective.source === 'project' ? effective.file ?? '项目级配置' : 'profile'
+                    }`,
+                )
+                return [
+                    renderBudgets(run, { problems: effective.problems.length }),
+                    '',
+                    `预算来源：${effective.source === 'project' ? effective.file ?? '项目级配置' : 'profile 配置'}（${run.scope.total} 条已配置）`,
+                    `mission: ${mission === undefined ? '(无 — 基线照记，但裁决不会落到任何 mission 上)' : mission.id}`,
+                    `gate record: ${gateId ?? '(未记录)'}`,
+                    '说明：这次裁决只覆盖预算，不会清零本会话的"待验证写"计数——交付前仍需不带 only/phase 跑一次完整的 quality_gate_run。',
+                ].join('\n')
+            },
+        }),
+        'budget_check',
+    )
+
+    register(
+        defineTool({
+            name: 'contract_check',
+            description:
+                'Run the host-configured smoke contracts and report EVERY declared expectation separately (never one boolean): the exit code, strings that must (or must not) appear on stdout, and JSON values addressed by a dotted path with [n] indices. A JSON path that does not exist is a FAILURE naming the path, never a skip, and stdout that is not valid JSON fails every path assertion. This is a smoke gate, not a mocking framework: it runs the configured command for real, and it proves the declared interface still behaves — not that the interface is correct. Refuses a contract it cannot evaluate (unknown kind, empty command, unknown expectation key, empty expect) with the fix, and records a gate row with scope.full=false.',
+            parameters: {
+                missionId: { type: 'string', description: 'Mission to record the contract verdict against (default: the session mission).' },
+            },
+            output: { schema: TEXT_OUTPUT, render: (_args, value) => [{ type: 'text', text: value }] },
+            async execute(args: ContractArgs = {} as ContractArgs, exec) {
+                const agent = (exec as { agent?: AgentLike }).agent
+                const cwd = declaredCwdOrThrow(agent)
+                const store = deps.stores.for(cwd)
+                const logger = deps.logger.for(cwd)
+                const effective = deps.configFor(cwd)
+                const mission = missionOrRefusal(store, agent, args.missionId)
+                const run = await runContracts({
+                    cwd,
+                    config: effective.config,
+                    service: deps.subprocess(),
+                    ...((exec as { signal?: AbortSignal }).signal === undefined ? {} : { signal: (exec as { signal?: AbortSignal }).signal }),
+                })
+                if (!run.ok) {
+                    logger.warn(`contract_check 拒绝执行：${run.problem}`)
+                    throw new Error(
+                        [
+                            run.problem,
+                            '',
+                            '（契约的写法示例：）',
+                            '```yaml',
+                            EXAMPLE_CONTRACTS,
+                            '```',
+                        ].join('\n'),
+                    )
+                }
+                const fingerprint = gitFingerprint(cwd, { excludePaths: [store.layout.rootDir] })
+                let gateId: string | undefined
+                if (mission !== undefined) {
+                    gateId = store.recordGate(mission.id, {
+                        source: 'dsh-quality-gate',
+                        state: run.state,
+                        reason: `${run.reason}（契约裁决；scope.full=false，不构成交付依据）`,
+                        results: run.results,
+                        scope: run.scope,
+                        fingerprint,
+                    }).id
+                }
+                logger.info(
+                    `contract_check: ${run.state} — ${run.reason}；契约 ${run.evaluations
+                        .map((evaluation) => `${evaluation.id}=${evaluation.checks.filter((check) => check.state === 'FAIL').length} 项失败`)
+                        .join(', ')}；mission ${mission === undefined ? '(无)' : mission.id}`,
+                )
+                return [
+                    renderContracts(run, { problems: effective.problems.length }),
+                    '',
+                    `契约来源：${effective.source === 'project' ? effective.file ?? '项目级配置' : 'profile 配置'}（${run.scope.total} 条已配置）`,
+                    `mission: ${mission === undefined ? '(无 — 裁决不会落到任何 mission 上)' : mission.id}`,
+                    `gate record: ${gateId ?? '(未记录)'}`,
+                    '说明：这次裁决只覆盖契约，不会清零本会话的"待验证写"计数——交付前仍需不带 only/phase 跑一次完整的 quality_gate_run。',
+                ].join('\n')
+            },
+        }),
+        'contract_check',
     )
 
     return { disposers, registered, failed }

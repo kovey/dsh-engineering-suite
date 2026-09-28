@@ -34,5 +34,15 @@ export function sectionText(config: ImpactGateConfig, projectFile?: string): str
         '  **不产生 import 边**，所以选中的测试是**必要**集合（"先跑这些"），不是"其余可以跳过"的证明；跳过其余只能是宿主用',
         '  `fullTestCommand` 显式对照之后的决定。',
         '- 风险等级由 `RISK_RULES` 阈值判定，不是判断；没有任何测试覆盖一律 high。改阈值等于改口径，是代码改动，需要 review。',
+        '',
+        '不稳定用例（flaky）不当成"重跑一次就绿了"：',
+        '- `flaky_plan` 把不稳定数据变成**计划**：每个用例恰好落一类——稳定 / 隔离 / 查根因 / 疑似仪器；',
+        '  "疑似仪器"是失败输出匹配了 `flaky.signatures`（超时、端口被占用、时钟、网络、资源）——先修环境，别急着隔离一条健康的用例。',
+        '- **隔离是向未来借的债，不是修复**：每条隔离必须有 `owner` 与到期时间（`flaky.quarantineMaxDays`，默认 14 天）。',
+        config.flaky.owner === undefined
+            ? '  ⚠️ 当前没有配置 `flaky.owner`：`flaky_plan` 会**拒绝**给出隔离命令（没有负责人的隔离等于没人管）。请由人指定负责人。'
+            : `  当前 owner=${config.flaky.owner}。`,
+        '- **过期的隔离是升级项**："要么修，要么删，不能继续挂着"。本插件只渲染"写入隔离台账"的命令，**绝不自己执行**：让一条用例闭嘴是人的决定。',
+        '- `flaky_status` 只读：当前隔离清单、已过期的、以及**被隔离后最近 N 次运行再没出现过**的用例——隔离后被删除/改名，等于覆盖静默消失。',
     ].join('\n')
 }

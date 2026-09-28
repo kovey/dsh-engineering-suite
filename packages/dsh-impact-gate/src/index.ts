@@ -84,6 +84,10 @@ export function apply(ctx: Context, config: unknown = {}): void {
             configFor: (cwd: string) => resolveEffectiveConfig(resolved, stores.for(cwd).layout, log),
             stores,
             subagents: () => context.get('subagents') as SubagentsLike | undefined,
+            // `flaky_plan`'s repeated-run mode uses the host's managed process
+            // seam when it exists (sandboxing, teardown) and the node transport
+            // otherwise — the same rule as every other command in the suite.
+            subprocess: () => context.get('subprocess'),
             logger: log,
         }
 
@@ -125,7 +129,8 @@ export function apply(ctx: Context, config: unknown = {}): void {
 
         log.info(
             `applied (tools: ${tools.registered.join(', ') || 'none'}; base=${resolved.defaultBase}; maxDistance=${resolved.maxDistance}; ` +
-                `template=${resolved.testCommandTemplate === '' ? 'NOT CONFIGURED' : resolved.testCommandTemplate}; reviewDispatch=${resolved.reviewDispatch.enabled})`,
+                `template=${resolved.testCommandTemplate === '' ? 'NOT CONFIGURED' : resolved.testCommandTemplate}; reviewDispatch=${resolved.reviewDispatch.enabled}; ` +
+                `flakyOwner=${resolved.flaky.owner ?? 'NOT CONFIGURED'}; quarantineMaxDays=${resolved.flaky.quarantineMaxDays})`,
         )
         if (resolved.testCommandTemplate === '') {
             log.warn(

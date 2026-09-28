@@ -1,10 +1,12 @@
 /**
- * The model-facing tool surface: `coverage_check`, `flaky_check`, `coverage_status`.
+ * The model-facing tool surface: `coverage_check`, `flaky_check`,
+ * `mutation_check`, `coverage_status`.
  *
  * Division of labour, the same one the rest of the suite follows:
  *
  *  - the NUMBERS are produced by host-configured commands or by a report the
- *    host pointed at, and are parsed by pure functions (`./coverage`, `./flaky`);
+ *    host pointed at, and are parsed by pure functions (`./coverage`, `./flaky`,
+ *    `./mutation`);
  *  - the THRESHOLDS come from the host profile and may be refined per repository
  *    — never invented here. A gate with no threshold REFUSES instead of passing;
  *  - the VERDICT is recorded on the mission as a `GateRecord`
@@ -14,6 +16,8 @@
  * Fail-closed, everywhere: an unreadable report is a refusal with the next step,
  * an unparseable one is a `BLOCK` carrying the parser's complaint, and a
  * threshold that could not be judged is reported as unjudged — never as a pass.
+ * `mutation_check` adds the strictest version of that rule: a mutant whose test
+ * command could not RUN is `run-error`, never a kill.
  *
  * @module dsh-coverage-gate/tools
  */
@@ -41,8 +45,12 @@ import {
 } from 'dsh-eng-core'
 import {
     MAX_FLAKY_REPEATS,
+    MAX_MUTANTS_CEILING,
     MIN_FLAKY_REPEATS,
+    MIN_MUTATION_TIME_BUDGET_MS,
     REPORT_FORMATS,
+    describeMutation,
+    describeMutationThresholds,
     describeSource,
     describeThresholds,
     formatPercent,
@@ -51,6 +59,7 @@ import {
     type CoverageGateConfig,
     type CoverageThresholds,
     type EffectiveConfig,
+    type MutationConfig,
     type ReportFormat,
     type ThresholdKey,
 } from './config.js'
@@ -63,7 +72,22 @@ import {
     type IncrementalCoverage,
 } from './coverage.js'
 import { detectFlakiness, toRunResult, type FlakinessVerdict, type RunResult } from './flaky.js'
-import { renderForDisplay, tokenizeTemplate } from './command.js'
+import {
+    collectSourceFiles,
+    judgeMutation,
+    planMutants,
+    resolveOperators,
+    runMutationPlan,
+    scoreThresholdFor,
+    stripCoverageDecorations,
+    MUTATION_OPERATOR_GROUPS,
+    MUTATION_OPERATOR_IDS,
+    type CollectedSources,
+    type MutantResult,
+    type MutationPlan,
+    type MutationRun,
+} from './mutation.js'
+import { placeholdersOf, renderForDisplay, tokenizeTemplate } from './command.js'
 
 const TEXT_OUTPUT = { type: 'string' } as const
 
@@ -106,6 +130,15 @@ interface FlakyArgs {
 /** Arguments of `coverage_status`. */
 interface StatusArgs {
     missionId?: string
+}
+
+/** Arguments of `mutation_check`. */
+interface MutationArgs {
+    missionId?: string
+    changed?: boolean
+    maxMutants?: number
+    operators?: string[]
+    timeBudgetMs?: number
 }
 
 function agentOf(exec: unknown): AgentLike | undefined {
@@ -275,6 +308,177 @@ function combinedOutput(outcome: RunOutcome, limit: number): string {
     const text = [outcome.stdout, outcome.stderr].filter((part) => part.trim() !== '').join('\n--- stderr ---\n')
     const spawn = outcome.spawnError === undefined ? '' : `\n[spawn error] ${outcome.spawnError}`
     return `${tail(text, limit)}${spawn}`.trim()
+}
+
+// --- mutation_check helpers -------------------------------------------------
+
+/** Bound of the survivor list printed in the report (the artifact keeps them all). */
+const SURVIVOR_PRINT_LIMIT = 25
+
+/** The refusal a disabled mutation gate produces. */
+function mutationDisabledRefusal(file: string): string {
+    return [
+        '本仓库没有启用变异测试（mutation.enabled 默认 false）：它会把源码改坏、跑一遍完整测试、再改回来，每个变异体一次，代价是真实的。',
+        `下一步：在 profile 的 coverage-gate 配置里写 mutation: { enabled: true, testCommand: "…", thresholds: { mutationScore: 60 } }，或在 ${file} 里为本仓库启用。`,
+        '说明：覆盖率回答"这行跑到了吗"，变异测试回答"改坏它，有没有断言会喊"——后者能发现"覆盖到但没测到"，但它是可选项，不会被默认打开。',
+    ].join('\n')
+}
+
+/** The refusal a missing mutation threshold produces. */
+function missingMutationThresholdsRefusal(file: string, changed: boolean): string {
+    return [
+        '没有生效的变异阈值：没有阈值就没有门禁，本插件不会用默认值静默放行。',
+        `下一步：在 profile 或 ${file} 里配置 mutation.thresholds，至少要有 mutationScore（0–100 的变异得分下限）${
+            changed ? '；按改动判定还需要 changedMutationScore（没有它时会退回到 mutationScore）' : ''
+        }；可选的 maxSurvived（存活变异体的数量上限）。`,
+    ].join('\n')
+}
+
+/** The refusal a missing test command produces (and how to fix each case). */
+function missingTestCommandRefusal(config: MutationConfig): string {
+    return [
+        '没有可用的测试命令：变异测试必须能跑一遍测试套件，否则变异体无从检验（没有命令就没有门禁）。',
+        '下一步（任选其一）：',
+        '  1. 配置 mutation.testCommand（例如 "node --test test/*.test.ts" 或 "go test ./..."；argv 直传、无 shell，可用占位符 {workspace}）；',
+        '  2. 配置 flakyCommand（它本身就是一条"跑测试"的命令，会被复用）；',
+        '  3. 把 coverageCommand 写成"测试命令 + 覆盖率开关"的形式（例如 "npx vitest run --coverage"）：本插件会去掉覆盖率参数后复用它。',
+        `当前：mutation.testCommand=${config.testCommand === undefined ? '未配置' : `\`${config.testCommand}\``}，flakyCommand 与 coverageCommand 见 coverage_status 的输出。`,
+    ].join('\n')
+}
+
+/** The refusal a coverage command that is not a test invocation produces. */
+function ambiguousCoverageCommandRefusal(coverageCommand: string, reason: string): string {
+    return [
+        `coverageCommand（\`${coverageCommand}\`）不能推出测试命令：${reason}。`,
+        '猜"哪一部分是跑测试"就是在拿一个不相干的命令当测试跑，所以本插件不猜。',
+        '下一步：显式配置 mutation.testCommand（推荐），或把 coverageCommand 写成"测试命令 + 覆盖率参数"（例如 "npx vitest run --coverage" 或 "go test -coverprofile=coverage.out ./..."）。',
+    ].join('\n')
+}
+
+/** The refusal an empty source set produces. */
+function noSourcesRefusal(collected: CollectedSources, config: MutationConfig): string {
+    const skipped = collected.skipped.slice(0, 6).map((entry) => `${entry.path}（${entry.reason}）`)
+    return [
+        `没有任何源文件可以变异：匹配 mutation.sourceGlobs（${collected.sourceGlobs.join(', ')}）的文件 0 个。`,
+        skipped.length === 0 ? '' : `被跳过（前 ${skipped.length} 个）：${skipped.join('；')}`,
+        `当前排除（内置 + 配置）：${config.excludeGlobs.length === 0 ? '(仅内置：.dsh/**、.git/**、node_modules/**、vendor/**、构建产物、生成文件)' : config.excludeGlobs.join(', ')}`,
+        '下一步：检查 mutation.sourceGlobs / mutation.excludeGlobs 是否写错（测试文件与 .dsh/** 永远不参与变异），或确认工作区里确实有源码。',
+    ]
+        .filter((line) => line !== '')
+        .join('\n')
+}
+
+/** The refusal "files matched, but no operator applied" produces. */
+function noMutantsRefusal(plan: MutationPlan, fileCount: number): string {
+    return [
+        `选中的 ${fileCount} 个源文件里没有任何可应用的变异（操作符：${plan.operatorIds.join(', ')}）。`,
+        '这通常意味着：这些文件里没有该操作符覆盖的 token（比较、布尔、算术、整数字面量），或者代码都在注释/字符串里（本插件按词法扫描，注释与字符串不参与变异）。',
+        '下一步：确认选中的文件是实现代码而不是类型声明/配置，或放宽 mutation.operators（当前可用：' +
+            `${MUTATION_OPERATOR_IDS.join(', ')}；也可以只写组名 ${MUTATION_OPERATOR_GROUPS.join(', ')}）。`,
+    ].join('\n')
+}
+
+/**
+ * The test command a mutation run uses.
+ *
+ * `mutation.testCommand` is the answer. Two configured commands are considered
+ * next, in the order of how little has to be guessed: `flakyCommand` (the host
+ * already declared it as "run the tests"), then `coverageCommand` with its
+ * coverage decorations stripped. Anything else is a refusal naming the key to
+ * set — a wrong test command would produce a score about the wrong program.
+ */
+export function mutationTestCommandOf(
+    config: CoverageGateConfig,
+    cwd: string,
+): { argv: string[]; text: string; source: string } | { error: string } {
+    const mutation = config.mutation
+    if (mutation.testCommand !== undefined) {
+        const tokenized = tokenizeTemplate(mutation.testCommand, { workspace: cwd })
+        if ('error' in tokenized) {
+            return {
+                error: [
+                    `mutation.testCommand 无法执行：${tokenized.error}`,
+                    '下一步：改写成不带 shell 语法的 argv 形式（需要管道/重定向就写成一个脚本文件再调用）；可用占位符 {workspace}。',
+                ].join('\n'),
+            }
+        }
+        return {
+            argv: tokenized.argv,
+            text: renderForDisplay(mutation.testCommand, { workspace: cwd }),
+            source: '宿主配置 mutation.testCommand',
+        }
+    }
+    if (config.flakyCommand !== undefined) {
+        const tokenized = tokenizeTemplate(config.flakyCommand, { run: '1', run0: '0', workspace: cwd })
+        if ('error' in tokenized) {
+            return {
+                error: [
+                    `flakyCommand 无法执行（变异测试想复用它当测试命令）：${tokenized.error}`,
+                    '下一步：修好 flakyCommand，或直接配置 mutation.testCommand。',
+                ].join('\n'),
+            }
+        }
+        return {
+            argv: tokenized.argv,
+            text: renderForDisplay(config.flakyCommand, { run: '1', run0: '0', workspace: cwd }),
+            source: '复用宿主配置的 flakyCommand',
+        }
+    }
+    if (config.coverageCommand !== undefined) {
+        const needed = placeholdersOf(config.coverageCommand).filter((name) => name !== 'workspace')
+        if (needed.length > 0) {
+            return {
+                error: ambiguousCoverageCommandRefusal(
+                    config.coverageCommand,
+                    `它使用了占位符 ${needed.map((name) => `{${name}}`).join(', ')}，去掉覆盖率参数后这些值仍会留在命令行里`,
+                ),
+            }
+        }
+        const tokenized = tokenizeTemplate(config.coverageCommand, { workspace: cwd })
+        if ('error' in tokenized) {
+            return {
+                error: [
+                    `coverageCommand 无法执行（变异测试想从中推出测试命令）：${tokenized.error}`,
+                    '下一步：修好 coverageCommand，或直接配置 mutation.testCommand。',
+                ].join('\n'),
+            }
+        }
+        const stripped = stripCoverageDecorations(tokenized.argv)
+        if (stripped.stripped.length === 0) {
+            return {
+                error: ambiguousCoverageCommandRefusal(config.coverageCommand, '里面没有可识别的覆盖率参数（如 --coverage、-coverprofile=…），无法判断哪一部分是"跑测试"'),
+            }
+        }
+        if (stripped.argv.length === 0) {
+            return {
+                error: ambiguousCoverageCommandRefusal(config.coverageCommand, `去掉覆盖率参数（${stripped.stripped.join(' ')}）后命令行里不剩任何东西`),
+            }
+        }
+        return {
+            argv: stripped.argv,
+            text: stripped.argv.join(' '),
+            source: `由宿主配置的 coverageCommand 去掉覆盖率参数（${stripped.stripped.join(' ')}）`,
+        }
+    }
+    return { error: missingTestCommandRefusal(mutation) }
+}
+
+/** One line for a mutant, the shape the survivor list is printed in. */
+function renderMutantLine(result: MutantResult, limit = 160): string {
+    const snippet = result.snippetAfter.length > limit ? `${result.snippetAfter.slice(0, limit)}…` : result.snippetAfter
+    return `${result.file}:${result.line}:${result.column} [${result.operator}] ${result.tokenBefore} → ${result.tokenAfter}；\`${snippet}\``
+}
+
+/** Bounded list of mutants, one line each (the artifact keeps them all). */
+function renderMutantList(results: readonly MutantResult[], limit = SURVIVOR_PRINT_LIMIT): string[] {
+    const lines = results.slice(0, limit).map((result) => `  - ${renderMutantLine(result)}`)
+    if (results.length > limit) lines.push(`  - …另有 ${results.length - limit} 个（完整清单见工件）`)
+    return lines
+}
+
+/** The file:line list of the mutants a run actually produced a verdict for. */
+function mutantScopeFiles(run: MutationRun): string[] {
+    return [...new Set(run.results.map((result) => result.file))].sort()
 }
 
 /** Register the coverage-gate tools. */
@@ -944,9 +1148,326 @@ export function registerTools(
 
     register(
         defineTool({
+            name: 'mutation_check',
+            description:
+                'Ask whether the tests would NOTICE a change: rewrite source files with small textual mutations (relational/boolean/arithmetic/equality flips and ±1 on integer literals), run the configured test command once per mutant, restore every file byte-for-byte, and report the mutation score (killed ÷ (killed + survived)) plus the list of SURVIVED mutants — each one is a line the suite executes but does not assert. A mutant whose command could not run (spawn error, timeout, abort) is run-error: NEVER counted as killed, and reported separately. Off unless mutation.enabled is true; bounded by maxMutants (default 20) and timeBudgetMs (default 10 min), and it never extrapolates a score beyond the mutants it actually ran. Refuses without a configured test command or threshold, and refuses (leaving nothing mutated) if the workspace cannot be restored.',
+            parameters: {
+                missionId: { type: 'string', description: 'Mission to record the verdict against (default: the session mission).' },
+                changed: {
+                    type: 'boolean',
+                    description:
+                        'Mutate only the source files this change touches (git diff against mutation.baseRef, default HEAD) instead of every source file. Judged with changedMutationScore when it is configured.',
+                },
+                maxMutants: {
+                    type: 'integer',
+                    description: `How many mutants to plan at most (1–${MAX_MUTANTS_CEILING}); capped by the host configuration, and a narrower value than the configuration makes the verdict non-authorising (scope.full=false).`,
+                },
+                operators: {
+                    type: 'array',
+                    items: { type: 'string' },
+                    description: `Operator ids (${MUTATION_OPERATOR_IDS.join(', ')}) or group names (${MUTATION_OPERATOR_GROUPS.join(
+                        ', ',
+                    )}). Unknown names are refused, never ignored. Overriding the configured set makes the verdict non-authorising (scope.full=false).`,
+                },
+                timeBudgetMs: {
+                    type: 'integer',
+                    description: `Wall-clock budget for the whole run in milliseconds (min ${MIN_MUTATION_TIME_BUDGET_MS}); capped by the host configuration. When it runs out the partial result is reported as partial — the score covers only the mutants that ran.`,
+                },
+            },
+            output: { schema: TEXT_OUTPUT, render: (_args, value) => [{ type: 'text', text: value }] },
+            async execute(args: MutationArgs = {} as MutationArgs, exec) {
+                const agent = agentOf(exec)
+                const cwd = declaredCwdOrThrow(agent)
+                const store = deps.stores.for(cwd)
+                const logger = deps.logger.for(cwd)
+                const effective = deps.configFor(agent)
+                const config = effective.config
+                const signal = (exec as { signal?: AbortSignal }).signal
+                const mutation = config.mutation
+
+                // --- opt-in, thresholds and command: refuse, never guess ----
+                if (!mutation.enabled) throw new Error(mutationDisabledRefusal(effective.file))
+                const changed = args.changed === true
+                const scoreThreshold = scoreThresholdFor(mutation.thresholds, changed)
+                if (scoreThreshold === undefined) throw new Error(missingMutationThresholdsRefusal(effective.file, changed))
+
+                if (
+                    args.operators !== undefined &&
+                    (!Array.isArray(args.operators) || args.operators.some((entry) => typeof entry !== 'string'))
+                ) {
+                    throw new Error(
+                        `operators 必须是字符串数组（操作符 id 或组名）。下一步：传 ["relational"] 或 ["REL_LT_TO_LE", "TRUE_TO_FALSE"] 这样的数组，或省略它使用配置值（${
+                            mutation.operators.join(', ') || '全部操作符'
+                        }）。`,
+                    )
+                }
+                const callOperators =
+                    args.operators === undefined ? undefined : args.operators.map((entry) => entry.trim()).filter((entry) => entry !== '')
+                const operatorNames = callOperators === undefined || callOperators.length === 0 ? mutation.operators : callOperators
+                const resolved = resolveOperators(operatorNames.length === 0 ? undefined : operatorNames)
+                if ('error' in resolved) {
+                    throw new Error([resolved.error, '下一步：使用上面列出的 id 或组名，或省略 operators 使用配置值。'].join('\n'))
+                }
+                const operatorsOverridden =
+                    callOperators !== undefined &&
+                    callOperators.length > 0 &&
+                    [...callOperators].sort().join(',') !== [...mutation.operators].sort().join(',')
+
+                const command = mutationTestCommandOf(config, cwd)
+                if ('error' in command) throw new Error(command.error)
+
+                if (args.maxMutants !== undefined && (!Number.isInteger(args.maxMutants) || args.maxMutants < 1)) {
+                    throw new Error(
+                        `maxMutants 必须是正整数（收到 ${JSON.stringify(args.maxMutants)}）。下一步：传 1–${
+                            mutation.maxMutants
+                        } 之间的整数，或省略它使用配置值 ${mutation.maxMutants}。`,
+                    )
+                }
+                if (
+                    args.timeBudgetMs !== undefined &&
+                    (!Number.isFinite(args.timeBudgetMs) || args.timeBudgetMs < MIN_MUTATION_TIME_BUDGET_MS)
+                ) {
+                    throw new Error(
+                        `timeBudgetMs 必须是不小于 ${MIN_MUTATION_TIME_BUDGET_MS} 的数字（收到 ${JSON.stringify(
+                            args.timeBudgetMs,
+                        )}）。下一步：提高预算或省略它使用配置值 ${mutation.timeBudgetMs}。`,
+                    )
+                }
+                const notes: string[] = []
+                const requestedCap = args.maxMutants ?? mutation.maxMutants
+                const maxMutants = Math.max(1, Math.min(Math.floor(requestedCap), mutation.maxMutants))
+                const capFromCall = maxMutants < mutation.maxMutants
+                if (Math.floor(requestedCap) > mutation.maxMutants) {
+                    notes.push(`调用要求最多 ${Math.floor(requestedCap)} 个变异体，按宿主配置上限 ${mutation.maxMutants} 执行（每个变异体都要跑一遍完整测试）`)
+                }
+                const requestedBudget = args.timeBudgetMs ?? mutation.timeBudgetMs
+                const timeBudgetMs = Math.max(MIN_MUTATION_TIME_BUDGET_MS, Math.min(Math.floor(requestedBudget), mutation.timeBudgetMs))
+                const budgetFromCall = timeBudgetMs < mutation.timeBudgetMs
+
+                // --- which files -------------------------------------------
+                const collected = await collectSourceFiles({
+                    cwd,
+                    ...(mutation.sourceGlobs === undefined ? {} : { sourceGlobs: mutation.sourceGlobs }),
+                    excludeGlobs: mutation.excludeGlobs,
+                    changed,
+                    baseRef: mutation.baseRef,
+                    logger,
+                })
+                if (collected.problem !== undefined) {
+                    throw new Error(
+                        [
+                            `无法读取改动文件（changed=true，baseRef=${mutation.baseRef}）：${collected.problem}`,
+                            '下一步：确认工作区是 git 仓库、mutation.baseRef 指向一个存在的 ref（例如 HEAD、origin/main），或改用 changed=false（全部源码）。',
+                        ].join('\n'),
+                    )
+                }
+                if (collected.files.length === 0) throw new Error(noSourcesRefusal(collected, mutation))
+
+                // --- the plan (pure) ---------------------------------------
+                const plan = planMutants({
+                    files: collected.files,
+                    ...(operatorNames.length === 0 ? {} : { operators: operatorNames }),
+                    maxMutants,
+                })
+                if (plan.mutants.length === 0) throw new Error(noMutantsRefusal(plan, collected.files.length))
+
+                // --- the run (mutate → run → restore, per mutant) -----------
+                const run = await runMutationPlan(plan, {
+                    cwd,
+                    argv: command.argv,
+                    timeoutMs: config.commandTimeoutMs,
+                    timeBudgetMs,
+                    maxOutputBytes: config.maxOutputBytes,
+                    ...(signal === undefined ? {} : { signal }),
+                    subprocess: () => deps.subprocess(),
+                    logger,
+                })
+                // A cancelled run is not a verdict: no gate record, no artifact.
+                // (Every mutated file has already been restored — see runMutationPlan.)
+                if (run.stopped === 'aborted') {
+                    return [
+                        '⛔ 变异测试：已取消',
+                        `本次运行被 signal 取消（已跑完 ${run.counts.executed} 个变异体）：结果不构成裁决，未写入门禁记录。`,
+                        '说明：已改写的源码文件都已按运行前的字节快照还原（本门禁的任何退出路径都会还原）。',
+                        '下一步：在未被取消的轮次重跑 mutation_check。',
+                    ].join('\n')
+                }
+
+                // --- verdict ------------------------------------------------
+                const judged = judgeMutation({ run, thresholds: mutation.thresholds, changed })
+                const full =
+                    run.stopped === 'complete' &&
+                    run.counts.runError === 0 &&
+                    !plan.truncated &&
+                    !operatorsOverridden &&
+                    !capFromCall &&
+                    !budgetFromCall
+                const scope: GateScope = { selected: mutantScopeFiles(run), total: plan.files.length, full }
+                const checks: GateCommandResult[] = judged.checks.map((check) =>
+                    checkResult(check.id, check.name, check.expectation, check.ok === null ? null : check.ok ? 0 : 1, check.output),
+                )
+
+                // --- artifact + gate record ---------------------------------
+                const artifact = {
+                    kind: 'mutation',
+                    at: Date.now(),
+                    workspace: cwd,
+                    changed,
+                    baseRef: mutation.baseRef,
+                    command: command.text,
+                    commandSource: command.source,
+                    operators: plan.operatorIds,
+                    limits: { maxMutants, timeBudgetMs, timeoutMs: config.commandTimeoutMs },
+                    plan: {
+                        available: plan.available,
+                        planned: plan.mutants.length,
+                        truncated: plan.truncated,
+                        files: plan.files,
+                        skipped: collected.skipped,
+                    },
+                    counts: run.counts,
+                    score: run.score ?? null,
+                    formula: run.formula,
+                    stopped: run.stopped,
+                    elapsedMs: run.elapsedMs,
+                    thresholds: mutation.thresholds,
+                    checks: checks.map((check) => ({ id: check.id, exitCode: check.exitCode, output: check.output })),
+                    state: judged.state,
+                    reason: judged.reason,
+                    survivors: run.survivors.map((survivor) => ({
+                        id: survivor.id,
+                        file: survivor.file,
+                        line: survivor.line,
+                        column: survivor.column,
+                        operator: survivor.operator,
+                        tokenBefore: survivor.tokenBefore,
+                        tokenAfter: survivor.tokenAfter,
+                        snippetBefore: survivor.snippetBefore,
+                        snippetAfter: survivor.snippetAfter,
+                    })),
+                    mutants: run.results,
+                    notes: [...notes, ...collected.notes, ...judged.notes],
+                }
+                const mission = store.resolveForAgent(agent, {
+                    ...(args.missionId === undefined ? {} : { explicitId: args.missionId }),
+                })
+                let artifactNote = '(无 mission，未落盘)'
+                if (mission !== undefined) {
+                    const file = store.writeArtifact(
+                        mission.id,
+                        path.join('mutation', 'mutants.json'),
+                        `${JSON.stringify(artifact, undefined, 2)}\n`,
+                    )
+                    artifactNote = path.relative(cwd, file)
+                }
+                const gateId = recordIfMission(store, agent, args.missionId, {
+                    state: judged.state,
+                    reason: judged.reason,
+                    results: checks,
+                    scope,
+                    fingerprint: fingerprintOf(cwd, store),
+                })
+                logger.info(
+                    `mutation_check: ${judged.state} — ${judged.reason}；变异体 ${run.counts.executed}/${plan.mutants.length}（killed ${run.counts.killed}、survived ${run.counts.survived}、run-error ${run.counts.runError}）；scope.full=${full}；mission ${mission?.id ?? '(无)'}`,
+                )
+
+                // --- report --------------------------------------------------
+                const lines: string[] = []
+                lines.push(
+                    `${judged.state === 'PASS' ? '✅' : judged.state === 'WARN' ? '⚠️' : '⛔'} 变异测试（mutation）：${judged.state}`,
+                )
+                lines.push(`原因：${judged.reason}`)
+                lines.push('')
+                lines.push(`命令：\`${command.text}\`（${command.source}）`)
+                lines.push(
+                    `范围：${changed ? `只变异本次改动（baseRef=${mutation.baseRef}）` : '全部源码'}；源文件 ${collected.files.length} 个（globs：${collected.sourceGlobs.join(', ')}），参与变异 ${plan.files.length} 个${
+                        collected.skipped.length === 0 ? '' : `，跳过 ${collected.skipped.length} 个`
+                    }`,
+                )
+                lines.push(
+                    `变异体：可用 ${plan.available} 个，本次计划 ${plan.mutants.length} 个${
+                        plan.truncated ? `（超过上限 ${maxMutants}，按文件轮转抽样，顺序确定、不是随机）` : ''
+                    }；操作符 ${plan.operatorIds.join(', ')}`,
+                )
+                lines.push(
+                    `执行：跑过 ${run.counts.executed} 个 → killed ${run.counts.killed}、survived ${run.counts.survived}、run-error ${run.counts.runError}（用时 ${Math.round(
+                        run.elapsedMs / 1000,
+                    )}s，预算 ${Math.round(timeBudgetMs / 1000)}s${run.stopped === 'budget' ? '，预算用尽、提前结束' : ''}）`,
+                )
+                lines.push(`变异得分：${run.formula}`)
+                lines.push('')
+                lines.push('判定：')
+                for (const check of checks) {
+                    lines.push(
+                        `  - [${check.exitCode === 0 ? 'PASS' : check.exitCode === null ? 'SKIP' : 'FAIL'}] ${check.id}（${check.name}）：${check.output}`,
+                    )
+                }
+                lines.push('')
+                lines.push(
+                    `阈值（生效值，来源 ${describeSource(effective)}）：${describeMutationThresholds(mutation.thresholds)}${
+                        scoreThreshold.key === 'changedMutationScore' && mutation.thresholds.changedMutationScore === undefined
+                            ? '（changed=true 时 changedMutationScore 未配置，已回退到 mutationScore）'
+                            : ''
+                    }`,
+                )
+                lines.push(
+                    run.survivors.length === 0
+                        ? '存活变异体：0 个 —— 本次跑过的每一处改动都被测试发现了。'
+                        : `存活变异体 ${run.survivors.length} 个（**每一行都是一条没有断言的测试**，这就是本门禁的交付物）：`,
+                )
+                if (run.survivors.length > 0) {
+                    lines.push(...renderMutantList(run.survivors))
+                    lines.push('  （没有断言的代码 = 覆盖率的盲区：这些行被测到了，但改坏它没有任何测试会失败。）')
+                }
+                const runErrors = run.results.filter((result) => result.verdict === 'run-error')
+                if (runErrors.length > 0) {
+                    lines.push(
+                        `未能运行（run-error ${runErrors.length} 个，**不计入得分**：跑不起来既不是"被杀"也不是"存活"，是未知）：`,
+                    )
+                    lines.push(...renderMutantList(runErrors, 6))
+                }
+                lines.push('')
+                lines.push(
+                    `覆盖范围：${full ? `完整（${plan.files.length}/${plan.files.length} 个源文件、${run.counts.executed}/${plan.mutants.length} 个变异体）` : '部分'} — ${
+                        full ? '可作为交付依据' : '不构成完整的交付依据'
+                    }`,
+                )
+                if (!full) {
+                    const why: string[] = []
+                    if (plan.truncated) why.push(`变异体超过上限 ${maxMutants}，只跑了抽样（可用 ${plan.available} 个）`)
+                    if (run.counts.runError > 0) why.push(`${run.counts.runError} 个变异体未能运行（run-error）`)
+                    if (run.stopped === 'budget') why.push(`时间预算用尽（跑了 ${run.counts.executed}/${plan.mutants.length}）`)
+                    if (operatorsOverridden) why.push('操作符由调用参数提供（非宿主配置）')
+                    if (capFromCall) why.push(`maxMutants 比宿主配置更窄（${maxMutants} < ${mutation.maxMutants}）`)
+                    if (budgetFromCall) why.push('timeBudgetMs 比宿主配置更窄')
+                    lines.push(`  scope.full=false 的原因：${why.join('；')}`)
+                }
+                const allNotes = [...notes, ...collected.notes, ...judged.notes]
+                if (allNotes.length > 0) lines.push(renderNotes(allNotes))
+                lines.push('')
+                lines.push(`gate record: ${gateId ?? '(无 mission，未记录)'}`)
+                lines.push(`工件：${artifactNote}`)
+                lines.push(
+                    '诚实的边界：变异操作符是**词法**的（按行扫描、跳过字符串与注释），不是解析器——等价变异体（改完语义不变）不会被发现，语法被改坏的变异体会因为构建失败而算作 killed，因此得分是"套件弱点"的**下界**，不是质量分。',
+                )
+                lines.push(
+                    judged.state === 'PASS'
+                        ? '下一步：这条 PASS 只说明"跑过的这些变异都被发现了"；抽样不等于全量，重要的交付可以提高 maxMutants。'
+                        : judged.state === 'WARN'
+                          ? '下一步：先让未能运行的变异体跑起来（缩小算子集或提高 commandTimeoutMs），再按得分判断；存活变异体要补断言，不要靠调整阈值。'
+                          : '下一步：给存活变异体补断言（每个存活变异体都是一条"改坏了也没人喊"的代码路径）；**不要**调低 mutationScore 或删掉存活项让它变绿。',
+                )
+                return lines.join('\n')
+            },
+        }),
+        'mutation_check',
+    )
+
+    register(
+        defineTool({
             name: 'coverage_status',
             description:
-                'Read-only: the coverage thresholds in force and where they come from, whether a coverage command/report and a flaky command are configured, and the newest coverage/flaky gate recorded on the mission with its numbers. Use it before claiming a coverage result, or to see why coverage_check refuses.',
+                'Read-only: the coverage thresholds in force and where they come from, whether a coverage command/report, a flaky command and the mutation block are configured, and the newest coverage/flaky/mutation gate recorded on the mission with its numbers. Use it before claiming a coverage or mutation result, or to see why coverage_check / mutation_check refuse.',
             parameters: {
                 missionId: { type: 'string', description: 'Mission to inspect (default: the session mission).' },
             },
@@ -988,6 +1509,7 @@ export function registerTools(
                         config.flakyCommand === undefined ? '（未配置 —— flaky_check 会拒绝执行）' : `\`${config.flakyCommand}\``
                     }`,
                 )
+                lines.push(`mutation：${describeMutation(config.mutation)}`)
                 const mission = store.resolveForAgent(agent, {
                     ...(args.missionId === undefined ? {} : { explicitId: args.missionId }),
                 })
@@ -1014,6 +1536,51 @@ export function registerTools(
                 )
                 if (flakyGate !== undefined) {
                     for (const result of flakyGate.results) lines.push(`  - [exit=${result.exitCode ?? 'null'}] ${result.id} ${result.timedOut ? '（超时）' : ''}`)
+                }
+                const mutationGate = latestGateOfKind(store, mission.id, 'mutation')
+                lines.push(
+                    mutationGate === undefined
+                        ? '最新 mutation 门禁：(未运行过)'
+                        : `最新 mutation 门禁：${mutationGate.state} @ ${formatTime(mutationGate.checkedAt)} — ${mutationGate.reason}\n  ${describeGateScope(mutationGate)}`,
+                )
+                if (mutationGate !== undefined) {
+                    for (const result of mutationGate.results) lines.push(`  - [${result.exitCode === 0 ? 'PASS' : result.exitCode === null ? 'SKIP' : 'FAIL'}] ${result.id}：${result.output}`)
+                }
+                const mutationText = store.readArtifact(mission.id, path.join('mutation', 'mutants.json'))
+                if (mutationText !== undefined) {
+                    try {
+                        const artifact = JSON.parse(mutationText) as {
+                            at?: number
+                            command?: string
+                            counts?: { executed?: number; killed?: number; survived?: number; runError?: number }
+                            score?: number | null
+                            formula?: string
+                            stopped?: string
+                            survivors?: { file: string; line: number; operator: string }[]
+                        }
+                        const counts = artifact.counts ?? {}
+                        const stale = artifact.at !== undefined && mutationGate !== undefined && artifact.at < mutationGate.checkedAt
+                        lines.push(
+                            `最新变异工件（mutation/mutants.json @ ${artifact.at === undefined ? '?' : formatTime(artifact.at)}${
+                                stale ? '，⚠️ 早于最新门禁：该门禁没有产出新工件（例如还原失败），下面是更早一次运行的数字' : ''
+                            }）：跑过 ${counts.executed ?? 0} 个变异体（killed ${counts.killed ?? 0}、survived ${counts.survived ?? 0}、run-error ${
+                                counts.runError ?? 0
+                            }）；得分 ${
+                                artifact.score === null || artifact.score === undefined ? '无法判定' : formatPercent(artifact.score)
+                            }${artifact.stopped === 'budget' ? '（时间预算用尽，部分结果）' : ''}`,
+                        )
+                        const survivors = artifact.survivors ?? []
+                        if (survivors.length > 0) {
+                            lines.push(
+                                `  存活变异体 ${survivors.length} 个，前几个：${survivors
+                                    .slice(0, 5)
+                                    .map((mutant) => `${mutant.file}:${mutant.line} [${mutant.operator}]`)
+                                    .join('，')}`,
+                            )
+                        }
+                    } catch {
+                        lines.push('⚠️ mutation/mutants.json 无法解析（工件被改动过？）')
+                    }
                 }
                 const artifactText = store.readArtifact(mission.id, path.join('artifacts', 'coverage.json'))
                 if (artifactText !== undefined) {
@@ -1115,8 +1682,8 @@ function recordIfMission(
     }).id
 }
 
-/** The newest recorded gate of one kind (`coverage-*` / `flaky-*` results). */
-function latestGateOfKind(store: MissionStore, missionId: string, kind: 'coverage' | 'flaky') {
+/** The newest recorded gate of one kind (`coverage-*` / `flaky-*` / `mutation-*` results). */
+function latestGateOfKind(store: MissionStore, missionId: string, kind: 'coverage' | 'flaky' | 'mutation') {
     return store
         .readGates(missionId)
         .filter((gate) => gate.source === GATE_SOURCE && gate.results.some((result) => result.id.startsWith(`${kind}-`)))

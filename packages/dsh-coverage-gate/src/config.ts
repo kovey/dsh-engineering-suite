@@ -18,6 +18,11 @@
  */
 
 import { loadProjectConfig, type Layout, type LayoutOptions, type Logger } from 'dsh-eng-core'
+import {
+    MUTATION_OPERATOR_GROUPS,
+    MUTATION_OPERATOR_IDS,
+    type MutationThresholds,
+} from './mutation.js'
 
 /** Which report format the parser should expect (`auto` sniffs it). */
 export type ReportFormat = 'auto' | 'lcov' | 'cobertura' | 'go-cover' | 'istanbul-json'
@@ -74,10 +79,276 @@ export interface CoverageGateConfig {
     commandTimeoutMs: number
     /** Per-stream capture cap for one run. */
     maxOutputBytes: number
+    /**
+     * Mutation testing: `coverage_check` says the line ran, `mutation_check` says
+     * whether an assertion would have noticed it being wrong. Off by default —
+     * it rewrites source files and runs the suite once per mutant.
+     */
+    mutation: MutationConfig
     prompt: {
         enabled: boolean
         order: number
     }
+}
+
+/**
+ * Mutation-testing configuration (see {@link module:dsh-coverage-gate/mutation}).
+ *
+ * Every limit here exists because this gate spends real wall-clock time and real
+ * CPU: it runs the FULL test command once per mutant, having first rewritten a
+ * source file. `enabled` therefore defaults to `false`.
+ */
+export interface MutationConfig {
+    /** Off unless the host turns it on (a repository may turn it ON, never off). */
+    enabled: boolean
+    /** Source globs to mutate; unset = detected from the workspace's languages. */
+    sourceGlobs?: string[]
+    /** Extra excludes, on top of the built-in `.dsh/**`, `.git/**`, vendor, build output list. */
+    excludeGlobs: string[]
+    /**
+     * Command template that runs the tests, tokenised without a shell (argv only).
+     * Placeholder: `{workspace}`.
+     */
+    testCommand?: string
+    /** Operator ids or group names; empty = the whole set. */
+    operators: string[]
+    /** Hard cap on planned mutants (1…{@link MAX_MUTANTS_CEILING}). */
+    maxMutants: number
+    /** Wall-clock budget for one `mutation_check` run. */
+    timeBudgetMs: number
+    /** Thresholds in force; no score threshold → `mutation_check` refuses. */
+    thresholds: MutationThresholds
+    /** Diff base for `changed: true` (default `HEAD`). */
+    baseRef: string
+}
+
+/**
+ * Hard ceiling for `maxMutants`: running the whole suite once per mutant is a
+ * real cost, and a gate that takes an hour is a gate people turn off.
+ */
+export const MAX_MUTANTS_CEILING = 200
+
+/** Default mutant cap when the host names none. */
+export const DEFAULT_MAX_MUTANTS = 20
+
+/** Default wall-clock budget for one mutation run (10 minutes). */
+export const DEFAULT_MUTATION_TIME_BUDGET_MS = 600_000
+
+/** Shortest budget that can run anything at all. */
+export const MIN_MUTATION_TIME_BUDGET_MS = 1_000
+
+/** The keys of the `mutation` block, for messages and the project overlay. */
+export const MUTATION_KEYS: readonly string[] = [
+    'enabled',
+    'sourceGlobs',
+    'excludeGlobs',
+    'testCommand',
+    'operators',
+    'maxMutants',
+    'timeBudgetMs',
+    'thresholds',
+    'baseRef',
+]
+
+/** Threshold keys of the `mutation.thresholds` block. */
+export const MUTATION_THRESHOLD_KEYS: readonly string[] = ['mutationScore', 'changedMutationScore', 'maxSurvived']
+
+/** The configuration in force when the host says nothing about mutation. */
+export function defaultMutationConfig(): MutationConfig {
+    return {
+        enabled: false,
+        excludeGlobs: [],
+        operators: [],
+        maxMutants: DEFAULT_MAX_MUTANTS,
+        timeBudgetMs: DEFAULT_MUTATION_TIME_BUDGET_MS,
+        thresholds: {},
+        baseRef: 'HEAD',
+    }
+}
+
+/**
+ * Validate a `mutation` block (profile and project files share this).
+ * @param input - the untrusted value.
+ * @param where - the provenance, for messages.
+ * @param warn - sink for recoverable problems.
+ * @param base - the values to start from (the profile's, for a project overlay).
+ */
+export function parseMutationConfig(
+    input: unknown,
+    where: string,
+    warn: (message: string) => void,
+    base: MutationConfig = defaultMutationConfig(),
+): MutationConfig {
+    const next: MutationConfig = { ...base, thresholds: { ...base.thresholds } }
+    if (input === undefined || input === null) return next
+    if (!isRecord(input)) {
+        warn(`${where}: mutation 必须是对象（例如 { "enabled": true, "testCommand": "node --test test/*.test.ts" }）`)
+        return next
+    }
+    for (const key of Object.keys(input)) {
+        if (!MUTATION_KEYS.includes(key)) {
+            warn(`${where}: 未知的 mutation 键 "${key}"（可用：${MUTATION_KEYS.join(', ')}）`)
+        }
+    }
+
+    if (input['enabled'] !== undefined) {
+        if (typeof input['enabled'] === 'boolean') next.enabled = input['enabled']
+        else warn(`${where}: mutation.enabled 必须是布尔值（收到 ${JSON.stringify(input['enabled'])}），已忽略（保持 ${next.enabled}）`)
+    }
+
+    for (const key of ['sourceGlobs', 'excludeGlobs'] as const) {
+        if (input[key] === undefined) continue
+        const value = input[key]
+        if (!Array.isArray(value) || value.some((entry) => typeof entry !== 'string' || entry.trim() === '')) {
+            warn(`${where}: mutation.${key} 必须是非空字符串数组，已忽略（不会用默认值替代一个写错的 glob）`)
+            continue
+        }
+        const globs = (value as string[]).map((entry) => entry.trim())
+        const absolute = globs.filter((glob) => glob.startsWith('/') || /^[A-Za-z]:[\\/]/.test(glob))
+        if (absolute.length > 0) {
+            warn(`${where}: mutation.${key} 里的 ${absolute.join(', ')} 是绝对路径：glob 必须相对工作区（这些条目永不匹配，已按原样保留但请改掉）`)
+        }
+        next[key] = globs
+    }
+    if (next.sourceGlobs !== undefined && next.sourceGlobs.length === 0) delete next.sourceGlobs
+
+    if (input['testCommand'] !== undefined) {
+        if (typeof input['testCommand'] === 'string' && input['testCommand'].trim() !== '') {
+            next.testCommand = input['testCommand'].trim()
+        } else if (input['testCommand'] === null) {
+            delete next.testCommand
+        } else {
+            warn(`${where}: mutation.testCommand 必须是非空字符串，或显式 null 表示"没有"（已忽略）`)
+        }
+    }
+
+    if (input['operators'] !== undefined) {
+        const value = input['operators']
+        if (!Array.isArray(value) || value.some((entry) => typeof entry !== 'string' || entry.trim() === '')) {
+            warn(`${where}: mutation.operators 必须是非空字符串数组（操作符 id 或组名），已忽略（按全部操作符处理）`)
+        } else {
+            const names = (value as string[]).map((entry) => entry.trim())
+            const unknown = names.filter(
+                (name) => !MUTATION_OPERATOR_IDS.includes(name) && !MUTATION_OPERATOR_GROUPS.includes(name as never),
+            )
+            if (unknown.length > 0) {
+                // Dropping ONE operator out of a list would silently change the
+                // gate's measurement; the whole key is refused instead.
+                warn(
+                    `${where}: mutation.operators 含未知操作符 ${unknown
+                        .map((name) => `"${name}"`)
+                        .join(', ')}：已忽略整个 operators 配置（不会只丢掉写错的那些，那等于静默改变门禁口径）；可用 id：${MUTATION_OPERATOR_IDS.join(
+                        ', ',
+                    )}；可用组名：${MUTATION_OPERATOR_GROUPS.join(', ')}`,
+                )
+            } else {
+                next.operators = names
+            }
+        }
+    }
+
+    if (input['maxMutants'] !== undefined) {
+        const value = input['maxMutants']
+        if (typeof value === 'number' && Number.isInteger(value) && value >= 1) {
+            if (value > MAX_MUTANTS_CEILING) {
+                warn(`${where}: mutation.maxMutants=${value} 超过上限 ${MAX_MUTANTS_CEILING}，已收敛到上限（每个变异体都要跑一遍完整测试）`)
+            }
+            next.maxMutants = Math.min(MAX_MUTANTS_CEILING, value)
+        } else {
+            warn(`${where}: mutation.maxMutants 必须是正整数，已忽略（保持 ${next.maxMutants}）`)
+        }
+    }
+
+    if (input['timeBudgetMs'] !== undefined) {
+        const value = input['timeBudgetMs']
+        if (typeof value === 'number' && Number.isFinite(value) && value >= MIN_MUTATION_TIME_BUDGET_MS) {
+            next.timeBudgetMs = Math.floor(value)
+        } else {
+            warn(`${where}: mutation.timeBudgetMs 必须是不小于 ${MIN_MUTATION_TIME_BUDGET_MS} 的数字，已忽略（保持 ${next.timeBudgetMs}）`)
+        }
+    }
+
+    if (input['baseRef'] !== undefined) {
+        const value = input['baseRef']
+        if (typeof value === 'string' && value.trim() !== '') next.baseRef = value.trim()
+        else warn(`${where}: mutation.baseRef 必须是非空字符串（例如 HEAD、origin/main），已忽略（保持 ${next.baseRef}）`)
+    }
+
+    if (input['thresholds'] !== undefined) {
+        const parsed = parseMutationThresholds(input['thresholds'], `${where}: mutation.thresholds`)
+        for (const problem of parsed.problems) warn(problem)
+        // Merged onto the base, never substituted for it: a project file with a
+        // typo in one key must not silently DROP the host's other thresholds.
+        next.thresholds = { ...base.thresholds, ...parsed.thresholds }
+    }
+    return next
+}
+
+/**
+ * Validate a `mutation.thresholds` block.
+ *
+ * Same rule as the coverage thresholds: a value that is not a number in its
+ * domain is DROPPED WITH A MESSAGE, never replaced by a default — a silently
+ * defaulted threshold is a silently weakened gate.
+ * @param input - the untrusted value.
+ * @param where - the provenance, for messages.
+ */
+export function parseMutationThresholds(
+    input: unknown,
+    where: string,
+): { thresholds: MutationThresholds; problems: string[] } {
+    const problems: string[] = []
+    const thresholds: MutationThresholds = {}
+    if (input === undefined || input === null) return { thresholds, problems }
+    if (!isRecord(input)) {
+        problems.push(`${where} 必须是对象（例如 { "mutationScore": 60, "maxSurvived": 5 }）`)
+        return { thresholds, problems }
+    }
+    for (const key of MUTATION_THRESHOLD_KEYS) {
+        if (!Object.prototype.hasOwnProperty.call(input, key)) continue
+        const value = input[key]
+        if (key === 'maxSurvived') {
+            if (typeof value === 'number' && Number.isInteger(value) && value >= 0) {
+                thresholds.maxSurvived = value
+            } else {
+                problems.push(`${where}.maxSurvived 必须是不小于 0 的整数（收到 ${JSON.stringify(value)}）；已忽略该阈值，不会用默认值替代`)
+            }
+            continue
+        }
+        const parsed = parsePercent(value, key, where)
+        if (typeof parsed === 'number') thresholds[key as 'mutationScore' | 'changedMutationScore'] = parsed
+        else problems.push(parsed.error)
+    }
+    for (const key of Object.keys(input)) {
+        if (!MUTATION_THRESHOLD_KEYS.includes(key)) {
+            problems.push(`${where}: 未知的阈值键 "${key}"（可用：${MUTATION_THRESHOLD_KEYS.join(', ')}）`)
+        }
+    }
+    return { thresholds, problems }
+}
+
+/** Render the mutation thresholds as a compact one-line table. */
+export function describeMutationThresholds(thresholds: MutationThresholds): string {
+    const parts: string[] = []
+    if (thresholds.mutationScore !== undefined) parts.push(`mutationScore ≥ ${formatPercent(thresholds.mutationScore)}`)
+    if (thresholds.changedMutationScore !== undefined) parts.push(`changedMutationScore ≥ ${formatPercent(thresholds.changedMutationScore)}`)
+    if (thresholds.maxSurvived !== undefined) parts.push(`maxSurvived ≤ ${thresholds.maxSurvived}`)
+    return parts.length === 0 ? '(未配置任何变异阈值)' : parts.join('，')
+}
+
+/** One-line description of the mutation block for prompts and status output. */
+export function describeMutation(config: MutationConfig): string {
+    if (!config.enabled) return '未启用（默认关闭：每个变异体都要跑一遍完整测试；把 mutation.enabled 设为 true 才会进入门禁）'
+    return [
+        `已启用：testCommand ${
+            config.testCommand === undefined ? '（未配置：会尝试 flakyCommand / coverageCommand 的测试调用，都不行就拒绝）' : `\`${config.testCommand}\``
+        }`,
+        `sourceGlobs ${config.sourceGlobs === undefined ? '(按工作区语言探测)' : config.sourceGlobs.join(', ')}`,
+        `operators ${config.operators.length === 0 ? '(全部)' : config.operators.join(', ')}`,
+        `maxMutants ${config.maxMutants}`,
+        `时间预算 ${Math.round(config.timeBudgetMs / 1000)}s`,
+        `阈值 ${describeMutationThresholds(config.thresholds)}`,
+    ].join('；')
 }
 
 /** Hard ceiling for `flakyRepeats`: flakiness detection must not become a load test. */
@@ -112,6 +383,7 @@ export const PROJECT_OVERRIDABLE_KEYS: readonly string[] = [
     'flakyCommand',
     'commandTimeoutMs',
     'maxOutputBytes',
+    'mutation',
 ]
 
 /** Keys a project file may set to `null` to mean "this repository has none". */
@@ -276,6 +548,7 @@ export function resolveConfig(input: unknown, warn: (message: string) => void = 
             : {}),
         commandTimeoutMs: Math.max(1_000, Math.floor(num(raw['commandTimeoutMs'], 300_000))),
         maxOutputBytes: Math.max(1_024, Math.floor(num(raw['maxOutputBytes'], 64_000))),
+        mutation: parseMutationConfig(raw['mutation'], 'profile 配置', warn),
         prompt: {
             enabled: bool(prompt['enabled'], true),
             order: num(prompt['order'], 645),
@@ -322,7 +595,12 @@ export function resolveEffectiveConfig(
         }
     }
 
-    const next: CoverageGateConfig = { ...host, thresholds: { ...host.thresholds }, prompt: host.prompt }
+    const next: CoverageGateConfig = {
+        ...host,
+        thresholds: { ...host.thresholds },
+        mutation: { ...host.mutation, thresholds: { ...host.mutation.thresholds } },
+        prompt: host.prompt,
+    }
     let applied = 0
     const reject = (message: string): void => {
         problems.push(message)
@@ -393,6 +671,20 @@ export function resolveEffectiveConfig(
     }
     takePositiveInt('commandTimeoutMs', 1_000)
     takePositiveInt('maxOutputBytes', 1_024)
+
+    // mutation: the repository knows whether its suite can be run per mutant and
+    // which globs hold its source. ONE asymmetry is deliberate — a project may
+    // turn mutation testing ON for itself, but may not turn OFF a gate the host
+    // enabled (self-exemption, the same rule as `enabled` and `flakyPolicy`).
+    if (raw['mutation'] !== undefined) {
+        const merged = parseMutationConfig(raw['mutation'], file.file, (message) => reject(message), host.mutation)
+        if (isRecord(raw['mutation']) && raw['mutation']['enabled'] === false && host.mutation.enabled) {
+            reject(`${file.file}: mutation.enabled 不能在项目级配置里关闭（profile 已启用）：仓库不能给自己关掉门禁；已保持 profile 的 true`)
+            merged.enabled = true
+        }
+        if (JSON.stringify(merged) !== JSON.stringify(host.mutation)) applied += 1
+        next.mutation = merged
+    }
 
     if (applied === 0) return { config: host, source: 'profile', file: file.file, problems }
     return { config: next, source: 'project', file: file.file, problems }

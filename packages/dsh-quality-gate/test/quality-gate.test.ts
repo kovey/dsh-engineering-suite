@@ -91,7 +91,7 @@ test('the plugin declares its name and required services', () => {
 
 test('apply() registers the tools, hooks and prompt section', () => {
     const fake = host()
-    assert.deepEqual([...fake.tools.keys()].sort(), ['quality_gate_run', 'quality_gate_status'])
+    assert.deepEqual([...fake.tools.keys()].sort(), ['budget_check', 'contract_check', 'quality_gate_run', 'quality_gate_status'])
     assert.deepEqual(
         [...new Set([...fake.listeners.keys()])].sort(),
         ['agent/disposed', 'agent/turn-stopping', 'tools/post-execute'],

@@ -138,14 +138,15 @@ test('the plugin declares its name and required services', () => {
     assert.deepEqual(inject, ['tools', 'systemPrompt'])
 })
 
-test('apply() registers the three tools and the prompt section, and disposes cleanly', () => {
+test('apply() registers the four tools and the prompt section, and disposes cleanly', () => {
     const cwd = tempWorkspace('cov-apply-')
     const fake = host(cwd, { thresholds: { total: 80 } })
-    assert.deepEqual([...fake.tools.keys()].sort(), ['coverage_check', 'coverage_status', 'flaky_check'])
+    assert.deepEqual([...fake.tools.keys()].sort(), ['coverage_check', 'coverage_status', 'flaky_check', 'mutation_check'])
     const section = fake.sectionText('eng:coverage-gate')
     assert.match(section, /覆盖率数字不是正确性/)
     assert.match(section, /flaky/)
     assert.match(section, /total ≥ 80%/)
+    assert.match(section, /run-error` 不是 kill/)
     fake.dispose()
     assert.equal(fake.tools.size, 0)
 })

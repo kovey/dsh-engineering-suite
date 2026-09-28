@@ -54,13 +54,22 @@ profile 配置是**上限**，每个仓库可以用自己的 `.dsh/quality-gate.
     { "id": "test", "name": "单元测试", "command": "cargo test", "required": true, "phase": "gate" },
     { "id": "clippy", "name": "clippy", "command": "cargo clippy", "required": false, "phase": "lint" }
   ],
+  "budgets": [
+    { "id": "bundle", "name": "发布包体积", "metric": "bytes", "command": "node scripts/size.mjs",
+      "regex": "size=(\\d+)", "max": 200000, "maxRegressionPercent": 10 }
+  ],
+  "contracts": [
+    { "id": "cli-help", "name": "CLI 冒烟", "kind": "cli", "command": "cargo run -- --help",
+      "expect": { "exitCode": 0, "stdoutContains": ["USAGE"] } }
+  ],
   "limits": { "maxChangedFiles": 30 },
   "turnStop": { "maxBlocksPerTurn": 3 }
 }
 ```
 
-- `commands` **替换** profile 的命令集（Rust 仓库不该跑 `pnpm test`）；`commands[].cwd` 相对**会话工作区**解析。
-- 可覆盖键：`commands`、`limits`、`defaultTimeoutMs`、`maxOutputBytes`、`writeTools`、`turnStop`、`afterWrite`。
+- `commands` / `budgets` / `contracts` 各自**替换** profile 的同名列表（Rust 仓库不该跑 `pnpm test`，包体积口径也不一样）；
+  `commands[].cwd` 相对**会话工作区**解析。
+- 可覆盖键：`commands`、`budgets`、`contracts`、`limits`、`defaultTimeoutMs`、`maxOutputBytes`、`writeTools`、`turnStop`、`afterWrite`。
 - **不可覆盖**：`enabled`、`logFile`、布局路径等宿主决策——写了也会被忽略并记日志（模型可能经 shell 改这个文件，所以它不能是"关掉门禁"的开关）。
 - 文件损坏 → 回退 profile 配置并记日志；`commands: []` 是"这个仓库没有门禁命令"的显式决定 → 诚实 WARN 并指出文件路径。
 - `quality_gate_run` / `quality_gate_status` 都会显示命令来源（profile 还是哪个项目文件）。
@@ -71,6 +80,12 @@ profile 配置是**上限**，每个仓库可以用自己的 `.dsh/quality-gate.
 |---|---|---|
 | `quality_gate_run` | `missionId` `only[]` `phase` `reason` | 跑命令并返回渲染后的裁决（含 `scope` 覆盖范围）；同时记录 gate + 证据 |
 | `quality_gate_status` | `missionId` | 配置的命令表、最近裁决（含 scope 与工作区漂移）、本会话 pendingWrites / 阻断计数 |
+| `budget_check` | `missionId` `only[]` | 跑**回归预算**：每个预算测一个数字（命令耗时，或按 `regex` 从输出里取的数），判绝对上下限与"相对历史最佳值"的回归；记录 gate（`scope.full` 恒为 false） |
+| `contract_check` | `missionId` | 跑**契约冒烟**：逐条判定声明的期望（退出码 / stdout 含与不含 / JSON 路径），每条期望单独报告；记录 gate（`scope.full` 恒为 false） |
+
+> `budget_check` / `contract_check` 的裁决**不构成交付依据**：它们跑的都不是宿主的门禁命令集，所以记录里 `scope.full` 恒为 `false`
+> （`dsh-evidence-gate` 只认 `scope.full === true` 的 `PASS`）。它们也不会清零本会话的"待验证写"计数——交付前仍然必须跑一次
+> 不带 `only`/`phase` 的完整 `quality_gate_run`。这样设计是刻意的：多一条能放行的通道，就等于少一层门禁。
 
 ### `scope` 契约（`quality_gate_run` / 收尾门禁都会写）
 
@@ -86,6 +101,70 @@ scope: {
 - **只有 `full` 的运行才会清零 `pendingWrites`**（收尾门禁的“待验证写”计数）；部分运行
   （`only`/`phase`）保留计数，下一次收尾会再跑一次完整命令集。
 - 旧记录没有 `scope` 字段：消费方必须当作“未知”，不得当作 `full`。
+
+## 回归预算（`budget_check`）
+
+"测试通过"回答不了团队真正会回归的东西：命令慢了三倍、包体积翻倍、迁移不可逆、某个计数悄悄涨了。这些都需要**数字的界限**：
+
+```yaml
+budgets:
+  - id: test-duration
+    name: 测试套件耗时
+    metric: durationMs          # 命令的墙钟时间
+    commandId: test             # 复用 hosts 的门禁命令（继承 cwd/超时/env）；也可直接写 command
+    max: 120000                 # 绝对上限
+    maxRegressionPercent: 20    # 相对"历史最佳值"允许的变差
+  - id: bundle
+    name: 发布包体积
+    metric: bytes               # 数字从输出里按 regex 取（第一个捕获组）
+    command: node scripts/size.mjs
+    regex: "size=(\\d+)"
+    unit: bytes
+    max: 200000
+```
+
+规则（固定，不可配置）：
+
+- **两种测量来源**：`metric: durationMs` 直接测命令耗时；`metric: number|bytes` 必须给 `regex`，取**第一个捕获组**并作为数字解析
+  （`12.3kB`、`1,200`、`n/a` 都是**拒绝**，绝不退化成 `0`）。
+- **绝对界限**：`max`（上界）/ `min`（下界）。同时声明 `max` 与 `min` 时，回归方向按 `max`（越小越好）。
+- **回归对照"历史最佳值"**：`<rootDir>/budgets.json` 是**只增不改**的历史（每个预算 id 一条），对照的是
+  **历史最优**（越小越好取最小，越大越好取最大），所以一次变慢不会被下一次更慢的记录冲淡。
+  失败信息会点名**对照的是哪一次记录、值是多少、什么时候记的**。
+- **第一次测量**：记录基线并明说"基线已记录，本次还没有可比的历史值"——那是"暂无数据"，不是通过。
+- **只有被接受的测量才进基线**：越界的那次不写入（它从来没被接受过）。
+- **命令没成功执行 ≠ 通过**：非零退出 / 超时 / 起不来 → 这条预算判 `BLOCK` 并记录，但**不写入基线**
+  （从崩溃的运行里量出来的耗时说明不了任何事），其他预算照常判定。
+- **测不到数字就是拒绝**：正则没匹配、捕获内容不是数字 → `budget_check` **整体拒绝执行**（列出已判定但未写入的预算供修复参考），
+  既定的语义是"没有数据"而不是"通过"，也绝不退化成 `0`。基线文件损坏同样按 fail closed 拒绝（当成"没有历史"会让护栏悄悄消失）。
+- 配置里的预算条目**不会被静默丢弃**：写错的条目会被保留并在 `budget_check` 时被拒绝（规则"消失"和"全部通过"看起来一模一样）。
+
+## 契约冒烟（`contract_check`）
+
+```yaml
+contracts:
+  - id: api-smoke
+    name: 接口冒烟
+    kind: http                  # cli | http | schema | command（声明接口类别，写错即拒绝）
+    command: node scripts/smoke.mjs
+    expect:
+      exitCode: 0
+      stdoutContains: ["ok"]
+      stdoutNotContains: ["stack trace"]
+      jsonPaths:
+        - { path: data.items[0].id, type: number }
+        - { path: data.total, equals: 1 }
+```
+
+- 这是**冒烟**契约门禁，不是 mock 框架：它跑宿主声明的**真实命令**，不拦截、不替身、不重写被测系统。
+  它证明的是"声明的接口仍然按声明的方式行为"，**不是**"接口是正确的"。
+- **每条期望单独判定**（一份带名字的清单，不是一个布尔）：`exitCode`、每条 `stdoutContains` / `stdoutNotContains`、
+  每条 `jsonPaths` 各自一行，附实际值。
+- `jsonPaths` 用点号 + `[n]` 下标（`data.items[0].id`）；**路径不存在 = 失败并点名该路径**，绝不是"跳过"；
+  stdout 不是合法 JSON 时，`jsonPaths` 里每条路径都判失败（外加一条 `stdout 是合法 JSON` 失败）。
+- 没声明 `expect.exitCode` 时退出码**不判定**，报告里明确写 `[未断言]`——契约只对它写下的东西负责。
+- **无法判定的期望一律拒绝**（并给出改法）：未知 `kind`、空 `command`、`expect` 里不认识的键、没有任何可判定期望的 `expect`、
+  非法 `jsonPaths` 路径、未知的 `type`。拒绝时不跑任何命令、不记录门禁。
 
 ## 配置
 
@@ -118,6 +197,9 @@ scope: {
 | `commands[]` | `[]` | 命令表；`phase: gate` 默认必需，`phase: lint` 默认非必需 |
 | `commands[].cwd` | 会话工作区 | 子目录里跑命令 |
 | `commands[].env` | — | 追加环境变量 |
+| `budgets[]` | `[]` | 回归预算表；`id`/`name`/`metric`（`durationMs`/`number`/`bytes`）+ `command` 或 `commandId` + `regex`（非 durationMs 必填）+ `max`/`min`/`maxRegressionPercent` + `unit`/`baselineFile` |
+| `budgets[].baselineFile` | `<rootDir>/budgets.json` | 该预算的基线历史文件（相对路径按会话工作区解析；默认文件是所有预算共享的一份，每个 id 一条历史） |
+| `contracts[]` | `[]` | 契约表；`id`/`name`/`kind`（`cli`/`http`/`schema`/`command`）+ `command` + `expect`（`exitCode`/`stdoutContains`/`stdoutNotContains`/`jsonPaths`） |
 | `defaultTimeoutMs` | `300000` | 未声明 `timeoutMs` 时的超时（超时按失败处理） |
 | `maxOutputBytes` | `64000` | 单命令输出上限（保留尾部） |
 | `limits.maxChangedFiles` | `0`（关闭） | 一次任务的改动文件数上限（docs.md §9）；超限 → `BLOCK`。计数来自 `git status --porcelain`，**排除 `.dsh/` 工程台账自身**（否则任务自己的工件会吃掉预算）；不是 git 仓库时按 fail closed 阻断 |
@@ -147,6 +229,8 @@ scope: {
 - 优先走 `ctx.subprocess`（harness 的受管进程 seam，带沙箱与 spill），缺失时回退
   `node:child_process`；两条路径返回同一形状的结果。
 - 非零退出**不是**工具错误：它是一条裁决数据（`exitCode` 进 gate 记录与证据账本）。
+- 预算与契约的命令同样**不经过 shell**（`splitCommand` → argv），走同一个 `ctx.subprocess`/`child_process` 双通道；
+  预算的 `commandId` 复用门禁命令的 `cwd`/超时/env，**不会**用调用参数去改写宿主设定的界限。
 
 ## 与其它插件的协作
 
@@ -157,3 +241,6 @@ scope: {
   `only`/`phase`）→ `mission_complete`；若在门禁之后又登记了命令/测试证据，重跑一次
   `quality_gate_run` 即可自愈。
 - `dsh-orchestrator`：`quality-verify` 阶段的出口门禁就是本插件写下的那条 `PASS`。
+- **预算 / 契约裁决不是交付依据**：它们以 `source: dsh-quality-gate`、`scope.full=false` 记录（理由写在 `reason` 里），
+  `dsh-evidence-gate` 的 `gate-scope` 检查会因此拒绝只拿它们放行。预算/契约失败时修代码；要交付仍然要跑完整的
+  `quality_gate_run`。

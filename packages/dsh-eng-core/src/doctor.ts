@@ -487,6 +487,91 @@ export function checkWorkspace(options: DoctorOptions): DoctorReport {
         fix: '在 .dsh/impact-gate.json 写 testCommandTemplate（例如 "go test {files}" 或 "vitest run {files}"）',
     })
 
+    // ---- test budgets / mutation / contracts / flaky (all opt-in) ----------
+    const coverageMutation = (coverage.value?.['mutation'] ?? undefined) as Record<string, unknown> | undefined
+    const mutationEnabled = coverageMutation?.['enabled'] === true
+    const mutationCommand = coverageMutation?.['testCommand'] ?? coverageCommand
+    add({
+        id: 'config.mutation',
+        area: 'test',
+        state: !mutationEnabled ? 'ok' : typeof mutationCommand === 'string' && mutationCommand !== '' ? 'ok' : 'missing',
+        severity: mutationEnabled ? 'required' : 'recommended',
+        label: '变异测试（.dsh/coverage-gate.json 的 mutation）',
+        detail: !mutationEnabled
+            ? '未启用（可选）：覆盖率只证明"这行跑过"，变异测试才回答"断言会不会发现它变坏"'
+            : typeof mutationCommand === 'string' && mutationCommand !== ''
+              ? `已启用，测试命令：${mutationCommand}`
+              : '已启用但没有可用的测试命令（mutation.testCommand 缺失，且覆盖率命令无法明确推导）：mutation_check 会拒绝运行',
+        ...(mutationEnabled && (typeof mutationCommand !== 'string' || mutationCommand === '')
+            ? { fix: '在 .dsh/coverage-gate.json 的 mutation.testCommand 写明跑测试的命令（argv 形式，例如 "go test ./..."）' }
+            : {}),
+    })
+
+    const budgets = Array.isArray(quality.value?.['budgets']) ? (quality.value?.['budgets'] as unknown[]) : []
+    const brokenBudgets = budgets.filter((entry) => {
+        if (typeof entry !== 'object' || entry === null) return true
+        const budget = entry as Record<string, unknown>
+        const hasCommand = typeof budget['command'] === 'string' || typeof budget['commandId'] === 'string'
+        const hasBound = budget['max'] !== undefined || budget['min'] !== undefined || budget['maxRegressionPercent'] !== undefined
+        const needsRegex = budget['metric'] !== undefined && budget['metric'] !== 'durationMs' && budget['metric'] !== 'bytes'
+        const hasRegex = typeof budget['regex'] === 'string' && budget['regex'] !== ''
+        return !hasCommand || !hasBound || (needsRegex && !hasRegex)
+    })
+    add({
+        id: 'config.budgets',
+        area: 'test',
+        state: budgets.length === 0 ? 'ok' : brokenBudgets.length === 0 ? 'ok' : 'partial',
+        severity: budgets.length > 0 ? 'required' : 'recommended',
+        label: '指标预算（.dsh/quality-gate.json 的 budgets）',
+        detail:
+            budgets.length === 0
+                ? '未配置（可选）：命令通过不等于没有变慢/变大，预算防的是"这次改动让数字变坏"'
+                : brokenBudgets.length === 0
+                  ? `${budgets.length} 条预算，字段齐备（命令 + 界限${budgets.some((b) => typeof (b as Record<string, unknown>)['maxRegressionPercent'] === 'number') ? '，含回归对比' : ''}）`
+                  : `${brokenBudgets.length}/${budgets.length} 条预算字段不全：每条都需要 command（或 commandId）+ 至少一个界限（max/min/maxRegressionPercent）；提取数字的预算还需要 regex`,
+        ...(brokenBudgets.length > 0 ? { fix: '补齐 budgets 里缺字段的条目（或删掉不打算维护的那条）——字段不全的预算会在 budget_check 时被拒绝' } : {}),
+    })
+
+    const contracts = Array.isArray(quality.value?.['contracts']) ? (quality.value?.['contracts'] as unknown[]) : []
+    const brokenContracts = contracts.filter((entry) => {
+        if (typeof entry !== 'object' || entry === null) return true
+        const contract = entry as Record<string, unknown>
+        const expect = contract['expect']
+        return typeof contract['command'] !== 'string' || typeof expect !== 'object' || expect === null || Object.keys(expect).length === 0
+    })
+    add({
+        id: 'config.contracts',
+        area: 'test',
+        state: contracts.length === 0 ? 'ok' : brokenContracts.length === 0 ? 'ok' : 'partial',
+        severity: contracts.length > 0 ? 'required' : 'recommended',
+        label: '契约冒烟检查（.dsh/quality-gate.json 的 contracts）',
+        detail:
+            contracts.length === 0
+                ? '未配置（可选）：用来证明"声明的接口还能按预期行为"，不是正确性证明'
+                : brokenContracts.length === 0
+                  ? `${contracts.length} 条契约检查`
+                  : `${brokenContracts.length}/${contracts.length} 条缺 command 或 expect（expect 至少要有一条期望）`,
+        ...(brokenContracts.length > 0 ? { fix: '给每条 contract 写 command 与 expect（exitCode/stdoutContains/stdoutNotContains/jsonPaths 至少一项）' } : {}),
+    })
+
+    const impactCfg = readProjectConfig(layout, 'impact-gate')
+    const flaky = (impactCfg.value?.['flaky'] ?? undefined) as Record<string, unknown> | undefined
+    const quarantineDays = flaky?.['quarantineMaxDays']
+    add({
+        id: 'config.flaky',
+        area: 'test',
+        state: quarantineDays === 0 ? 'partial' : 'ok',
+        severity: quarantineDays === 0 ? 'recommended' : 'recommended',
+        label: 'flaky 隔离策略（.dsh/impact-gate.json 的 flaky）',
+        detail:
+            flaky === undefined
+                ? '未配置：flaky_plan 使用默认签名与 14 天隔离期（每条隔离都要 owner 与到期时间）'
+                : quarantineDays === 0
+                  ? 'quarantineMaxDays=0：隔离立即过期，flaky_plan 的每次输出都会是"已过期"升级'
+                  : `已配置（隔离期 ${String(quarantineDays ?? 14)} 天）`,
+        ...(quarantineDays === 0 ? { fix: '把 flaky.quarantineMaxDays 设为正数（例如 14），否则隔离形同虚设' } : {}),
+    })
+
     // ---- interact ---------------------------------------------------------
     const interaction = readProjectConfig(layout, 'interaction-gate')
     add({

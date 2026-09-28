@@ -24,8 +24,22 @@
 - **粒度忽略规则**：运行时（missions/audit/state/specs、已存在的根级 `*.jsonl`）必须被 git 忽略，配置类文件（`.dsh/*.json`、`roles/`）**不能**——否则 `requireCleanTree` 会把"每次门禁都改动工作区"报成两个不同的 diff 摘要。脚手架会自动补上正确的行，且幂等。
 - **部署/交互的配置骨架**：`project-config.sh --interaction on --deploy on`；deploy 骨架默认 `environments: []`（未声明就拒绝部署）。
 
+### 新增 · 测试有效性（P4）
+
+- **变异测试**（`coverage-gate` 的 `mutation_check`）：16 个词法操作符，逐个变异 → 跑测试 → **按字节还原**；
+  killed / survived / **run-error** 三分类，run-error 绝不算 killed 也不进分母；得分公式与两个数字一起打印；
+  预算与抽样截断时如实标注"部分结果"，绝不分外推。
+- **指标预算**（`quality-gate` 的 `budget_check`）：命令耗时或正则提取的数字；绝对上下限 + `maxRegressionPercent`
+  对比历史最好值（点名那个值与时间）；首次运行只记录基线并如实说明"还没有数据"。
+- **契约冒烟**（`quality-gate` 的 `contract_check`）：逐条断言退出码/stdout/JSON 路径（路径缺失 = 失败，不是跳过）。
+- **flaky 隔离计划**（`impact-gate` 的 `flaky_plan`/`flaky_status`）：分类 + 必须有 owner 与到期时间 + 过期升级 +
+  "隔离后长期未出现"提醒。
+- **自检同步**：`suite_status`/`doctor.sh` 新增四项配置检查（变异/预算/契约/flaky），未配置时如实说明"可选"。
+
 ### 修复
 
+- **辅助裁决不得授权交付**：`budget_check`/`contract_check` 记录门禁时用 `scope.full=false`、不清 `pendingWrites`、
+  reason 带前缀——否则"source 撞车 + full=true"能在没跑过宿主命令集的情况下授权交付（P4 实现时发现并固化）。
 - `scripts/doctor.mjs` 的参数解析：`--json <path>` 时路径被忽略、结果报的是当前目录（看起来像"目标仓库是空的"）。
 - 目录型忽略规则必须用尾斜杠查询，文件则不能带尾斜杠（两个 bug 都是在真实仓库上抓到的，不是测试里）。
 - `.dsh/media/` 等只在对应插件被使用后才存在的运行时目录，改为"存在才要求忽略"（避免给每个仓库塞无效规则）。

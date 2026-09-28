@@ -20,6 +20,12 @@
  */
 
 import { loadProjectConfig, type Layout, type LayoutOptions, type Logger } from 'dsh-eng-core'
+import {
+    compileSignatures,
+    DEFAULT_QUARANTINE_MAX_DAYS,
+    DEFAULT_UNSEEN_RUNS,
+    type FlakySettings,
+} from './flaky.js'
 
 /** Resolved plugin configuration. */
 export interface ImpactGateConfig {
@@ -64,6 +70,11 @@ export interface ImpactGateConfig {
         maxDepth: number
         targets: number
     }
+    /**
+     * Flakiness policy: the failure signatures that mean "the environment is
+     * broken", and the rules a quarantine has to obey (an owner and a deadline).
+     */
+    flaky: FlakySettings
     prompt: {
         enabled: boolean
         order: number
@@ -136,6 +147,18 @@ export function resolveConfig(input: unknown, warn: Warn = () => undefined): Imp
     }
     const model = optionalString(review['model'])
     const fullTestCommand = optionalString(raw['fullTestCommand'])
+    const flaky = isRecord(raw['flaky']) ? raw['flaky'] : {}
+    if (raw['flaky'] !== undefined && !isRecord(raw['flaky'])) warn('config.flaky 必须是对象，已忽略（flaky 策略继续用默认值）')
+    for (const key of Object.keys(flaky)) {
+        if (!FLAKY_KEYS.includes(key)) warn(`config.flaky 里不认识的键 "${key}"（支持：${FLAKY_KEYS.join(' / ')}），已忽略`)
+    }
+    // `flaky.signatures` is the documented place; the top-level
+    // `flakySignatures` spelling is accepted as an alias so the older phrasing of
+    // the same setting does not silently do nothing.
+    const compiled = compileSignatures(flaky['signatures'] ?? raw['flakySignatures'])
+    for (const problem of compiled.problems) warn(`config: ${problem}`)
+    const flakyOwner = optionalString(flaky['owner'])
+    const flakyQuarantineFile = optionalString(flaky['quarantineFile'])
     return {
         enabled: bool(raw['enabled'], true),
         logFile: str(raw['logFile'], '~/.dsh/impact-gate.log'),
@@ -163,12 +186,22 @@ export function resolveConfig(input: unknown, warn: Warn = () => undefined): Imp
             maxDepth: intAtLeast(review['maxDepth'], 1, 1, 'reviewDispatch.maxDepth', warn),
             targets: intAtLeast(review['targets'], 5, 1, 'reviewDispatch.targets', warn),
         },
+        flaky: {
+            signatures: compiled.signatures,
+            quarantineMaxDays: intAtLeast(flaky['quarantineMaxDays'], DEFAULT_QUARANTINE_MAX_DAYS, 1, 'flaky.quarantineMaxDays', warn),
+            unseenRunsBeforeWarn: intAtLeast(flaky['unseenRunsBeforeWarn'], DEFAULT_UNSEEN_RUNS, 1, 'flaky.unseenRunsBeforeWarn', warn),
+            ...(flakyQuarantineFile === undefined ? {} : { quarantineFile: flakyQuarantineFile }),
+            ...(flakyOwner === undefined ? {} : { owner: flakyOwner }),
+        },
         prompt: {
             enabled: bool(prompt['enabled'], true),
             order: typeof prompt['order'] === 'number' && Number.isFinite(prompt['order']) ? prompt['order'] : 670,
         },
     }
 }
+
+/** Keys `config.flaky` accepts (anything else is reported, never silently used). */
+export const FLAKY_KEYS: readonly string[] = ['signatures', 'quarantineMaxDays', 'quarantineFile', 'unseenRunsBeforeWarn', 'owner']
 
 /**
  * Keys a target repository may override in `<repo>/.dsh/impact-gate.json`.
@@ -186,6 +219,7 @@ export const PROJECT_OVERRIDABLE_KEYS: readonly string[] = [
     'maxDistance',
     'maxFiles',
     'maxFileBytes',
+    'flaky',
 ]
 
 /** The resolved configuration plus where it came from. */
@@ -283,6 +317,66 @@ export function resolveEffectiveConfig(
     takeInt('maxDistance', 1)
     takeInt('maxFiles', 1)
     takeInt('maxFileBytes', 1_024)
+
+    if (has('flaky')) {
+        const rawFlaky = raw['flaky']
+        if (!isRecord(rawFlaky)) {
+            note(`${file.file}: flaky 必须是对象，已忽略（继续使用 profile 的 flaky 策略）`)
+        } else {
+            const nextFlaky: FlakySettings = { ...next.flaky }
+            for (const key of Object.keys(rawFlaky)) {
+                if (!FLAKY_KEYS.includes(key)) note(`${file.file}: flaky 里不认识的键 "${key}"（支持：${FLAKY_KEYS.join(' / ')}），已忽略`)
+            }
+            if (Object.prototype.hasOwnProperty.call(rawFlaky, 'signatures')) {
+                const compiled = compileSignatures(rawFlaky['signatures'])
+                for (const problem of compiled.problems) note(`${file.file}: ${problem}`)
+                // A repository's failure vocabulary is repository knowledge, so the
+                // list REPLACES the profile's (including with `[]`).
+                nextFlaky.signatures = compiled.signatures
+                applied += 1
+            }
+            // `owner` and `quarantineFile` are facts about the repository.
+            if (Object.prototype.hasOwnProperty.call(rawFlaky, 'owner')) {
+                const owner = optionalString(rawFlaky['owner'])
+                if (owner === undefined) note(`${file.file}: flaky.owner 必须是非空字符串，已忽略（继续使用 profile 的值）`)
+                else {
+                    nextFlaky.owner = owner
+                    applied += 1
+                }
+            }
+            if (Object.prototype.hasOwnProperty.call(rawFlaky, 'quarantineFile')) {
+                const quarantineFile = optionalString(rawFlaky['quarantineFile'])
+                if (quarantineFile === undefined) note(`${file.file}: flaky.quarantineFile 必须是非空字符串，已忽略（继续使用 profile 的值）`)
+                else {
+                    nextFlaky.quarantineFile = quarantineFile
+                    applied += 1
+                }
+            }
+            // The two numbers are POLICY, and the profile is the ceiling: a
+            // project may shorten a quarantine (or warn sooner) but may not
+            // lengthen the deadline the host set.
+            const takeTighter = (key: 'quarantineMaxDays' | 'unseenRunsBeforeWarn'): void => {
+                if (!Object.prototype.hasOwnProperty.call(rawFlaky, key)) return
+                const value = rawFlaky[key]
+                if (typeof value !== 'number' || !Number.isFinite(value) || value < 1) {
+                    note(`${file.file}: flaky.${key} 必须是 ≥ 1 的数字，已忽略（继续使用 profile 的值 ${next.flaky[key]}）`)
+                    return
+                }
+                const floor = Math.floor(value)
+                if (floor > next.flaky[key]) {
+                    note(
+                        `${file.file}: flaky.${key}=${floor} 比 profile 的 ${next.flaky[key]} 更宽松，已忽略（profile 是上限：项目只能收紧）`,
+                    )
+                    return
+                }
+                nextFlaky[key] = floor
+                applied += 1
+            }
+            takeTighter('quarantineMaxDays')
+            takeTighter('unseenRunsBeforeWarn')
+            next.flaky = nextFlaky
+        }
+    }
 
     if (applied === 0) return { config: host, source: 'profile', file: file.file, present: file.present, problems }
     return { config: next, source: 'project', file: file.file, present: file.present, problems }

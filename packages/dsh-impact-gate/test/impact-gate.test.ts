@@ -124,10 +124,10 @@ test('the plugin declares its name and the services it injects', () => {
     assert.deepEqual(inject, ['tools', 'systemPrompt'])
 })
 
-test('the three tools register, the prompt section renders, and dispose releases both', () => {
+test('the tools register, the prompt section renders, and dispose releases both', () => {
     const cwd = fixture()
     const fake = host(cwd)
-    assert.deepEqual([...fake.tools.keys()].sort(), ['impact_analyze', 'impact_status', 'impact_tests'])
+    assert.deepEqual([...fake.tools.keys()].sort(), ['flaky_plan', 'flaky_status', 'impact_analyze', 'impact_status', 'impact_tests'])
     const declared = fake.tools.get('impact_analyze')?.parameters as { properties?: Record<string, unknown> } | undefined
     assert.deepEqual(Object.keys(declared?.properties ?? {}).sort(), ['base', 'missionId', 'paths'])
     // `paths` is declared `json` on purpose: a wrong shape reaches the tool and
@@ -439,7 +439,7 @@ test('the project-level overlay applies a valid key and refuses an invalid one',
     const refused = effective.problems.join('\n')
     for (const key of ['enabled', 'reviewDispatch', 'logFile', 'prompt']) assert.match(refused, new RegExp(`"${key}" 不允许`))
     assert.equal(effective.present, true)
-    assert.deepEqual([...PROJECT_OVERRIDABLE_KEYS].sort(), ['defaultBase', 'fullTestCommand', 'maxDistance', 'maxFileBytes', 'maxFiles', 'testCommandTemplate'])
+    assert.deepEqual([...PROJECT_OVERRIDABLE_KEYS].sort(), ['defaultBase', 'flaky', 'fullTestCommand', 'maxDistance', 'maxFileBytes', 'maxFiles', 'testCommandTemplate'])
 
     // An unusable VALUE keeps the profile's value (never a plugin default).
     fs.writeFileSync(path.join(dir, 'impact-gate.json'), `${JSON.stringify({ maxDistance: 0, testCommandTemplate: 42, fullTestCommand: '' }, null, 2)}\n`)
@@ -481,7 +481,7 @@ test('a disabled plugin registers nothing, and reviewDispatch is opt-in', () => 
     const on = createFakeHost({ cwd })
     hosts.push(on)
     apply(on.ctx as never, { logFile: path.join(LOG_DIR, 'enabled-default.log') })
-    assert.deepEqual([...on.tools.keys()].sort(), ['impact_analyze', 'impact_status', 'impact_tests'])
+    assert.deepEqual([...on.tools.keys()].sort(), ['flaky_plan', 'flaky_status', 'impact_analyze', 'impact_status', 'impact_tests'])
     assert.equal(resolveConfig({}).reviewDispatch.enabled, false)
     assert.equal(resolveConfig({ reviewDispatch: { enabled: true, provider: 'spawn' } }).reviewDispatch.maxDepth, 1)
 })

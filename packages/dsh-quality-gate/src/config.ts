@@ -5,6 +5,8 @@
  */
 
 import { loadProjectConfig, type Layout, type LayoutOptions, type Logger } from 'dsh-eng-core'
+import { parseBudget, type BudgetConfig } from './budget.js'
+import { parseContract, type ContractConfig } from './contract.js'
 
 /** Which phase a configured command belongs to. */
 export type CommandPhase = 'gate' | 'lint'
@@ -38,6 +40,13 @@ export interface QualityGateConfig {
     logFileTemplate?: string
     layout: LayoutOptions
     commands: readonly GateCommandConfig[]
+    /**
+     * Regression budgets (docs.md §3.4's missing half): numbers that must not
+     * get worse, measured from host-configured commands.
+     */
+    budgets: readonly BudgetConfig[]
+    /** Smoke contracts: declared interface expectations, asserted one by one. */
+    contracts: readonly ContractConfig[]
     readonly writeTools: readonly string[]
     /** Gate evaluation when the agent stops its turn. */
     turnStop: {
@@ -90,6 +99,34 @@ function strList(value: unknown, fallback: readonly string[]): string[] {
 export const DEFAULT_WRITE_TOOLS: readonly string[] = ['write', 'edit']
 
 /** Example commands, shown when the host configures none. */
+export const EXAMPLE_BUDGETS: string = [
+    '# budgets:',
+    '#   - id: bundle',
+    '#     name: 前端包体积',
+    '#     metric: bytes            # durationMs | number | bytes',
+    '#     command: node scripts/bundle-size.mjs',
+    "#     regex: 'size=(\\d+)'      # metric != durationMs 时必填：第一个捕获组是纯数字",
+    '#     unit: bytes',
+    '#     max: 200000              # 绝对上限',
+    '#     min: 0                   # 绝对下限',
+    '#     maxRegressionPercent: 10 # 相对"历史最佳值"允许的变差幅度',
+].join('\n')
+
+/** Example contracts, shown when the host configures none. */
+export const EXAMPLE_CONTRACTS: string = [
+    '# contracts:',
+    '#   - id: api-smoke',
+    '#     name: 接口冒烟',
+    '#     kind: http               # cli | http | schema | command',
+    '#     command: node scripts/smoke.mjs',
+    '#     expect:',
+    '#       exitCode: 0',
+    '#       stdoutContains: [ok]',
+    '#       stdoutNotContains: [stack trace]',
+    "#       jsonPaths: [{ path: 'data.items[0].id', type: number }]",
+].join('\n')
+
+/** Example commands, shown when the host configures none. */
 export const EXAMPLE_COMMANDS: string = [
     '# commands:',
     "#   - id: test",
@@ -115,6 +152,8 @@ export const EXAMPLE_COMMANDS: string = [
  */
 export const PROJECT_OVERRIDABLE_KEYS: readonly string[] = [
     'commands',
+    'budgets',
+    'contracts',
     'limits',
     'defaultTimeoutMs',
     'maxOutputBytes',
@@ -166,7 +205,33 @@ export function resolveEffectiveConfig(host: QualityGateConfig, layout: Layout, 
     const appliedKeys = Object.keys(raw).filter((key) => PROJECT_OVERRIDABLE_KEYS.includes(key))
     if (appliedKeys.length === 0) return { config: host, source: 'profile', file: file.file, problems }
 
+    let budgets = host.budgets
+    let contracts = host.contracts
     let commands = host.commands
+    // The list keys are parsed before the scalar ones so that a project file
+    // replacing `budgets`/`contracts` is reported in file order.
+    if (Object.prototype.hasOwnProperty.call(raw, 'budgets')) {
+        const parsed = parseBudgetList(raw['budgets'], { file: file.file, report: (problem) => { problems.push(problem); logger?.warn(problem) } })
+        if (parsed === undefined) {
+            const problem = `${file.file}: budgets 必须是数组，已忽略项目级预算（继续使用 profile 的预算）`
+            problems.push(problem)
+            logger?.warn(problem)
+        } else {
+            budgets = parsed
+            logger?.info(`quality-gate: 使用项目级预算集（${parsed.length} 条，来自 ${file.file}）`)
+        }
+    }
+    if (Object.prototype.hasOwnProperty.call(raw, 'contracts')) {
+        const parsed = parseContractList(raw['contracts'], { file: file.file, report: (problem) => { problems.push(problem); logger?.warn(problem) } })
+        if (parsed === undefined) {
+            const problem = `${file.file}: contracts 必须是数组，已忽略项目级契约（继续使用 profile 的契约）`
+            problems.push(problem)
+            logger?.warn(problem)
+        } else {
+            contracts = parsed
+            logger?.info(`quality-gate: 使用项目级契约集（${parsed.length} 条，来自 ${file.file}）`)
+        }
+    }
     if (Object.prototype.hasOwnProperty.call(raw, 'commands')) {
         const entries = raw['commands']
         if (!Array.isArray(entries)) {
@@ -214,6 +279,8 @@ export function resolveEffectiveConfig(host: QualityGateConfig, layout: Layout, 
     const config: QualityGateConfig = {
         ...host,
         commands,
+        budgets,
+        contracts,
         defaultTimeoutMs: num(raw['defaultTimeoutMs'], host.defaultTimeoutMs),
         maxOutputBytes: num(raw['maxOutputBytes'], host.maxOutputBytes),
         writeTools: strList(raw['writeTools'], host.writeTools),
@@ -271,6 +338,57 @@ export function parseCommand(
 }
 
 /**
+ * Parse one configured list of budgets (profile row or project file).
+ *
+ * The list is REPLACED wholesale, like `commands`: a Rust repository's budgets
+ * are not the host's. A malformed entry is reported AND kept — the check refuses
+ * it later with its own message, which is better than a rule that quietly
+ * stopped existing.
+ * @param value - the untrusted list.
+ * @param options - provenance label and problem sink.
+ * @returns the parsed budgets, or `undefined` when the value is not an array.
+ */
+export function parseBudgetList(value: unknown, options: { file: string; report: (problem: string) => void }): BudgetConfig[] | undefined {
+    if (!Array.isArray(value)) return undefined
+    const parsed: BudgetConfig[] = []
+    const seen = new Set<string>()
+    for (const [index, entry] of value.entries()) {
+        const result = parseBudget(entry, index)
+        if (result.problem !== undefined) options.report(`${options.file}: ${result.problem}`)
+        if (seen.has(result.budget.id)) {
+            options.report(`${options.file}: 重复的预算 id "${result.budget.id}" 已忽略（同一 id 会共用一份基线历史）`)
+            continue
+        }
+        seen.add(result.budget.id)
+        parsed.push(result.budget)
+    }
+    return parsed
+}
+
+/**
+ * Parse one configured list of contracts (profile row or project file).
+ * @param value - the untrusted list.
+ * @param options - provenance label and problem sink.
+ * @returns the parsed contracts, or `undefined` when the value is not an array.
+ */
+export function parseContractList(value: unknown, options: { file: string; report: (problem: string) => void }): ContractConfig[] | undefined {
+    if (!Array.isArray(value)) return undefined
+    const parsed: ContractConfig[] = []
+    const seen = new Set<string>()
+    for (const [index, entry] of value.entries()) {
+        const result = parseContract(entry, index)
+        for (const problem of result.problems) options.report(`${options.file}: ${problem}`)
+        if (seen.has(result.contract.id)) {
+            options.report(`${options.file}: 重复的契约 id "${result.contract.id}" 已忽略`)
+            continue
+        }
+        seen.add(result.contract.id)
+        parsed.push(result.contract)
+    }
+    return parsed
+}
+
+/**
  * Resolve user configuration into the effective one.
  * @param input - the loader row's `config` value (untrusted).
  * @param warn - sink for recoverable configuration problems.
@@ -302,6 +420,12 @@ export function resolveConfig(input: unknown, warn: (message: string) => void = 
         seen.add(command.id)
         return true
     })
+    // Budgets and contracts are lists too, and a wrong type is reported rather
+    // than silently treated as "none configured" (which would read as green).
+    const budgets = parseBudgetList(raw['budgets'], { file: 'profile 配置', report: warn }) ?? []
+    if (raw['budgets'] !== undefined && !Array.isArray(raw['budgets'])) warn('profile 配置: budgets 必须是数组，已忽略（预算门禁将没有可测的预算）')
+    const contracts = parseContractList(raw['contracts'], { file: 'profile 配置', report: warn }) ?? []
+    if (raw['contracts'] !== undefined && !Array.isArray(raw['contracts'])) warn('profile 配置: contracts 必须是数组，已忽略（契约门禁将没有可判定的契约）')
     return {
         enabled: bool(raw['enabled'], true),
         logFile: str(raw['logFile'], '~/.dsh/quality-gate.log'),
@@ -312,6 +436,8 @@ export function resolveConfig(input: unknown, warn: (message: string) => void = 
             ...(typeof raw['specsDir'] === 'string' ? { specsDir: raw['specsDir'] } : {}),
         },
         commands: unique,
+        budgets,
+        contracts,
         writeTools: strList(raw['writeTools'], DEFAULT_WRITE_TOOLS),
         turnStop: {
             enabled: bool(turnStop['enabled'], true),
