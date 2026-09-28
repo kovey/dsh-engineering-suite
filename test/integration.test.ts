@@ -24,6 +24,9 @@ import { apply as applyQuality } from '../packages/dsh-quality-gate/dist/index.j
 import { apply as applyRoleGuard } from '../packages/dsh-role-guard/dist/index.js'
 import { apply as applySpecGate } from '../packages/dsh-spec-gate/dist/index.js'
 import { apply as applyTestDesign } from '../packages/dsh-test-design-gate/dist/index.js'
+import { apply as applyInteraction } from '../packages/dsh-interaction-gate/dist/index.js'
+import { apply as applySuiteDoctor } from '../packages/dsh-suite-doctor/dist/index.js'
+import { apply as applyDeploy } from '../packages/dsh-deploy-gate/dist/index.js'
 
 const TEST_DESIGN = [
     '### 正向场景',
@@ -75,11 +78,18 @@ function suite(): Suite {
     // The four newest plugins mount here too: this test is what catches a
     // cross-package contract drifting (a renamed service, a changed event shape,
     // a tool list that no longer lines up) — with seven of eleven mounted it
-    // silently stopped covering the rest.
+    // silently stopped covering the rest, and the same mistake is easy to make
+    // again now that the suite has fourteen bundles across six phases.
     applyStandards(fake.ctx as never, { logFile: log('standards-gate') })
     applyImpact(fake.ctx as never, { logFile: log('impact-gate'), testCommandTemplate: 'go test {files}' })
     applyCoverage(fake.ctx as never, { logFile: log('coverage-gate') })
     applySupplyChain(fake.ctx as never, { logFile: log('supply-chain-gate') })
+    // The three phase-completing plugins (交互 / 自检 / 部署) mount here as well:
+    // the suite's claim is that the six phases are covered, and this test is
+    // where a drift between the phases' plugins shows up.
+    applyInteraction(fake.ctx as never, { logFile: log('interaction-gate') })
+    applySuiteDoctor(fake.ctx as never, { logFile: log('suite-doctor') })
+    applyDeploy(fake.ctx as never, { logFile: log('deploy-gate') })
     return { fake, steers, stores: new MissionStoreRegistry().for(cwd) }
 }
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # e2e-mission.sh — run the REAL dsh harness against a SCRIPTED local model and
-# assert that the eleven-plugin engineering suite actually produced its
+# assert that the fourteen-plugin engineering suite actually produced its
 # artifacts.
 #
 # Why: the suite had never been verified with a live agent loop (no
@@ -44,8 +44,9 @@ DO_BUILD=1
 KEEP=0
 PERMISSION_MODE="${E2E_PERMISSION_MODE:-danger-full-access}"
 
-# The eight plugins under verification (dsh-eng-core is a library dependency,
-# linked but not a bundle).
+# Every plugin under verification (dsh-eng-core is a library dependency, linked
+# but not a bundle). The assertion below counts these mounts, so a plugin that
+# silently fails to apply fails the run.
 SUITE=(
   dsh-role-guard
   dsh-standards-gate
@@ -58,6 +59,9 @@ SUITE=(
   dsh-evidence-gate
   dsh-audit-trail
   dsh-orchestrator
+  dsh-interaction-gate
+  dsh-suite-doctor
+  dsh-deploy-gate
 )
 
 while [ $# -gt 0 ]; do
@@ -556,7 +560,7 @@ fi
 # ---------------------------------------------------------------------------
 section "summary"
 if [ "$FAILURES" = "0" ]; then
-  printf '  \033[32mE2E GREEN\033[0m — the eleven plugins ran a real mission in a live dsh session.\n'
+  printf '  \033[32mE2E GREEN\033[0m — the fourteen plugins ran a real mission in a live dsh session.\n'
   printf '  artifacts: %s\n' "$DOT"
   printf '  logs:      %s\n' "$LOGS"
   exit 0
