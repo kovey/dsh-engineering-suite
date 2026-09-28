@@ -11,16 +11,39 @@
 
 ---
 
-## 1. 升级到 harness 0.1.7-rc.1
+## 1. 升级到 harness 0.1.7-rc.1 / rc.2
 
-### 1.1 peer 声明必须锁版
+### 1.1 peer 声明会被**加载时强制校验**（0.1.7-rc.2 起必须处理）
 
-0.1.7 的官方与生态包都用**精确版本**：`"@deepseek-ai/dsh-agent": "0.1.7-rc.1"`、`"@deepseek-ai/cordis": "~4.0.4"`。
+`dsh-app-boot` 的 `evaluatePluginCompatibility` 会对每个 `@deepseek-ai/dsh*` peer 跑
+`semver.satisfies(runtimeVersion, requirement, { includePrerelease: true })`；不满足就**跳过整个插件**：
 
-**不要**写 `^0.1.5-rc.2` 这类范围：semver 规定，带预发布的范围只匹配**同一 major.minor.patch 元组**的预发布，
-所以 `^0.1.5-rc.2` **不匹配** `0.1.7-rc.1` —— `dsh plugin add` 会报 peer 不满足（或装上了却在运行期解析失败）。
+```text
+dsh: skipping profile bundle "dsh-role-guard": Error: Plugin dsh-role-guard@0.1.0 is incompatible with
+dsh 0.1.7-rc.2: peerDependencies {"@deepseek-ai/dsh-agent":"0.1.7-rc.1", …}
+```
 
-若确实要同时支持两版，用并集：`"^0.1.5-rc.1 || ^0.1.7-rc.1"`（本套件选择锁版，因为它按版本验证）。
+**症状很有迷惑性**：插件"装上了"但在会话里全都不在（`applied (` 一行都没有），工具变成 `unknown tool`，
+门的记录、mission、审计文件一个都不产生——看起来像插件坏了，其实是版本声明没过门。
+
+写法怎么选（下表是用 harness 自带的 `semver` 实测的，`includePrerelease: true`）：
+
+| 写法 | rc.2 | rc.3 | 0.1.7 | 0.1.8-rc.1 | 0.2.0-rc.1 | 适合谁 |
+|---|---|---|---|---|---|---|
+| `0.1.7-rc.2`（官方/生态常用，精确） | ✓ | ✗ | ✗ | ✗ | ✗ | 每个 rc 都愿意重新发版的插件 |
+| `^0.1.7-rc.2` | ✓ | ✓ | ✓ | ✓ | ✗ | 能接受跨 minor 自动跟随 |
+| **`>=0.1.7-rc.2 <0.1.8-0`** | ✓ | ✓ | ✓ | ✗ | ✗ | **同线自动跟随、跨 minor 必重验**（本套件采用） |
+| `^0.1.5-rc.2` | ✗ | ✗ | ✗ | ✗ | ✗ | 谁都匹配不上——不要用 |
+
+三种例外情况：
+
+- `workspace:^` / `workspace:~` / `workspace:*` 会被当成"当前 runtime 版本"，用于同仓开发；
+- 老写法 `^0.1.5-rc.2` **匹配不到任何 0.1.7 预发布**（semver 规定：带预发布的范围只匹配同元组的预发布）；
+- 想临时放行：`dsh plugin allow-version <插件>@<版本>`（或在插件管理器里开 exact-version 豁免）——
+  这是"明确接受风险"，不要当成升级方案。
+
+**协议再漂移怎么排查**：`STUB_DUMP_DIR=/tmp/dump bash scripts/e2e-mission.sh` 会把每个请求体落盘
+（`req-001.json`…）。rc.2 这次就是靠它证明"工具结果形状没变、只是插件被门禁跳过了"。
 
 ### 1.2 消息来源 kind：`'plugin'` 没有了
 

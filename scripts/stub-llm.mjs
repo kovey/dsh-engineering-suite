@@ -79,6 +79,15 @@ import process from 'node:process'
 const PORT = Number(process.env.STUB_PORT ?? 8787)
 const SCRIPT_PATH = process.env.STUB_SCRIPT ?? ''
 const STRICT = process.env.STUB_STRICT !== '0'
+/**
+ * Where to write every request body (one JSON file per request).
+ *
+ * Protocol drift is the failure mode this harness keeps meeting — 0.1.7-rc.1
+ * moved the provider to the Messages protocol, rc.2 reshaped how tool results
+ * are replayed — and the raw body is the only authority on what the harness
+ * actually sent. Off by default; set `STUB_DUMP_DIR=/tmp/x` when a check fails.
+ */
+const DUMP_DIR = process.env.STUB_DUMP_DIR ?? ''
 
 /** Frames are `event: <type>\ndata: <json>\n\n`; the blank line dispatches them. */
 const FRAME_TERMINATOR = '\n\n'
@@ -460,6 +469,14 @@ const server = http.createServer((request, response) => {
             }
             const messages = Array.isArray(body.messages) ? body.messages : []
             const tools = Array.isArray(body.tools) ? body.tools : []
+            if (DUMP_DIR !== '') {
+                try {
+                    fs.mkdirSync(DUMP_DIR, { recursive: true })
+                    fs.writeFileSync(`${DUMP_DIR}/req-${String(served + 1).padStart(3, '0')}.json`, JSON.stringify(body, null, 2))
+                } catch (error) {
+                    log('WARN', `could not dump the request body: ${error.message}`)
+                }
+            }
             log('REQ', `POST ${pathname} ${describeRequest(body, messages, tools)}`)
             assertProtocol(body, pathname)
 

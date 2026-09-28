@@ -1,28 +1,40 @@
 # 验证记录（2026-09-17）
 
-> **兼容基线（本文件全部结论的宿主版本）**：`@deepseek-ai/dsh-*` **0.1.7-rc.1**（`cordis ~4.0.4`）。
-> 11 个插件的 `peerDependencies` 按官方与生态约定**精确锁版**（`0.1.7-rc.1`，cordis `~4.0.4`），
-> 而不是 caret 范围：semver 规定带预发布的 `^0.1.5-rc.2` **不匹配** `0.1.7-rc.1`，
-> 用范围写会导致 `dsh plugin add` 报 peer 不满足。宿主每升一版，锁版随插件版本一起升。
+> **兼容基线（本文件全部结论的宿主版本）**：`@deepseek-ai/dsh-*` **0.1.7-rc.2**（`cordis ~4.0.4`）。
+> 11 个插件的 `peerDependencies` 用**同一 0.1.7 线**的范围 `>=0.1.7-rc.2 <0.1.8-0`。
+>
+> **0.1.7-rc.2 会在加载时强制校验 peer 版本**（`dsh-app-boot` 的 `evaluatePluginCompatibility`，
+> 判定用 `semver.satisfies(runtime, requirement, { includePrerelease: true })`）：锁 `0.1.7-rc.1` 的插件
+> 在 rc.2 下会被**整包跳过**（真机日志：`skipping profile bundle "dsh-role-guard": … is incompatible with dsh 0.1.7-rc.2`，
+> 11 个插件 0 挂载 → 端到端全红），可用 `dsh plugin allow-version` 为 exact 版本开豁免。
+> 范围取值是实测选定的（`semver` 真值表，`includePrerelease: true`）：
+>
+> | 写法 | rc.2 | rc.3 | 0.1.7 | 0.1.8-rc.1 | 0.2.0-rc.1 |
+> |---|---|---|---|---|---|
+> | `0.1.7-rc.2`（精确） | ✓ | ✗ | ✗ | ✗ | ✗ |
+> | `^0.1.7-rc.2` | ✓ | ✓ | ✓ | ✓ | ✗ |
+> | **`>=0.1.7-rc.2 <0.1.8-0`** | ✓ | ✓ | ✓ | ✗ | ✗ |
+>
+> 采用第三条：**同线 rc 增量自动跟随（不必重发插件），跨 minor 一律重新验证**——与本套件"先验证再放宽"的立场一致。
 > 已核实仍存在的接缝：`tools/pre-execute`、`tools/result`、`tools/post-execute`、`agent/turn-stopping`、
 > `agent/disposed`、`approval/request`、`session/title`；子代理在 rc1 由 harness 自动**钉住
 > `approvalPolicy: 'never'`** 并继承 preset/sandbox（`captureDelegatedPolicyOverrides`），
 > 与我们"派出去的子代理不能自己批准什么"的立场一致，无需插件侧改动。
 >
-> **0.1.7-rc.1 适配记录**（三处真实改动，都已验证）：
+> **0.1.7-rc.1 / rc.2 适配记录**（真实改动，全部实测过）：
 > 1. **消息来源词汇表**：`MessageSourceMap` 里**没有**共享的 `plugin` 兜底 kind 了（官方文档原话：each producer declares its own kind），
 >    每个生产者要用 `declare module '@deepseek-ai/dsh-llm'` 声明自己的 kind。我们新增
 >    `dsh-orchestrator/src/sources.ts` 与 `dsh-quality-gate/src/sources.ts`，注入的通知分别标成
 >    `kind: 'dsh-orchestrator'` / `'dsh-quality-gate'`（`form: 'notice'`），测试断言 kind/form/摘要 ≤120 字符。
-> 2. **DeepSeek provider 换成 Messages 协议**：0.1.5 走 `POST /chat/completions` + OpenAI chunk；
+> 2. **DeepSeek provider 换成 Messages 协议**（rc.1 起）：0.1.5 走 `POST /chat/completions` + OpenAI chunk；
 >    0.1.7 走 `POST /messages`，SSE 每一帧的 JSON 必须带 `type`（且与 `event:` 名一致），
 >    顺序为 `message_start → content_block_start → content_block_delta* → content_block_stop → message_delta → message_stop`，
 >    工具结果是 `user` 消息里的 `tool_result` 块，工具用 `input_schema`，**没有 `data: [DONE]`**。
 >    `scripts/stub-llm.mjs` 已按新协议重写（工具参数仍故意拆两个 delta 以持续检验分片拼接）；
 >    在此之前 E2E 会以 `MALFORMED_RESPONSE: SSE event type mismatch` 直接失败——旧 stub 只能证明旧协议下的框架路径。
-> 3. **peer 约定**：官方与生态包（如 `dsh-user-approval`、`dsh-memory`）用**精确锁版**；本仓库 11 个插件统一为
->    `@deepseek-ai/dsh-*: "0.1.7-rc.1"` + `cordis: "~4.0.4"`。用范围写会导致 `dsh plugin add` 报 peer 不满足
->    （semver 规定带预发布的 `^0.1.x-rc.y` 不匹配 `0.1.7-rc.1`）。
+>    协议再漂移时的排查入口：`STUB_DUMP_DIR=/tmp/x bash scripts/e2e-mission.sh` 会把每个请求体落盘（原始 body 是唯一权威）。
+> 3. **peer 从"精确锁版"改为"同线范围"**：rc.1 时锁 `0.1.7-rc.1`（官方与生态包的做法）；rc.2 起加载时强制校验，
+>    精确锁版会让每个 rc 都变成"必须先发插件"，于是改用 `>=0.1.7-rc.2 <0.1.8-0`（真值表见本节开头）。
 >
 > 顺带核实的 rc1 新能力（本套件暂未依赖，记录备查）：`dsh-fs-sandbox` / `dsh-bash-sandbox` / `dsh-pwsh-sandbox`
 > （沙箱策略服务）、`dsh-permission-presets`（权限预设）、`dsh-mcp-client`（MCP 客户端）、

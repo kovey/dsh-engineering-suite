@@ -55,7 +55,7 @@
   只有已知凭据形状阻断；熵检测按上下文降为建议级（复测阻断级 0 命中）。
 - 多个 flaky（时间容差、门禁新鲜度同毫秒、`isError` 与文本拒绝混用等）修正并补测试。
 
-### 变更 · 兼容基线（harness 0.1.7-rc.1）
+### 变更 · 兼容基线（harness `>=0.1.7-rc.2 <0.1.8-0`）
 
 - `peerDependencies` 从 `^0.1.5-rc.2` 改为**精确锁版** `0.1.7-rc.1`（cordis `~4.0.4`）：semver 规定带预发布的
   `^0.1.x-rc.y` 不匹配 `0.1.7-rc.1`，用范围会导致 `dsh plugin add` 报 peer 不满足。
@@ -63,6 +63,10 @@
   `dsh-orchestrator/src/sources.ts`、`dsh-quality-gate/src/sources.ts`。
 - **DeepSeek provider 换成 Messages 协议**（`POST /messages`、帧带 `type`、无 `[DONE]`）→
   `scripts/stub-llm.mjs` 按新协议重写，端到端验证重新可用。
+- **0.1.7-rc.2：peer 版本在加载时被强制校验**（`dsh-app-boot`），锁 `0.1.7-rc.1` 的插件会被整包跳过
+  （真机：11 个插件 0 挂载、工具变 `unknown tool`、端到端全红）。声明改为同一 0.1.7 线的范围
+  `>=0.1.7-rc.2 <0.1.8-0`（实测真值表见 UPGRADE），同线 rc 增量自动跟随、跨 minor 必须重新验证。
+- `scripts/stub-llm.mjs` 新增 `STUB_DUMP_DIR`：把每个请求体落盘，协议漂移时以原始 body 为准排查。
 - 详见 [UPGRADE.md](./UPGRADE.md)。
 
 ### 验证
