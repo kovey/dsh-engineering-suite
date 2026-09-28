@@ -140,6 +140,47 @@ declare module '@deepseek-ai/dsh-llm' {
 
 ---
 
+## 2.5 从 v0.1.0 到当前开发版（六阶段补齐）
+
+v0.1.0 覆盖 规划/实现/测试/交付 四段为主；这一版把 **交互** 与 **部署** 补上。要做的事：
+
+**① 挂三个新 bundle**（默认不打扰，但要用就得挂）：
+
+```json
+"bundles": ["…原有 11 个…", "dsh-interaction-gate", "dsh-suite-doctor", "dsh-deploy-gate"]
+```
+
+**② 需要人决定的两个新配置**（都在仓库里，属于信任根）：
+
+```bash
+bash scripts/project-config.sh --workspace <repo> --write --interaction on --deploy on
+# 顺带会把运行时台账写进 .gitignore（幂等，可用 --no-gitignore 跳过）
+```
+
+- `.dsh/interaction-gate.json`：`askTimeoutMs`、`requireApproverList`（严格名单）等；**严格名单要配
+  `<repo>.dsh/interaction-approvers.txt`**，否则所有回答都会被判"无权限"。
+- `.dsh/deploy-gate.json`：`environments` 默认空 → `deploy_plan`/`deploy_run` 直接拒绝；
+  每个环境要声明 `deployCommands` / `verifyCommands` / `rollbackCommands`（**没有回滚命令就不判 go**）。
+
+**③ 如果想让流水线覆盖部署**：在阶段配置里用新的门禁种类 `deploy-go`（部署已执行）与 `deploy-verified`
+（上线后验证通过）。它们**不在默认流水线里**——多数 mission 不部署，宿主显式声明阶段才生效。
+
+**④ 台账只增不减的仓库**：先看再搬：
+
+```bash
+bash scripts/archive-missions.sh --keep 20 --days 90 --dry-run   # 看会搬什么
+bash scripts/archive-missions.sh --keep 20 --days 90             # 执行（未交付默认不动）
+```
+
+**⑤ 先自检再开工**：`bash scripts/doctor.sh [<repo>]`（必需项缺失时退出码 1），会话里用 `suite_status`。
+它会指出仓库缺哪些门禁配置、每条都给出确切命令；`unknown` 不等于没问题。
+
+**行为变化**：`.gitignore` 的粒度被明确（运行时忽略、配置提交）；`dsh-interaction-gate` 会往
+`.dsh/interaction.jsonl` 写决定台账；`dsh-deploy-gate` 会往 `.dsh/deployments.jsonl` 写部署台账——
+两者都是运行时文件，应被忽略（脚手架会补）。
+
+---
+
 ## 3. 升级后的验收清单（照着跑）
 
 ```bash

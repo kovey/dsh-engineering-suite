@@ -3,6 +3,33 @@
 本文件的格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；
 版本号遵循语义化版本。**harness 版本与套件版本是两个数字**：当前开发版声明并验证于 `@deepseek-ai/dsh-*` **0.1.7-rc.1**（见下方"兼容基线"）。
 
+## [未发布]
+
+按 **六阶段（规划 / 实现 / 测试 / 交互 / 交付 / 部署）** 补齐套件：v0.1.0 覆盖了前四段中的三段半，
+这一轮把**交互**与**部署**两段补上，并把"还缺什么"做成一个可回答的问题。
+
+### 新增 · 插件（3）
+
+| 插件 | 阶段 | 职责 | 工具 |
+|---|---|---|---|
+| `dsh-interaction-gate` | 交互 | 统一 ask / notify / progress；**通道可插拔**（IM 插件注册一个 channel 即可）；一次性 token；项目级审批人名单；决定台账；超时 fail-closed | `interaction_ask`、`interaction_notify`、`interaction_progress`、`interaction_status` |
+| `dsh-suite-doctor` | 入口 | 一个工具回答"我们在哪、缺什么"：18 项配置/台账检查 + 运行时事实（插件挂载、阶段、待审批、通道能力）；每条发现带下一步命令 | `suite_status` |
+| `dsh-deploy-gate` | 部署 | 环境清单 → go/no-go → 人工批准（生产默认要）→ argv 执行 → 上线后验证（有限重试）→ 回滚；部署台账记 revision/审批人/门禁 | `deploy_plan`、`deploy_run`、`deploy_verify`、`deploy_rollback`、`deploy_status` |
+
+### 新增 · 机制
+
+- **自检引擎**（`dsh-eng-core` 的 `checkWorkspace`/`renderDoctor` + `scripts/doctor.sh`）：离线可判定的部分（配置、台账、指纹陷阱、规模）与运行时事实合并成一份报告；**读不到就说 `unknown`，绝不算通过**；每条发现都给确切命令。
+- **部署门禁**：编排器新增 `deploy-go` / `deploy-verified` 两种门禁种类（同一来源、最新一条必须 PASS、不早于阶段进入——与规范门禁同一套 fail-closed 规则）。**不进默认流水线**：多数 mission 不部署。
+- **台账归档**（`archiveMissions` + `scripts/archive-missions.sh`）：把旧的**已交付** mission 移到 `.dsh/archive/<年-月>/`，写索引，仍可反查；未交付默认不动；只搬不删；目标冲突拒绝合并。
+- **粒度忽略规则**：运行时（missions/audit/state/specs、已存在的根级 `*.jsonl`）必须被 git 忽略，配置类文件（`.dsh/*.json`、`roles/`）**不能**——否则 `requireCleanTree` 会把"每次门禁都改动工作区"报成两个不同的 diff 摘要。脚手架会自动补上正确的行，且幂等。
+- **部署/交互的配置骨架**：`project-config.sh --interaction on --deploy on`；deploy 骨架默认 `environments: []`（未声明就拒绝部署）。
+
+### 修复
+
+- `scripts/doctor.mjs` 的参数解析：`--json <path>` 时路径被忽略、结果报的是当前目录（看起来像"目标仓库是空的"）。
+- 目录型忽略规则必须用尾斜杠查询，文件则不能带尾斜杠（两个 bug 都是在真实仓库上抓到的，不是测试里）。
+- `.dsh/media/` 等只在对应插件被使用后才存在的运行时目录，改为"存在才要求忽略"（避免给每个仓库塞无效规则）。
+
 ## [0.1.0] — 2026-09-28
 
 首个发布（v0.1.0）：11 个插件 + 1 个共享库，`verify.sh` 全绿、真机 harness 端到端可复现（11 个插件全部挂载）。
