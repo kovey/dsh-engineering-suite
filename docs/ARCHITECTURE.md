@@ -397,6 +397,47 @@ artifact + 证据行（kind=artifact）
 IM 侧的职责（不在本仓库）：卡片按钮不可伪造且一次性、点击者要在项目级审批人名单里、
 超时返回 `cancelled` 而不是落到别的应答者、每个决定写一条含 `messageId` 的台账。
 
+### 5.13 六阶段视图与自检入口：一个工具回答"我们在哪、缺什么"
+
+套件按**六个阶段**组织：**规划 → 实现 → 测试 → 交互 → 交付 → 部署**。这是给人的导航，
+不是新的运行时抽象——每个阶段由已有插件承担，缺口也按阶段暴露：
+
+| 阶段 | 承担者 | 产物 | 门禁 |
+|---|---|---|---|
+| 规划 | spec-gate（需求/AC/边界/负面约束/增改删）、test-design-gate、impact-gate | `specs/<id>.md`、`mission.json` | `spec-approved`、`test-design` |
+| 实现 | role-guard（权限/模型/派发）、standards-gate、quality-gate（写后 lint）、supply-chain-gate、audit-trail | 代码、审计 JSONL、门禁记录 | `standards-pass`（可选） |
+| 测试 | quality-gate（跑命令）、coverage-gate、impact-gate（最小回归集）、test-design-gate | 覆盖率/flaky 工件、证据行 | `quality-pass` |
+| 交互 | interaction-gate（ask/notify/progress + 通道注册）、宿主的 approval 接缝 | 决定台账 `interaction.jsonl` | 无（它是横切的） |
+| 交付 | evidence-gate、audit-trail、orchestrator（receipt 门禁） | `receipts/`、`gates/`、`evidence.jsonl` | `receipt` |
+| 部署 | deploy-gate | `deploy/*-plan.json`、部署台账 | `deploy-go`、`deploy-verified` |
+
+**自检**是这套视图的入口：`dsh-eng-core` 的 `checkWorkspace()` 产出一份报告（配置是否就绪、
+缺什么、下一步的确切命令、台账规模），三种消费方式共用同一份判定——
+
+- `scripts/doctor.sh [--json] [<workspace>]`：人/CI 入口，必需项缺失时退出码 1；
+- 插件 `suite_status`：在会话里补上**运行时事实**（哪些插件挂载、当前阶段、待审批、通道能力）；
+- `checkWorkspace` 直接给测试用（12 条用例覆盖每条判定与每个"说不清"的分支）。
+
+四条设计约束：
+
+1. **读不到就不说 ok**：配置解析失败是 `unknown`（附解析器的原话），不是通过；离线看不到的事实
+   （通道可用性、当前阶段）一律 `unknown`，由插件在运行时补齐。
+2. **每条发现都要给下一步**：没有确切命令的发现是抱怨，不是诊断。
+3. **粒度正确**：运行时台账必须被 git 忽略（否则 `requireCleanTree` 会把"每次门禁都改动工作区"
+   报成两个不同的 diff 摘要），而配置类文件（`.dsh/*.json`、`roles/`）**不能**被忽略——它们属于信任根，
+   应当提交评审。目录型忽略规则要用尾斜杠查询才能匹配，文件则不能带尾斜杠（两个 bug 都是在真实仓库上抓到的）。
+4. **自检不改任何东西**：无门禁记录、无文件写入、无 mission 变更——它只报告。
+
+### 5.14 部署也是门禁（`dsh-deploy-gate`）：`deploy-go` / `deploy-verified`
+
+交付回执回答"这套改动可以交付"，部署门禁回答"这次交付真的上去了，并且验证通过"。两个门禁种类
+读同一个来源 `dsh-deploy-gate` 的记录，规则与规范门禁一致：**最新一条必须是 PASS**，且**不早于阶段进入时间**
+（上一轮的部署证明不了这一轮）。同一个来源承载运行与验证两种记录，是因为"最新一条"在部署阶段就是运行记录、
+在验证阶段就是验证记录——不需要第二个来源 id 去同步。
+
+部署阶段**不进默认流水线**：多数 mission 不部署，让每次交付都被部署阶段卡住是错的；宿主按需声明阶段
+（示例见插件 README 与 §5.13 的表）。
+
 ## 6. 为什么这样切分
 
 - **一个关注点一个插件**：门禁可以单独失效（例如先只上 quality-gate），不影响其它环节。
