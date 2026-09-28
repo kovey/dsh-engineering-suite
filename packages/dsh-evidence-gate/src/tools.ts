@@ -1,12 +1,16 @@
 /**
  * The model-facing tool surface: `evidence_record`, `evidence_status`,
- * `mission_complete` (docs.md §3.5, PLUGIN-CONVENTIONS §7).
+ * `mission_complete` (docs.md §3.5, PLUGIN-CONVENTIONS §7) and the release
+ * ledger surface `release_record` / `release_notes` / `release_status`, which
+ * binds a delivery to a version (the other half of the traceability chain).
  * @module dsh-evidence-gate/tools
  */
 
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import {
     agentIdOf,
+    formatTime,
+    gitFingerprint,
     normalizeApprovalReply,
     renderApprovalContext,
     sessionIdOf,
@@ -18,6 +22,24 @@ import {
 import { RECORDABLE_KINDS, type EffectiveEvidenceGateConfig } from './config.js'
 import { evaluateDelivery, finalizeDelivery, relaxForForce } from './delivery.js'
 import { captureEvidence, confirmationText } from './evidence.js'
+import {
+    buildReleaseNotes,
+    deliveredMissions,
+    findRelease,
+    isSafeVersion,
+    missionsDeliveredSince,
+    notesFileFor,
+    previewMissions,
+    previousRelease,
+    readReleaseLedger,
+    recordRelease,
+    releasesDirFor,
+    releasesFileFor,
+    releasesNewestFirst,
+    unreleasedMissions,
+    type ReleaseMission,
+    type ReleaseNotes,
+} from './releases.js'
 import { declaredCwd, NO_WORKSPACE_ERROR } from './workspace.js'
 import {
     renderAlreadyDelivered,
@@ -26,6 +48,13 @@ import {
     renderNoMission,
     renderNoMissionDelivery,
     renderOverview,
+    renderReleaseNotes,
+    renderReleaseNotesEmpty,
+    renderReleaseNotesView,
+    renderReleaseRecorded,
+    renderReleaseRefused,
+    renderReleaseStatus,
+    renderReleaseStatusUnknown,
 } from './report.js'
 
 const TEXT_OUTPUT = { type: 'string' } as const
@@ -62,6 +91,24 @@ interface CompleteArgs {
     missionId?: string
     summary?: string
     force?: boolean
+}
+
+interface ReleaseRecordArgs {
+    version?: string
+    tag?: string
+    missionIds?: string[]
+    note?: string
+}
+
+interface ReleaseNotesArgs {
+    version?: string
+    missionIds?: string[]
+    json?: boolean
+}
+
+interface ReleaseStatusArgs {
+    version?: string
+    json?: boolean
 }
 
 function agentOf(exec: unknown): AgentLike | undefined {
@@ -113,7 +160,13 @@ function noMissionError(): string {
     ].join('\n')
 }
 
-/** Register every evidence-gate tool. */
+/**
+ * Register every evidence-gate tool.
+ *
+ * `release_notes` previews missions through `previewMissions`: an unknown id or
+ * a mission without a receipt is reported, never dropped — the notes show what
+ * the record supports, including the parts it does not support yet.
+ */
 export function registerTools(
     ctx: { tools: { register: (definition: never) => () => void } },
     deps: ToolDeps,
@@ -355,6 +408,225 @@ export function registerTools(
             },
         }),
         'mission_complete',
+    )
+
+    register(
+        defineTool({
+            name: 'release_record',
+            description:
+                'Record one release: bind the missions that were DELIVERED (they must already have receipts) to a version, a tag and the current Git revision, write the release notes artifact and append one append-only row to the release ledger. This is the step that links "mission X was delivered" to "v1.2.0 contains X", so it belongs right after the delivery receipts exist — before or together with the tag, never instead of it. Fail closed: a listed mission that does not exist or has no receipt is refused (naming it), a version that already exists in the ledger is refused with the existing row\'s date, an empty mission set is refused, and a workspace that is not a git repository is refused (a release without a revision is not a release). When `missionIds` is omitted it defaults to the missions delivered since the previous release row (receipts issued strictly after that row\'s `at`; with no previous row, every delivered mission), and refuses when that set is empty. `requireTagFormat` (host config) is enforced on the version when set. The ledger is append-only: nothing is ever rewritten or deleted. The workspace is the calling session\'s own (`session.header.cwd`); a session that declared no workspace is refused.',
+            parameters: {
+                version: {
+                    type: 'string',
+                    required: true,
+                    description: 'Version this release is known by (the ledger key; must be unique and a single path segment, e.g. "v1.2.0").',
+                },
+                tag: { type: 'string', description: 'Git tag the version is published under (optional: a release may be recorded without one, and is marked as such).' },
+                missionIds: {
+                    type: 'array',
+                    items: { type: 'string' },
+                    description:
+                        'Missions this release contains. Default: the missions delivered since the previous release row. Every listed mission must exist and carry a receipt.',
+                },
+                note: { type: 'string', description: 'Free-form note recorded on the ledger row.' },
+            },
+            output: { schema: TEXT_OUTPUT, render: (_args, value) => [{ type: 'text', text: value }] },
+            async execute(args: ReleaseRecordArgs = {} as ReleaseRecordArgs, exec) {
+                const { store, agent, cwd } = storeFor(deps, exec)
+                const config = deps.configFor(cwd).config
+                const outcome = recordRelease({
+                    store,
+                    config,
+                    cwd,
+                    recordedBy: recordedBy(agent),
+                    ...(args.version === undefined ? {} : { version: args.version }),
+                    ...(args.tag === undefined ? {} : { tag: args.tag }),
+                    ...(args.missionIds === undefined ? {} : { missionIds: args.missionIds }),
+                    ...(args.note === undefined ? {} : { note: args.note }),
+                    renderNotes: (notes) => renderReleaseNotes(notes, config),
+                })
+                if (!outcome.ok) return renderReleaseRefused(outcome.refusal)
+                return renderReleaseRecorded({ row: outcome.row, file: outcome.file, notesFile: outcome.notesFile })
+            },
+        }),
+        'release_record',
+    )
+
+    register(
+        defineTool({
+            name: 'release_notes',
+            description:
+                'Build the release notes of a version (Markdown) from the recorded artifacts — specification requirements with their ids, acceptance-criteria count, the newest gate verdict per source with its scope, the evidence kinds the receipts bind, the delivery approver and the files the evidence names — plus a header (version, revision, date, missions) and a footer stating what the notes are NOT. Read-only: it returns the document and writes nothing; release_record is what persists it. Give `version` to regenerate the notes of a recorded release (the ledger row supplies the mission list and the revision) or to label a draft preview; give `missionIds` to preview a specific set; omit both to preview what release_record would record next. A gate record without a scope is rendered as 未记录 instead of an invented file list, and evidence no receipt binds is reported as unbound rather than folded in. `json: true` returns the structured projection instead of Markdown.',
+            parameters: {
+                version: { type: 'string', description: 'Version to build notes for (a recorded one is regenerated from its ledger row; an unrecorded one is a draft preview).' },
+                missionIds: {
+                    type: 'array',
+                    items: { type: 'string' },
+                    description: 'Missions to include (default: the ones release_record would pick — delivered since the previous release row).',
+                },
+                json: { type: 'boolean', description: 'Return the structured notes projection as JSON instead of the Markdown document.' },
+            },
+            output: { schema: TEXT_OUTPUT, render: (_args, value) => [{ type: 'text', text: value }] },
+            async execute(args: ReleaseNotesArgs = {} as ReleaseNotesArgs, exec) {
+                const { store, cwd } = storeFor(deps, exec)
+                const config = deps.configFor(cwd).config
+                const layout = store.layout
+                const ledger = readReleaseLedger(releasesFileFor(layout, config))
+                const version = args.version === undefined ? undefined : args.version.trim()
+                const recorded = version === undefined ? undefined : findRelease(ledger.rows, version)
+                const warnings: string[] = []
+                let entries: ReleaseMission[]
+                // A recorded release shows the revision it was recorded with (a
+                // hand-edited row without one reads 未记录 — never the state of
+                // today); a draft shows the current fingerprint, which is what
+                // release_record would bind.
+                let revision = recorded === undefined ? gitFingerprint(cwd, { excludePaths: [layout.rootDir] }) : recorded.revision
+                let at = recorded?.at ?? Date.now()
+                let receiptIds = recorded?.receiptIds
+
+                if (recorded !== undefined) {
+                    // A recorded release is regenerated from the ledger, not from
+                    // whatever the caller passes now: the document must describe
+                    // the release that was recorded.
+                    const resolved = previewMissions(store, recorded.missionIds)
+                    entries = resolved.entries
+                    if (resolved.missing.length > 0) {
+                        warnings.push(
+                            `台账里 ${recorded.version} 记录的 mission ${resolved.missing.join('、')} 现在读不到（被删除/归档）：本说明只包含仍然可读的部分。`,
+                        )
+                    }
+                    if (args.missionIds !== undefined) {
+                        warnings.push(
+                            `本次还显式传了 missionIds（${[...new Set(args.missionIds)].join('、')}），但 ${recorded.version} 已是台账里记录的发布：说明按台账记录生成。`,
+                        )
+                    }
+                } else if (args.missionIds !== undefined && args.missionIds.length > 0) {
+                    const resolved = previewMissions(store, args.missionIds)
+                    entries = resolved.entries
+                    if (resolved.missing.length > 0) warnings.push(`mission 不存在：${resolved.missing.join('、')}（不会出现在说明里）。`)
+                } else {
+                    entries = missionsDeliveredSince(store, previousRelease(ledger.rows))
+                    if (recorded === undefined) revision = gitFingerprint(cwd, { excludePaths: [layout.rootDir] })
+                    at = Date.now()
+                    receiptIds = undefined
+                }
+                if (entries.length === 0) {
+                    return renderReleaseNotesEmpty({ ...(version === undefined ? {} : { version }), known: ledger.rows.map((row) => row.version) })
+                }
+                const noReceipt = entries.filter((entry) => entry.receipts.length === 0).map((entry) => entry.mission.id)
+                if (recorded === undefined && noReceipt.length > 0) {
+                    warnings.push(`mission ${noReceipt.join('、')} 还没有回执（未交付）：可以预览，但 release_record 会拒绝把它们记入发布。`)
+                }
+                const notes: ReleaseNotes = buildReleaseNotes({
+                    store,
+                    missions: entries,
+                    at,
+                    recorded: recorded !== undefined,
+                    ...(version === undefined ? {} : { version }),
+                    ...(recorded?.tag === undefined ? {} : { tag: recorded.tag }),
+                    revision,
+                    ...(receiptIds === undefined ? {} : { receiptIds }),
+                    ...(recorded?.notesPath === undefined ? {} : { notesPath: recorded.notesPath }),
+                    warnings,
+                })
+                if (args.json === true) return JSON.stringify(notes, undefined, 2)
+                // Where release_record would write it: only computable once the
+                // version is known and safe as a file name.
+                const notesFile =
+                    version !== undefined && isSafeVersion(version)
+                        ? notesFileFor(layout, config, version)
+                        : `${releasesDirFor(layout, config)}/<version>.md`
+                return renderReleaseNotesView({
+                    notes,
+                    config,
+                    notesFile,
+                    ...(recorded === undefined ? {} : { recorded }),
+                })
+            },
+        }),
+        'release_notes',
+    )
+
+    register(
+        defineTool({
+            name: 'release_status',
+            description:
+                'Show the release ledger of this workspace: every recorded release newest-first (version, date, revision, tag, mission count), the missions that are delivered but not yet in any release — the "what am I about to ship" view — and the newest receipt id per delivered mission. Read-only, and honest about a damaged ledger: a truncated last line (what a crash leaves) is reported and ignored instead of making the whole ledger unreadable. Pass `version` to inspect one recorded release (and be refused when it is not in the ledger), `json: true` to get the same view structured. Nothing is written, no mission or receipt is touched.',
+            parameters: {
+                version: { type: 'string', description: 'Inspect one recorded release by version (default: list them all).' },
+                json: { type: 'boolean', description: 'Return the view as JSON instead of the Chinese report.' },
+            },
+            output: { schema: TEXT_OUTPUT, render: (_args, value) => [{ type: 'text', text: value }] },
+            async execute(args: ReleaseStatusArgs = {} as ReleaseStatusArgs, exec) {
+                const { store, cwd } = storeFor(deps, exec)
+                const config = deps.configFor(cwd).config
+                const file = releasesFileFor(store.layout, config)
+                const ledger = readReleaseLedger(file)
+                const releases = releasesNewestFirst(ledger.rows)
+                const delivered = deliveredMissions(store)
+                const unreleased = unreleasedMissions(store, ledger.rows)
+                const version = args.version === undefined ? undefined : args.version.trim()
+                const focus = version === undefined ? undefined : findRelease(ledger.rows, version)
+                if (version !== undefined && focus === undefined) {
+                    if (args.json === true) {
+                        return JSON.stringify(
+                            { workspace: cwd, file, version, found: false, releases: releases.map((row) => row.version) },
+                            undefined,
+                            2,
+                        )
+                    }
+                    return renderReleaseStatusUnknown(version, releases)
+                }
+                if (args.json === true) {
+                    const newest = (entry: ReleaseMission) =>
+                        [...entry.receipts].sort((left, right) => right.issuedAt - left.issuedAt)[0]
+                    return JSON.stringify(
+                        {
+                            workspace: cwd,
+                            ledger: file,
+                            unreadableLines: ledger.unreadable,
+                            releases: releases.map((row) => ({
+                                version: row.version,
+                                at: row.at,
+                                date: formatTime(row.at),
+                                ...(row.tag === undefined ? {} : { tag: row.tag }),
+                                revision: row.revision ?? null,
+                                missionIds: row.missionIds,
+                                receiptIds: row.receiptIds,
+                                ...(row.notesPath === undefined ? {} : { notesPath: row.notesPath }),
+                                ...(row.recordedBy === undefined ? {} : { recordedBy: row.recordedBy }),
+                                ...(row.note === undefined ? {} : { note: row.note }),
+                            })),
+                            focused:
+                                focus === undefined
+                                    ? null
+                                    : { version: focus.version, at: focus.at, date: formatTime(focus.at), missionIds: focus.missionIds, receiptIds: focus.receiptIds },
+                            unreleased: unreleased.map((entry) => ({
+                                missionId: entry.mission.id,
+                                title: entry.mission.title,
+                                receiptIds: entry.receipts.map((receipt) => receipt.id),
+                            })),
+                            delivered: delivered.map((entry) => ({
+                                missionId: entry.mission.id,
+                                newestReceiptId: newest(entry)?.id ?? null,
+                            })),
+                        },
+                        undefined,
+                        2,
+                    )
+                }
+                return renderReleaseStatus({
+                    file,
+                    cwd,
+                    releases,
+                    unreleased,
+                    delivered,
+                    unreadable: ledger.unreadable,
+                    ...(focus === undefined ? {} : { focus }),
+                })
+            },
+        }),
+        'release_status',
     )
 
     return { disposers, registered, failed }

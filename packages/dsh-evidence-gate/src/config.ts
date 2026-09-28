@@ -14,7 +14,7 @@
  * @module dsh-evidence-gate/config
  */
 
-import { loadProjectConfig, type EvidenceKind, type Layout, type LayoutOptions, type Logger } from 'dsh-eng-core'
+import { isInside, loadProjectConfig, resolvePath, type EvidenceKind, type Layout, type LayoutOptions, type Logger } from 'dsh-eng-core'
 
 /** Resolved plugin configuration. */
 export interface EvidenceGateConfig {
@@ -70,6 +70,36 @@ export interface EvidenceGateConfig {
     allowForceOverride: boolean
     /** `0` = no age limit; otherwise a gate older than N minutes blocks. */
     maxGateAgeMinutes: number
+    /**
+     * Append-only release ledger, resolved against the workspace root.
+     *
+     * The default (`.dsh/releases.jsonl`) is exactly `<layout.rootDir>/releases.jsonl`
+     * for the default layout; a host that relocates `layout.rootDir` should
+     * relocate this with it, or the release ledger and the rest of the trail
+     * would live in two different places.
+     */
+    releasesFile: string
+    /** Directory the generated release notes land in (default `.dsh/releases`). */
+    releasesDir: string
+    /**
+     * Optional regular expression the recorded `version` must match
+     * (e.g. `^v\d+\.\d+\.\d+$`). Off by default: a repository that does not
+     * version releases through this ledger must still be able to record one.
+     *
+     * The check is on the version, not on `tag`: `tag` is the Git-side name the
+     * caller happens to push under, while `version` is what the ledger is keyed
+     * by (see `release_record`). A pattern that does not compile is refused
+     * rather than skipped — a rule the host asked for must never fail open.
+     */
+    requireTagFormat?: string
+    /**
+     * Whether `release_notes` lists the acceptance criteria themselves.
+     *
+     * Default `true`: the criteria are what they were approved against. `false`
+     * keeps the count and drops the list (a repository whose criteria are long
+     * and quoted elsewhere can still get short notes).
+     */
+    notesIncludeCriteria: boolean
     prompt: {
         enabled: boolean
         order: number
@@ -95,6 +125,12 @@ export const RECORDABLE_KINDS: readonly EvidenceKind[] = ['command', 'test', 'ar
 
 /** Kinds a delivery must carry unless the host says otherwise. */
 export const DEFAULT_REQUIRED_EVIDENCE_KINDS: readonly EvidenceKind[] = ['command', 'test']
+
+/** Default release ledger path, resolved against the workspace root. */
+export const DEFAULT_RELEASES_FILE = '.dsh/releases.jsonl'
+
+/** Default directory the generated release notes land in. */
+export const DEFAULT_RELEASES_DIR = '.dsh/releases'
 
 /** The plugin whose gate verdicts authorize a delivery. */
 export const DEFAULT_GATE_SOURCE = 'dsh-quality-gate'
@@ -151,6 +187,11 @@ function kindList(value: unknown, fallback: readonly EvidenceKind[]): EvidenceKi
  * The file lives inside the trust root: `dsh-spec-gate`'s guard closes
  * `.dsh/**` to the write tools (only the derived `specs/*.md` is writable), so
  * a model cannot rewrite its own delivery checklist with `write`/`edit`.
+ *
+ * `releasesFile` / `releasesDir` are overridable WITH a containment check
+ * ({@link readWorkspacePath}): a project may move its release ledger inside its
+ * own workspace, never outside it — the layout keys that decide where the rest
+ * of the trail lives stay host-only.
  */
 export const PROJECT_OVERRIDABLE_KEYS: readonly string[] = [
     'requiredEvidenceKinds',
@@ -162,6 +203,10 @@ export const PROJECT_OVERRIDABLE_KEYS: readonly string[] = [
     'gateSource',
     'maxGateAgeMinutes',
     'maxOutputTail',
+    'releasesFile',
+    'releasesDir',
+    'requireTagFormat',
+    'notesIncludeCriteria',
 ]
 
 /**
@@ -271,6 +316,59 @@ function readPositiveInteger(sink: ProblemSink, raw: Record<string, unknown>, ke
 }
 
 /**
+ * Read a project-level path override, constrained to the workspace.
+ *
+ * The release ledger and the generated notes are reviewable artifacts of the
+ * repository they describe, so a project file may relocate them *within* the
+ * workspace and never outside it: a `../../` value would hide the trail from
+ * the people reviewing it (and would write into a directory the workspace does
+ * not own). An escaping value is a reported problem and the profile value stays
+ * in force. The profile itself is not constrained — the host owns the layout.
+ */
+function readWorkspacePath(sink: ProblemSink, raw: Record<string, unknown>, key: string, fallback: string, cwd: string): string {
+    if (!has(raw, key)) return fallback
+    const value = raw[key]
+    if (typeof value !== 'string' || value.trim() === '') {
+        problem(sink, `${key} 必须是非空字符串（收到 ${describeValue(value)}），已忽略该项目级取值（继续使用 profile 配置）`)
+        return fallback
+    }
+    if (!isInside(cwd, resolvePath(value, cwd))) {
+        problem(
+            sink,
+            `${key} 必须指向工作区内的路径（收到 ${describeValue(value)}，解析为 ${resolvePath(value, cwd)}）：发布台账与发布说明是本仓库的工件，项目文件不能把它们挪到工作区外，已忽略该项目级取值（继续使用 profile 配置）`,
+        )
+        return fallback
+    }
+    return value
+}
+
+/**
+ * Read a project-level `requireTagFormat`.
+ *
+ * A pattern that does not compile keeps the profile's value and is reported as
+ * a problem; when BOTH are unusable the release tools refuse to record rather
+ * than record an unchecked version (see `compileVersionPattern`).
+ */
+function readTagFormat(sink: ProblemSink, raw: Record<string, unknown>, fallback: string | undefined): string | undefined {
+    if (!has(raw, 'requireTagFormat')) return fallback
+    const value = raw['requireTagFormat']
+    if (typeof value !== 'string' || value.trim() === '') {
+        problem(sink, `requireTagFormat 必须是非空字符串（收到 ${describeValue(value)}），已忽略该项目级取值（继续使用 profile 配置）`)
+        return fallback
+    }
+    try {
+        new RegExp(value.trim())
+    } catch (error) {
+        problem(
+            sink,
+            `requireTagFormat 不是合法正则（收到 ${describeValue(value)}：${error instanceof Error ? error.message : String(error)}），已忽略该项目级取值（继续使用 profile 配置）`,
+        )
+        return fallback
+    }
+    return value.trim()
+}
+
+/**
  * Read `requiredEvidenceKinds` from a project file.
  *
  * Unknown names are dropped with a problem, and `gate` is never accepted: a
@@ -356,6 +454,7 @@ export function resolveEffectiveConfig(
         )
     }
 
+    const tagFormat = readTagFormat(sink, raw, host.requireTagFormat)
     const config: EvidenceGateConfig = {
         ...host,
         requiredEvidenceKinds: readKinds(sink, raw, host.requiredEvidenceKinds),
@@ -367,6 +466,10 @@ export function resolveEffectiveConfig(
         gateSource: readNonEmptyString(sink, raw, 'gateSource', host.gateSource),
         maxGateAgeMinutes: readNonNegativeNumber(sink, raw, 'maxGateAgeMinutes', host.maxGateAgeMinutes),
         maxOutputTail: readPositiveInteger(sink, raw, 'maxOutputTail', host.maxOutputTail),
+        releasesFile: readWorkspacePath(sink, raw, 'releasesFile', host.releasesFile, layout.cwd),
+        releasesDir: readWorkspacePath(sink, raw, 'releasesDir', host.releasesDir, layout.cwd),
+        ...(tagFormat === undefined ? {} : { requireTagFormat: tagFormat }),
+        notesIncludeCriteria: readBool(sink, raw, 'notesIncludeCriteria', host.notesIncludeCriteria),
     }
     // `source` says where the EFFECTIVE values came from: a file whose keys were
     // all refused (or all ill-typed) contributed nothing, so it is not the
@@ -391,6 +494,10 @@ function overrides(host: EvidenceGateConfig, config: EvidenceGateConfig): boolea
         config.gateSource !== host.gateSource ||
         config.maxGateAgeMinutes !== host.maxGateAgeMinutes ||
         config.maxOutputTail !== host.maxOutputTail ||
+        config.releasesFile !== host.releasesFile ||
+        config.releasesDir !== host.releasesDir ||
+        config.requireTagFormat !== host.requireTagFormat ||
+        config.notesIncludeCriteria !== host.notesIncludeCriteria ||
         config.requiredEvidenceKinds.join('\u0000') !== host.requiredEvidenceKinds.join('\u0000')
     )
 }
@@ -418,6 +525,7 @@ export function resolveConfig(input: unknown): EvidenceGateConfig {
     const missionsDir = pick('missionsDir')
     const maxOutputTail = Math.trunc(num(raw['maxOutputTail'], 2000))
     const maxGateAgeMinutes = num(raw['maxGateAgeMinutes'], 0)
+    const requireTagFormat = raw['requireTagFormat']
     return {
         enabled: bool(raw['enabled'], true),
         logFile: str(raw['logFile'], '~/.dsh/evidence-gate.log'),
@@ -438,6 +546,15 @@ export function resolveConfig(input: unknown): EvidenceGateConfig {
         requireDeliveryApproval: bool(raw['requireDeliveryApproval'], false),
         allowForceOverride: bool(raw['allowForceOverride'], false),
         maxGateAgeMinutes: maxGateAgeMinutes > 0 ? maxGateAgeMinutes : 0,
+        releasesFile: str(raw['releasesFile'], DEFAULT_RELEASES_FILE),
+        releasesDir: str(raw['releasesDir'], DEFAULT_RELEASES_DIR),
+        // A profile-level pattern is taken as written: `compileVersionPattern`
+        // is what refuses a pattern that does not compile, so a typo can never
+        // silently disable the check the host asked for.
+        ...(typeof requireTagFormat === 'string' && requireTagFormat.trim() !== ''
+            ? { requireTagFormat: requireTagFormat.trim() }
+            : {}),
+        notesIncludeCriteria: bool(raw['notesIncludeCriteria'], true),
         prompt: {
             enabled: bool(prompt['enabled'], true),
             order: num(prompt['order'], 650),

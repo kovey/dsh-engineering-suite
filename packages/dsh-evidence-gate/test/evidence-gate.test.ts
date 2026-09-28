@@ -27,8 +27,9 @@ import {
 } from 'dsh-eng-core'
 import { createFakeHost, fakeAgent, runText, tempWorkspace, type FakeAgent, type FakeHost } from 'dsh-eng-core/testing'
 import { apply, inject, name } from '../dist/index.js'
-import { resolveConfig } from '../dist/config.js'
+import { resolveConfig, resolveEffectiveConfig } from '../dist/config.js'
 import { captureEvidence } from '../dist/evidence.js'
+import type { ReleaseRow } from '../dist/releases.js'
 
 const SESSION = 'session-1'
 const GATE_SOURCE = 'dsh-quality-gate'
@@ -251,12 +252,17 @@ test('the plugin declares its name and required services', () => {
     assert.deepEqual(inject, ['tools', 'systemPrompt'])
 })
 
-test('apply() registers the three tools and the prompt section; dispose() removes them', () => {
+test('apply() registers every tool and the prompt section; dispose() removes them', () => {
     const { fake } = rig()
+    // The delivery surface (evidence_* / mission_complete) plus the release
+    // ledger surface (release_*) — the same registration, one dispose().
     assert.deepEqual([...fake.tools.keys()].sort(), [
         'evidence_record',
         'evidence_status',
         'mission_complete',
+        'release_notes',
+        'release_record',
+        'release_status',
     ])
     assert.deepEqual(
         fake.sections.map((section) => section.name),
@@ -275,7 +281,7 @@ test('the prompt section and the tools can be switched off', () => {
     const noPrompt = rig({ config: { prompt: { enabled: false } } })
     assert.equal(noPrompt.fake.sections.length, 0)
     assert.equal(noPrompt.fake.sectionText('eng:evidence-gate'), '')
-    assert.equal(noPrompt.fake.tools.size, 3)
+    assert.equal(noPrompt.fake.tools.size, 6)
 
     const disabled = rig({ config: { enabled: false } })
     assert.equal(disabled.fake.tools.size, 0)
@@ -1159,7 +1165,7 @@ test('host-only 键（enabled/allowForceOverride/logFile/layout）在项目文�
     })
     const { fake, store } = rig({ cwd, logFile: path.join(cwd, 'evidence-gate.log') })
     // `enabled: false` is ignored: the gate is still assembled.
-    assert.equal(fake.tools.size, 3)
+    assert.equal(fake.tools.size, 6)
 
     const missionId = seedMission(store, cwd)
     await recordProof(fake, missionId, ['command'])
@@ -1238,7 +1244,7 @@ test('损坏的项目级文件回退到 profile 配置，交付照常 (regressio
     const cwd = tempWorkspace('evidence-gate-broken-')
     writeProjectConfig(cwd, '{ not json')
     const { fake, store } = rig({ cwd, logFile: path.join(cwd, 'evidence-gate.log') })
-    assert.equal(fake.tools.size, 3, 'a broken file must not stop the plugin')
+    assert.equal(fake.tools.size, 6, 'a broken file must not stop the plugin')
 
     const missionId = seedMission(store, cwd)
     const status = runText(await fake.runTool('evidence_status', { missionId }))
@@ -1640,4 +1646,489 @@ test('a missing approval seam fails closed when the delivery approval is require
     assert.equal(run.isError, true)
     assert.match(runText(run), /没有装配审批通道/)
     assert.equal(store.readReceipts(missionId).length, 0)
+})
+
+// --- 发布台账（release_record / release_notes / release_status） -------------
+//
+// The receipt answers "this mission was delivered"; the release ledger answers
+// "which version contains it". These tests drive that second link end to end:
+// recording is fail-closed, the notes are a projection of recorded artifacts,
+// and both read-only tools write nothing at all.
+
+/** Deliver one mission through the real tool path (evidence → gate → receipt). */
+async function deliverMission(
+    fake: FakeHost,
+    store: MissionStore,
+    id: string,
+    options: { title?: string; beforeGate?: () => Promise<void> } = {},
+): Promise<string> {
+    const missionId = seedMission(store, fake.cwd, { id, ...(options.title === undefined ? {} : { title: options.title }) })
+    await recordProof(fake, missionId)
+    if (options.beforeGate !== undefined) await options.beforeGate()
+    await sleep(5)
+    recordGate(store, missionId)
+    const run = await fake.runTool('mission_complete', { missionId })
+    assert.match(runText(run), /已交付/, runText(run))
+    return missionId
+}
+
+/** Every readable row of the release ledger (a truncated tail is skipped here too). */
+function ledgerRows(cwd: string): ReleaseRow[] {
+    const file = path.join(cwd, '.dsh', 'releases.jsonl')
+    if (!fs.existsSync(file)) return []
+    const rows: ReleaseRow[] = []
+    for (const line of fs.readFileSync(file, 'utf8').split('\n')) {
+        if (line.trim() === '') continue
+        try {
+            rows.push(JSON.parse(line) as ReleaseRow)
+        } catch {
+            // A truncated line is not a row (same rule as readReleaseLedger).
+        }
+    }
+    return rows
+}
+
+/**
+ * A log file OUTSIDE the workspace under test: the plugin's own log is an
+ * untracked file, and writing it into the fixture repository would make every
+ * recorded revision read `+1 changed` — the release tests care about the real
+ * workspace state.
+ */
+function outsideLog(prefix: string): string {
+    return path.join(fs.mkdtempSync(path.join(os.tmpdir(), `${prefix}-log-`)), 'evidence-gate.log')
+}
+
+test('release_record 拒绝没有回执的 mission（发布即“已交付”，并点名） (regression)', async (t) => {
+    const cwd = gitRepo('evidence-release-refuse-')
+    if (cwd === undefined) {
+        t.skip('git is unavailable in this environment')
+        return
+    }
+    const { fake, store } = rig({ cwd, logFile: outsideLog('release-refuse') })
+    const delivered = await deliverMission(fake, store, 'M-1')
+    const pending = seedMission(store, cwd, { id: 'M-2' }) // no receipt: not delivered
+
+    const run = await fake.runTool('release_record', { version: 'v1.0.0', missionIds: [delivered, pending] })
+    assert.equal(run.isError, false, 'a refusal is a report, not an exception')
+    const text = runText(run)
+    assert.match(text, /❌ 拒绝记录发布 v1\.0\.0/)
+    assert.match(text, /没有回执（未交付）：M-2/)
+    assert.match(text, /下一步：先交付它们/)
+    assert.equal(fs.existsSync(path.join(cwd, '.dsh', 'releases.jsonl')), false, '拒绝时不写台账行')
+    assert.equal(fs.existsSync(path.join(cwd, '.dsh', 'releases')), false, '拒绝时不写发布说明')
+
+    // A mission that does not exist at all is named too (a typo must not shrink a release).
+    const unknown = runText(await fake.runTool('release_record', { version: 'v1.0.0', missionIds: ['M-NOPE'] }))
+    assert.match(unknown, /mission 不存在：M-NOPE/)
+    assert.match(unknown, /下一步/)
+    // A tag Git itself would refuse is refused here, with the value quoted.
+    const badTag = runText(await fake.runTool('release_record', { version: 'v1.0.0', missionIds: [delivered], tag: 'v 1.0.0' }))
+    assert.match(badTag, /tag 不是合法的 Git tag 名/)
+    assert.match(badTag, /"v 1\.0\.0"/)
+    assert.equal(ledgerRows(cwd).length, 0)
+})
+
+test('release_record 拒绝重复的版本，并给出台账里已有记录的日期 (regression)', async (t) => {
+    const cwd = gitRepo('evidence-release-duplicate-')
+    if (cwd === undefined) {
+        t.skip('git is unavailable in this environment')
+        return
+    }
+    const { fake, store } = rig({ cwd, logFile: outsideLog('release') })
+    const missionId = await deliverMission(fake, store, 'M-1')
+    const first = runText(await fake.runTool('release_record', { version: 'v1.0.0', tag: 'v1.0.0', missionIds: [missionId] }))
+    assert.match(first, /✅ 已记录发布 v1\.0\.0（mission 1 个，回执 1 个）/)
+
+    const again = runText(await fake.runTool('release_record', { version: 'v1.0.0', missionIds: [missionId] }))
+    assert.match(again, /❌ 拒绝记录发布 v1\.0\.0/)
+    assert.match(again, /该版本已在发布台账里/)
+    assert.match(again, /记录于 \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}Z/)
+    assert.match(again, /append-only/)
+    assert.equal(ledgerRows(cwd).length, 1, '台账是 append-only：重复调用不会追加第二行')
+})
+
+test('省略 missionIds 时默认发布“上一条发布记录之后交付”的 mission (regression)', async (t) => {
+    const cwd = gitRepo('evidence-release-since-')
+    if (cwd === undefined) {
+        t.skip('git is unavailable in this environment')
+        return
+    }
+    const { fake, store } = rig({ cwd, logFile: outsideLog('release') })
+    await deliverMission(fake, store, 'M-1')
+    // No previous row: every delivered mission counts.
+    assert.match(runText(await fake.runTool('release_record', { version: 'v1.0.0' })), /✅ 已记录发布 v1\.0\.0（mission 1 个/)
+    assert.deepEqual(ledgerRows(cwd)[0]?.missionIds, ['M-1'])
+
+    await sleep(5)
+    const second = await deliverMission(fake, store, 'M-2')
+    await sleep(5)
+    assert.match(runText(await fake.runTool('release_record', { version: 'v1.1.0' })), /✅ 已记录发布 v1\.1\.0（mission 1 个/)
+    const rows = ledgerRows(cwd)
+    // Only the receipt issued AFTER the previous row's `at` makes a mission new.
+    assert.deepEqual(rows[1]?.missionIds, ['M-2'])
+    assert.deepEqual(rows[1]?.receiptIds, store.readReceipts(second).map((receipt) => receipt.id))
+
+    // Nothing delivered since: an empty version is refused, not recorded.
+    await sleep(5)
+    const empty = runText(await fake.runTool('release_record', { version: 'v1.2.0' }))
+    assert.match(empty, /自上次发布以来没有新的交付/)
+    assert.match(empty, /release_status/)
+    assert.equal(ledgerRows(cwd).length, 2, '拒绝时不追加台账行')
+
+    // An explicit empty array is a different refusal (it is not "auto").
+    assert.match(runText(await fake.runTool('release_record', { version: 'v1.2.0', missionIds: [] })), /missionIds 是空数组/)
+})
+
+test('release_record 在非 git 工作区拒绝记录（没有 revision 的发布不是发布） (regression)', async () => {
+    const { fake, store } = rig() // a temp workspace that is not a git repository
+    const missionId = await deliverMission(fake, store, 'M-1')
+    const text = runText(await fake.runTool('release_record', { version: 'v1.0.0', missionIds: [missionId] }))
+    assert.match(text, /❌ 拒绝记录发布 v1\.0\.0/)
+    assert.match(text, /工作区不是 git 仓库/)
+    assert.match(text, /没有 revision 的发布不是发布/)
+    assert.match(text, /下一步/)
+    assert.equal(fs.existsSync(path.join(fake.cwd, '.dsh', 'releases.jsonl')), false)
+    assert.equal(fs.existsSync(path.join(fake.cwd, '.dsh', 'releases')), false)
+})
+
+test('release_record 写出发布说明与台账行（revision / tag / mission / 回执） (regression)', async (t) => {
+    const cwd = gitRepo('evidence-release-record-')
+    if (cwd === undefined) {
+        t.skip('git is unavailable in this environment')
+        return
+    }
+    const { fake, store } = rig({ cwd, logFile: outsideLog('release') })
+    const missionId = await deliverMission(fake, store, 'M-1', { title: 'Add health endpoint' })
+    const out = runText(
+        await fake.runTool('release_record', { version: 'v1.2.0', tag: 'v1.2.0', missionIds: [missionId], note: '首个版本' }),
+    )
+    assert.match(out, /✅ 已记录发布 v1\.2\.0（mission 1 个，回执 1 个）/)
+    const notesFile = path.join(cwd, '.dsh', 'releases', 'v1.2.0.md')
+    assert.ok(out.includes(notesFile), `报告里要给出发布说明的路径：${out}`)
+
+    const row = ledgerRows(cwd)[0]
+    assert.equal(row?.version, 'v1.2.0')
+    assert.equal(row?.tag, 'v1.2.0')
+    assert.equal(row?.notesPath, '.dsh/releases/v1.2.0.md')
+    assert.equal(row?.recordedBy, 'agent-1')
+    assert.equal(row?.note, '首个版本')
+    assert.deepEqual(row?.missionIds, ['M-1'])
+    assert.deepEqual(row?.receiptIds, store.readReceipts(missionId).map((receipt) => receipt.id))
+    // The revision is the workspace fingerprint at recording time (trail excluded,
+    // so recording does not dirty the revision it records).
+    const fingerprint = gitFingerprint(cwd)
+    assert.equal(row?.revision?.isRepo, true)
+    assert.equal(row?.revision?.head, fingerprint.head)
+    assert.equal(row?.revision?.branch, fingerprint.branch)
+
+    const notes = fs.readFileSync(notesFile, 'utf8')
+    assert.match(notes, /^# 发布说明 v1\.2\.0/)
+    assert.match(notes, /- 版本：v1\.2\.0/)
+    assert.match(notes, /- tag：v1\.2\.0/)
+    assert.match(notes, /- mission（1）：M-1/)
+    assert.match(notes, /## M-1 — Add health endpoint/)
+    assert.match(notes, /## 本说明是什么、不是什么/)
+
+    // Regenerating the notes of a recorded release reads the ledger row, not the caller.
+    const regenerated = runText(await fake.runTool('release_notes', { version: 'v1.2.0' }))
+    assert.match(regenerated, /按台账里 v1\.2\.0 的记录/)
+    assert.match(regenerated, /## M-1 — Add health endpoint/)
+})
+
+test('release_notes 渲染需求/验收标准/门禁/证据/审批人；没有 scope 的门禁写“未记录” (regression)', async (t) => {
+    const cwd = gitRepo('evidence-release-notes-')
+    if (cwd === undefined) {
+        t.skip('git is unavailable in this environment')
+        return
+    }
+    const fake = createFakeHost({ cwd })
+    apply(fake.ctx as never, { logFile: outsideLog('release'), requireDeliveryApproval: true })
+    ;(fake.ctx as unknown as { get: (name: string) => unknown }).get = ((name: string) =>
+        name === 'approval'
+            ? {
+                  request: async () => ({
+                      decision: 'allowed-once',
+                      by: 'ou_im_user',
+                      messageId: 'om_card_1',
+                      source: 'im',
+                      at: Date.now(),
+                  }),
+              }
+            : undefined) as never
+    const store = new MissionStoreRegistry().for(cwd)
+    const missionId = await deliverMission(fake, store, 'M-1', {
+        title: 'Add health endpoint',
+        beforeGate: async () => {
+            const artifact = await fake.runTool('evidence_record', {
+                missionId: 'M-1',
+                kind: 'artifact',
+                summary: '构建产物',
+                artifactPath: 'dist/app.js',
+            })
+            assert.equal(artifact.isError, false, runText(artifact))
+            // A second source whose record carries NO scope (a pre-GateScope
+            // record): recorded BEFORE the delivery, so the receipt binds it.
+            store.recordGate('M-1', {
+                source: 'dsh-standards-gate',
+                state: 'PASS',
+                reason: 'PASS：结构规范检查',
+                results: [gateResult('standards')],
+            })
+        },
+    })
+    // spec-gate writes `{id, text}` rows; the fixture writes a bare string, so the
+    // id must be reported honestly rather than invented (see the dedicated test).
+    store.update(missionId, (record) => ({
+        spec: { ...(record.spec ?? {}), requirements: [{ id: 'R-001', text: '暴露 GET /health' }] },
+    }))
+    // Evidence recorded AFTER the receipt: it did not justify this delivery, so
+    // it is reported as unbound instead of being folded into the release.
+    const late = await fake.runTool('evidence_record', { missionId, kind: 'diff', summary: '交付后补记的 diff' })
+    assert.equal(late.isError, false, runText(late))
+
+    const notes = runText(await fake.runTool('release_notes', { missionIds: [missionId] }))
+    assert.match(notes, /# 发布说明 \(未命名\)/)
+    assert.match(notes, /- 需求（1 条）：/)
+    assert.match(notes, /- R-001 暴露 GET \/health/)
+    assert.match(notes, /- 验收标准（1 条）：/)
+    assert.match(notes, /- AC-001 GET \/health 返回 200/)
+    assert.match(notes, /- 门禁裁决（每个来源最新一条）：/)
+    assert.match(notes, /dsh-quality-gate：PASS — /)
+    assert.match(notes, /dsh-standards-gate：PASS — PASS：结构规范检查/)
+    // The scopeless gate is reported as 未记录, never as a guessed file list.
+    assert.match(notes, /dsh-standards-gate：未记录（该记录没有 scope 字段，不推断它覆盖了什么）/)
+    assert.match(notes, /dsh-quality-gate：完整覆盖 1\/1（host-test）/)
+    assert.match(
+        notes,
+        /- 证据类型（回执绑定的 5 条）：artifact 1、command 1、gate 2、test 1；台账另有 1 条未被任何回执绑定（不计入本说明）/,
+    )
+    assert.match(notes, /- 观测到的文件（证据 artifactPath 并集）：dist\/app\.js/)
+    assert.match(notes, /- 交付审批：by ou_im_user via im #om_card_1（回执 RCP-/)
+    // The footer states what the notes are NOT.
+    assert.match(notes, /这些说明由已登记的工件生成/)
+    assert.match(notes, /只读预览/)
+    assert.match(notes, /release_record/)
+
+    // `json: true` returns the same projection, structured.
+    const json = JSON.parse(runText(await fake.runTool('release_notes', { missionIds: [missionId], json: true }))) as {
+        missionIds: string[]
+        missions: {
+            requirements: { id: string; text: string }[]
+            criteriaCount: number
+            gates: { source: string; state: string; scope?: unknown }[]
+            evidenceKinds: { kind: string; count: number }[]
+            evidenceCount: number
+            unboundEvidence: number
+            files: string[]
+            approver?: { by: string }
+        }[]
+    }
+    assert.deepEqual(json.missionIds, ['M-1'])
+    assert.deepEqual(json.missions[0]?.requirements, [{ id: 'R-001', text: '暴露 GET /health' }])
+    assert.equal(json.missions[0]?.criteriaCount, 1)
+    assert.equal(json.missions[0]?.gates.find((gate) => gate.source === 'dsh-standards-gate')?.scope, undefined)
+    assert.equal(json.missions[0]?.approver?.by, 'ou_im_user')
+    assert.deepEqual(json.missions[0]?.files, ['dist/app.js'])
+    assert.equal(json.missions[0]?.evidenceCount, 5)
+    assert.equal(json.missions[0]?.unboundEvidence, 1)
+})
+
+test('release_notes 对没有 id 的手写需求照实标注，不编造编号 (regression)', async (t) => {
+    const cwd = gitRepo('evidence-release-handwritten-')
+    if (cwd === undefined) {
+        t.skip('git is unavailable in this environment')
+        return
+    }
+    const { fake, store } = rig({ cwd, logFile: outsideLog('release') })
+    const missionId = await deliverMission(fake, store, 'M-1')
+    // A durable mission.json a human edited may carry bare strings where
+    // spec-gate writes `{id, text}` rows.
+    store.update(missionId, (record) => ({ spec: { ...(record.spec ?? {}), requirements: ['暴露 GET /health'] } }))
+    const notes = runText(await fake.runTool('release_notes', { missionIds: [missionId] }))
+    assert.match(notes, /- \(未记录 id\) 暴露 GET \/health/)
+})
+
+test('release_status 列出“交付但未发布”的 mission 与每个 mission 的最新回执 (regression)', async (t) => {
+    const cwd = gitRepo('evidence-release-status-')
+    if (cwd === undefined) {
+        t.skip('git is unavailable in this environment')
+        return
+    }
+    const { fake, store } = rig({ cwd, logFile: outsideLog('release') })
+    const first = await deliverMission(fake, store, 'M-1', { title: '第一个版本' })
+    await fake.runTool('release_record', { version: 'v1.0.0', tag: 'v1.0.0', missionIds: [first] })
+    await sleep(5)
+    const second = await deliverMission(fake, store, 'M-2', { title: '下一个版本' })
+
+    const text = runText(await fake.runTool('release_status', {}))
+    assert.match(text, /## 发布台账（工作区 /)
+    assert.match(text, /已记录 1 次发布/)
+    const fingerprint = gitFingerprint(cwd)
+    assert.ok(
+        text.includes(`- v1.0.0 — `) && text.includes(`revision ${fingerprint.branch}@${fingerprint.head?.slice(0, 8)} clean`),
+        text,
+    )
+    assert.match(text, /mission 1 个（M-1）/)
+    assert.match(text, /交付但未发布（这就是“我准备发什么”）（1 个）/)
+    assert.match(text, /- M-2 下一个版本 — 最新回执 RCP-/)
+    assert.ok(text.includes(`最新回执 ${store.readReceipts(second).at(-1)?.id}`), text)
+    assert.ok(text.includes(`- M-1 → ${store.readReceipts(first).at(-1)?.id}`), text)
+
+    // One version in focus (and an unknown one is refused, naming what exists).
+    const focus = runText(await fake.runTool('release_status', { version: 'v1.0.0' }))
+    assert.match(focus, /本次查看: v1\.0\.0/)
+    assert.match(focus, /- tag: v1\.0\.0/)
+    assert.match(focus, /- 发布说明: \.dsh\/releases\/v1\.0\.0\.md（存在）/)
+    const unknown = runText(await fake.runTool('release_status', { version: 'v9.9.9' }))
+    assert.match(unknown, /❌ 发布台账里没有 v9\.9\.9/)
+    assert.match(unknown, /已记录的版本：v1\.0\.0/)
+
+    const json = JSON.parse(runText(await fake.runTool('release_status', { json: true }))) as {
+        releases: { version: string; missionIds: string[] }[]
+        unreleased: { missionId: string }[]
+        delivered: { missionId: string; newestReceiptId: string }[]
+    }
+    assert.deepEqual(json.releases.map((row) => row.version), ['v1.0.0'])
+    assert.deepEqual(json.unreleased.map((entry) => entry.missionId), ['M-2'])
+    assert.equal(json.delivered.length, 2)
+    assert.equal(json.delivered.find((entry) => entry.missionId === 'M-2')?.newestReceiptId, store.readReceipts(second).at(-1)?.id)
+})
+
+test('release_status / release_record 容忍台账末尾被截断的行 (regression)', async (t) => {
+    const cwd = gitRepo('evidence-release-truncated-')
+    if (cwd === undefined) {
+        t.skip('git is unavailable in this environment')
+        return
+    }
+    const { fake, store } = rig({ cwd, logFile: outsideLog('release') })
+    await deliverMission(fake, store, 'M-1')
+    await fake.runTool('release_record', { version: 'v1.0.0' })
+    // Exactly what a crash between two appends leaves behind.
+    fs.appendFileSync(path.join(cwd, '.dsh', 'releases.jsonl'), '{"at":1690000000000,"version":"v9.9.9","missionIds":["M-X"]')
+
+    const text = runText(await fake.runTool('release_status', {}))
+    assert.match(text, /⚠️ 台账里有 1 行无法解析/)
+    assert.match(text, /已记录 1 次发布/)
+    assert.doesNotMatch(text, /v9\.9\.9/, '截断行不能被当成一条发布记录')
+
+    // The damaged tail neither blocks a new release nor fakes a duplicate version.
+    await sleep(5)
+    await deliverMission(fake, store, 'M-2')
+    await sleep(5)
+    assert.match(runText(await fake.runTool('release_record', { version: 'v9.9.9' })), /✅ 已记录发布 v9\.9\.9/)
+    assert.deepEqual(ledgerRows(cwd).map((row) => row.version), ['v1.0.0', 'v9.9.9'])
+})
+
+test('requireTagFormat 拒绝不符合格式的版本，并在消息里给出模式 (regression)', async (t) => {
+    const cwd = gitRepo('evidence-release-format-')
+    if (cwd === undefined) {
+        t.skip('git is unavailable in this environment')
+        return
+    }
+    const { fake, store } = rig({ cwd, logFile: outsideLog('release'), config: { requireTagFormat: '^v\\d+\\.\\d+\\.\\d+$' } })
+    const missionId = await deliverMission(fake, store, 'M-1')
+
+    const bad = runText(await fake.runTool('release_record', { version: '1.0.0', missionIds: [missionId] }))
+    assert.match(bad, /❌ 拒绝记录发布 1\.0\.0/)
+    assert.match(bad, /版本不符合 requireTagFormat：\^v\\d\+\\\.\\d\+\\\.\\d\+\$/)
+    assert.ok(bad.includes('^v\\d+\\.\\d+\\.\\d+$'), bad)
+    assert.match(bad, /下一步/)
+    assert.equal(ledgerRows(cwd).length, 0, '不符合格式的版本不写台账')
+
+    assert.match(runText(await fake.runTool('release_record', { version: 'v1.0.0', missionIds: [missionId] })), /✅ 已记录发布 v1\.0\.0/)
+
+    // A pattern that does not compile is refused, never skipped (fail closed).
+    const other = createFakeHost({ cwd })
+    apply(other.ctx as never, { logFile: outsideLog('release-broken'), requireTagFormat: '([unclosed' })
+    const broken = runText(await other.runTool('release_record', { version: 'v2.0.0', missionIds: [missionId] }))
+    assert.match(broken, /requireTagFormat 配置的正则无法编译/)
+    assert.match(broken, /下一步：修正 profile/)
+})
+
+test('发布相关键可在项目级覆盖（限制在工作区内），host-only 键仍然被忽略 (regression)', async (t) => {
+    const cwd = gitRepo('evidence-release-project-')
+    if (cwd === undefined) {
+        t.skip('git is unavailable in this environment')
+        return
+    }
+    writeProjectConfig(cwd, {
+        releasesDir: '.trail/releases',
+        releasesFile: '.trail/releases.jsonl',
+        notesIncludeCriteria: false,
+        requireTagFormat: '^v\\d+$',
+    })
+    const { fake, store } = rig({ cwd, logFile: outsideLog('release') })
+    const missionId = await deliverMission(fake, store, 'M-1')
+
+    // The project's pattern is in force: `v1.0.0` no longer matches `^v\d+$`.
+    const refused = runText(await fake.runTool('release_record', { version: 'v1.0.0', missionIds: [missionId] }))
+    assert.match(refused, /版本不符合 requireTagFormat：\^v\\d\+\$/)
+    assert.match(runText(await fake.runTool('release_record', { version: 'v1', missionIds: [missionId] })), /✅ 已记录发布 v1/)
+
+    // The ledger and the notes land where THIS repository asked, inside it.
+    assert.equal(fs.existsSync(path.join(cwd, '.trail', 'releases.jsonl')), true)
+    assert.equal(fs.existsSync(path.join(cwd, '.trail', 'releases', 'v1.md')), true)
+    assert.equal(fs.existsSync(path.join(cwd, '.dsh', 'releases.jsonl')), false)
+    const notes = fs.readFileSync(path.join(cwd, '.trail', 'releases', 'v1.md'), 'utf8')
+    assert.match(notes, /- 验收标准：1 条（notesIncludeCriteria=false：不列出条目文本）/)
+    assert.doesNotMatch(notes, /AC-001/)
+
+    // A project file cannot move the artifacts OUT of the workspace, and the
+    // host-only layout keys stay refused (profile is the ceiling).
+    const escape = tempWorkspace('evidence-release-escape-')
+    writeProjectConfig(escape, { releasesDir: '../../hijacked', releasesFile: '/tmp/hijacked.jsonl', rootDir: 'hijacked' })
+    const effective = resolveEffectiveConfig(resolveConfig({}), new MissionStoreRegistry().for(escape).layout)
+    assert.equal(effective.config.releasesDir, '.dsh/releases')
+    assert.equal(effective.config.releasesFile, '.dsh/releases.jsonl')
+    assert.equal(effective.source, 'profile')
+    assert.ok(
+        effective.problems.some((entry) => entry.includes('releasesDir') && entry.includes('必须指向工作区内')),
+        effective.problems.join('\n'),
+    )
+    assert.ok(effective.problems.some((entry) => entry.includes('rootDir')), effective.problems.join('\n'))
+})
+
+test('release_notes / release_status 只读：不动台账、不写任何文件 (regression)', async (t) => {
+    const cwd = gitRepo('evidence-release-readonly-')
+    if (cwd === undefined) {
+        t.skip('git is unavailable in this environment')
+        return
+    }
+    const { fake, store } = rig({ cwd, logFile: outsideLog('release') })
+    const missionId = await deliverMission(fake, store, 'M-1')
+    await fake.runTool('release_record', { version: 'v1.0.0', missionIds: [missionId] })
+
+    const dsh = path.join(cwd, '.dsh')
+    const before = listFiles(dsh)
+    const ledger = fs.readFileSync(path.join(dsh, 'releases.jsonl'), 'utf8')
+    const notes = fs.readFileSync(path.join(dsh, 'releases', 'v1.0.0.md'), 'utf8')
+
+    assert.match(runText(await fake.runTool('release_notes', { version: 'v1.0.0' })), /只读/)
+    assert.match(runText(await fake.runTool('release_notes', { missionIds: [missionId], json: true })), /"missionIds"/)
+    const empty = runText(await fake.runTool('release_notes', {}))
+    assert.match(empty, /没有可生成发布说明的 mission/)
+    assert.match(runText(await fake.runTool('release_status', {})), /## 发布台账/)
+    assert.match(runText(await fake.runTool('release_status', { version: 'v1.0.0', json: true })), /"releases"/)
+
+    assert.deepEqual(listFiles(dsh), before, '只读工具不得新增/删除任何文件')
+    assert.equal(fs.readFileSync(path.join(dsh, 'releases.jsonl'), 'utf8'), ledger)
+    assert.equal(fs.readFileSync(path.join(dsh, 'releases', 'v1.0.0.md'), 'utf8'), notes)
+})
+
+test('release 工具在未声明工作区时拒绝执行，且不写任何文件 (regression)', async () => {
+    const ws = tempWorkspace('evidence-release-undeclared-')
+    const agent = { id: 'agent-undeclared', session: { id: SESSION, header: { id: SESSION } } }
+    const fake = createFakeHost({ cwd: ws, agent: agent as never })
+    apply(fake.ctx as never, { logFile: path.join(ws, 'evidence-gate.log') })
+
+    const runs = [
+        await fake.runTool('release_record', { version: 'v1.0.0' }),
+        await fake.runTool('release_notes', {}),
+        await fake.runTool('release_status', {}),
+    ]
+    for (const run of runs) {
+        assert.equal(run.isError, true, `${run.name} 必须拒绝执行（不能猜工作区）`)
+        assert.match(String(run.content), /无法确定本会话的工作区/)
+    }
+    assert.equal(fs.existsSync(path.join(ws, '.dsh')), false, '未声明工作区时不得写台账/发布说明')
 })

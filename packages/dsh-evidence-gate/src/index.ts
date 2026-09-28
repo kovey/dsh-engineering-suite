@@ -2,7 +2,8 @@
  * dsh-evidence-gate — the evidence and delivery gate (docs.md §3.5).
  *
  * Responsibilities:
- *  - register `evidence_record` / `evidence_status` / `mission_complete`;
+ *  - register `evidence_record` / `evidence_status` / `mission_complete` and the
+ *    release ledger surface `release_record` / `release_notes` / `release_status`;
  *  - keep the evidence ledger of a mission as an append-only JSONL artifact
  *    (`<root>/missions/<id>/evidence.jsonl`), every row bound to the Git
  *    fingerprint observed at recording time;
@@ -10,6 +11,9 @@
  *    refused with a Chinese checklist and the exact next tool call;
  *  - issue one immutable receipt (`receipts/<receipt-id>.json`) only after a
  *    deterministic quality-gate `PASS`;
+ *  - link deliveries to versions: an append-only release ledger
+ *    (`<root>/releases.jsonl`) plus generated notes (`<root>/releases/<version>.md`),
+ *    both projections of the recorded artifacts, never of memory;
  *  - contribute the evidence contract to the system prompt.
  *
  * Extension points used here (verified against the installed packages):
@@ -133,7 +137,7 @@ export function apply(ctx: Context, config: unknown = {}): void {
         })
 
         logger.info(
-            `applied (tools: ${tools.registered.join(', ')}${tools.failed.length > 0 ? `; failed: ${tools.failed.join(', ')}` : ''}; requireGate=${resolved.requireGate}; gateSource=${resolved.gateSource}; required=${resolved.requiredEvidenceKinds.join('+') || 'none'}; requireCleanTree=${resolved.requireCleanTree}; projectConfig=.dsh/evidence-gate.json)`,
+            `applied (tools: ${tools.registered.join(', ')}${tools.failed.length > 0 ? `; failed: ${tools.failed.join(', ')}` : ''}; requireGate=${resolved.requireGate}; gateSource=${resolved.gateSource}; required=${resolved.requiredEvidenceKinds.join('+') || 'none'}; requireCleanTree=${resolved.requireCleanTree}; releasesFile=${resolved.releasesFile}; releasesDir=${resolved.releasesDir}; requireTagFormat=${resolved.requireTagFormat ?? '(off)'}; projectConfig=.dsh/evidence-gate.json)`,
         )
     } catch (error) {
         logger.error('apply failed:', error)

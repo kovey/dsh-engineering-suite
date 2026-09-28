@@ -52,6 +52,9 @@ function effectiveLines(config: EvidenceGateConfig, effective?: EffectiveEvidenc
         `- 必填证据类型：${kindsText(active)}——缺任何一类都会被拒绝。`,
         `- 门禁：来源 ${active.gateSource}；requireGate=${active.requireGate}；maxGateAgeMinutes=${active.maxGateAgeMinutes}。`,
         `- requireCleanTree=${active.requireCleanTree}——${cleanTree}。`,
+        `- 发布台账：${active.releasesFile}；发布说明目录：${active.releasesDir}；版本格式校验：${
+            active.requireTagFormat === undefined ? '未启用（requireTagFormat 关闭）' : active.requireTagFormat
+        }；notesIncludeCriteria=${active.notesIncludeCriteria}。`,
     ]
 }
 
@@ -96,5 +99,15 @@ export function sectionText(config: EvidenceGateConfig, effective?: EffectiveEvi
         '- mission 解析顺序：显式 `missionId` → 本会话绑定的 mission → 委派父会话的 mission；**不会**回退到"工作区里最新的 mission"，解析不到时请显式传 `missionId` 或用 `orchestrate start` / `spec_create` 建立绑定。',
         '',
         '`force=true` 只放松"必填证据类型"检查，并且会强制写入一条 `manual` 证据留痕；它**绝不**能绕过质量门禁（含伪造/部分覆盖）、未审批的规格、`blocked` 状态或证据陈旧。',
+        '',
+        '### 交付之后：把回执绑到版本上（release_record / release_notes / release_status）',
+        '',
+        '回执回答"这个 mission 交付了"，**不回答"哪个版本包含它"**：不记录版本，事后就只能翻 git 历史猜。',
+        '- `release_record({ version, tag?, missionIds?, note? })`：把一个版本记进发布台账（`<root>/releases.jsonl`，append-only），行里带 tag、当前 revision（git 指纹）、mission 与回执 id，并写出发布说明 `<root>/releases/<version>.md`。',
+        '- **什么时候记**：交付回执**已经存在之后**、打 tag 之前或同时——记录这一步本身就是把"回执"和"版本/tag"绑起来的动作；只打 tag 不记录，台账里仍然查不到"v1.2.0 里有什么"。',
+        '- 省略 `missionIds` 时默认取"上一条发布记录之后签发的回执"对应的 mission（没有上一条时=全部已交付 mission）；一条都没有时拒绝记录空版本。列出的 mission 必须**已存在且有回执**，否则拒绝并点名。同一版本只能记录一次（重复即拒绝，并给出已有记录的日期）；非 git 工作区直接拒绝。',
+        '- `release_notes({ version?, missionIds?, json? })`：按已登记工件（规格需求/验收标准、每个来源最新门禁裁决与 scope、回执绑定的证据类型、交付审批人、证据指到的文件）**生成**发布说明，只读返回；`release_record` 才落盘，不要手写 CHANGELOG。门禁没有 `scope`、证据没有记录文件路径时照实写"未记录"，不推断。',
+        '- `release_status({ version?, json? })`：台账最新在前的已记录发布、**交付但未发布**的 mission（"我准备发什么"）、每个 mission 的最新回执；台账末尾被截断的行会被忽略并报出，不影响其余记录。',
+        '- 发布说明是**投影**：它只包含已记录的工件，不会声称记录里没有的东西；没有 tag 的发布允许记录，但会被标注"未记录 tag"。',
     ].join('\n')
 }
