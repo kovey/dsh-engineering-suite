@@ -1,0 +1,34 @@
+# dsh-deploy-gate bundle patch.
+#
+# `insert` is pure-append and the loader rejects duplicate entry ids, so the row
+# uses the plugin's short id (`deploy-gate`) — a profile overrides parameters
+# with a top-level `- id: deploy-gate` + `config:` block.
+#
+# `environments` is deliberately EMPTY here: this plugin executes host-configured
+# commands (argv, never a shell) against a real environment, so it has nothing to
+# run until the host declares where and how. With no environment declared every
+# tool refuses and says so — a plugin default like "deploy to localhost" would be
+# a silently different target from the one the host meant.
+#
+# A repository may declare its own environments (and refine the numbers) through
+# `<repo>/.dsh/deploy-gate.json`, but it may never turn OFF a human approval the
+# profile requires, and it can never reach `enabled`, `logFile`, the layout,
+# `ledgerFile` or the `goNoGo` ceiling.
+- insert:
+    - id: deploy-gate
+      name: 'dsh-deploy-gate'
+      config:
+        enabled: true
+        logFile: '~/.dsh/deploy-gate.log'
+        ledgerFile: '.dsh/deployments.jsonl'
+        verifyRetries: 3
+        verifyBackoffMs: 5000
+        commandTimeoutMs: 600000
+        autoRollbackOnFailure: false
+        goNoGo:
+          requireReceipt: true
+          requireGateNewerThanEvidence: true
+          requireNoPendingAsks: true
+          maxGateAgeMinutes: 0
+          requireCleanTree: true
+        environments: []

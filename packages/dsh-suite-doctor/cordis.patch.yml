@@ -1,0 +1,19 @@
+# dsh-suite-doctor bundle patch.
+#
+# `insert` is pure-append and the loader rejects duplicate entry ids, so the row
+# uses the plugin's short id (`suite-doctor`) — a profile overrides parameters
+# with a top-level `- id: suite-doctor` + `config:` block.
+#
+# `expectedPlugins` is deliberately NOT here: its default is the suite's eleven
+# plugin ids, and a deployment that ships a deliberately smaller set states that
+# in its own profile row (a deployment without coverage-gate should say so)
+# rather than in this shipped file. `expectedPlugins` is the SUITE build this
+# host expects; whether a plugin is actually mounted is a runtime fact and is
+# probed per call.
+- insert:
+    - id: suite-doctor
+      name: 'dsh-suite-doctor'
+      config:
+        enabled: true
+        logFile: '~/.dsh/suite-doctor.log'
+        prompt: { enabled: true, order: 605 }

@@ -1,0 +1,27 @@
+# dsh-interaction-gate bundle patch.
+#
+# `insert` is pure-append and the loader rejects duplicate entry ids, so the row
+# uses the plugin's short id (`interaction-gate`) — a profile overrides parameters
+# with a top-level `- id: interaction-gate` + `config:` block.
+#
+# Where a decision is DELIVERED (which channel) and who may answer belong to the
+# target repository (`.dsh/interaction-approvers.txt`, and the overridable keys
+# in `<repo>/.dsh/interaction-gate.json`), which spec-gate's trust root keeps out
+# of the model's reach. How long a turn may wait for a human, and whether an
+# approver list is mandatory, stay host-owned: a repository that could raise the
+# timeout or clear the list would be exempting itself.
+- insert:
+    - id: interaction-gate
+      name: 'dsh-interaction-gate'
+      config:
+        enabled: true
+        logFile: '~/.dsh/interaction-gate.log'
+        askTimeoutMs: 900000
+        requireApproverList: false
+        approversFile: .dsh/interaction-approvers.txt
+        ledgerFile: .dsh/interaction/decisions.jsonl
+        notifyLevels: [warn, error]
+        preferredChannels: []
+        maxPayloadChars: 4000
+        redactPatterns: []
+        prompt: { enabled: true, order: 600 }
