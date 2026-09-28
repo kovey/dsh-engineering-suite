@@ -116,6 +116,16 @@ export interface MutationConfig {
     maxMutants: number
     /** Wall-clock budget for one `mutation_check` run. */
     timeBudgetMs: number
+    /**
+     * Bounded settle window (ms) before the end-of-run "the workspace is
+     * byte-identical" verification (default {@link DEFAULT_VERIFY_SETTLE_MS}).
+     *
+     * The test command's process group is killed, but a grandchild that ignores
+     * signals — or one spawned just before the kill — can still write a source
+     * file AFTER the last mutant. Waiting first, then checking, turns that race
+     * into a refusal instead of a silently voided invariant.
+     */
+    verifySettleMs: number
     /** Thresholds in force; no score threshold → `mutation_check` refuses. */
     thresholds: MutationThresholds
     /** Diff base for `changed: true` (default `HEAD`). */
@@ -137,6 +147,12 @@ export const DEFAULT_MUTATION_TIME_BUDGET_MS = 600_000
 /** Shortest budget that can run anything at all. */
 export const MIN_MUTATION_TIME_BUDGET_MS = 1_000
 
+/** Default settle window before the end-of-run verification (see {@link MutationConfig.verifySettleMs}). */
+export const DEFAULT_VERIFY_SETTLE_MS = 250
+
+/** Ceiling for `verifySettleMs`: the settle window may not turn a gate into a sleep. */
+export const MAX_VERIFY_SETTLE_MS = 5_000
+
 /** The keys of the `mutation` block, for messages and the project overlay. */
 export const MUTATION_KEYS: readonly string[] = [
     'enabled',
@@ -146,6 +162,7 @@ export const MUTATION_KEYS: readonly string[] = [
     'operators',
     'maxMutants',
     'timeBudgetMs',
+    'verifySettleMs',
     'thresholds',
     'baseRef',
 ]
@@ -161,6 +178,7 @@ export function defaultMutationConfig(): MutationConfig {
         operators: [],
         maxMutants: DEFAULT_MAX_MUTANTS,
         timeBudgetMs: DEFAULT_MUTATION_TIME_BUDGET_MS,
+        verifySettleMs: DEFAULT_VERIFY_SETTLE_MS,
         thresholds: {},
         baseRef: 'HEAD',
     }
@@ -268,6 +286,26 @@ export function parseMutationConfig(
         }
     }
 
+    if (input['verifySettleMs'] !== undefined) {
+        const value = input['verifySettleMs']
+        if (typeof value === 'number' && Number.isInteger(value) && value >= 0) {
+            if (value > MAX_VERIFY_SETTLE_MS) {
+                warn(
+                    `${where}: mutation.verifySettleMs=${value} 超过上限 ${MAX_VERIFY_SETTLE_MS}，已收敛到上限（这是"最后一次变异之后等多久再校验工作区"的稳定窗口，不是测试超时）`,
+                )
+            }
+            next.verifySettleMs = Math.min(MAX_VERIFY_SETTLE_MS, value)
+        } else {
+            // The suite rule: an unusable value KEEPS the host's value (never a
+            // substituted default) and is reported.
+            warn(
+                `${where}: mutation.verifySettleMs 必须是 0–${MAX_VERIFY_SETTLE_MS} 之间的整数（收到 ${JSON.stringify(
+                    value,
+                )}），已忽略（保持 ${next.verifySettleMs}）`,
+            )
+        }
+    }
+
     if (input['baseRef'] !== undefined) {
         const value = input['baseRef']
         if (typeof value === 'string' && value.trim() !== '') next.baseRef = value.trim()
@@ -347,6 +385,7 @@ export function describeMutation(config: MutationConfig): string {
         `operators ${config.operators.length === 0 ? '(全部)' : config.operators.join(', ')}`,
         `maxMutants ${config.maxMutants}`,
         `时间预算 ${Math.round(config.timeBudgetMs / 1000)}s`,
+        `稳定窗口 ${config.verifySettleMs}ms`,
         `阈值 ${describeMutationThresholds(config.thresholds)}`,
     ].join('；')
 }

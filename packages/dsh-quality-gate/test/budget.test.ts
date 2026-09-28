@@ -10,6 +10,8 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { Worker } from 'node:worker_threads'
 import test from 'node:test'
 import { MissionStoreRegistry, formatTime } from 'dsh-eng-core'
 import { createFakeHost, runText, tempWorkspace, type FakeHost } from 'dsh-eng-core/testing'
@@ -26,6 +28,9 @@ import {
     readBaseline,
     runBudgets,
     selectBudgets,
+    DEFAULT_BASELINE_LOCK_RETRY_MS,
+    DEFAULT_BASELINE_LOCK_STALE_MS,
+    MAX_BASELINE_LOCK_RETRY_MS,
     type BaselineEntry,
     type BudgetCheck,
     type BudgetConfig,
@@ -564,4 +569,259 @@ test('budgets: a foreign JSON document is not "no history", and appending never 
     assert.deepEqual(readBaseline(shaped, 'b'), { entries: [] })
     appendBaseline(shaped, 'b', { at: CLOCK, value: 5, metric: 'number', unit: 'count', command: 'x', exitCode: 0 })
     assert.deepEqual(readBaseline(shaped, 'b').entries.map((entry) => entry.value), [5])
+})
+
+// --- 2026-09 follow-up audit: the baseline lock -----------------------------
+
+/** A baseline entry, with the value the only thing a test cares about. */
+function sample(at: number, value: number): BaselineEntry {
+    return { at, value, metric: 'number', unit: 'count', command: 'x', exitCode: 0 }
+}
+
+test('budgets: two concurrent writers both end up in the history (an append is never lost)', async () => {
+    const cwd = tempWorkspace('budget-lock-race-')
+    const file = path.join(cwd, 'budgets.json')
+    fs.writeFileSync(file, `${JSON.stringify({ version: 1, budgets: {} }, null, 2)}\n`)
+    // The compiled module, so a REAL second process does the writing: this test's
+    // claim is about concurrency, and an interleaved stub cannot make it.
+    const modulePath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../dist/budget.js')
+    const worker = (value: number): Worker => {
+        const code = `
+            import { parentPort, workerData } from 'node:worker_threads'
+            import fs from 'node:fs'
+            const barrier = new Int32Array(workerData.barrier)
+            const index = workerData.value - 1
+            const file = workerData.file
+            const entry = { at: Date.now(), value: workerData.value, metric: 'number', unit: 'count', command: 'x', exitCode: 0 }
+            // A counting barrier for exactly these two writers, implemented with a
+            // pure spin (no Atomics.wait: its timeout can fire even after another
+            // agent changed the slot, which makes the release unreliable). Writers 1
+            // and 2 arrive, the LAST one pushes the counter to 3, and both then spin
+            // until they observe it — so they leave this line within microseconds of
+            // each other, which is what makes the read-modify-write window a window.
+            barrier[index] = 1
+            if (Atomics.add(barrier, 2, 1) === 1) Atomics.store(barrier, 2, 3)
+            const deadline = Date.now() + 30_000
+            while (Atomics.load(barrier, 2) !== 3) {
+                if (Date.now() > deadline) throw new Error('barrier timeout')
+            }
+            const before = fs.readFileSync(file, 'utf8')
+            let spin = 0
+            while (spin < 500000) spin += 1
+            const { appendBaseline } = await import(workerData.modulePath)
+            appendBaseline(file, 'b', entry, { lockRetryMs: 10000 })
+            const document = JSON.parse(fs.readFileSync(file, 'utf8'))
+            parentPort.postMessage({ ok: true, before: before.length, keys: Object.keys(document.budgets) })
+        `
+        return new Worker(code, {
+            eval: true,
+            type: 'module',
+            workerData: { file, modulePath, value, barrier: barrier.buffer },
+        })
+    }
+    const barrier = new Int32Array(new SharedArrayBuffer(16))
+    const results: { ok: boolean }[] = []
+    const running = [worker(1), worker(2)].map(
+        (instance) =>
+            new Promise<void>((resolve, reject) => {
+                instance.on('message', (message: { ok: boolean }) => results.push(message))
+                instance.on('error', reject)
+                instance.on('exit', () => resolve())
+            }),
+    )
+    await Promise.all(running)
+    assert.equal(Atomics.load(barrier, 0), 1, 'writer 1 reached the barrier')
+    assert.equal(Atomics.load(barrier, 1), 1, 'writer 2 reached the barrier')
+    assert.equal(results.length, 2, 'both writers finished')
+    const entries = readBaseline(file, 'b').entries
+    assert.deepEqual(
+        entries.map((entry) => entry.value).sort((left, right) => left - right),
+        [1, 2],
+        'both measurements are in the append-only history: one was not overwritten by the other',
+    )
+})
+
+test('budgets: a stale lock file is reported with its path and age, and refused (never waited out)', () => {
+    const cwd = tempWorkspace('budget-lock-stale-')
+    const file = path.join(cwd, 'budgets.json')
+    const lock = `${file}.lock`
+    fs.writeFileSync(file, `${JSON.stringify({ version: 1, budgets: { b: [sample(CLOCK, 1)] } }, null, 2)}\n`)
+    const before = fs.readFileSync(file, 'utf8')
+    fs.writeFileSync(lock, `${JSON.stringify({ pid: 4242, at: CLOCK - 120_000, file })}\n`)
+    const problems: string[] = []
+    assert.throws(
+        () =>
+            appendBaseline(file, 'b', sample(CLOCK, 2), {
+                now: () => CLOCK,
+                sleep: () => problems.push('sleep called'),
+            }),
+        (error: unknown) => {
+            const message = String((error as Error).message)
+            assert.match(message, /已过期/)
+            assert.match(message, /budgets\.json\.lock/)
+            assert.match(message, /120s/)
+            assert.match(message, /pid=4242/)
+            assert.match(message, /手动删除/)
+            assert.match(message, /不会自动删掉这个锁/)
+            return true
+        },
+    )
+    assert.deepEqual(problems, [], 'a stale lock is refused outright — it is never waited on')
+    assert.equal(fs.readFileSync(file, 'utf8'), before, 'the baseline document is untouched')
+    assert.equal(fs.existsSync(lock), true, 'the stale lock is left for a human to remove')
+})
+
+test('budgets: a live lock makes the second writer wait, then refuses loudly (no silent skip)', async () => {
+    const cwd = tempWorkspace('budget-lock-live-')
+    const file = path.join(cwd, 'budgets.json')
+    const lock = `${file}.lock`
+    fs.writeFileSync(file, `${JSON.stringify({ version: 1, budgets: {} }, null, 2)}\n`)
+    // A live lock (age 2s, well under the 30s stale bound) owned by this process.
+    fs.writeFileSync(lock, `${JSON.stringify({ pid: process.pid, at: CLOCK - 2_000, file })}\n`)
+    const sleeps: number[] = []
+    assert.throws(
+        () =>
+            appendBaseline(file, 'b', sample(CLOCK, 1), {
+                now: () => CLOCK,
+                lockRetryMs: 200,
+                lockSleepMs: 30,
+                sleep: (ms) => sleeps.push(ms),
+            }),
+        (error: unknown) => {
+            const message = String((error as Error).message)
+            assert.match(message, /等待基线文件 .* 的锁超时（200ms/)
+            assert.match(message, /budgets\.json\.lock/)
+            assert.match(message, /该锁的年龄约 2s/)
+            assert.match(message, /不会丢测量|丢失其中一次测量/)
+            return true
+        },
+    )
+    assert.equal(sleeps.length > 0, true, 'the retry loop really waited (with the injected sleep)')
+    assert.deepEqual(readBaseline(file, 'b').entries, [], 'nothing was appended without the lock')
+
+    // Through the run: the refusal is the tool-level refusal, not a lost append.
+    // The default baseline lives at `<rootDir>/budgets.json`, so that is where the
+    // live lock has to be for a `budget_check` to meet it.
+    const rootDir = path.join(cwd, '.dsh')
+    const defaultFile = path.join(rootDir, 'budgets.json')
+    fs.mkdirSync(rootDir, { recursive: true })
+    fs.writeFileSync(`${defaultFile}.lock`, `${JSON.stringify({ pid: process.pid, at: Date.now() - 2_000, file: defaultFile })}\n`)
+    const run = await runBudgets({
+        cwd,
+        config: resolveConfig(budget()),
+        rootDir,
+        runner: stubRunner([{ exitCode: 0, stdout: 'size=1000' }]).runner,
+        now: () => CLOCK,
+        baselineLockRetryMs: 100,
+        baselineLockStaleMs: 60_000,
+        lockSleep: () => undefined,
+    })
+    assert.equal(run.ok, false)
+    assert.match(run.ok === false ? run.problem : '', /锁超时/)
+    assert.match(run.ok === false ? run.problem : '', /没有写入/)
+    assert.deepEqual(readBaseline(defaultFile, 'bundle').entries, [], 'a refused run writes no history')
+    assert.equal(fs.existsSync(defaultFile), false, 'a refused run does not invent a baseline document either')
+
+    // Release it by hand: the next append works, which is the documented fix.
+    fs.unlinkSync(lock)
+    appendBaseline(file, 'b', sample(CLOCK, 1), { lockRetryMs: 50 })
+    assert.deepEqual(readBaseline(file, 'b').entries.map((entry) => entry.value), [1])
+    assert.equal(fs.existsSync(lock), false, 'the lock is always released, including after a successful append')
+})
+
+test('budgets: the lock file is created exclusively, written atomically and always released', () => {
+    const cwd = tempWorkspace('budget-lock-shape-')
+    const file = path.join(cwd, 'budgets.json')
+    const lock = `${file}.lock`
+    // A document that must be refused on the WRITE side: the lock is still taken
+    // and still released (a lock left behind would refuse every later run).
+    fs.writeFileSync(file, JSON.stringify({ someone: 'else' }))
+    assert.throws(
+        () => appendBaseline(file, 'b', sample(CLOCK, 1), { lockRetryMs: 50 }),
+        /拒绝写入基线文件/,
+    )
+    assert.equal(fs.existsSync(lock), false, 'the finally released the lock on the refusal path')
+    assert.equal(fs.readFileSync(file, 'utf8'), JSON.stringify({ someone: 'else' }), 'the foreign document is untouched')
+
+    // A crash mid-write cannot truncate the document: the new bytes arrive by
+    // rename, so the previous COMPLETE document is what a reader ever sees.
+    const shaped = path.join(cwd, 'other.json')
+    fs.writeFileSync(shaped, `${JSON.stringify({ version: 1, budgets: {} }, null, 2)}\n`)
+    appendBaseline(shaped, 'b', sample(CLOCK, 1), { lockRetryMs: 50 })
+    appendBaseline(shaped, 'b', sample(CLOCK + 1, 2), { lockRetryMs: 50 })
+    assert.deepEqual(readBaseline(shaped, 'b').entries.map((entry) => entry.value), [1, 2])
+    assert.deepEqual(
+        fs.readdirSync(cwd).filter((entry) => entry.includes('.tmp-')),
+        [],
+        'the atomic write leaves no temp file behind',
+    )
+
+    // Two concurrent writers on the SAME document cannot both hold the lock: the
+    // second `wx` create fails while the first is alive. (`held.json.lock` holds a
+    // real record, so the holder is "alive", not an unreadable orphan.)
+    const heldTarget = path.join(cwd, 'held.json')
+    const held = `${heldTarget}.lock`
+    fs.writeFileSync(held, `${JSON.stringify({ pid: process.pid, at: Date.now(), file: heldTarget })}\n`)
+    try {
+        assert.throws(
+            () =>
+                appendBaseline(heldTarget, 'b', sample(CLOCK, 1), {
+                    lockRetryMs: 0,
+                    sleep: () => undefined,
+                }),
+            /锁超时/,
+        )
+    } finally {
+        fs.unlinkSync(held)
+    }
+    // An unreadable/orphaned lock (no record at all) is refused as stale, with the
+    // manual-removal instruction — never "wait for it" and never deleted for the
+    // other run: this is the shape a crash mid-create leaves behind.
+    fs.writeFileSync(held, '')
+    try {
+        assert.throws(
+            () => appendBaseline(heldTarget, 'b', sample(CLOCK, 1), { lockRetryMs: 0 }),
+            /已过期[\s\S]*手动删除/,
+        )
+    } finally {
+        fs.unlinkSync(held)
+    }
+})
+
+test('budgets: the lock bounds are host keys with defaults, a ceiling and a reported unusable value', () => {
+    const defaults = resolveConfig({})
+    assert.equal(defaults.baselineLockRetryMs, DEFAULT_BASELINE_LOCK_RETRY_MS)
+    assert.equal(defaults.baselineLockRetryMs, 2_000)
+    assert.equal(defaults.baselineLockStaleMs, DEFAULT_BASELINE_LOCK_STALE_MS)
+    assert.equal(defaults.baselineLockStaleMs, 30_000)
+    assert.equal(MAX_BASELINE_LOCK_RETRY_MS, 10_000)
+
+    assert.equal(resolveConfig({ baselineLockRetryMs: 250 }).baselineLockRetryMs, 250)
+    assert.equal(resolveConfig({ baselineLockRetryMs: 0 }).baselineLockRetryMs, 0, '0 is a real value: fail fast')
+    const problems: string[] = []
+    assert.equal(
+        resolveConfig({ baselineLockRetryMs: 60_000 }, (message) => problems.push(message)).baselineLockRetryMs,
+        MAX_BASELINE_LOCK_RETRY_MS,
+        'waiting for a lock may not become a hang',
+    )
+    assert.match(problems.join('\n'), /baselineLockRetryMs=60000 超过上限 10000/)
+    for (const bad of ['2000', -1, 1.5, null, {}]) {
+        const warnings: string[] = []
+        const resolved = resolveConfig({ baselineLockStaleMs: bad }, (message) => warnings.push(message))
+        assert.equal(resolved.baselineLockStaleMs, DEFAULT_BASELINE_LOCK_STALE_MS, `${JSON.stringify(bad)} is not usable`)
+        assert.match(warnings.join('\n'), /baselineLockStaleMs 必须是 0 或正整数/)
+    }
+    // Host-only: a project file may not shorten the wait and start losing appends.
+    const projectCwd = tempWorkspace('budget-lock-project-')
+    const layout = new MissionStoreRegistry().for(projectCwd).layout
+    fs.mkdirSync(layout.rootDir, { recursive: true })
+    fs.writeFileSync(
+        path.join(layout.rootDir, 'quality-gate.json'),
+        JSON.stringify({ baselineLockRetryMs: 1, baselineLockStaleMs: 1, budgets: [] }),
+    )
+    const { config, problems: projectProblems } = resolveEffectiveConfig(resolveConfig({}), layout)
+    assert.equal(config.baselineLockRetryMs, DEFAULT_BASELINE_LOCK_RETRY_MS, 'the lock bounds stay the host\'s')
+    assert.equal(config.baselineLockStaleMs, DEFAULT_BASELINE_LOCK_STALE_MS)
+    assert.match(projectProblems.join('\n'), /键 "baselineLockRetryMs" 不允许在项目级配置里覆盖/)
+    assert.match(projectProblems.join('\n'), /键 "baselineLockStaleMs" 不允许在项目级配置里覆盖/)
 })

@@ -651,8 +651,16 @@ test('two concurrent adr_record calls with one title never lose a decision docum
             `round ${round}: two calls must never claim the same ADR number`,
         )
         for (const loser of results.filter((result) => !result.ok)) {
-            assert.match(loser.problem ?? '', /被另一条 adr_record 占用/)
-            assert.match(loser.nextSteps ?? '', /重试会重新读取目录里的编号/)
+            // Two legitimate orders, both safe, and which one happens is timing:
+            // the loser either scanned while the file was still absent and then
+            // lost the exclusive create ("被另一条 adr_record 占用"), or it scanned
+            // after the winner had finished and the plain existence guard fired
+            // ("目标文件已存在"). Asserting only the first made this test fail
+            // under load (measured 3/6 concurrent runs) while the plugin was
+            // behaving exactly as designed — the invariant that matters is below:
+            // the loser wrote nothing and never overwrote the winner.
+            assert.match(loser.problem ?? '', /(被另一条 adr_record 占用|目标文件已存在)/)
+            assert.doesNotMatch(loser.problem ?? '', /ENOENT|EEXIST|undefined/)
         }
         // One document per successful call, and no temporary file left behind:
         // with one shared title the pre-fix code renamed the loser's document

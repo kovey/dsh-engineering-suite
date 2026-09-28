@@ -18,9 +18,9 @@
 |---|---|
 | `deploy_plan` | 对某个已声明环境做 **go/no-go**（见下表），列出**将要执行的确切命令**、canary 步骤与**回滚路径**。对**环境只读**：不执行任何命令、不请求任何审批。有 mission 时把计划落盘成 `.dsh/missions/<id>/deploy/<stamp>-plan.json`。 |
 | `deploy_run` | 再算一次 go/no-go（不通过 → 直接拒绝，逐条列出未通过项），需要审批的环境**先问人**（`interaction` 服务 → 宿主审批通道；两者都没有 → 拒绝并说明），然后按配置顺序执行 `deployCommands`（argv 直传）。**非零退出立即停止**并带出输出尾部；有 canary 时按步执行（每步命令 → 等待 `waitMs` → 该步验证）。记录一条门禁 + 一行台账（revision / 审批人 / 审批消息 id）。`dryRun` 只打印会发生什么，**不写任何文件、不执行任何命令**。 |
-| `deploy_verify` | 执行 `verifyCommands`，**有限次重试 + 退避**（`verifyRetries` / `verifyBackoffMs`）。任一次尝试全部退出码 0 → PASS；尝试用尽 → **BLOCK**，且报告里**原样列出该环境声明的回滚命令**，让下一步是可执行的而不是一句讨论。**只验证真的发生过的部署**：有 mission 时，台账里必须有一次成功、仍然上线、且 revision 与当前工作区一致的部署，否则拒绝并说明台账里实际找到的是哪一行——否则一次“只验证”的 PASS 会被编排器读成“部署已执行且通过”。 |
+| `deploy_verify` | 执行 `verifyCommands`，**有限次重试 + 退避**（`verifyRetries` / `verifyBackoffMs`）。**审批走与 `deploy_run` 完全相同的路径**（同一通道注册表 `list → arm → send → awaitAnswer`，否则同一宿主审批接缝，都没有就大声拒绝；同一审批人名单、同一 `approvalTimeoutMs`）：默认**跟随该环境的 `requiresApproval`**（生产环境验证同样要人，staging 不要，除非它声明 `verifyRequiresApproval: true`），宿主可用 `verifyApproval: 'always'`（处处要人）或 `'never'`（仅宿主可写）改变它。**没人批准的验证不会执行**：记一行 `refused` + 一条 BLOCK，写明"验证未执行，因为没有人批准"。任一次尝试全部退出码 0 → PASS；尝试用尽 → **BLOCK**，且报告里**原样列出该环境声明的回滚命令**，让下一步是可执行的而不是一句讨论。**只验证真的发生过的部署**：有 mission 时，台账里必须有一次成功、仍然上线、且 revision 与当前工作区一致的部署，否则拒绝并说明台账里实际找到的是哪一行——否则一次“只验证”的 PASS 会被编排器读成“部署已执行且通过”。 |
 | `deploy_rollback` | 与 `deploy_run` **相同的审批规则**；环境没有声明 `rollbackCommands` → 拒绝。执行回滚命令，并记一行台账，`rollbackOf` 指向这次要撤销的部署（`to` 指向台账 id，或当前上线的那次，或最后一次尝试）。 |
-| `deploy_status` | **只读**：已声明环境（是否需要审批、回滚是否已声明）、台账摘要（每环境最近一次 + 当前上线版本 + **回滚目标**）、最近一条 `dsh-deploy-gate` 门禁、挂起的提问、工作区 revision。 |
+| `deploy_status` | **只读**：已声明环境（是否需要审批、**验证是否需要审批**、回滚是否已声明）、台账摘要（每环境最近一次 + 当前上线版本 + **回滚目标**）、最近一条 `dsh-deploy-gate` 门禁、挂起的提问、工作区 revision。 |
 
 报告全部是中文，并且**每一条都以"下一步"结尾**——包括拒绝的报告。
 
@@ -38,18 +38,22 @@
 | 6 | `gate-state` | 最新裁决是 **PASS**（WARN/BLOCK 不放行） | 恒开 |
 | 7 | `gate-newer-than-evidence` | 门禁**严格晚于**最新 command/test 证据（同毫秒算陈旧） | `goNoGo.requireGateNewerThanEvidence` |
 | 8 | `gate-age` | 门禁年龄 ≤ N 分钟 | `goNoGo.maxGateAgeMinutes`（0 = 关） |
-| 9 | `asks` | 没有等待人工回答的提问 | `goNoGo.requireNoPendingAsks` |
+| 9 | `asks` | 没有等待人工回答的提问 | `goNoGo.requireNoPendingAsks`；**查不到就是不过**（见下） |
 | 10 | `clean-tree` | 工作区没有未提交改动（`.dsh/**` 与台账不计入） | `goNoGo.requireCleanTree` |
 | 11 | `environment-deploy-commands` | 环境声明了部署命令 | 恒开 |
 | 12 | `environment-verify-commands` | 环境声明了验证命令 | 恒开 |
 | 13 | `environment-rollback-commands` | 环境声明了回滚命令 | 恒开 |
 | 14–17 | `commands-deploy-usable` / `commands-verify-usable` / `commands-rollback-usable` / `commands-canary-usable` | 每一组命令都能 argv 直传（无 shell 元字符、无未知占位符）；只在该组有命令时出现 | 恒开 |
 
-两点是刻意的：
+三点是刻意的：
 
-- **"未校验"是一个可见状态**：非 git 工作区无法核对 revision、宿主声明 `requireReceipt: false`、没有装配
-  `interaction` 服务（查不了挂起提问）时，那一项会通过但标成 `⚠️ 未校验`，报告里写明"本项未实际核对，不计为已验证"。
-  一个部署裁决**不许暗示**一次没有发生的核对。
+- **"未校验"是一个可见状态**：非 git 工作区无法核对 revision、宿主声明 `requireReceipt: false` 时，那一项会通过但标成
+  `⚠️ 未校验`，报告里写明"本项未实际核对，不计为已验证"。一个部署裁决**不许暗示**一次没有发生的核对。
+- **"查不到"不等于"没有"**：`asks` 这一项在**无法执行**时（没有装配 `interaction` 服务、访问器读不出来、服务还没读到
+  本工作区的台账）**默认不通过**（`goNoGo.pendingAsksUnverifiable` 默认 `'block'`），报告写明**到底没读到什么**以及
+  **怎么让它可读**（在这个工作区跑一次任何交互工具让本进程观察到台账，或把 `interaction.ledgerFile` 配成绝对路径）。
+  宿主显式写 `'warn'` 才回到旧的 `⚠️ 未校验` 行为——这个键是**宿主专属**的，项目文件写不了。
+  "有人在等回答"与"读不到"是**两条不同的消息**，但都是 BLOCK。
 - **回滚与验证是恒开的**：`environment-verify-commands` / `environment-rollback-commands` 不是可关的开关。
   部署完不看结果、出事时现场想办法，都不是这个插件愿意签字的"上线"。
 
@@ -68,11 +72,13 @@ profile（宿主上限）与 `<repo>/.dsh/deploy-gate.json`（项目级细化）
     verifyBackoffMs: 5000   # 两次尝试之间的退避（0–600000）
     commandTimeoutMs: 600000
     approvalTimeoutMs: 900000      # 一次审批提问的截止时间（宿主专属；超时 = 拒绝，不是同意）
+    verifyApproval: environment    # 验证审批：environment（默认，跟随环境）| always（强迫处处要人）| never（宿主专属）
     autoRollbackOnFailure: false   # true = 部署/验证失败后自动执行环境声明的回滚命令
     goNoGo:
       requireReceipt: true
       requireGateNewerThanEvidence: true
       requireNoPendingAsks: true
+      pendingAsksUnverifiable: block  # 查不到挂起提问时的处置：block（默认，fail closed）| warn（旧的 ⚠️ 未校验）
       maxGateAgeMinutes: 0        # 0 = 不检查门禁年龄
       requireCleanTree: true
     environments:
@@ -82,12 +88,14 @@ profile（宿主上限）与 `<repo>/.dsh/deploy-gate.json`（项目级细化）
         verifyCommands: ['bash scripts/healthcheck.sh']
         rollbackCommands: ['bash scripts/rollback.sh --to {revision}']
         # requiresApproval 省略 = 按 kind 推导：只有 local/staging 默认免审批
+        # verifyRequiresApproval 省略 = 跟随 requiresApproval（同一环境、同一批宿主命令，只有一套信任要求）
       - name: production
         kind: production           # production/未声明/自定义 kind → 默认需要人工批准
         approversFile: .dsh/deploy-approvers.txt   # 可选：审批人名单（一行一个，# 注释）
         deployCommands: ['bash scripts/deploy.sh --env production']
         verifyCommands: ['bash scripts/smoke.sh', 'bash scripts/healthcheck.sh']
         rollbackCommands: ['bash scripts/rollback.sh --env production --to {revision}']
+        verifyRequiresApproval: true   # 显式：部署后验证同样要人（默认已如此，这里写出来给读者看）
         canary:
           steps:
             - { percent: 10, command: 'bash scripts/canary.sh --percent 10', waitMs: 60000, verifyCommands: ['bash scripts/smoke.sh'] }
@@ -95,14 +103,17 @@ profile（宿主上限）与 `<repo>/.dsh/deploy-gate.json`（项目级细化）
     prompt: { enabled: true, order: 650 }
 ```
 
-**项目级可覆盖**：`environments`、`verifyRetries`、`verifyBackoffMs`、`commandTimeoutMs`——"这个项目怎么发布、
-发到哪里"确实只有仓库自己知道。
+**项目级可覆盖**：`environments`、`verifyRetries`、`verifyBackoffMs`、`commandTimeoutMs`、`verifyApproval`——"这个项目怎么发布、
+发到哪里"确实只有仓库自己知道；`verifyApproval` 在项目级**只能写 `'always'`**（把验证收紧成必须有人批），写 `'never'` 或
+`'environment'` 会被拒绝并保持 profile 的值。
 
 **宿主专属**（项目级写了会被拒绝并记日志）：`enabled`、`logFile`、`logFileTemplate`、`layout`、`ledgerFile`、
-`goNoGo`、`autoRollbackOnFailure`、`approvalTimeoutMs`、`prompt`。一个仓库不能给自己关掉门禁，不能把
-`requireReceipt` 调松，也不能把“失败要不要自动回滚”“等人能等多久”的决定权拿走。**两个键是单调的**：
+`goNoGo`（含 `pendingAsksUnverifiable`）、`autoRollbackOnFailure`、`approvalTimeoutMs`、`prompt`。一个仓库不能给自己关掉门禁，
+不能把 `requireReceipt` 调松，不能把"查不到挂起提问也算过"，也不能把“失败要不要自动回滚”“等人能等多久”的决定权拿走。
+**三个键是单调的**：
 
 - `requiresApproval`：项目级可以把它加上，不能把 profile 声明的“需要人工批准”关掉（写 `false` 会被拒并保持 `true`）；
+- `verifyRequiresApproval`：同一条规则——profile 下需要人工批准的验证，项目级不能关掉（写 `false` 会被拒并保持 `true`）；
 - `approversFile`：profile 声明了名单时，项目级**不能替换或去掉**它（换一份名单等于悄悄放宽“谁能批”）——
   只能为 profile 没声明的环境补一份；换名单的尝试会被拒绝并保持 profile 的名单。
 
@@ -171,7 +182,7 @@ profile（宿主上限）与 `<repo>/.dsh/deploy-gate.json`（项目级细化）
 
 ## 审批接缝（`interaction` / `ctx.approval`）
 
-需要人工批准的环境按这个顺序找人：
+需要人工批准的动作（`deploy_run` / `deploy_rollback`，以及**需要批准的 `deploy_verify`**）按这个顺序找人：
 
 1. `ctx.get('interaction')` 提供 `ask(request)` 时用它（旧的单一方法形态）：请求形如
    `{ title, question, options: [{value: 'yes'|'no', label}], agent, toolName, signal }`，返回值被规范化为
@@ -183,8 +194,9 @@ profile（宿主上限）与 `<repo>/.dsh/deploy-gate.json`（项目级细化）
    等答案；`answered` 的答案走与 `ask()` **同一个**规范化器与**同一个**审批人名单校验，`timeout` / `cancelled` /
    `unknown-token` / 读不出来的结果一律 **fail closed**（超时既不是拒绝也不是同意）。
    挂起提问通过 `pendingAsks()`（兼容 `pending()` / `listPending()`）读取，支持数组、`{asks: [...]}` 或一个数量；
-   服务暴露 `ledgers()` 且其为空时，这一项按**无法核对**处理（`pending()` 只读本进程见过的台账，
-   “`[]`”在那时**不等于**“没有人在等回答”）。
+   服务暴露 `ledgers()` 且其为空时，这一项**无法核对**（`pending()` 只读本进程见过的台账，“`[]`”在那时**不等于**
+   “没有人在等回答”）——而"无法核对"**默认就是不通过**（`goNoGo.pendingAsksUnverifiable: 'block'`），
+   报告会写明没读到什么、以及怎么让它可读；宿主显式写 `'warn'` 才退回 `⚠️ 未校验` 通过。
 3. 否则用宿主审批通道 `ctx.get('approval')`（`normalizeApprovalReply`，与套件其它插件同一接缝，记录
    `by` / `messageId` / `source`）。
 4. 都没有、或者通道都不可用 → **拒绝**并说明（把试过的东西原样列出来：注册了几个通道、各自为什么不能提问、
@@ -192,6 +204,13 @@ profile（宿主上限）与 `<repo>/.dsh/deploy-gate.json`（项目级细化）
 
 人工**拒绝/取消** → 返回一份“未执行”的报告（正常结果）；**没有通道** → 报错（配置缺失）。
 两者都会写一行 `refused` 台账（有 mission 时再写一条 BLOCK 门禁）。
+
+**验证的审批是同一件事**：`deploy_verify` 执行的是**同一个环境里的宿主命令**，所以它的信任要求不能比 `deploy_run` 松。
+判定顺序是：宿主 `verifyApproval` 为 `'always'` → 要人；为 `'never'`（仅宿主可写）→ 不要人；否则看该环境的
+`verifyRequiresApproval`，省略时**跟随 `requiresApproval`**。需要批准时走上面**完全相同的**路径（同一通道注册表序列、
+同一 `approvalTimeoutMs`、同一 `approversFile` 名单校验），批准人写进**验证那行台账**（`approvedBy` / `approvalMessageId`）
+与**门禁 reason**；没人批准则**不执行任何验证命令**，写一行 `refused` 与一条 BLOCK，report 与门禁里都写明
+"验证未执行，因为没有人批准"——编排器读到的最新一条 `dsh-deploy-gate` 记录因此永远是 BLOCK，而不是上一次部署的 PASS。
 
 **审批之后的复算（TOCTOU）**：go/no-go 与工作区指纹是在**发卡片之前**算的，而卡片打开期间工作区不会冻结。
 所以批准之后、执行第一条命令之前，本插件会**重新观察**一次：指纹/revision 变了（HEAD 动了、多了一个未提交文件、

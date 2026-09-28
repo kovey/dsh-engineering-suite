@@ -24,7 +24,7 @@ import {
     type GateState,
 } from 'dsh-eng-core'
 import { createFakeHost, runText, tempWorkspace, type FakeHost } from 'dsh-eng-core/testing'
-import { apply, environmentByName, evaluateGoNoGo, inject, name, resolveConfig, resolveEffectiveConfig, sectionText } from '../dist/index.js'
+import { apply, environmentByName, evaluateGoNoGo, inject, name, resolveConfig, resolveEffectiveConfig, sectionText, verifyNeedsApproval } from '../dist/index.js'
 import { resolveCommands, tokenizeTemplate } from '../dist/command.js'
 import {
     appendLedgerRow,
@@ -145,13 +145,27 @@ interface Harness {
     text: (toolName: string, args?: unknown) => Promise<string>
 }
 
+/**
+ * The interaction facts of a HEALTHY workspace: the service is mounted AND it
+ * has read this workspace's ledger, so "no pending asks" is a verified fact
+ * rather than "this process could not look".
+ *
+ * It is the default service set because the go/no-go policy is fail-closed
+ * (`goNoGo.pendingAsksUnverifiable` defaults to `'block'`): with no observable
+ * ledger every verdict would be `no-go` for a reason unrelated to what the test
+ * is about. Tests that need the unobservable case pass their own `services`.
+ */
+function healthyInteraction(): Record<string, unknown> {
+    return { pending: () => [], ledgers: () => ['/repo/.dsh/interaction/decisions.jsonl'] }
+}
+
 function harnessFor(cwd: string, options: HarnessOptions = {}): Harness {
     const stores = new MissionStoreRegistry()
     const host = createFakeHost({
         cwd,
         ...(options.withApproval === undefined ? {} : { withApproval: options.withApproval }),
         ...(options.approvalOutcome === undefined ? {} : { approvalOutcome: options.approvalOutcome }),
-        ...(options.services === undefined ? {} : { services: options.services }),
+        services: options.services ?? { interaction: healthyInteraction() },
     })
     const config = resolveConfig({ ...rawConfig(), ...(options.config ?? {}) })
     const deps: ToolDeps = {
@@ -555,18 +569,43 @@ test('go/no-go: a missing, non-PASS, stale or too-old quality gate blocks', () =
     assert.equal(young.ok, true)
 })
 
-test('go/no-go: pending asks block, and an unqueryable channel is unverified rather than "clear"', () => {
+test('go/no-go: pending asks block, and an unverifiable channel blocks by default', () => {
     assert.deepEqual(failing(goNoGoInput({ pendingAsks: [{ title: '确认回滚窗口', ageMs: 600_000 }] })), ['asks'])
     const off = evaluateGoNoGo(
         goNoGoInput({ pendingAsks: [{ title: 'x' }], config: resolveConfig({ environments: [stagingEnvironment()], goNoGo: { requireNoPendingAsks: false } }) }),
     )
     assert.equal(off.ok, true)
     assert.equal(off.checks.some((check) => check.id === 'asks'), false)
-    const noChannel = evaluateGoNoGo(goNoGoInput({ pendingAsks: [], pendingAsksQueryable: false }))
+    // An unreadable pending-ask fact is a FAILED check, not a ⚠️ pass: two
+    // different messages for two different situations ("there ARE pending asks"
+    // vs "we could not look"), both BLOCK.
+    const noChannel = evaluateGoNoGo(
+        goNoGoInput({ pendingAsks: [], pendingAsksQueryable: false, pendingAsksProblem: '宿主没有装配 interaction 服务' }),
+    )
     const check = noChannel.checks.find((entry) => entry.id === 'asks')
-    assert.equal(check?.ok, true)
-    assert.equal(check?.unverified, true)
-    assert.match(String(check?.detail), /无法核对/)
+    assert.equal(noChannel.ok, false)
+    assert.equal(check?.ok, false)
+    assert.notEqual(check?.unverified, true, 'a failed check is not an "unverified pass"')
+    assert.match(String(check?.detail), /无法确认有没有人在等回答/)
+    assert.match(String(check?.detail), /宿主没有装配 interaction 服务/)
+    assert.match(String(check?.fix), /interaction\.ledgerFile|交互工具/)
+    // ...and the host may deliberately opt back into the old ⚠️ behaviour.
+    const warn = evaluateGoNoGo(
+        goNoGoInput({
+            pendingAsks: [],
+            pendingAsksQueryable: false,
+            config: resolveConfig({ environments: [stagingEnvironment()], goNoGo: { pendingAsksUnverifiable: 'warn' } }),
+        }),
+    )
+    const warned = warn.checks.find((entry) => entry.id === 'asks')
+    assert.equal(warn.ok, true)
+    assert.equal(warned?.ok, true)
+    assert.equal(warned?.unverified, true)
+    assert.match(String(warned?.detail), /无法核对/)
+    // A genuinely observed-and-empty ledger still passes.
+    const observed = evaluateGoNoGo(goNoGoInput({ pendingAsks: [], pendingAsksQueryable: true }))
+    assert.equal(observed.ok, true)
+    assert.equal(observed.checks.find((entry) => entry.id === 'asks')?.unverified, undefined)
 })
 
 test('go/no-go: an uncommitted tree blocks, a non-git workspace is unverified', () => {
@@ -694,6 +733,8 @@ test('deploy_plan: writes the plan artifact, executes nothing, and shows command
     assert.equal(artifact['verdict'], 'go')
     assert.equal(artifact['environment'], 'staging')
     assert.deepEqual(artifact['rollbackCommands'], ['node scripts/rollback.mjs'])
+    assert.equal(artifact['requiresApproval'], false)
+    assert.equal(artifact['verifyRequiresApproval'], false, 'the plan records the verification-approval rule too')
     assert.ok(Array.isArray(artifact['checks']))
 })
 
@@ -761,7 +802,7 @@ test('production requires approval: approved runs, refused does not, no channel 
     const h1 = harnessFor(approved.cwd, {
         config,
         withApproval: false,
-        services: { interaction: { ask: async () => ({ answer: 'yes', by: 'feishu:ou_1', messageId: 'om_card_1', source: 'im' }) } },
+        services: { interaction: { ask: async () => ({ answer: 'yes', by: 'feishu:ou_1', messageId: 'om_card_1', source: 'im' }), ...healthyInteraction() } },
     })
     deliveredMission(h1.stores, approved.cwd)
     const runTextApproved = await h1.text('deploy_run', { environment: 'production' })
@@ -799,7 +840,7 @@ test('approversFile: an unlisted approver is refused even after a yes', async ()
     const h = harnessFor(cwd, {
         config,
         withApproval: false,
-        services: { interaction: { ask: async () => ({ answer: 'yes', by: 'feishu:ou_stranger', messageId: 'om_9' }) } },
+        services: { interaction: { ask: async () => ({ answer: 'yes', by: 'feishu:ou_stranger', messageId: 'om_9' }), ...healthyInteraction() } },
     })
     deliveredMission(h.stores, cwd)
     const text = await h.text('deploy_run', { environment: 'production' })
@@ -850,7 +891,7 @@ test('the ledger row carries revision + approver + approval message id', async (
     const h = harnessFor(cwd, {
         config,
         withApproval: false,
-        services: { interaction: { ask: async () => ({ decision: 'allowed-once', by: 'ou_zhangyong', messageId: 'om_card_42', source: 'im' }) } },
+        services: { interaction: { ask: async () => ({ decision: 'allowed-once', by: 'ou_zhangyong', messageId: 'om_card_42', source: 'im' }), ...healthyInteraction() } },
     })
     const { missionId } = deliveredMission(h.stores, cwd)
     await h.text('deploy_run', { environment: 'production' })
@@ -1056,14 +1097,15 @@ test('deploy_status summarises a ledger whose last line is truncated', async () 
     fs.appendFileSync(ledgerFile, '{"at":9999999,"id":"DPL-trunc","environment":"stag')
     const text = await h.text('deploy_status', {})
     assert.match(text, /## 部署状态/)
-    assert.match(text, /staging（kind=staging；无需批准）/)
+    // The environment line now also names the verification-approval rule.
+    assert.match(text, /staging（kind=staging；无需批准；验证无需人工批准）/)
     assert.match(text, /部署 1 条，验证 1 条，回滚 1 条/)
     assert.match(text, /1 行无法解析/)
     assert.match(text, /截断末行/)
     assert.match(text, /回滚目标：DPL-/)
     assert.match(text, /最近一条部署门禁（source=dsh-deploy-gate，编排器读的就是这一条）：GATE-.* PASS/)
     assert.match(text, new RegExp(missionId))
-    assert.match(text, /挂起的提问：无法确定/)
+    assert.match(text, /挂起的提问：0 个/)
     assert.match(text, /下一步：deploy_plan/)
     assert.match(text, /revision：main@/)
 })
@@ -1121,29 +1163,58 @@ test('interaction replies are normalised fail-closed, and pending asks degrade s
     assert.equal(normalizeInteractionReply(undefined).decision, 'unavailable')
     assert.equal(normalizeInteractionReply({ random: true }).decision, 'unavailable')
 
-    assert.deepEqual(pendingAsksOf(undefined), { asks: [], queryable: false })
-    assert.deepEqual(pendingAsksOf({ ask: async () => 'yes' }), { asks: [], queryable: false })
+    assert.deepEqual(pendingAsksOf(undefined), {
+        asks: [],
+        queryable: false,
+        problem: '宿主没有装配 interaction 服务（ctx.get("interaction") 为空），本进程无法查询任何交互台账',
+        fix:
+            '让宿主装配一个可查询的 interaction 服务/通道插件（例如 dsh-interaction-gate）后重启会话；' +
+            '如果服务已经装配、只是本进程还没读到台账，就在这个工作区里跑一次任何一个交互工具（interaction_status / interaction_ask），' +
+            '或把 interaction.ledgerFile 配成一个绝对路径；然后重新 deploy_plan/deploy_run',
+    })
+    const askOnly = pendingAsksOf({ ask: async () => 'yes' })
+    assert.deepEqual(askOnly.asks, [])
+    assert.equal(askOnly.queryable, false)
+    assert.match(String(askOnly.problem), /没有暴露任何待回答提问的访问器/)
     assert.deepEqual(pendingAsksOf({ pendingAsks: () => [{ title: 'x', ageMs: 5 }] }), { asks: [{ title: 'x', ageMs: 5 }], queryable: true })
     assert.deepEqual(pendingAsksOf({ pendingAsks: () => ({ asks: ['y'] }) }), { asks: [{ title: 'y' }], queryable: true })
     // A bare count is ONE synthetic ask naming the count — never `new Array(n)`.
     assert.deepEqual(pendingAsksOf({ pendingAsks: () => 2 }).asks, [{ title: '通道只报告了数量：2 个提问在等人回答（通道没有给出标题）' }])
     assert.equal(pendingAsksOf({ pendingAsks: () => 0 }).queryable, true)
-    assert.deepEqual(pendingAsksOf({ pendingAsks: () => { throw new Error('hub down') } }), { asks: [], queryable: false })
-    // A non-array answer is UNREADABLE, not a verified empty list.
-    assert.deepEqual(pendingAsksOf({ pending: () => 'weird' }), { asks: [], queryable: false })
-    assert.deepEqual(pendingAsksOf({ pending: () => undefined }), { asks: [], queryable: false })
-    assert.deepEqual(pendingAsksOf({ pending: () => ({}) }), { asks: [], queryable: false })
+    const thrown = pendingAsksOf({
+        pendingAsks: () => {
+            throw new Error('hub down')
+        },
+    })
+    assert.deepEqual(thrown.asks, [])
+    assert.equal(thrown.queryable, false)
+    assert.match(String(thrown.problem), /hub down/, 'the reason it could not be read must survive')
+    // A non-array answer is UNREADABLE, not a verified empty list — and the
+    // shape it actually returned is part of the report.
+    const weird = pendingAsksOf({ pending: () => 'weird' })
+    assert.deepEqual([weird.asks, weird.queryable], [[], false])
+    assert.match(String(weird.problem), /不是一个提问数组（收到 string）/)
+    const emptyObject = pendingAsksOf({ pending: () => ({}) })
+    assert.deepEqual([emptyObject.asks, emptyObject.queryable], [[], false])
+    assert.match(String(emptyObject.problem), /不是一个提问数组（收到 对象（键：\(无\)））/)
+    assert.deepEqual(pendingAsksOf({ pending: () => undefined }).asks, [])
     // ...but a service that HAS observed a ledger can say "nobody is waiting".
     assert.deepEqual(pendingAsksOf({ pending: () => [], ledgers: () => ['/repo/.dsh/interaction/decisions.jsonl'] }), { asks: [], queryable: true })
-    assert.deepEqual(pendingAsksOf({ pending: () => [], ledgers: () => [] }), { asks: [], queryable: false })
+    const unobserved = pendingAsksOf({ pending: () => [], ledgers: () => [] })
+    assert.deepEqual([unobserved.asks, unobserved.queryable], [[], false])
+    assert.match(String(unobserved.problem), /还没有观察到任何交互台账/)
+    assert.match(String(unobserved.fix), /interaction\.ledgerFile|交互工具/)
 })
 
 test('the prompt section reports the effective environments and the honest limits', () => {
     const config = resolveConfig({ environments: [productionEnvironment()] })
     const text = sectionText(config)
     assert.match(text, /deploy_plan.*deploy_run.*deploy_verify.*deploy_rollback/s)
-    assert.match(text, /production（kind=production，需要人工批准）/)
+    // The environment line now also names the verification-approval rule.
+    assert.match(text, /production（kind=production，需要人工批准，验证需要人工批准）/)
     assert.match(text, /requireReceipt=true/)
+    assert.match(text, /pendingAsksUnverifiable='block'/)
+    assert.match(text, /verifyApproval='environment'/)
     assert.match(text, /不要把凭据写进命令行/)
     assert.match(text, /无法证明环境实际发生了什么/)
     assert.match(sectionText(config, '/repo/.dsh/deploy-gate.json'), /可能被本仓库的 `\/repo\/\.dsh\/deploy-gate\.json` 细化/)
@@ -1250,7 +1321,7 @@ test('a project environment entry inherits the profile keys it does not declare 
         config: { environments: [productionEnvironment({ approversFile: '.dsh/deploy-approvers.txt' })] },
         resolveProject: true,
         withApproval: false,
-        services: { interaction: { ask: async () => ({ decision: 'allowed-once', by: 'stranger', messageId: 'msg-1' }) } },
+        services: { interaction: { ask: async () => ({ decision: 'allowed-once', by: 'stranger', messageId: 'msg-1' }), ...healthyInteraction() } },
     })
     const { store, missionId } = deliveredMission(h.stores, cwd)
     const effective = resolveEffectiveConfig(h.config, h.stores.for(cwd).layout)
@@ -1280,16 +1351,34 @@ test('a project entry may ADD an approver list but never replace the host one (m
     assert.equal(staging?.approversFile, 'mine.txt', 'an environment the profile does not declare may bring its own list')
 })
 
-test('an unobservable interaction ledger is reported as unverified, never as "no pending asks"', async () => {
-    // Repro a16.mjs: the service's `pending()` reads only the ledgers THIS
-    // process has observed, so `[]` cannot be read as "nobody is waiting".
+test('an unobservable interaction ledger BLOCKS by default, and only warn makes it a ⚠️ pass', async () => {
+    // Repro a16.mjs + follow-up: the service's `pending()` reads only the ledgers
+    // THIS process has observed, so `[]` cannot be read as "nobody is waiting" —
+    // and since "we could not look" must not authorise a deploy, the default is
+    // now a FAILED check naming exactly what could not be observed.
     const unobserved = scriptRepo()
     const h = harnessFor(unobserved.cwd, { services: { interaction: { pending: () => [], ledgers: () => [] } } })
     deliveredMission(h.stores, unobserved.cwd)
     const text = await h.text('deploy_plan', { environment: 'staging' })
-    assert.match(text, /⚠️ 没有等待人工回答的提问/)
-    assert.match(text, /本项未实际核对，不计为已验证/)
-    assert.doesNotMatch(text, /✅ 没有等待人工回答的提问/)
+    assert.match(text, /⛔ 没有等待人工回答的提问/)
+    assert.match(text, /⛔ 裁决：不可部署/)
+    assert.match(text, /无法区分"没有等待"与"还没读到台账"/)
+    assert.match(text, /interaction\.ledgerFile/)
+    assert.doesNotMatch(text, /本项未实际核对/)
+
+    // The host may deliberately keep the old ⚠️ behaviour — and then the pass is
+    // still visibly "unverified" rather than silently green.
+    const warned = scriptRepo()
+    const h1 = harnessFor(warned.cwd, {
+        config: { goNoGo: { pendingAsksUnverifiable: 'warn' } },
+        services: { interaction: { pending: () => [], ledgers: () => [] } },
+    })
+    deliveredMission(h1.stores, warned.cwd)
+    const text1 = await h1.text('deploy_plan', { environment: 'staging' })
+    assert.match(text1, /⚠️ 没有等待人工回答的提问/)
+    assert.match(text1, /本项未实际核对，不计为已验证/)
+    assert.match(text1, /✅ 裁决：可以部署/)
+    assert.doesNotMatch(text1, /⛔ 没有等待人工回答的提问/)
 
     const observed = scriptRepo()
     const h2 = harnessFor(observed.cwd, { services: { interaction: { pending: () => [], ledgers: () => ['/repo/.dsh/interaction/decisions.jsonl'] } } })
@@ -1303,8 +1392,47 @@ test('an unobservable interaction ledger is reported as unverified, never as "no
     })
     deliveredMission(h3.stores, waiting.cwd)
     const blocked = await h3.text('deploy_plan', { environment: 'staging' })
+    // Two different situations, two different messages — both BLOCK.
     assert.match(blocked, /⛔ 没有等待人工回答的提问/)
+    assert.match(blocked, /有 1 个提问还在等人回答/)
+    assert.doesNotMatch(blocked, /无法确认有没有人在等回答/)
     assert.match(blocked, /⛔ 裁决：不可部署/)
+})
+
+test('a workspace with NO interaction service cannot reach a go verdict (fail closed, with the fix)', async () => {
+    const { cwd, calls } = scriptRepo()
+    const h = harnessFor(cwd, { services: {} })
+    const { store, missionId } = deliveredMission(h.stores, cwd)
+    const result = await h.run('deploy_run', { environment: 'staging' })
+    assert.equal(result.isError, true)
+    const message = String(result.content)
+    assert.match(message, /无法确认有没有人在等回答/)
+    assert.match(message, /宿主没有装配 interaction 服务/)
+    assert.match(message, /ctx\.get\("interaction"\)/)
+    assert.deepEqual(callsOf(calls), [], 'nothing may run while the pending-ask fact is unobservable')
+    const gate = store.lastGate(missionId, { source: 'dsh-deploy-gate' })
+    assert.equal(gate?.state, 'BLOCK')
+    assert.equal(gate?.results[0]?.id, 'check:asks')
+})
+
+test('goNoGo.pendingAsksUnverifiable is host-only: a project file cannot loosen it', () => {
+    const cwd = tempWorkspace('deploy-gate-gonogo-')
+    fs.mkdirSync(path.join(cwd, '.dsh'), { recursive: true })
+    fs.writeFileSync(
+        path.join(cwd, '.dsh', 'deploy-gate.json'),
+        JSON.stringify({ goNoGo: { pendingAsksUnverifiable: 'warn', requireReceipt: false } }),
+    )
+    const host = resolveConfig({ environments: [stagingEnvironment()] })
+    const effective = resolveEffectiveConfig(host, resolveLayout(cwd))
+    assert.equal(effective.config.goNoGo.pendingAsksUnverifiable, 'block', 'the profile value is kept')
+    assert.equal(effective.config.goNoGo.requireReceipt, true)
+    assert.equal(effective.source, 'profile')
+    assert.ok(effective.problems.some((problem) => /goNoGo/.test(problem)), JSON.stringify(effective.problems))
+    // ...while the host itself may choose it, and the invalid value falls back to block.
+    assert.equal(resolveConfig({ goNoGo: { pendingAsksUnverifiable: 'warn' } }).goNoGo.pendingAsksUnverifiable, 'warn')
+    const problems: string[] = []
+    assert.equal(resolveConfig({ goNoGo: { pendingAsksUnverifiable: 'nope' } }, (message) => problems.push(message)).goNoGo.pendingAsksUnverifiable, 'block')
+    assert.ok(problems.some((problem) => /pendingAsksUnverifiable/.test(problem)), JSON.stringify(problems))
 })
 
 test('a numeric pending() return is a count, never an allocation', () => {
@@ -1449,6 +1577,7 @@ test('a workspace that moves while the approval card is open is refused, naming 
                     fs.writeFileSync(path.join(cwd, 'late-change.txt'), 'someone kept working\n')
                     return { decision: 'allowed-once', by: 'alice', messageId: 'om_1' }
                 },
+                ...healthyInteraction(),
             },
         },
     })
@@ -1510,6 +1639,9 @@ test('a mounted interaction service with no usable channel refuses loudly, namin
         arm: () => true,
         send: async () => ({ ok: true }),
         awaitAnswer: async () => ({ outcome: 'timeout', answer: null }),
+        // The go/no-go check must be able to READ the pending-ask fact, or it
+        // refuses before the approval path this test is about is reached.
+        ...healthyInteraction(),
     }
     const h = harnessFor(cwd, { config: { environments: [productionEnvironment()] }, withApproval: false, services: { interaction: registry } })
     deliveredMission(h.stores, cwd)
@@ -1531,6 +1663,7 @@ test('an approval timeout through the channel registry is a REFUSAL, never a con
         arm: () => true,
         send: async () => ({ ok: true, messageId: 'card-7' }),
         awaitAnswer: async () => ({ outcome: 'timeout', answer: null }),
+        ...healthyInteraction(),
     }
     const h = harnessFor(cwd, { config: { environments: [productionEnvironment()] }, withApproval: false, services: { interaction: registry } })
     const { store, missionId } = deliveredMission(h.stores, cwd)
@@ -1540,4 +1673,252 @@ test('an approval timeout through the channel registry is a REFUSAL, never a con
     assert.deepEqual(callsOf(calls), [])
     assert.equal(store.lastGate(missionId, { source: 'dsh-deploy-gate' })?.state, 'BLOCK')
     assert.deepEqual(readLedger(path.join(cwd, '.dsh', 'deployments.jsonl')).rows.map((row) => row.state), ['refused'])
+})
+
+// --- verification approval (follow-up audit: deploy_verify ran host commands
+// --- with no approval at all, in the same environment deploy_run guards) ----
+
+test('config: verifyRequiresApproval defaults to the environment rule, never to "skip the human"', () => {
+    const host = resolveConfig({ environments: [stagingEnvironment(), productionEnvironment()] })
+    const staging = host.environments.find((environment) => environment.name === 'staging') as never
+    const production = host.environments.find((environment) => environment.name === 'production') as never
+    assert.equal(verifyNeedsApproval(host, staging), false, 'an explicitly declared staging environment needs nobody for a deploy or a verify')
+    assert.equal(verifyNeedsApproval(host, production), true, 'production needs a person for BOTH')
+    assert.equal(verifyNeedsApproval({ ...host, verifyApproval: 'always' }, staging), true)
+    assert.equal(verifyNeedsApproval({ ...host, verifyApproval: 'never' }, production), false, 'only the host may switch it off')
+
+    // An unusable value falls back to "follow requiresApproval" — NOT to false.
+    const problems: string[] = []
+    const explicit = resolveConfig(
+        { environments: [stagingEnvironment({ verifyRequiresApproval: true }), productionEnvironment({ verifyRequiresApproval: 'yes' })] },
+        (message) => problems.push(message),
+    )
+    assert.equal(explicit.environments[0]?.verifyRequiresApproval, true)
+    assert.equal(explicit.environments[1]?.verifyRequiresApproval, undefined)
+    assert.equal(verifyNeedsApproval(explicit, explicit.environments[1] as never), true)
+    assert.ok(problems.some((problem) => /verifyRequiresApproval/.test(problem)), JSON.stringify(problems))
+
+    // An unknown host rule is reported and falls back to the default.
+    const bad: string[] = []
+    assert.equal(resolveConfig({ verifyApproval: 'sometimes' }, (message) => bad.push(message)).verifyApproval, 'environment')
+    assert.ok(bad.some((problem) => /verifyApproval/.test(problem)), JSON.stringify(bad))
+})
+
+test('config: the verification rule is monotone — a project may add it, never remove it', () => {
+    const cwd = tempWorkspace('deploy-gate-verify-approval-')
+    fs.mkdirSync(path.join(cwd, '.dsh'), { recursive: true })
+    const file = path.join(cwd, '.dsh', 'deploy-gate.json')
+    const host = resolveConfig({ environments: [stagingEnvironment(), productionEnvironment()] })
+
+    // A project entry may TIGHTEN staging's verification…
+    fs.writeFileSync(file, JSON.stringify({ environments: [{ name: 'staging', verifyRequiresApproval: true }] }))
+    const tightened = resolveEffectiveConfig(host, resolveLayout(cwd))
+    const staging = tightened.config.environments.find((environment) => environment.name === 'staging') as never
+    assert.equal(verifyNeedsApproval(tightened.config, staging), true)
+
+    // …but it may not switch production's verification approval off.
+    fs.writeFileSync(file, JSON.stringify({ environments: [{ name: 'production', verifyRequiresApproval: false }] }))
+    const loosened = resolveEffectiveConfig(host, resolveLayout(cwd))
+    const production = loosened.config.environments.find((environment) => environment.name === 'production') as never
+    assert.equal(production.verifyRequiresApproval, true, 'the profile requirement stays authoritative')
+    assert.equal(verifyNeedsApproval(loosened.config, production), true)
+    assert.ok(
+        loosened.problems.some((problem) => /verifyRequiresApproval 不能由项目级配置关闭/.test(problem)),
+        JSON.stringify(loosened.problems),
+    )
+})
+
+test('config: verifyApproval tightens from a project file, and "never" is refused there', () => {
+    const cwd = tempWorkspace('deploy-gate-verify-approval2-')
+    fs.mkdirSync(path.join(cwd, '.dsh'), { recursive: true })
+    const file = path.join(cwd, '.dsh', 'deploy-gate.json')
+    const host = resolveConfig({ environments: [stagingEnvironment(), productionEnvironment()] })
+
+    fs.writeFileSync(file, JSON.stringify({ verifyApproval: 'always' }))
+    const always = resolveEffectiveConfig(host, resolveLayout(cwd))
+    assert.equal(always.config.verifyApproval, 'always')
+    assert.equal(verifyNeedsApproval(always.config, always.config.environments[0] as never), true, 'always forces a human everywhere')
+
+    // The loosening value is host-only: a project writing it is refused and the
+    // profile value is kept (the same discipline as approversFile).
+    fs.writeFileSync(file, JSON.stringify({ verifyApproval: 'never' }))
+    const refused = resolveEffectiveConfig(host, resolveLayout(cwd))
+    assert.equal(refused.config.verifyApproval, 'environment')
+    assert.equal(refused.source, 'profile')
+    assert.ok(refused.problems.some((problem) => /verifyApproval 不能设为 'never'/.test(problem)), JSON.stringify(refused.problems))
+    assert.ok(refused.problems.some((problem) => /宿主专属/.test(problem)), JSON.stringify(refused.problems))
+
+    // 'environment' would also relax a host that chose 'always'.
+    const strictHost = resolveConfig({ verifyApproval: 'always', environments: [stagingEnvironment()] })
+    fs.writeFileSync(file, JSON.stringify({ verifyApproval: 'environment' }))
+    const relaxed = resolveEffectiveConfig(strictHost, resolveLayout(cwd))
+    assert.equal(relaxed.config.verifyApproval, 'always')
+    assert.ok(relaxed.problems.some((problem) => /只接受收紧值 'always'/.test(problem)), JSON.stringify(relaxed.problems))
+})
+
+test('deploy_verify asks the SAME human as deploy_run, and records the approver', async () => {
+    const { cwd, calls } = scriptRepo()
+    const cards: Record<string, unknown>[] = []
+    const registry = {
+        list: () => [{ name: 'im', canAsk: true, canNotify: true, reason: '', order: 0 }],
+        get: () => undefined,
+        arm: () => true,
+        send: async (_name: string, message: Record<string, unknown>) => {
+            cards.push(message)
+            return { ok: true, messageId: `card-${cards.length}` }
+        },
+        awaitAnswer: async () => ({ outcome: 'answered', answer: { value: 'yes', by: 'alice', messageId: 'card-1' } }),
+        ...healthyInteraction(),
+    }
+    const h = harnessFor(cwd, { config: { environments: [productionEnvironment()] }, withApproval: false, services: { interaction: registry } })
+    const { store, missionId } = deliveredMission(h.stores, cwd)
+    const deployed = await h.text('deploy_run', { environment: 'production' })
+    assert.match(deployed, /### 部署执行：成功/)
+    const verified = await h.text('deploy_verify', { environment: 'production' })
+    assert.match(verified, /✅ 裁决：PASS/)
+    assert.equal(cards.length, 2, 'one card for the deploy, one for the verification')
+    assert.match(String(cards[1]?.['body']), /部署后验证审批/)
+    assert.match(JSON.stringify(cards[1]?.['buttons']), /批准验证/)
+    assert.deepEqual(callsOf(calls), ['deploy', 'verify'])
+
+    // The approver is recorded where an audit reads it: the ledger row AND the
+    // gate reason of the verification (not only the deploy).
+    const rows = readLedger(path.join(cwd, '.dsh', 'deployments.jsonl')).rows
+    assert.deepEqual(rows.map((row) => row.state), ['deployed', 'verified'])
+    assert.equal(rows[1]?.approvedBy, 'alice')
+    assert.equal(rows[1]?.approvalMessageId, 'card-1')
+    const gate = store.lastGate(missionId, { source: 'dsh-deploy-gate' })
+    assert.equal(gate?.state, 'PASS')
+    assert.match(gate?.reason ?? '', /审批 alice/)
+})
+
+test('a verification nobody approved is NOT run: refused row + BLOCK naming it', async () => {
+    const { cwd, calls } = scriptRepo()
+    let answer = 'yes'
+    const h = harnessFor(cwd, {
+        config: { environments: [productionEnvironment()] },
+        withApproval: false,
+        services: {
+            interaction: {
+                ask: async () => ({ answer, by: 'alice', messageId: 'om_1' }),
+                ...healthyInteraction(),
+            },
+        },
+    })
+    const { store, missionId } = deliveredMission(h.stores, cwd)
+    const deployed = await h.text('deploy_run', { environment: 'production' })
+    assert.match(deployed, /### 部署执行：成功/)
+
+    answer = 'no'
+    const refused = await h.text('deploy_verify', { environment: 'production' })
+    assert.match(refused, /### 未执行部署后验证/)
+    assert.match(refused, /人工审批被拒绝/)
+    assert.deepEqual(callsOf(calls), ['deploy'], 'a refused verification must not run its commands')
+
+    const rows = readLedger(path.join(cwd, '.dsh', 'deployments.jsonl')).rows
+    assert.deepEqual(rows.map((row) => row.state), ['deployed', 'refused'])
+    assert.match(rows[1]?.note ?? '', /验证未执行/)
+    const gate = store.lastGate(missionId, { source: 'dsh-deploy-gate' })
+    assert.equal(gate?.state, 'BLOCK', 'the newest record must never stay the deploy PASS')
+    assert.equal(gate?.results[0]?.id, 'check:verify-not-approved')
+    assert.match(gate?.reason ?? '', /没有人批准/)
+    assert.match(gate?.reason ?? '', /验证未执行/)
+    assert.match(gate?.results[0]?.output ?? '', /需要人工批准/)
+})
+
+test('verifyApproval=always forces a human for a staging verification; no channel is a loud refusal', async () => {
+    const { cwd, calls } = scriptRepo()
+    const h = harnessFor(cwd, {
+        config: { environments: [stagingEnvironment()], verifyApproval: 'always' },
+        approvalOutcome: 'allowed-once',
+    })
+    const { store, missionId } = deliveredMission(h.stores, cwd)
+    assert.match(await h.text('deploy_run', { environment: 'staging' }), /### 部署执行：成功/)
+    assert.equal(h.host.approvalRequests.length, 0, 'staging itself needs no approval to deploy')
+    const verified = await h.text('deploy_verify', { environment: 'staging' })
+    assert.match(verified, /✅ 裁决：PASS/)
+    assert.equal(h.host.approvalRequests.length, 1, 'verifyApproval=always must ask even where a deploy would not')
+    assert.equal((h.host.approvalRequests[0] as { toolName?: string }).toolName, 'deploy_verify')
+    assert.match(String((h.host.approvalRequests[0] as { reason?: string }).reason), /部署后验证审批/)
+    assert.equal(store.lastGate(missionId, { source: 'dsh-deploy-gate' })?.state, 'PASS')
+
+    // No approval channel at all: refuse loudly, run nothing, leave a BLOCK.
+    const forced = scriptRepo()
+    const h2 = harnessFor(forced.cwd, {
+        config: { environments: [stagingEnvironment()], verifyApproval: 'always' },
+        withApproval: false,
+        services: {},
+    })
+    const fixture = deliveredMission(h2.stores, forced.cwd)
+    // The go/no-go check needs an observable pending-ask fact before the
+    // verification path is reached: assert that FIRST, then the approval refusal.
+    const blockedByAsks = await h2.run('deploy_run', { environment: 'staging' })
+    assert.equal(blockedByAsks.isError, true)
+    assert.match(String(blockedByAsks.content), /无法确认有没有人在等回答/)
+
+    const noChannel = scriptRepo()
+    const h3 = harnessFor(noChannel.cwd, {
+        config: { environments: [stagingEnvironment()], verifyApproval: 'always' },
+        withApproval: false,
+    })
+    const live = deliveredMission(h3.stores, noChannel.cwd)
+    // A live deployment must exist first (deploy_run itself is gated by the
+    // forced verification approval, so use the ledger directly).
+    appendLedgerRow(path.join(noChannel.cwd, '.dsh', 'deployments.jsonl'), {
+        at: Date.now(),
+        id: 'DPL-fixture-1',
+        environment: 'staging',
+        revision: live.fingerprint.isRepo ? `main@${(live.fingerprint.head ?? '').slice(0, 8)} +0 changed (diff ${(live.fingerprint.diffDigest ?? '').slice(0, 8)})` : '',
+        deployer: 'session-1',
+        state: 'deployed',
+    })
+    const result = await h3.run('deploy_verify', { environment: 'staging' })
+    assert.equal(result.isError, true)
+    const message = String(result.content)
+    assert.match(message, /需要人工批准才能验证/)
+    assert.match(message, /ctx\.approval/)
+    assert.match(message, /verifyRequiresApproval/, 'the refusal must name the key that decides it')
+    assert.deepEqual(callsOf(noChannel.calls), [], 'no approval channel means no command may run')
+    assert.equal(h3.stores.for(noChannel.cwd).lastGate(live.missionId, { source: 'dsh-deploy-gate' })?.state, 'BLOCK')
+    assert.equal(readLedger(path.join(noChannel.cwd, '.dsh', 'deployments.jsonl')).rows.at(-1)?.state, 'refused')
+    assert.equal(fixture.missionId.length > 0, true)
+})
+
+test('verifyApproval=never is a HOST decision: production verifies without asking', async () => {
+    const { cwd, calls } = scriptRepo()
+    const h = harnessFor(cwd, {
+        config: { environments: [productionEnvironment()], verifyApproval: 'never' },
+        approvalOutcome: 'allowed-once',
+    })
+    const { store, missionId } = deliveredMission(h.stores, cwd)
+    assert.match(await h.text('deploy_run', { environment: 'production' }), /### 部署执行：成功/)
+    assert.equal(h.host.approvalRequests.length, 1, 'the DEPLOY still needs a human')
+    const verified = await h.text('deploy_verify', { environment: 'production' })
+    assert.match(verified, /✅ 裁决：PASS/)
+    assert.match(verified, /审批：验证无需人工批准（verifyApproval='never'/)
+    assert.equal(h.host.approvalRequests.length, 1, 'the host switched verification approval off')
+    assert.deepEqual(callsOf(calls), ['deploy', 'verify'])
+    assert.equal(store.lastGate(missionId, { source: 'dsh-deploy-gate' })?.state, 'PASS')
+})
+
+test('deploy_verify enforces the SAME approver allowlist as deploy_run', async () => {
+    const { cwd, calls } = scriptRepo()
+    fs.writeFileSync(path.join(cwd, 'APPROVERS'), '# who may approve\nzhangyong\n')
+    execFileSync('git', ['add', '-A'], { cwd })
+    execFileSync('git', ['commit', '-qm', 'approvers'], { cwd })
+    let by = 'zhangyong'
+    const h = harnessFor(cwd, {
+        config: { environments: [productionEnvironment({ approversFile: 'APPROVERS' })] },
+        withApproval: false,
+        services: { interaction: { ask: async () => ({ answer: 'yes', by, messageId: 'om_1' }), ...healthyInteraction() } },
+    })
+    const { store, missionId } = deliveredMission(h.stores, cwd)
+    assert.match(await h.text('deploy_run', { environment: 'production' }), /### 部署执行：成功/)
+    by = 'feishu:ou_stranger'
+    const refused = await h.text('deploy_verify', { environment: 'production' })
+    assert.match(refused, /### 未执行部署后验证/)
+    assert.match(refused, /不在名单/)
+    assert.deepEqual(callsOf(calls), ['deploy'], 'an unlisted approver must not run the verification either')
+    assert.equal(store.lastGate(missionId, { source: 'dsh-deploy-gate' })?.state, 'BLOCK')
+    assert.equal(readLedger(path.join(cwd, '.dsh', 'deployments.jsonl')).rows.at(-1)?.state, 'refused')
 })

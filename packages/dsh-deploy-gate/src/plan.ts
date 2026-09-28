@@ -79,9 +79,17 @@ export interface GoNoGoInput {
     /**
      * Whether those asks could actually be queried (`ctx.get('interaction')`).
      * `false` turns the pending-asks check into an explicit "unverified" pass
-     * instead of a silent one.
+     * when the host asked for `warn`, and into a FAILED check by default.
      */
     pendingAsksQueryable?: boolean
+    /**
+     * WHAT could not be observed, when {@link GoNoGoInput.pendingAsksQueryable}
+     * is `false`. Rendered verbatim: "无法核对" without the reason is the kind of
+     * message an operator cannot act on.
+     */
+    pendingAsksProblem?: string
+    /** The exact next step that makes the pending-ask fact observable. */
+    pendingAsksFix?: string
     /** The workspace state observed right now. */
     fingerprint: GitFingerprint
     /** The effective configuration (only `goNoGo` is read). */
@@ -307,22 +315,37 @@ export function evaluateGoNoGo(input: GoNoGoInput): GoNoGoResult {
     // --- 4. Nobody is still waiting to answer a question -------------------
     if (goNoGo.requireNoPendingAsks) {
         const queryable = input.pendingAsksQueryable !== false
+        // "We could not look" is not "nobody is waiting". The default is to fail
+        // the check; only a host that explicitly wrote `warn` gets the ⚠️ pass.
+        const unobservable = !queryable && goNoGo.pendingAsksUnverifiable !== 'warn'
         const waiting = pendingAsks.length === 0 ? '' : pendingAsks
             .slice(0, 5)
             .map((ask) => `${ask.title}${ask.ageMs === undefined ? '' : `（已等 ${Math.round(ask.ageMs / 60_000)} 分钟）`}`)
             .join('；')
+        const problem = input.pendingAsksProblem ?? '没有可查询的 interaction 服务（未装配 interaction）'
         checks.push({
             id: 'asks',
-            ok: pendingAsks.length === 0,
-            ...(queryable ? {} : { unverified: true }),
+            ok: pendingAsks.length === 0 && !unobservable,
+            ...(queryable || unobservable ? {} : { unverified: true }),
             label: '没有等待人工回答的提问（goNoGo.requireNoPendingAsks）',
             detail:
                 pendingAsks.length > 0
                     ? `有 ${pendingAsks.length} 个提问还在等人回答：${waiting}`
                     : queryable
                       ? '没有挂起的提问'
-                      : '没有可查询的交互服务（未装配 interaction）：本项无法核对，标为未校验（不是"确认没有提问"）',
-            fix: 'interaction_status（先回答或撤掉这些提问，再部署）',
+                      : unobservable
+                        ? `无法确认有没有人在等回答（本项无法执行，goNoGo.pendingAsksUnverifiable 默认 'block'）：${problem}。` +
+                          '"读不到"不等于"没有人在等回答"，所以本项按未通过处理（fail closed）'
+                        : `没有可查询的交互服务（未装配 interaction）：本项无法核对，标为未校验（不是"确认没有提问"）——` +
+                          `宿主显式声明了 goNoGo.pendingAsksUnverifiable='warn'：${problem}`,
+            fix:
+                pendingAsks.length > 0
+                    ? 'interaction_status（先回答或撤掉这些提问，再部署）'
+                    : unobservable
+                      ? (input.pendingAsksFix ??
+                        '在这个工作区里跑一次任何一个交互工具（例如 interaction_status / interaction_ask），让本进程观察到它的交互台账；' +
+                            '或在 profile 里把 interaction.ledgerFile 配成一个绝对路径，然后重新 deploy_plan/deploy_run')
+                      : 'interaction_status（想把这个事实查清楚：让宿主装配 interaction 服务，或把 goNoGo.pendingAsksUnverifiable 改回默认的 block）',
         })
     }
 

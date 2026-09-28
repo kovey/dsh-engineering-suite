@@ -1278,6 +1278,7 @@ export function registerTools(
                     timeoutMs: config.commandTimeoutMs,
                     timeBudgetMs,
                     maxOutputBytes: config.maxOutputBytes,
+                    verifySettleMs: mutation.verifySettleMs,
                     ...(signal === undefined ? {} : { signal }),
                     subprocess: () => deps.subprocess(),
                     logger,

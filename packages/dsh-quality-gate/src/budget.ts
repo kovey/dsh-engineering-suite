@@ -33,9 +33,13 @@
  * @module dsh-quality-gate/budget
  */
 
+import fs from 'node:fs'
 import path from 'node:path'
+import { randomUUID } from 'node:crypto'
+import { setTimeout as sleepPromise } from 'node:timers/promises'
 import {
     containedPath,
+    ensureDir,
     exists,
     formatTime,
     outputDigestOf,
@@ -43,7 +47,6 @@ import {
     runCommand,
     splitCommand,
     tail,
-    writeJsonAtomic,
     type GateCommandResult,
     type GateScope,
     type GateState,
@@ -184,6 +187,16 @@ export interface BudgetRunOptions {
     requireSpecBudgets?: boolean
     /** Injected clock (the recorded timestamp; tests). */
     now?: () => number
+    /**
+     * Bounded retry budget for the exclusive baseline lock, in ms
+     * (`config.baselineLockRetryMs`, default {@link DEFAULT_BASELINE_LOCK_RETRY_MS}).
+     * A lock that cannot be taken REFUSES the run — a lost measurement is worse.
+     */
+    baselineLockRetryMs?: number
+    /** Age beyond which an existing lock file is reported and refused (`config.baselineLockStaleMs`). */
+    baselineLockStaleMs?: number
+    /** Injected sleep between lock retries (tests drive the loop without waiting). */
+    lockSleep?: (ms: number) => void
     /** Injected command runner; defaults to `dsh-eng-core`'s `runCommand`. */
     runner?: (spec: RunSpec, service?: unknown) => Promise<RunOutcome>
     /** `ctx.subprocess`, when the host provides it. */
@@ -777,6 +790,232 @@ export interface BaselineRead {
     problem?: string
 }
 
+/** Default time to keep retrying an exclusive baseline lock. */
+export const DEFAULT_BASELINE_LOCK_RETRY_MS = 2_000
+
+/** Hard ceiling for `baselineLockRetryMs` (host-only): a queue may not become a hang. */
+export const MAX_BASELINE_LOCK_RETRY_MS = 10_000
+
+/** Default age at which an orphaned lock file is treated as stale (30s). */
+export const DEFAULT_BASELINE_LOCK_STALE_MS = 30_000
+
+/** Only the exact basename is locked, never a path the caller passes in. */
+function baselineLockPathFor(file: string): string {
+    return `${file}.lock`
+}
+
+/** What the lock file records about its owner; readable after a crash. */
+interface LockRecord {
+    pid: number
+    at: number
+    file: string
+}
+
+/** Lock bounds and the injected seams a test drives the retry loop with. */
+export interface AppendBaselineOptions {
+    /** Total retry budget in ms (default {@link DEFAULT_BASELINE_LOCK_RETRY_MS}). */
+    lockRetryMs?: number
+    /** Age beyond which an existing lock file refuses instead of waiting (default {@link DEFAULT_BASELINE_LOCK_STALE_MS}). */
+    lockStaleMs?: number
+    /** How long one retry waits (default 50ms; injected so tests never really sleep). */
+    lockSleepMs?: number
+    /** Injected sleep between retries. */
+    sleep?: (ms: number) => void
+    /** Injected clock (the lock's `at` and the age in the refusal). */
+    now?: () => number
+    /** Provenance of a lock problem, e.g. the budget id whose append was refused. */
+    where?: string
+}
+
+/** What one lock attempt found. */
+type LockOutcome = { lockPath: string } | { problem: string }
+
+/** Read the owner record of an existing lock file; `undefined` when unreadable. */
+function readLockRecord(file: string): { record?: LockRecord; problem?: string; observedAt?: number } {
+    let stats: fs.Stats
+    try {
+        stats = fs.statSync(file)
+    } catch {
+        // It vanished between EEXIST and here: another run released it, so the
+        // retry loop can simply try again.
+        return {}
+    }
+    const text = (() => {
+        try {
+            return fs.readFileSync(file, 'utf8')
+        } catch {
+            return undefined
+        }
+    })()
+    if (text === undefined) return { problem: '锁定文件无法读取', observedAt: stats.mtimeMs }
+    try {
+        const parsed = JSON.parse(text) as unknown
+        if (isRecord(parsed) && typeof parsed['at'] === 'number' && Number.isFinite(parsed['at'])) {
+            return {
+                record: {
+                    pid: typeof parsed['pid'] === 'number' ? parsed['pid'] : -1,
+                    at: parsed['at'],
+                    file: typeof parsed['file'] === 'string' ? parsed['file'] : file,
+                },
+                observedAt: stats.mtimeMs,
+            }
+        }
+        return { problem: '锁定文件内容不是本门禁的记录', observedAt: stats.mtimeMs }
+    } catch {
+        return { problem: '锁定文件内容无法解析（可能被截断）', observedAt: stats.mtimeMs }
+    }
+}
+
+/**
+ * Take the exclusive lock guarding one baseline document's read-modify-write.
+ *
+ * `fs.openSync(path, 'wx')` is the atomic primitive: it fails with `EEXIST`
+ * when the file is already there, and no two callers can both succeed. The lock
+ * is retried for a bounded time — a `budget_check` run and a concurrent one are
+ * a normal thing to do — and then REFUSED, never skipped: silently appending
+ * without the lock is exactly how one measurement disappears from the history.
+ * A lock older than `lockStaleMs` is an orphan (the process that held it died
+ * mid-write); it is reported with its age and path and removed BY HAND, because
+ * deleting it automatically would recreate the race it protects against while a
+ * slow-but-alive run still holds it.
+ * @param file - the baseline document being written.
+ * @param options - lock bounds and injected clock/sleep.
+ * @returns the lock path, or a refusal naming the fix.
+ */
+export function acquireBaselineLock(file: string, options: AppendBaselineOptions = {}): string {
+    const now = options.now ?? (() => Date.now())
+    const sleep = options.sleep ?? ((ms: number) => atomicsWaitMs(ms))
+    const retryMs = Math.max(0, Math.floor(options.lockRetryMs ?? DEFAULT_BASELINE_LOCK_RETRY_MS))
+    const staleMs = Math.max(0, Math.floor(options.lockStaleMs ?? DEFAULT_BASELINE_LOCK_STALE_MS))
+    const sleepMs = Math.max(1, Math.min(1_000, Math.floor(options.lockSleepMs ?? 50)))
+    const lockPath = baselineLockPathFor(file)
+    const started = now()
+    const realStarted = Date.now()
+    // A REAL-time deadline next to the configured one. The retry bound is a
+    // wall-clock promise ("wait at most 2s"), and an injected clock is allowed to
+    // stand still or jump — the loop must still end when the promise expires.
+    // After this deadline the loop runs at most one final attempt (the next
+    // observed conflict refuses), which is what makes the termination provable.
+    const hardDeadline = realStarted + retryMs + 2_000
+    let attempt = 0
+    for (;;) {
+        attempt += 1
+        try {
+            ensureDir(path.dirname(lockPath))
+            const handle = fs.openSync(lockPath, 'wx')
+            try {
+                const record: LockRecord = { pid: process.pid, at: now(), file }
+                fs.writeFileSync(handle, `${JSON.stringify(record)}\n`)
+            } catch (error) {
+                // The lock exists but says nothing: an empty/partial lock file
+                // would make every later run read it as "age unknown".
+                try {
+                    fs.closeSync(handle)
+                } catch {
+                    // closable or not, the file must go
+                }
+                try {
+                    fs.unlinkSync(lockPath)
+                } catch {
+                    // best effort: the create error below is the real failure
+                }
+                throw error
+            }
+            fs.closeSync(handle)
+            return lockPath
+        } catch (error) {
+            const code = (error as { code?: string }).code
+            if (code !== 'EEXIST') {
+                throw new Error(
+                    `无法锁定基线文件 ${file}（锁文件 ${lockPath}）：${
+                        error instanceof Error ? error.message : String(error)
+                    }。` +
+                        '下一步：确认该目录可写（权限、只读挂载、磁盘满），修好后重跑 budget_check；' +
+                        '基线是"历史只增不改"的回归护栏，读-改-写没有锁就会丢测量，所以这里不会绕过锁继续写。',
+                )
+            }
+            const observed = readLockRecord(lockPath)
+            const age = observed.record === undefined ? undefined : now() - observed.record.at
+            const stale = observed.record === undefined ? true : (age as number) > staleMs
+            if (stale) {
+                const ageText =
+                    age === undefined
+                        ? `无法判定（${observed.problem ?? '锁定文件已被删除'}；mtime=${
+                              observed.observedAt === undefined ? '未知' : formatTime(observed.observedAt)
+                          }）`
+                        : `${Math.round(age / 1000)}s（超过上限 ${Math.round(staleMs / 1000)}s）`
+                throw new Error(
+                    `基线文件 ${file} 的锁文件 ${lockPath} 已过期，无法安全地追加测量${options.where === undefined ? '' : `（${options.where}）`}。` +
+                        `观测到的锁年龄：${ageText}。` +
+                        (observed.record === undefined
+                            ? ''
+                            : `写入它的进程：pid=${observed.record.pid}，记录时间 ${formatTime(observed.record.at)}。`) +
+                        `下一步：确认没有 budget_check 仍在运行（可能有进程在写这份基线），然后手动删除 ${lockPath} 再重跑。` +
+                        '本门禁不会自动删掉这个锁：持有它的进程可能只是慢，替它"清理"就会把丢测量的问题重新引回来。' +
+                        '（本次没有跑任何命令写入基线，也没有追加任何测量。）',
+                )
+            }
+            // Both clocks count: an injected clock that stands still must not turn
+            // the bounded retry into an unbounded loop.
+            const waited = Math.max(now() - started, Date.now() - realStarted)
+            if (waited >= retryMs || Date.now() >= hardDeadline) {
+                throw new Error(
+                    `等待基线文件 ${file} 的锁超时（${retryMs}ms，尝试 ${attempt} 次，锁文件 ${lockPath} 仍被占用${options.where === undefined ? '' : `；${options.where}`}）。` +
+                        (age === undefined ? '' : `该锁的年龄约 ${Math.round(age / 1000)}s，尚未超过过期上限 ${Math.round(staleMs / 1000)}s。`) +
+                        '下一步：等另一个 budget_check 结束后重跑（同一个工作区上并发的预算检查会排队，不会丢测量）；' +
+                        `若确认那个进程已经不在了，手动删除 ${lockPath} 后重跑。` +
+                        '按 fail closed 拒绝：没有锁的读-改-写会丢掉其中一次测量，而"少了一条历史"看起来和"通过"一模一样。',
+                )
+            }
+            // Bounded retry with an injected sleep: tests drive this loop without
+            // waiting, and the wait is capped by `retryMs` above.
+            const backoff = attempt >= 3 ? Math.min(sleepMs * 4, sleepMs + 150) : sleepMs
+            sleep(backoff)
+        }
+    }
+}
+
+/** Release the lock this call took. Best effort: a failure only warns at the call site. */
+export function releaseBaselineLock(lockPath: string): void {
+    try {
+        fs.unlinkSync(lockPath)
+    } catch {
+        // Already gone (another run cleaned it up) is fine; anything else means
+        // the file would stay and refuse later runs — the caller reports it.
+    }
+}
+
+/** Synchronous sleep for the lock retry loop (no timers in a sync read-modify-write). */
+function atomicsWaitMs(ms: number): void {
+    const shared = new SharedArrayBuffer(4)
+    Atomics.wait(new Int32Array(shared), 0, 0, ms)
+}
+
+/**
+ * Write a baseline document atomically: sibling temp file + `rename`.
+ *
+ * Same filesystem by construction (the temp sits next to the target), which is
+ * what makes the rename atomic rather than copy-then-delete: a crash leaves the
+ * previous COMPLETE document behind, never a truncated one. The temp is removed
+ * on every path. (`dsh-eng-core`'s `writeJsonAtomic` is the same shape but leaves
+ * its temp behind on a failed write; a lock-protected ledger should not.)
+ */
+function writeBaselineDocument(file: string, document: BudgetBaselineFile): void {
+    ensureDir(path.dirname(file))
+    const temporary = `${file}.tmp-${process.pid}-${Date.now()}-${randomUUID()}`
+    try {
+        fs.writeFileSync(temporary, `${JSON.stringify(document, undefined, 2)}\n`)
+        fs.renameSync(temporary, file)
+    } catch (error) {
+        try {
+            fs.unlinkSync(temporary)
+        } catch {
+            // Nothing was created, or someone else removed it: report the write error.
+        }
+        throw error
+    }
+}
+
 /**
  * Read one budget's recorded history.
  *
@@ -836,33 +1075,56 @@ export function readBaseline(file: string, budgetId: string): BaselineRead {
 }
 
 /**
- * Append one measurement to a budget's history (read-modify-write, atomic).
+ * Append one measurement to a budget's history (read-modify-write, exclusive).
+ *
+ * The write is a read-modify-write of ONE shared file (`<rootDir>/budgets.json`
+ * by default), so two `budget_check` runs — two sessions, or a session and a
+ * subagent — can interleave: both read the history, both write it back, and one
+ * measurement is silently LOST. A lost measurement is worse than a refused run
+ * (the regression ratchet is the thing being protected), so the whole
+ * read→modify→write runs under an exclusive lock file and a failure to take the
+ * lock is a loud refusal. The new document itself is written atomically
+ * (temp sibling + `rename`), so a crash leaves the previous COMPLETE document,
+ * never a truncated one.
  *
  * Fail closed on a document this function does not recognise: the write
  * REPLACES the whole file, so "I could not parse it" (or "it has no `budgets`
  * object") must never be treated as "it is empty" — that is what turned another
  * project's JSON into a single budget row. The caller has already read the file
  * with {@link readBaseline}, which refuses the same shapes with a fix.
+ * @param file - the baseline document.
+ * @param budgetId - which budget's history is appended to.
+ * @param entry - the accepted measurement.
+ * @param options - lock bounds and injected seams (clock / sleep).
  */
-export function appendBaseline(file: string, budgetId: string, entry: BaselineEntry): void {
-    if (exists(file)) {
-        const current = readJson<BudgetBaselineFile>(file)
-        if (current === undefined || !isRecord((current as { budgets?: unknown }).budgets)) {
-            throw new Error(
-                `拒绝写入基线文件 ${file}：它存在，但不是本门禁的基线文档（期望 { "version": 1, "budgets": { … } }）。` +
-                    `追加会整份覆盖它，所以按 fail closed 停下。` +
-                    `下一步：确认这个路径属于谁（ budgets[].baselineFile ），换一个路径，或把它修好/删掉后重新记录基线。`,
-            )
+export function appendBaseline(file: string, budgetId: string, entry: BaselineEntry, options: AppendBaselineOptions = {}): void {
+    // The lock is taken BEFORE the document is read: a read taken before the
+    // lock is exactly the lost-update this function exists to prevent.
+    const lockPath = acquireBaselineLock(file, options)
+    try {
+        if (exists(file)) {
+            const current = readJson<BudgetBaselineFile>(file)
+            if (current === undefined || !isRecord((current as { budgets?: unknown }).budgets)) {
+                throw new Error(
+                    `拒绝写入基线文件 ${file}：它存在，但不是本门禁的基线文档（期望 { "version": 1, "budgets": { … } }）。` +
+                        `追加会整份覆盖它，所以按 fail closed 停下。` +
+                        `下一步：确认这个路径属于谁（ budgets[].baselineFile ），换一个路径，或把它修好/删掉后重新记录基线。`,
+                )
+            }
+            const previous = (current as { budgets: Record<string, BaselineEntry[]> }).budgets
+            const history = Array.isArray(previous[budgetId]) ? (previous[budgetId] as BaselineEntry[]) : []
+            writeBaselineDocument(file, {
+                version: 1,
+                budgets: { ...previous, [budgetId]: [...history, entry] },
+            } satisfies BudgetBaselineFile)
+            return
         }
-        const previous = (current as { budgets: Record<string, BaselineEntry[]> }).budgets
-        const history = Array.isArray(previous[budgetId]) ? (previous[budgetId] as BaselineEntry[]) : []
-        writeJsonAtomic(file, {
-            version: 1,
-            budgets: { ...previous, [budgetId]: [...history, entry] },
-        } satisfies BudgetBaselineFile)
-        return
+        writeBaselineDocument(file, { version: 1, budgets: { [budgetId]: [entry] } } satisfies BudgetBaselineFile)
+    } finally {
+        // Released on every path — success, refusal, unusable document, a write
+        // error — because a lock left behind refuses every later run.
+        if (lockPath !== undefined) releaseBaselineLock(lockPath)
     }
-    writeJsonAtomic(file, { version: 1, budgets: { [budgetId]: [entry] } } satisfies BudgetBaselineFile)
 }
 
 /** The number a `regex` extracted from a command's output. */
@@ -1303,7 +1565,35 @@ export async function runBudgets(options: BudgetRunOptions): Promise<BudgetRun> 
             })
         }
     }
-    for (const entry of pending) appendBaseline(entry.file, entry.budgetId, entry.entry)
+    // Every append is a read-modify-write of one shared document under an
+    // exclusive lock: without it two concurrent budget_check runs (two sessions
+    // on one workspace) each read the old history and the later write drops the
+    // other's measurement. A lock that cannot be taken refuses the call.
+    const lockOptions: AppendBaselineOptions = {
+        ...(options.baselineLockRetryMs === undefined ? {} : { lockRetryMs: options.baselineLockRetryMs }),
+        ...(options.baselineLockStaleMs === undefined ? {} : { lockStaleMs: options.baselineLockStaleMs }),
+        ...(options.lockSleep === undefined ? {} : { sleep: options.lockSleep }),
+        ...(options.now === undefined ? {} : { now: options.now }),
+    }
+    for (const entry of pending) {
+        try {
+            appendBaseline(entry.file, entry.budgetId, entry.entry, { ...lockOptions, where: `预算 "${entry.budgetId}"` })
+        } catch (error) {
+            // The lock could not be taken (or the document became unusable): a
+            // refusal, in the same shape as every other refusal here. Skipping the
+            // append silently would be the one outcome this gate must never have —
+            // "one measurement fewer" and "everything passed" look identical.
+            const reason = error instanceof Error ? error.message : String(error)
+            const rows = evaluations.map((evaluation) => `- ${evaluation.id}：${evaluation.state} — ${evaluation.reason}`)
+            return {
+                ok: false,
+                problem: [
+                    `${reason}`,
+                    ...(rows.length === 0 ? [] : ['', '（本次已判定但**没有写入**的预算，仅供修复参考：）', ...rows]),
+                ].join('\n'),
+            }
+        }
+    }
 
     const blocked = evaluations.filter((evaluation) => evaluation.state === 'BLOCK')
     const state: GateState = blocked.length === 0 ? 'PASS' : 'BLOCK'

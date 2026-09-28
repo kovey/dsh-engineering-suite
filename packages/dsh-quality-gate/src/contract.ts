@@ -146,8 +146,12 @@ export type PathSegment = string | number
  * Parse a dotted path with `[n]` indices.
  *
  * Supported: `a`, `a.b`, `a.b[0].c`, `[0].c`, `a[0][1]`. Anything else (`a..b`,
- * `a[`, `a[x]`, a trailing dot) is a config defect and refuses the run — an
- * address this gate cannot evaluate must never be silently treated as satisfied.
+ * `a.[0]`, `a[`, `a[x]`, a trailing dot) is a config defect and refuses the run —
+ * an address this gate cannot evaluate must never be silently treated as
+ * satisfied. A dot whose next character is `[` is refused explicitly: no JSON
+ * path notation writes `items.[0].id` (it is `items[0].id`), and silently
+ * accepting it here would let a config that no other tool understands look
+ * verified.
  * @param path - the configured path.
  * @returns the segments, or the reason the path cannot be read.
  */
@@ -157,7 +161,7 @@ export function parseJsonPath(path: string): { segments: PathSegment[] } | { pro
     const segments: PathSegment[] = []
     let buffer = ''
     // A `.` is legal after a name or after an index (`a.b`, `a[0].b`) and
-    // illegal anywhere else (`a..b`, `.a`, `a.`).
+    // illegal anywhere else (`a..b`, `.a`, `a.`, `a.[0]`).
     let lastWasIndex = false
     const flush = (): void => {
         if (buffer !== '') {
@@ -176,6 +180,17 @@ export function parseJsonPath(path: string): { segments: PathSegment[] } | { pro
             continue
         }
         if (character === '[') {
+            // `a.[0]` — a dot directly in front of a bracket. No JSON path
+            // notation writes this (`a[0]` is how an index follows a field) and
+            // the error messages never mentioned it, so accepting it silently
+            // meant a config that no other tool can read looked verified.
+            if (buffer === '' && !lastWasIndex && index > 0 && text[index - 1] === '.') {
+                return {
+                    problem:
+                        `"${path}" 里 ".[" 连在一起：点号后面只能是字段名、方括号前面不能有点号。` +
+                        `两种写法是 .key（对象字段）和 [index]（数组下标）：写成 "items[0].id"，不是 "items.[0].id"`,
+                }
+            }
             flush()
             const close = text.indexOf(']', index)
             if (close === -1) return { problem: `"${path}" 的 "[" 没有对应的 "]"` }

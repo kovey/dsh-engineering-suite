@@ -58,7 +58,9 @@ import {
 import {
     describeCommands,
     describeSource,
+    describeVerifyApproval,
     environmentByName,
+    verifyNeedsApproval,
     type DeployGateConfig,
     type EffectiveConfig,
     type EnvironmentConfig,
@@ -262,28 +264,73 @@ function observedAnyLedger(interaction: InteractionLike): boolean {
 }
 
 /**
+ * How to make the pending-ask fact observable when it could not be read.
+ *
+ * Both halves are what the interaction gate actually offers: a tool call in this
+ * workspace registers its ledger with the running service (`trackLedger`), and an
+ * ABSOLUTE `interaction.ledgerFile` is registered at `apply()` time, before any
+ * session exists.
+ */
+export const PENDING_ASK_OBSERVABILITY_FIX =
+    '在这个工作区里跑一次任何一个交互工具（例如 interaction_status / interaction_ask），让本进程观察到它的交互台账；' +
+    '或在 profile 里把 interaction.ledgerFile 配成一个绝对路径，然后重新 deploy_plan/deploy_run'
+
+/**
+ * What querying the pending asks produced.
+ *
+ * `problem` is the reason the fact could NOT be read, and it is carried all the
+ * way into the verdict: "无法核对" without the reason is not actionable, and with
+ * the default policy it is what fails the go/no-go check.
+ */
+export interface PendingAsksQuery {
+    asks: PendingAsk[]
+    queryable: boolean
+    /** Why the fact could not be read (`queryable === false`). */
+    problem?: string
+    /** The exact next step that makes it readable. */
+    fix?: string
+}
+
+/**
  * The questions a human still has to answer.
  * @param interaction - the optional service.
- * @returns the asks, and whether they could actually be queried (an unqueried
- *   check is reported as unverified, never as verified-empty).
+ * @returns the asks, whether they could actually be queried, and — when they
+ *   could not — exactly what could not be observed and how to fix that.
  */
-export function pendingAsksOf(interaction: InteractionLike | undefined): { asks: PendingAsk[]; queryable: boolean } {
-    if (interaction === undefined) return { asks: [], queryable: false }
+export function pendingAsksOf(interaction: InteractionLike | undefined): PendingAsksQuery {
+    if (interaction === undefined) {
+        return {
+            asks: [],
+            queryable: false,
+            problem: '宿主没有装配 interaction 服务（ctx.get("interaction") 为空），本进程无法查询任何交互台账',
+            fix:
+                '让宿主装配一个可查询的 interaction 服务/通道插件（例如 dsh-interaction-gate）后重启会话；' +
+                '如果服务已经装配、只是本进程还没读到台账，就在这个工作区里跑一次任何一个交互工具（interaction_status / interaction_ask），' +
+                '或把 interaction.ledgerFile 配成一个绝对路径；然后重新 deploy_plan/deploy_run',
+        }
+    }
     for (const method of ['pendingAsks', 'pending', 'listPending'] as const) {
         const candidate = interaction[method]
         if (typeof candidate !== 'function') continue
         let raw: unknown
         try {
             raw = (candidate as () => unknown).call(interaction)
-        } catch {
-            return { asks: [], queryable: false }
+        } catch (error) {
+            return {
+                asks: [],
+                queryable: false,
+                problem: `interaction.${method}() 抛错（${error instanceof Error ? error.message : String(error)}）`,
+                fix: PENDING_ASK_OBSERVABILITY_FIX,
+            }
         }
         // A bare NUMBER is a count, not a list: materialising it (`new Array(n)`)
         // is an unbounded allocation (`pending: () => 20_000_000` killed the
         // process), and a positive count IS somebody waiting. So it becomes ONE
         // synthetic ask that says how many there are — clamped, never expanded.
         if (typeof raw === 'number') {
-            if (!Number.isFinite(raw)) return { asks: [], queryable: false }
+            if (!Number.isFinite(raw)) {
+                return { asks: [], queryable: false, problem: `interaction.${method}() 返回了非有限数字（${String(raw)}）`, fix: PENDING_ASK_OBSERVABILITY_FIX }
+            }
             const count = Math.max(0, Math.floor(raw))
             if (count === 0) return { asks: [], queryable: true }
             return {
@@ -299,16 +346,46 @@ export function pendingAsksOf(interaction: InteractionLike | undefined): { asks:
             : typeof raw === 'object' && raw !== null
               ? ((raw as Record<string, unknown>)['asks'] ?? (raw as Record<string, unknown>)['pending'] ?? (raw as Record<string, unknown>)['items'])
               : undefined
-        if (!Array.isArray(list)) return { asks: [], queryable: false }
+        if (!Array.isArray(list)) {
+            return {
+                asks: [],
+                queryable: false,
+                problem: `interaction.${method}() 的返回不是一个提问数组（收到 ${describeShape(raw)}）`,
+                fix: PENDING_ASK_OBSERVABILITY_FIX,
+            }
+        }
         const asks: PendingAsk[] = []
         for (const entry of list) {
             const ask = pendingAskOf(entry)
             if (ask !== undefined) asks.push(ask)
         }
-        if (asks.length === 0 && !observedAnyLedger(interaction)) return { asks: [], queryable: false }
+        if (asks.length === 0 && !observedAnyLedger(interaction)) {
+            return {
+                asks: [],
+                queryable: false,
+                problem:
+                    `interaction.${method}() 返回空列表，而本进程还没有观察到任何交互台账：` +
+                    `无法区分"没有等待"与"还没读到台账"（${method}() 只读它见过的台账，"[]"在这里不等于"没有人在等回答"）`,
+                fix: PENDING_ASK_OBSERVABILITY_FIX,
+            }
+        }
         return { asks, queryable: true }
     }
-    return { asks: [], queryable: false }
+    return {
+        asks: [],
+        queryable: false,
+        problem: `interaction 服务没有暴露任何待回答提问的访问器（试过 ${['pendingAsks', 'pending', 'listPending'].map((name) => `${name}()`).join(' / ')}）`,
+        fix: PENDING_ASK_OBSERVABILITY_FIX,
+    }
+}
+
+/** A short, safe description of an unreadable value (never throws, never huge). */
+function describeShape(value: unknown): string {
+    if (value === undefined) return 'undefined'
+    if (value === null) return 'null'
+    if (Array.isArray(value)) return `数组（${value.length} 项）`
+    if (typeof value === 'object') return `对象（键：${Object.keys(value as Record<string, unknown>).slice(0, 6).join(', ') || '(无)'}）`
+    return `${typeof value}`
 }
 
 // --- argument plumbing ------------------------------------------------------
@@ -556,6 +633,12 @@ function renderPlan(input: PlanRenderInput): string[] {
     lines.push(
         `审批：${environment.requiresApproval ? `需要人工批准${environment.approversFile === undefined ? '' : `（按名单 ${environment.approversFile} 核对审批人身份）`}` : '无需人工批准（该环境显式声明了 requiresApproval=false）'}`,
     )
+    // Verification executes the same host commands in the same environment, so a
+    // reader must see its own trust requirement BEFORE the deploy_verify card
+    // appears (or does not appear).
+    lines.push(
+        `验证审批：${verifyNeedsApproval(config, environment) ? '需要人工批准' : '无需人工批准'}（${describeVerifyApproval(config, environment)}）`,
+    )
     lines.push(`部署台账：${input.ledgerFile}`)
     lines.push(`自动回滚：${config.autoRollbackOnFailure ? '已开启（命令失败/验证失败后执行环境声明的回滚命令）' : '未开启（automatic rollback 关闭）'}`)
     return lines
@@ -733,12 +816,28 @@ export function approverAllowed(cwd: string, file: string, who: string): { ok: t
     return { ok: true }
 }
 
+/**
+ * The environment key that decides whether THIS action needs a human.
+ *
+ * Naming the key matters in a refusal: a reader told to "set requiresApproval to
+ * false" while a VERIFICATION is what was refused would edit the wrong switch.
+ * @param action - what was about to run.
+ */
+function approvalKeyOf(action: 'deploy' | 'rollback' | 'verify'): string {
+    return action === 'verify' ? 'verifyRequiresApproval' : 'requiresApproval'
+}
+
+/** What the approval is FOR, in a few words (used inside refusal sentences). */
+function approvalSubjectLabel(action: 'deploy' | 'rollback' | 'verify'): string {
+    return action === 'deploy' ? '部署' : action === 'rollback' ? '回滚' : '验证'
+}
+
 /** Ask a human, through the interaction service when one is mounted, else the approval seam. */
 async function askHuman(input: {
     deps: ToolDeps
     agent: AgentLike | undefined
-    toolName: 'deploy_run' | 'deploy_rollback'
-    action: 'deploy' | 'rollback'
+    toolName: 'deploy_run' | 'deploy_rollback' | 'deploy_verify'
+    action: 'deploy' | 'rollback' | 'verify'
     environment: EnvironmentConfig
     cwd: string
     missionId: string
@@ -753,7 +852,9 @@ async function askHuman(input: {
     const prose = [
         input.action === 'deploy'
             ? `部署审批：把 ${input.revision} 部署到环境 "${environment.name}"（kind=${environment.kind}）。`
-            : `回滚审批：把环境 "${environment.name}"（kind=${environment.kind}）回滚到 ${input.revision}。`,
+            : input.action === 'rollback'
+              ? `回滚审批：把环境 "${environment.name}"（kind=${environment.kind}）回滚到 ${input.revision}。`
+              : `部署后验证审批：在环境 "${environment.name}"（kind=${environment.kind}）上执行验证命令（revision ${input.revision}）。`,
         '',
         `mission：${input.missionId}`,
         `将要执行的命令（${input.commands.length} 条，来自宿主配置）：`,
@@ -767,7 +868,7 @@ async function askHuman(input: {
         .filter((line) => line !== '')
         .join('\n')
     const reason = renderApprovalContext(prose, {
-        kind: input.action === 'deploy' ? 'deploy' : 'rollback',
+        kind: input.action === 'deploy' ? 'deploy' : input.action === 'rollback' ? 'rollback' : 'verify',
         missionId: input.missionId,
         revision: input.revision,
         risk: environment.kind === 'production' ? 'high' : 'medium',
@@ -799,7 +900,8 @@ async function askHuman(input: {
         }
         return { kind: 'allowed', outcome, reason: '' }
     }
-    const titleOf = (): string => (input.action === 'deploy' ? `部署到 ${environment.name}` : `回滚 ${environment.name}`)
+    const titleOf = (): string =>
+        input.action === 'deploy' ? `部署到 ${environment.name}` : input.action === 'rollback' ? `回滚 ${environment.name}` : `验证 ${environment.name}`
 
     /**
      * Ask through the channel registry the interaction layer actually provides.
@@ -838,7 +940,7 @@ async function askHuman(input: {
                     ...(channels.length === 0
                         ? ['（一个通道都没有注册：让宿主/IM 插件向 interaction 服务注册一个通道）']
                         : channels.map((entry) => `  - ${String(entry['name'] ?? '(无名)')}：canAsk=false${typeof entry['reason'] === 'string' && entry['reason'] !== '' ? `（${entry['reason']}）` : ''}`)),
-                    '下一步（任选其一）：让该通道实现 wait()（收不到答案的通道不能用来批准部署）；换一个能提问的通道；或由人把该环境的 requiresApproval 设为 false（宿主的决定，模型改不了 `.dsh/**` 里的配置）。',
+                    `下一步（任选其一）：让该通道实现 wait()（收不到答案的通道不能用来批准${approvalSubjectLabel(input.action)}）；换一个能提问的通道；或由人把该环境的 ${approvalKeyOf(input.action)} 设为 false（宿主的决定，模型改不了 \`.dsh/**\` 里的配置）。`,
                 ].join('\n'),
             }
         }
@@ -865,7 +967,10 @@ async function askHuman(input: {
                     body: reason,
                     questionId,
                     buttons: [
-                        { value: 'yes', label: input.action === 'deploy' ? '批准部署' : '批准回滚' },
+                        {
+                            value: 'yes',
+                            label: input.action === 'deploy' ? '批准部署' : input.action === 'rollback' ? '批准回滚' : '批准验证',
+                        },
                         { value: 'no', label: '拒绝' },
                     ],
                 })
@@ -939,7 +1044,7 @@ async function askHuman(input: {
                 title: titleOf(),
                 question: reason,
                 options: [
-                    { value: 'yes', label: input.action === 'deploy' ? '批准部署' : '批准回滚' },
+                    { value: 'yes', label: input.action === 'deploy' ? '批准部署' : input.action === 'rollback' ? '批准回滚' : '批准验证' },
                     { value: 'no', label: '拒绝' },
                 ],
                 ...(input.agent === undefined ? {} : { agent: input.agent }),
@@ -975,9 +1080,10 @@ async function askHuman(input: {
         return {
             kind: 'no-channel',
             reason: [
-                `环境 "${environment.name}"（kind=${environment.kind}）需要人工批准，但宿主既没有装配可用的 interaction 服务，也没有审批通道（ctx.approval）：没有人可以批准，按 fail closed 拒绝。`,
+                `环境 "${environment.name}"（kind=${environment.kind}）需要人工批准才能${approvalSubjectLabel(input.action)}，` +
+                    `但宿主既没有装配可用的 interaction 服务，也没有审批通道（ctx.approval）：没有人可以批准，按 fail closed 拒绝。`,
                 ...(registryRefusal === undefined ? [] : ['interaction 服务的情况：', registryRefusal]),
-                '下一步（任选其一）：让宿主装配审批插件或交互通道（IM 通道必须实现 wait() 才能收到答案）；或由人把该环境的 requiresApproval 设为 false（这是宿主的决定，模型改不了 `.dsh/**` 里的配置）。',
+                `下一步（任选其一）：让宿主装配审批插件或交互通道（IM 通道必须实现 wait() 才能收到答案）；或由人把该环境的 ${approvalKeyOf(input.action)} 设为 false（这是宿主的决定，模型改不了 \`.dsh/**\` 里的配置）。`,
             ].join('\n'),
         }
     }
@@ -998,7 +1104,7 @@ async function askHuman(input: {
 }
 
 /** Render the denial block for a report (always ending with a next step). */
-function renderDenial(attempt: ApprovalAttempt, action: string, recorded?: string): string[] {
+function renderDenial(attempt: ApprovalAttempt, action: string, recorded?: string, approvalKey = 'requiresApproval'): string[] {
     return [
         `### 未${action}`,
         '',
@@ -1008,7 +1114,7 @@ function renderDenial(attempt: ApprovalAttempt, action: string, recorded?: strin
             : [`（审批人：${attempt.outcome.by}${attempt.outcome.source === '' ? '' : ` via ${attempt.outcome.source}`}${attempt.outcome.messageId === '' ? '' : `，消息 ${attempt.outcome.messageId}`}）`]),
         '',
         ...(recorded === undefined ? [] : [recorded, '']),
-        '下一步：与审批人确认后重试；或在配置里把该环境的 requiresApproval 设为 false（宿主的决定）——不要绕过本工具直接手动执行命令，那样这次上线不会进台账。',
+        `下一步：与审批人确认后重试；或在配置里把该环境的 ${approvalKey} 设为 false（宿主的决定）——不要绕过本工具直接手动执行命令，那样这次上线不会进台账。`,
     ]
 }
 
@@ -1326,6 +1432,8 @@ export function registerTools(
             ...(proofAt === undefined ? {} : { newestEvidenceAt: proofAt }),
             pendingAsks: asks.asks,
             pendingAsksQueryable: asks.queryable,
+            ...(asks.problem === undefined ? {} : { pendingAsksProblem: asks.problem }),
+            ...(asks.fix === undefined ? {} : { pendingAsksFix: asks.fix }),
             fingerprint: context.fingerprint,
             config: context.config,
             environment: context.environment,
@@ -1506,6 +1614,7 @@ export function registerTools(
                         rollbackCommands: context.environment.rollbackCommands ?? [],
                         canarySteps: context.environment.canary?.steps.length ?? 0,
                         requiresApproval: context.environment.requiresApproval,
+                        verifyRequiresApproval: verifyNeedsApproval(context.config, context.environment),
                         configurationSource: context.source,
                     }
                     const file = context.store.writeArtifact(
@@ -1870,7 +1979,7 @@ export function registerTools(
         defineTool({
             name: 'deploy_verify',
             description:
-                'Run the environment\'s verifyCommands against the freshly deployed revision, with a bounded number of attempts and a backoff between them (both from configuration). Refuses unless the ledger shows a successful deployment of THIS revision that is still live (a verify-only PASS would otherwise be read by an orchestrator as "deployed and verified"), and refuses when the environment declares no verification commands — a deploy nothing checks is not a verified deploy. Records a PASS gate when an attempt fully succeeds and a BLOCK gate when the attempts are exhausted; on exhaustion the report surfaces the environment\'s rollback commands verbatim, so the next step is executable rather than a discussion.',
+                'Run the environment\'s verifyCommands against the freshly deployed revision, with a bounded number of attempts and a backoff between them (both from configuration). Refuses unless the ledger shows a successful deployment of THIS revision that is still live (a verify-only PASS would otherwise be read by an orchestrator as "deployed and verified"), and refuses when the environment declares no verification commands — a deploy nothing checks is not a verified deploy. Requests human approval exactly like deploy_run when the environment requires it for verification (per-environment `verifyRequiresApproval`, defaulting to the environment\'s `requiresApproval`; the host may force it with `verifyApproval: "always"` or switch it off with `"never"`): through the interaction service, then the harness approval seam, otherwise a loud refusal — and a verification nobody approved is NOT run, records state=refused plus a BLOCK gate, and says so. Records a PASS gate when an attempt fully succeeds and a BLOCK gate when the attempts are exhausted (with the approver in the row and the reason); on exhaustion the report surfaces the environment\'s rollback commands verbatim, so the next step is executable rather than a discussion.',
             parameters: {
                 environment: { type: 'string', required: true, description: 'Declared environment name to verify.' },
                 missionId: { type: 'string', description: 'Mission the verification belongs to (default: the mission bound to this session).' },
@@ -1958,6 +2067,68 @@ export function registerTools(
                 // Nothing may run while its outcome cannot be recorded.
                 assertLedgerWritable(context, mission, '部署后验证')
 
+                // The SAME host commands in the SAME environment must not have two
+                // trust requirements: deploy_verify runs the environment's commands
+                // exactly like deploy_run does, so it asks the same human through
+                // the same path (`verifyRequiresApproval`, default: follow
+                // `requiresApproval`; the host may force it on with
+                // `verifyApproval: 'always'` or off with `'never'`).
+                const deployer = deployerOf(agent)
+                const needsApproval = verifyNeedsApproval(context.config, context.environment)
+                let approval: ApprovalOutcome | undefined
+                if (needsApproval) {
+                    const attempt = await askHuman({
+                        deps,
+                        agent,
+                        toolName: 'deploy_verify',
+                        action: 'verify',
+                        environment: context.environment,
+                        cwd: context.cwd,
+                        missionId: mission?.id ?? '(无 mission)',
+                        revision: context.revision,
+                        commands: verifyCommands,
+                        ...(signal === undefined ? {} : { signal }),
+                    })
+                    if (attempt.kind !== 'allowed') {
+                        const why = proseOf(attempt.reason).split('\n')[0] ?? ''
+                        const notRun: PlanCheck = {
+                            id: 'verify-not-approved',
+                            ok: false,
+                            label: '部署后验证需要人工批准（未经批准不执行）',
+                            detail:
+                                `本次验证**没有执行**：环境 "${context.environment.name}" 的验证需要人工批准（${describeVerifyApproval(context.config, context.environment)}），` +
+                                `而没有人批准它。${why}`,
+                            fix: `与审批人确认后重新 deploy_verify；或由人调整该环境/宿主的验证审批规则（${approvalKeyOf('verify')} / verifyApproval）`,
+                        }
+                        const recording = recordRefusal({
+                            store: context.store,
+                            mission,
+                            ledgerFile: context.ledgerFile,
+                            environment: context.environment,
+                            revision: context.revision,
+                            deployer,
+                            now: deps.now(),
+                            reason: `部署后验证未获批准：验证未执行（没有人批准在环境 "${context.environment.name}" 上执行验证命令）——${why}`,
+                            note: `审批未通过（${attempt.kind}）：验证未执行`,
+                            failures: [notRun],
+                            fingerprint: context.fingerprint,
+                            ...(attempt.outcome === undefined || attempt.outcome.by === '' ? {} : { approvedBy: attempt.outcome.by }),
+                            ...(attempt.outcome === undefined || attempt.outcome.messageId === '' ? {} : { approvalMessageId: attempt.outcome.messageId }),
+                        })
+                        loggerFor(deps.logger, context.cwd).warn(`deploy_verify: 未执行（${attempt.kind}）→ ${recording.row.id}`)
+                        const recorded = `已记录：台账 ${recording.row.id}（state=refused）${recording.gate === undefined ? '；无 mission：仅记台账，未写门禁记录' : `；门禁 ${recording.gate.id}（BLOCK）`}。`
+                        // A missing approval channel is a configuration failure the
+                        // caller must fix; a human saying "no" is a normal outcome
+                        // that gets a report (the same split as deploy_run).
+                        if (attempt.kind === 'no-channel') throw new Error(`${attempt.reason}\n${recorded}`)
+                        const denied = [`## 部署后验证：${context.environment.name}（kind=${context.environment.kind}）`, '', `revision：${context.revision}`, '']
+                        denied.push(...renderDenial(attempt, '执行部署后验证', recorded, approvalKeyOf('verify')))
+                        denied.push('', missionNote(mission))
+                        return denied.join('\n')
+                    }
+                    approval = attempt.outcome
+                }
+
                 const logger = loggerFor(deps.logger, context.cwd)
                 const attempts: { runs: SequenceRun[]; failed?: SequenceRun }[] = []
                 const maxAttempts = Math.max(1, context.config.verifyRetries)
@@ -1987,16 +2158,21 @@ export function registerTools(
                 const ok = last !== undefined && last.failed === undefined
                 const runs = attempts.flatMap((entry) => entry.runs)
                 const state: GateState = ok ? 'PASS' : 'BLOCK'
-                const reason = ok
-                    ? `部署后验证通过（${attempts.length}/${maxAttempts} 次尝试）：${verifyCommands.length} 条验证命令全部退出码 0`
-                    : `部署后验证失败：${attempts.length} 次尝试后仍未通过（最后一次失败于 \`${last?.failed?.argv.join(' ') ?? '(未知)'}\`，退出码 ${last?.failed?.outcome.exitCode ?? 'null'}）`
+                const approvalTrail =
+                    approval === undefined
+                        ? ''
+                        : `；审批 ${approverName(approval)}${approval.source === '' ? '' : ` via ${approval.source}`}${approval.messageId === '' ? '' : `，消息 ${approval.messageId}`}（${approval.decision}）`
+                const reason =
+                    (ok
+                        ? `部署后验证通过（${attempts.length}/${maxAttempts} 次尝试）：${verifyCommands.length} 条验证命令全部退出码 0`
+                        : `部署后验证失败：${attempts.length} 次尝试后仍未通过（最后一次失败于 \`${last?.failed?.argv.join(' ') ?? '(未知)'}\`，退出码 ${last?.failed?.outcome.exitCode ?? 'null'}）`) + approvalTrail
                 const recorded = recordExecution({
                     store: context.store,
                     mission,
                     ledgerFile: context.ledgerFile,
                     environment: context.environment,
                     revision: context.revision,
-                    deployer: deployerOf(agent),
+                    deployer,
                     now: deps.now(),
                     state,
                     reason,
@@ -2007,9 +2183,10 @@ export function registerTools(
                         at: deps.now(),
                         environment: context.environment.name,
                         revision: context.revision,
-                        deployer: deployerOf(agent),
+                        deployer,
                         state: ok ? 'verified' : 'verify-failed',
                         verify: { attempts: attempts.length, ok },
+                        ...(approval === undefined ? {} : { approvedBy: approverName(approval), approvalMessageId: approval.messageId }),
                     },
                 })
                 if (recorded.ledgerProblem !== undefined) {
@@ -2039,6 +2216,11 @@ export function registerTools(
                     lines.push(...renderRuns('  验证命令：', entry.runs, entry.failed))
                 })
                 lines.push('')
+                lines.push(
+                    approval === undefined
+                        ? `审批：验证无需人工批准（${describeVerifyApproval(context.config, context.environment)}）`
+                        : `审批：${approverName(approval)}${approval.source === '' ? '' : ` via ${approval.source}`}${approval.messageId === '' ? '' : `，消息 ${approval.messageId}`}（${approval.decision}）；规则：${describeVerifyApproval(context.config, context.environment)}`,
+                )
                 lines.push(`门禁记录：${gate?.id ?? '(未记录)'}（${state}）`)
                 lines.push(`台账：${describeRow(row)}`)
                 if (!ok) {
@@ -2293,7 +2475,7 @@ export function registerTools(
                     const deployable =
                         environment.deployCommands.length > 0 && (environment.verifyCommands?.length ?? 0) > 0 && (environment.rollbackCommands?.length ?? 0) > 0
                     lines.push(
-                        `  - ${environment.name}（kind=${environment.kind}；${environment.requiresApproval ? '需要人工批准' : '无需批准'}${environment.approversFile === undefined ? '' : `；名单 ${environment.approversFile}`}）`,
+                        `  - ${environment.name}（kind=${environment.kind}；${environment.requiresApproval ? '需要人工批准' : '无需批准'}${environment.approversFile === undefined ? '' : `；名单 ${environment.approversFile}`}；验证${verifyNeedsApproval(config, environment) ? '需要人工批准' : '无需人工批准'}）`,
                     )
                     lines.push(
                         `      部署 ${environment.deployCommands.length} 条，验证 ${environment.verifyCommands?.length ?? 0} 条，回滚 ${environment.rollbackCommands?.length ?? 0} 条${environment.canary === undefined ? '' : `，canary ${environment.canary.steps.length} 步`}${deployable ? '' : ' ⛔ 声明不完整：deploy_plan 会拒绝（缺部署/验证/回滚命令）'}`,

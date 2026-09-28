@@ -66,13 +66,29 @@ profile（宿主上限）：
     expectedPlugins: [role-guard, spec-gate, test-design-gate, quality-gate, evidence-gate, audit-trail,
                       orchestrator, standards-gate, impact-gate, coverage-gate, supply-chain-gate]  # 默认即这十一个
     probeTimeoutMs: 2000          # 只作用于 interaction 探测：通道插件卡住不能把自检拖住
+    probeTimeoutMsMax: 10000      # 宿主上限（宿主专属）：宿主自己也只能在上限之内调，项目级更不可能抬高它
     layout: { rootDir: .dsh }
     prompt: { enabled: true, order: 605 }
 ```
 
 项目级 `expectedPlugins` 会贡献给："哪些插件是我这个仓库依赖的"。  
 `expectedPlugins` 与 `probeTimeoutMs` 是**项目级可覆盖键**，而 `enabled` / `logFile` / `logFileTemplate` / `layout` /
-`prompt` 是**宿主键**：模型改不了 `.dsh/**`，而一个能关掉自检或搬走台账的项目文件等于自我豁免。
+`probeTimeoutMsMax` / `prompt` 是**宿主键**：模型改不了 `.dsh/**`，而一个能关掉自检、搬走台账或**让自检无限期等待**
+的项目文件等于自我豁免。
+
+**探测预算有两层**：真正生效的是 `min(probeTimeoutMs ?? 2000, probeTimeoutMsMax ?? 10000)`——宿主自己的 `probeTimeoutMs`
+也会被上限压住（可以调低，不能超过上限），项目级只能在这个上限之内收紧。项目文件写 `probeTimeoutMs: 86400000`（24 小时）
+不会让 `suite_status` 挂一天：它被压到宿主上限，并且**记一条问题**（绝不静默）：
+
+```
+<repo>/.dsh/suite-doctor.json: 项目级 probeTimeoutMs=86400000ms 超过宿主上限 10000ms，已按上限使用
+```
+
+| 键 | 项目级规则 |
+|---|---|
+| `expectedPlugins` | **只能做并集（收紧）**：可以加一个自己依赖的插件（报告更宽），删掉宿主期望的插件会被拒绝并记一条问题——删掉等于隐藏一个缺失的能力 |
+| `probeTimeoutMs` | 正数毫秒；**超过宿主 `probeTimeoutMsMax` 会被压到上限并记一条问题**；在上限之内按项目值使用（更短的预算只是更早返回）；负数 / 0 / 非数字 / 非有限值保留 profile 的值并记一条问题 |
+| `probeTimeoutMsMax` | **宿主键**：项目级写了会被拒绝（否则项目自己决定自检能等多久） |
 
 `deploy-gate` 与 `interaction-gate` **不在**默认的十一个里（本套件的默认装载不含它们），它们连同
 `suite-doctor` 一起构成"**补全某个阶段的可选 bundle**"：缺失时只报一条
@@ -85,11 +101,6 @@ profile（宿主上限）：
 （"没有探测器"的插件例外：那种情况仍是建议，因为要修的是探测器而不是安装。）
 
 `interaction` 的**事实**始终走服务探测，与插件是否在期望列表里无关。
-
-| 键 | 项目级规则 |
-|---|---|
-| `expectedPlugins` | **只能做并集（收紧）**：可以加一个自己依赖的插件（报告更宽），删掉宿主期望的插件会被拒绝并记一条问题——删掉等于隐藏一个缺失的能力 |
-| `probeTimeoutMs` | 正数毫秒；不可用的值保留 profile 的值并记一条问题 |
 
 任何不可用的值都是"**保留 profile 的值 + 报告问题**"，绝不静默回落到插件默认值。
 

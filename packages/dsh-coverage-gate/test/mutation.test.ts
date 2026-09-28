@@ -16,15 +16,16 @@
  *    and a real one proves the wiring.
  */
 import assert from 'node:assert/strict'
-import { execFileSync } from 'node:child_process'
+import { execFileSync, spawnSync } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
 import test from 'node:test'
 import { MissionStoreRegistry } from 'dsh-eng-core'
 import { createFakeHost, runText, tempWorkspace, type FakeHost } from 'dsh-eng-core/testing'
 import { apply, resolveEffectiveConfig } from '../dist/index.js'
-import { resolveConfig } from '../dist/config.js'
+import { DEFAULT_VERIFY_SETTLE_MS, MAX_VERIFY_SETTLE_MS, resolveConfig } from '../dist/config.js'
 import {
+    applyMutant,
     classifyMutantOutcome,
     collectSourceFiles,
     isExcludedPath,
@@ -38,6 +39,7 @@ import {
     MutationRestoreError,
     DEFAULT_EXCLUDE_GLOBS,
     MUTATION_OPERATORS,
+    type Mutant,
 } from '../dist/mutation.js'
 
 // --- fixtures and helpers ---------------------------------------------------
@@ -1000,4 +1002,235 @@ test('mutation_check: a source file that could not be mutated makes the verdict 
     const gate = new MissionStoreRegistry().for(cwd).lastGate(id, { source: 'dsh-coverage-gate' })
     assert.equal(gate?.scope?.full, false, 'a skipped source file is not covered')
     assert.deepEqual(gate?.scope?.selected, ['src/ok.ts'])
+})
+
+// --- 2026-09 follow-up audit: atomic writes and the settle window -----------
+
+test('mutation: the mutant lands through a sibling temp + rename (never a truncate of the source)', async () => {
+    const cwd = tempWorkspace('mut-atomic-')
+    const file = write(cwd, 'src/a.ts', SOURCE)
+    const before = fs.readFileSync(file)
+    const plan = planMutants({ files: [{ path: 'src/a.ts', text: SOURCE }], maxMutants: 1 })
+    // A live process cannot OBSERVE a torn file (the tear is a crash artifact), so
+    // the test pins the mechanism instead: the source path is never written
+    // directly, and the temp that replaces it is a sibling of the target (which is
+    // what makes the rename atomic rather than copy-then-delete).
+    const directWrites: string[] = []
+    const renameSources: string[] = []
+    const tempNames: string[] = []
+    const originalWriteFile = fs.writeFileSync
+    const originalRename = fs.renameSync
+    ;(fs as { writeFileSync: unknown }).writeFileSync = ((target: unknown, ...rest: unknown[]) => {
+        if (typeof target === 'string' && target === file) directWrites.push(target)
+        if (typeof target === 'string' && target.startsWith(`${file}.mutation-`)) tempNames.push(target)
+        return (originalWriteFile as (...args: unknown[]) => unknown)(target, ...rest)
+    }) as typeof fs.writeFileSync
+    ;(fs as { renameSync: unknown }).renameSync = ((from: unknown, to: unknown) => {
+        if (typeof from === 'string' && typeof to === 'string' && to === file && from.startsWith(`${file}.mutation-`)) {
+            renameSources.push(from)
+        }
+        return (originalRename as (...args: unknown[]) => unknown)(from, to)
+    }) as typeof fs.renameSync
+    let observedMutant: Buffer | undefined
+    try {
+        const run = await runMutationPlan(plan, {
+            cwd,
+            argv: ['node', '-e', '0'],
+            timeoutMs: 1_000,
+            timeBudgetMs: 60_000,
+            verifySettleMs: 0,
+            run: async () => {
+                // The mutant is already on disk, COMPLETE.
+                observedMutant = fs.readFileSync(file)
+                return { exitCode: 1, durationMs: 1 }
+            },
+        })
+        assert.equal(run.counts.killed, 1)
+    } finally {
+        ;(fs as { writeFileSync: unknown }).writeFileSync = originalWriteFile
+        ;(fs as { renameSync: unknown }).renameSync = originalRename
+    }
+    assert.deepEqual(directWrites, [], 'the source file is never the direct target of a write (that is the truncate)')
+    assert.equal(tempNames.length, 1 + 1, 'one temp for the mutant write and one for the restore')
+    assert.equal(renameSources.length, 2, 'both the mutant and the restore arrive by rename')
+    for (const temporary of tempNames) {
+        assert.equal(path.dirname(temporary), path.dirname(file), 'the temp is a SIBLING: same filesystem, so rename is atomic')
+        assert.match(path.basename(temporary), /^a\.ts\.mutation-\d+-\d+-[0-9a-f-]{36}$/, 'unique per call: pid, timestamp, uuid')
+    }
+    assert.notDeepEqual(observedMutant, before, 'the mutant was on disk while the command ran')
+    assert.equal(Buffer.from(observedMutant as Buffer).toString('utf8'), applyMutant(SOURCE, plan.mutants[0] as Mutant))
+    assert.deepEqual(fs.readFileSync(file), before, 'and the source is byte-identical after the run')
+    // No temp file survives on ANY path (write, restore, failure).
+    assert.deepEqual(
+        fs.readdirSync(path.dirname(file)).filter((entry) => entry.includes('.mutation-')),
+        [],
+        'the sibling temp of the atomic write is always cleaned up',
+    )
+})
+
+test('mutation: the original survives a failed run, restored byte for byte (non-regression)', async () => {
+    const cwd = tempWorkspace('mut-atomic-survive-')
+    const file = write(cwd, 'src/a.ts', SOURCE)
+    const before = fs.readFileSync(file)
+    const plan = planMutants({ files: [{ path: 'src/a.ts', text: SOURCE }], maxMutants: 1 })
+    await assert.rejects(
+        runMutationPlan(plan, {
+            cwd,
+            argv: ['node', '-e', '0'],
+            timeoutMs: 1_000,
+            timeBudgetMs: 60_000,
+            verifySettleMs: 0,
+            run: async () => {
+                throw new Error('the command runner exploded')
+            },
+        }),
+        /the command runner exploded/,
+    )
+    // A SIGKILL inside the write can only leave the original or the complete
+    // mutant — and this exit path (an exception, not a verdict) still restores.
+    assert.deepEqual(fs.readFileSync(file), before, 'the original bytes are back')
+    assert.deepEqual(
+        fs.readdirSync(path.dirname(file)).filter((entry) => entry.includes('.mutation-')),
+        [],
+    )
+})
+
+test('mutation: a write that fails leaves the original untouched and no temp file behind', async () => {
+    const cwd = tempWorkspace('mut-atomic-fail-')
+    const file = write(cwd, 'src/a.ts', SOURCE)
+    const before = fs.readFileSync(file)
+    const plan = planMutants({ files: [{ path: 'src/a.ts', text: SOURCE }], maxMutants: 1 })
+    // A directory where the temp file wants to be: the write fails between the
+    // "mutant applied" and "command ran" steps — the file must still be intact.
+    const blocker = `${file}.mutation-blocker`
+    fs.mkdirSync(blocker)
+    const originalWriteFile = fs.writeFileSync
+    ;(fs as { writeFileSync: unknown }).writeFileSync = ((target: unknown, ...rest: unknown[]) => {
+        if (typeof target === 'string' && target.startsWith(`${file}.mutation-`) && target !== blocker) {
+            throw new Error('ENOSPC: no space left on device')
+        }
+        return (originalWriteFile as (...args: unknown[]) => unknown)(target, ...rest)
+    }) as typeof fs.writeFileSync
+    try {
+        await assert.rejects(runMutationPlan(plan, { cwd, argv: ['node', '-e', '0'], timeoutMs: 1_000, timeBudgetMs: 60_000, verifySettleMs: 0, run: async () => ({ exitCode: 0 }) }), /ENOSPC/)
+    } finally {
+        ;(fs as { writeFileSync: unknown }).writeFileSync = originalWriteFile
+        fs.rmdirSync(blocker)
+    }
+    assert.deepEqual(fs.readFileSync(file), before, 'a failed mutant write never touches the file itself')
+    assert.deepEqual(
+        fs.readdirSync(path.dirname(file)).filter((entry) => entry.includes('.mutation-')),
+        [],
+    )
+})
+
+test('mutation: the settle window catches a grandchild that writes after the last mutant', async () => {
+    const cwd = tempWorkspace('mut-settle-late-')
+    const file = write(cwd, 'src/a.ts', SMALL)
+    const plan = planMutants({ files: [{ path: 'src/a.ts', text: SMALL }], maxMutants: 1 })
+    let slept = 0
+    await assert.rejects(
+        runMutationPlan(plan, {
+            cwd,
+            argv: ['node', '-e', '0'],
+            timeoutMs: 1_000,
+            timeBudgetMs: 60_000,
+            verifySettleMs: 5,
+            run: async () => ({ exitCode: 1, durationMs: 1 }),
+            // The "grandchild": it ignores SIGTERM/SIGKILL of the process group
+            // and writes the source file AFTER the restore, i.e. after the point
+            // where the pre-fix code had already given its verdict.
+            sleep: async (ms) => {
+                slept = ms
+                fs.writeFileSync(file, 'const grandchild = 9\n')
+            },
+        }),
+        (error: unknown) => {
+            assert.ok(error instanceof MutationRestoreError)
+            assert.match(error.message, /与运行前的字节快照不一致/)
+            assert.match(error.message, /src\/a\.ts/)
+            assert.match(error.message, /5ms 的稳定窗口/)
+            assert.match(error.message, /诚实的边界/)
+            return true
+        },
+    )
+    assert.equal(slept, 5, 'the injected sleep received the configured settle window')
+    assert.equal(fs.readFileSync(file, 'utf8'), 'const grandchild = 9\n', 'the late writer keeps its bytes: this tool does not overwrite them')
+})
+
+test('mutation: a clean settle window passes, and a same-bytes touch inside it refuses with the path', async () => {
+    const cwd = tempWorkspace('mut-settle-clean-')
+    const file = write(cwd, 'src/a.ts', SMALL)
+    const plan = planMutants({ files: [{ path: 'src/a.ts', text: SMALL }], maxMutants: 2 })
+    const sleeps: number[] = []
+    const clean = await runMutationPlan(plan, {
+        cwd,
+        argv: ['node', '-e', '0'],
+        timeoutMs: 1_000,
+        timeBudgetMs: 60_000,
+        verifySettleMs: 3,
+        run: async () => ({ exitCode: 1, durationMs: 1 }),
+        sleep: async (ms) => {
+            sleeps.push(ms)
+        },
+    })
+    assert.deepEqual(sleeps, [3], 'exactly one settle wait per run, after the last mutant')
+    assert.equal(clean.counts.killed, 2)
+    assert.equal(fs.readFileSync(file, 'utf8'), SMALL, 'a run with a clean window still delivers its verdict')
+
+    // mtime moved inside the window, bytes identical: the SECOND check passes (the
+    // bytes are the pre-run bytes), yet something wrote the source AFTER the first
+    // check had already said "byte-identical". That must be named, not swallowed —
+    // the invariant is "no difference at the moment of the FINAL check", and a file
+    // that keeps being rewritten is exactly the case a single check misses.
+    let touchedWithBytesEqual = false
+    const before = fs.readFileSync(file)
+    await assert.rejects(
+        runMutationPlan(plan, {
+            cwd,
+            argv: ['node', '-e', '0'],
+            timeoutMs: 1_000,
+            timeBudgetMs: 60_000,
+            verifySettleMs: 3,
+            run: async () => ({ exitCode: 1, durationMs: 1 }),
+            sleep: async () => {
+                // The wait makes the new mtime provably newer than the one observed
+                // before the window (a real sleep, not a fake clock).
+                spawnSync('sleep', ['0.02'])
+                const now = new Date()
+                fs.utimesSync(file, now, now)
+                touchedWithBytesEqual = fs.readFileSync(file).equals(before)
+            },
+        }),
+        (error: unknown) => {
+            assert.ok(error instanceof MutationRestoreError)
+            assert.match(error.message, /稳定窗口（3ms）/)
+            assert.match(error.message, /src\/a\.ts（重新校验后字节与运行前的快照一致）/)
+            assert.match(error.message, /还有进程在写这些文件/)
+            return true
+        },
+    )
+    assert.equal(touchedWithBytesEqual, true, 'the bytes really were identical: this is the mtime-only path')
+})
+
+test('mutation: verifySettleMs is a bounded, reported key (an unusable value keeps the host value)', () => {
+    const defaults = resolveConfig({})
+    assert.equal(defaults.mutation.verifySettleMs, DEFAULT_VERIFY_SETTLE_MS)
+    assert.equal(DEFAULT_VERIFY_SETTLE_MS, 250)
+    assert.equal(MAX_VERIFY_SETTLE_MS, 5_000)
+
+    const problems: string[] = []
+    const host = resolveConfig({ mutation: { verifySettleMs: 1_000 } })
+    assert.equal(host.mutation.verifySettleMs, 1_000)
+    // Unusable values keep the HOST's value (1_000 here) and are reported.
+    for (const bad of ['250', -1, 2.5, null, true]) {
+        const warnings: string[] = []
+        const resolved = resolveConfig({ mutation: { verifySettleMs: bad } }, (message) => warnings.push(message))
+        assert.equal(resolved.mutation.verifySettleMs, DEFAULT_VERIFY_SETTLE_MS, `${JSON.stringify(bad)} is not usable`)
+        assert.match(warnings.join('\n'), /verifySettleMs 必须是 0–5000 之间的整数/)
+    }
+    const over = resolveConfig({ mutation: { verifySettleMs: 60_000 } }, (message) => problems.push(message))
+    assert.equal(over.mutation.verifySettleMs, MAX_VERIFY_SETTLE_MS, 'a settle window may not become a sleep')
+    assert.match(problems.join('\n'), /超过上限 5000/)
+    assert.equal(resolveConfig({ mutation: { verifySettleMs: 0 } }).mutation.verifySettleMs, 0, '0 is a real value: no wait')
 })

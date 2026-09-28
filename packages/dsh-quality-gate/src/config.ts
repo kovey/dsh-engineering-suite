@@ -5,7 +5,13 @@
  */
 
 import { containedPath, loadProjectConfig, type Layout, type LayoutOptions, type Logger } from 'dsh-eng-core'
-import { parseBudget, type BudgetConfig } from './budget.js'
+import {
+    DEFAULT_BASELINE_LOCK_RETRY_MS,
+    DEFAULT_BASELINE_LOCK_STALE_MS,
+    MAX_BASELINE_LOCK_RETRY_MS,
+    parseBudget,
+    type BudgetConfig,
+} from './budget.js'
 import { parseContract, type ContractConfig } from './contract.js'
 
 /** Which phase a configured command belongs to. */
@@ -75,6 +81,25 @@ export interface QualityGateConfig {
     }
     defaultTimeoutMs: number
     maxOutputBytes: number
+    /**
+     * Bounded retry budget (ms) for the exclusive lock around the baseline
+     * read-modify-write (default {@link DEFAULT_BASELINE_LOCK_RETRY_MS}).
+     *
+     * Two `budget_check` runs on one workspace (two sessions, or a subagent) both
+     * read and rewrite `<rootDir>/budgets.json`: without the lock the later write
+     * silently drops the other's measurement, which is worse than a refused run.
+     * HOST-only, like `enabled` / `logFile`: how long a gate waits is a host
+     * scheduling decision, not repository knowledge — and an unusable value keeps
+     * the host's value (it is reported, never silently defaulted).
+     */
+    baselineLockRetryMs: number
+    /**
+     * Age (ms, default {@link DEFAULT_BASELINE_LOCK_STALE_MS}) beyond which an
+     * existing lock file is reported with its age and REFUSED with a manual
+     * removal instruction, instead of being waited on or deleted automatically —
+     * the process holding it may simply be slow.
+     */
+    baselineLockStaleMs: number
     limits: {
         /** `0` disables; otherwise a change budget the gate enforces (docs.md §9). */
         maxChangedFiles: number
@@ -104,6 +129,32 @@ function num(value: unknown, fallback: number): number {
 function strList(value: unknown, fallback: readonly string[]): string[] {
     if (!Array.isArray(value)) return [...fallback]
     return value.filter((entry): entry is string => typeof entry === 'string' && entry !== '')
+}
+
+/**
+ * Read one millisecond configuration value.
+ *
+ * The suite rule for an unusable value: it KEEPS the host's value and is
+ * REPORTED — never silently replaced by a default (a typo in a lock bound must
+ * not look like a deliberate choice), and never allowed past a ceiling that
+ * would turn a gate into a hang.
+ * @param value - the untrusted config value.
+ * @param fallback - the host's value in force.
+ * @param ceiling - hard maximum when the key has one.
+ * @param key - the key name, for the message.
+ * @param warn - problem sink.
+ */
+function clampLockMs(value: unknown, fallback: number, ceiling: number | undefined, key: string, warn: (message: string) => void): number {
+    if (value === undefined) return fallback
+    if (typeof value !== 'number' || !Number.isFinite(value) || !Number.isInteger(value) || value < 0) {
+        warn(`${key} 必须是 0 或正整数（收到 ${JSON.stringify(value)}），已忽略（保持 ${fallback}）`)
+        return fallback
+    }
+    if (ceiling !== undefined && value > ceiling) {
+        warn(`${key}=${value} 超过上限 ${ceiling}，已收敛到上限（等待锁不能变成挂死）`)
+        return ceiling
+    }
+    return value
 }
 
 /** The default write-class tools (docs.md §3.4's lint loop triggers on these). */
@@ -493,6 +544,8 @@ export function resolveConfig(input: unknown, warn: (message: string) => void = 
         },
         defaultTimeoutMs,
         maxOutputBytes: num(raw['maxOutputBytes'], 64_000),
+        baselineLockRetryMs: clampLockMs(raw['baselineLockRetryMs'], DEFAULT_BASELINE_LOCK_RETRY_MS, MAX_BASELINE_LOCK_RETRY_MS, 'baselineLockRetryMs', warn),
+        baselineLockStaleMs: clampLockMs(raw['baselineLockStaleMs'], DEFAULT_BASELINE_LOCK_STALE_MS, undefined, 'baselineLockStaleMs', warn),
         limits: {
             maxChangedFiles: (() => {
                 const limits = isRecord(raw['limits']) ? raw['limits'] : {}

@@ -19,6 +19,14 @@
  *     all of them), and verified against a pre-run byte snapshot afterwards. A
  *     file that does not match its snapshot is a refusal, not a warning: this
  *     gate writes to the source tree, so "it put it back" is a hard requirement.
+ *     Both writes (the mutant and the restore) are ATOMIC — a sibling temp file
+ *     plus `rename` — so a `SIGKILL` between truncate and write cannot tear a
+ *     user's source file; the file is either the original or the complete
+ *     mutant, never half of each. Because a command's processes outlive our own
+ *     writes, the end-of-run check runs after a bounded settle window
+ *     ({@link MutationRunOptions.verifySettleMs}) and again if a source file
+ *     changed during it — and the README states the boundary honestly: a
+ *     process that keeps writing forever cannot be stopped by a check.
  *  3. **The score covers exactly the mutants that ran.** No extrapolation, no
  *     "probably similar" — a bounded sample says it is a bounded sample.
  *
@@ -42,8 +50,10 @@
  * @module dsh-coverage-gate/mutation
  */
 
+import { randomUUID } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
+import { setTimeout as sleep } from 'node:timers/promises'
 import {
     changedRanges,
     isReallyInside,
@@ -1087,6 +1097,17 @@ export interface MutationRunOptions {
     subprocess?: () => unknown
     /** Injected clock, so the budget is testable without waiting. */
     now?: () => number
+    /**
+     * Bounded settle window (ms) waited after the LAST mutant and before the
+     * end-of-run verification, so a process of the test command that is still
+     * writing cannot invalidate the "byte-identical" verdict after it was given.
+     * `0` disables the wait (the verification still runs twice when a source file
+     * changed during the window). Defaults to {@link DEFAULT_VERIFY_SETTLE_MS},
+     * clamped to {@link MAX_VERIFY_SETTLE_MS}.
+     */
+    verifySettleMs?: number
+    /** Injected sleep (the settle window); tests must never wait 250 ms per run. */
+    sleep?: (ms: number) => Promise<void>
     logger?: Logger
 }
 
@@ -1118,6 +1139,134 @@ export class MutationRestoreError extends Error {
         super(message)
         this.name = 'MutationRestoreError'
     }
+}
+
+/** Default settle window before the end-of-run verification. */
+export const DEFAULT_VERIFY_SETTLE_MS = 250
+
+/** Ceiling for the settle window: a gate may not turn into a sleep. */
+export const MAX_VERIFY_SETTLE_MS = 5_000
+
+/**
+ * Atomically replace `target` with `bytes`: sibling temp file + `rename`.
+ *
+ * The sibling temp is not a style choice — `rename` is only atomic WITHIN one
+ * filesystem, and a temp in `/tmp` (or anywhere else) can silently degrade into
+ * copy-then-delete, which is exactly the torn write this avoids. Keeping the
+ * temp next to its target guarantees the same mount.
+ *
+ * The old content of `target` is never truncated: after `rename` the file is
+ * either the complete old content or the complete new content, so a `SIGKILL`
+ * anywhere in here cannot leave a half-written source file behind. The temp is
+ * removed on every path, and no code below ever writes to `target` directly.
+ * @param target - absolute path of the file to replace.
+ * @param bytes - the complete new content.
+ */
+function writeAtomic(target: string, bytes: Buffer): void {
+    // Unique per call, not per run: two mutants of the same file, a retry after
+    // an error and a concurrent run of the same workspace must never share a
+    // temp path (the loser would delete the winner's file mid-flight).
+    const temporary = `${target}.mutation-${process.pid}-${Date.now()}-${randomUUID()}`
+    try {
+        fs.writeFileSync(temporary, bytes)
+        fs.renameSync(temporary, target)
+    } catch (error) {
+        try {
+            fs.unlinkSync(temporary)
+        } catch {
+            // Nothing was created, or a concurrent run removed it: either way
+            // the original error is the one worth reporting.
+        }
+        throw error
+    }
+}
+
+/** A source file's mtime and length, used to notice a late write during the settle window. */
+interface ObservedFile {
+    mtimeMs: number
+    size: number
+}
+
+/** Compare two observations of the same file. */
+function observationChanged(before: ObservedFile | undefined, after: ObservedFile | undefined): boolean {
+    if (before === undefined || after === undefined) return before !== after
+    return before.mtimeMs !== after.mtimeMs || before.size !== after.size
+}
+
+/**
+ * Run the end-of-run verification, with the settle window in between.
+ *
+ * Two phases, both fail-closed:
+ *
+ *  1. verify BYTE EQUALITY right away (as before). A mismatch refuses at once.
+ *  2. before the window, remember every source file's mtime/size; sleep
+ *     `settleMs`; look again. A file whose mtime or size moved during the window
+ *     was written by something after the first check — so the bytes are verified
+ *     AGAIN, and the offending path is named.
+ *
+ * The window is bounded (one sleep, never a retry loop): a process that writes
+ * forever cannot be waited out, and pretending otherwise would hang the gate.
+ * What is guaranteed is narrower and stated in the README — no file this run
+ * mutated differs from its pre-run bytes at the moment of the FINAL check.
+ * @param snapshots - every file this run snapshotted, with its bytes.
+ * @param options - workspace and the settle window.
+ * @returns `undefined` when both checks pass, otherwise what was observed.
+ */
+async function verifyWithSettle(
+    snapshots: ReadonlyMap<string, Snapshot>,
+    options: { cwd: string; sleep: (ms: number) => Promise<void>; settleMs: number },
+): Promise<{ kind: 'bytes' | 'settle'; detail: string; files: string[] } | undefined> {
+    /** Compare every snapshot against the disk; the invariant of this whole gate. */
+    const verifyBytes = (): { kind: 'bytes' | 'settle'; detail: string; files: string[] } | undefined => {
+        const mismatched: { file: string; note: string }[] = []
+        for (const snapshot of snapshots.values()) {
+            try {
+                const current = fs.readFileSync(path.join(options.cwd, snapshot.file))
+                if (!current.equals(snapshot.bytes)) mismatched.push({ file: snapshot.file, note: '' })
+            } catch {
+                mismatched.push({ file: snapshot.file, note: '（无法读取）' })
+            }
+        }
+        if (mismatched.length === 0) return undefined
+        const sorted = [...mismatched].sort((left, right) => left.file.localeCompare(right.file))
+        return {
+            kind: 'bytes',
+            // The named paths, annotated — and the BARE paths, so the recovery
+            // command is a real `git checkout -- <path> …` (a note in the argument
+            // list would look like a file name that does not exist).
+            detail: sorted.map((entry) => `${entry.file}${entry.note}`).join('，'),
+            files: sorted.map((entry) => entry.file),
+        }
+    }
+    /** mtime + size of every snapshot, or `undefined` when the file is gone. */
+    const observe = (): Map<string, ObservedFile> => {
+        const observed = new Map<string, ObservedFile>()
+        for (const snapshot of snapshots.values()) {
+            try {
+                const stats = fs.statSync(path.join(options.cwd, snapshot.file))
+                observed.set(snapshot.file, { mtimeMs: stats.mtimeMs, size: stats.size })
+            } catch {
+                observed.set(snapshot.file, { mtimeMs: Number.NaN, size: -1 })
+            }
+        }
+        return observed
+    }
+
+    const first = verifyBytes()
+    if (first !== undefined) return first
+    const before = observe()
+    if (options.settleMs > 0) await options.sleep(options.settleMs)
+    const after = observe()
+    const moved = [...before.keys()].filter((file) => observationChanged(before.get(file), after.get(file)))
+    if (moved.length === 0) return undefined
+    const second = verifyBytes()
+    if (second !== undefined) return second
+    // The mtime moved but the bytes came back: whatever wrote during the window
+    // rewrote the very same content (or touched the file). A single check would
+    // have called this "byte-identical" without noticing that a writer is still
+    // active — so it is named, with the boundary spelled out in the message.
+    const named = [...moved].sort()
+    return { kind: 'settle', detail: named.join('，'), files: named }
 }
 
 /** The pre-run byte snapshot of one file, plus whether it differs from HEAD. */
@@ -1211,20 +1360,6 @@ export async function runMutationPlan(plan: MutationPlan, options: MutationRunOp
         )
     }
 
-    /** Compare every snapshot against the disk; the invariant of this whole gate. */
-    const verify = (): string | undefined => {
-        const mismatched: string[] = []
-        for (const snapshot of snapshots.values()) {
-            try {
-                const current = fs.readFileSync(path.join(options.cwd, snapshot.file))
-                if (!current.equals(snapshot.bytes)) mismatched.push(snapshot.file)
-            } catch {
-                mismatched.push(`${snapshot.file}（无法读取）`)
-            }
-        }
-        return mismatched.length === 0 ? undefined : mismatched.sort().join('，')
-    }
-
     // A function, not an expression: TypeScript's control-flow analysis would
     // otherwise narrow `signal.aborted` to `false` after the first check and
     // report the second one as an impossible comparison.
@@ -1289,7 +1424,12 @@ export async function runMutationPlan(plan: MutationPlan, options: MutationRunOp
             /** Set when the file no longer holds what this tool wrote (external writer). */
             let interferedWith: string | undefined
             try {
-                fs.writeFileSync(absolute, mutated, 'utf8')
+                // Atomic: a SIGKILL between truncate and write can no longer leave
+                // the user's source file TORN (and there is no on-disk backup to
+                // fall back on — the pre-run bytes live in this process's memory).
+                // `writeAtomic` renames a sibling temp into place, so after any
+                // kill the file is either the original or the complete mutant.
+                writeAtomic(absolute, Buffer.from(mutated, 'utf8'))
                 mutantBytesHeld.set(mutant.file, Buffer.from(mutated, 'utf8'))
                 if (options.run === undefined) {
                     const raw = await runCommand(
@@ -1326,7 +1466,7 @@ export async function runMutationPlan(plan: MutationPlan, options: MutationRunOp
                     afterRun = undefined
                 }
                 if (held !== undefined && afterRun !== undefined && afterRun.equals(held)) {
-                    fs.writeFileSync(absolute, snapshot.bytes)
+                    writeAtomic(absolute, snapshot.bytes)
                     mutantBytesHeld.delete(mutant.file)
                 } else if (held !== undefined) {
                     mutantBytesHeld.delete(mutant.file)
@@ -1393,8 +1533,8 @@ export async function runMutationPlan(plan: MutationPlan, options: MutationRunOp
         // longer holds them (or that this run never wrote) is left exactly as
         // found and reported: overwriting an external writer's content from our
         // pre-run snapshot would destroy their work, and the error that follows
-        // would claim the opposite. `verify()` still fails closed on any file that
-        // is not byte-identical to the pre-run snapshot.
+        // would claim the opposite. The end-of-run verification still fails closed
+        // on any file that is not byte-identical to the pre-run snapshot.
         for (const [file, written] of [...mutantBytesHeld]) {
             const absolute = path.join(options.cwd, file)
             let current: Buffer | undefined
@@ -1409,7 +1549,7 @@ export async function runMutationPlan(plan: MutationPlan, options: MutationRunOp
                 continue
             }
             try {
-                fs.writeFileSync(absolute, (snapshots.get(file) as Snapshot).bytes)
+                writeAtomic(absolute, (snapshots.get(file) as Snapshot).bytes)
                 mutantBytesHeld.delete(file)
             } catch (error) {
                 logger?.warn(`mutation: 还原 ${file} 失败`, error)
@@ -1417,19 +1557,40 @@ export async function runMutationPlan(plan: MutationPlan, options: MutationRunOp
         }
     }
 
-    const mismatch = verify()
-    if (mismatch !== undefined) {
+    const settleMs = Math.min(MAX_VERIFY_SETTLE_MS, Math.max(0, Math.floor(options.verifySettleMs ?? DEFAULT_VERIFY_SETTLE_MS)))
+    // Settle BEFORE the verdict is given: the command's process group was killed
+    // (SIGTERM → SIGKILL), but a grandchild that ignores signals — or one spawned
+    // in the last milliseconds — can still write a source file after the kill.
+    // Waiting first, then checking, turns "a race that resolves in the window"
+    // into a refusal instead of a silently voided invariant. The second check
+    // runs only when a file moved during the window (see `verifyWithSettle`).
+    const checked = await verifyWithSettle(snapshots, {
+        cwd: options.cwd,
+        sleep: options.sleep ?? ((ms: number) => sleep(ms)),
+        settleMs,
+    })
+    if (checked !== undefined) {
+        const settleOnly = checked.kind === 'settle'
         throw new MutationRestoreError(
             [
-                `变异测试结束后，这些文件与运行前的字节快照不一致：${mismatch}。`,
-                '本门禁会改写源码文件，因此"结束后工作区与运行前逐字节一致"是硬性要求；不满足时不给出任何裁决。',
+                settleOnly
+                    ? `变异测试结束后的稳定窗口（${settleMs}ms）里，这些文件的 mtime/大小发生了变化：${checked.detail}（重新校验后字节与运行前的快照一致）。`
+                    : `变异测试结束后，这些文件与运行前的字节快照不一致：${checked.detail}。`,
+                settleOnly
+                    ? '也就是说：在给出"工作区与运行前逐字节一致"这个结论之后，还有进程在写这些文件。本次字节恰好相同，但这不能证明下一个瞬间仍然相同。'
+                    : `本门禁会改写源码文件，因此"结束后工作区与运行前逐字节一致"是硬性要求；不满足时不给出任何裁决。${
+                          settleMs > 0 ? `本次在最后一次变异之后先等待了 ${settleMs}ms 的稳定窗口，仍未通过校验。` : ''
+                      }`,
                 ...(interference.length === 0
                     ? []
                     : [
                           `这些文件在运行期间被外部改动（本工具没有覆盖它们，保持现状）：${interference.join('；')}`,
                           '下一步：先确认这些改动是谁写的，再决定保留还是回退——本门禁不会替你做这个决定。',
                       ]),
-                `下一步：先恢复这些文件（git checkout -- ${mismatch.split(', ').join(' ')}），确认没有别的进程在写它们，再重跑 mutation_check。`,
+                settleOnly
+                    ? '下一步：找出仍在写这些文件的后台进程（测试命令的子进程若脱离进程组，`process.kill(-pid)` 杀不到它）：先在干净的工作区确认没有残留进程，再重跑 mutation_check。'
+                    : `下一步：先恢复这些文件（git checkout -- ${checked.files.join(' ')}），确认没有别的进程在写它们，再重跑 mutation_check。`,
+                '诚实的边界：本门禁只能保证"最后一次校验的瞬间"没有差异——一个持续不断写文件的进程无法被任何一次检查拦住。',
             ].join('\n'),
         )
     }

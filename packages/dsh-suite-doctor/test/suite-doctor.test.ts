@@ -18,9 +18,9 @@ import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import test, { after } from 'node:test'
-import { MissionStoreRegistry, resolveLayout } from 'dsh-eng-core'
+import { MissionStoreRegistry, clearProjectConfigCache, resolveLayout } from 'dsh-eng-core'
 import { createFakeHost, runText, tempWorkspace, type FakeHost } from 'dsh-eng-core/testing'
-import { apply, inject, name, resolveConfig, resolveEffectiveConfig } from '../dist/index.js'
+import { apply, effectiveProbeTimeoutMs, inject, name, resolveConfig, resolveEffectiveConfig } from '../dist/index.js'
 import { registerTools } from '../dist/tools.js'
 
 const hosts: FakeHost[] = []
@@ -539,4 +539,112 @@ test('a logger without for() must not break the report (eng-core\u2019s silentLo
     const text = runText(run)
     assert.match(text, /# 套件自检（suite_status）/)
     assert.ok(text.length > 100, 'the whole report must be produced, not a TypeError')
+})
+
+// --- the probe budget has a host-owned ceiling ------------------------------
+
+test('a project probeTimeoutMs is clamped to the host ceiling, honoured below it, and reported either way', () => {
+    const cwd = tempWorkspace('suite-doctor-probe-')
+    fs.mkdirSync(path.join(cwd, '.dsh'), { recursive: true })
+    const file = path.join(cwd, '.dsh', 'suite-doctor.json')
+    const write = (body: string): void => {
+        fs.writeFileSync(file, body)
+        clearProjectConfigCache()
+    }
+    const host = resolveConfig({ probeTimeoutMs: 4_000, probeTimeoutMsMax: 10_000 })
+    assert.equal(host.probeTimeoutMs, 4_000)
+    assert.equal(host.probeTimeoutMsMax, 10_000)
+    assert.equal(effectiveProbeTimeoutMs(host), 4_000)
+
+    // A 24-hour project budget is clamped to the ceiling AND said out loud.
+    write(JSON.stringify({ probeTimeoutMs: 86_400_000 }))
+    const clamped = resolveEffectiveConfig(host, resolveLayout(cwd))
+    assert.equal(clamped.config.probeTimeoutMs, 10_000, 'the host ceiling wins')
+    assert.equal(effectiveProbeTimeoutMs(clamped.config), 10_000)
+    assert.ok(
+        clamped.problems.some((problem) => problem.includes('项目级 probeTimeoutMs=86400000ms 超过宿主上限 10000ms，已按上限使用')),
+        JSON.stringify(clamped.problems),
+    )
+
+    // Below the ceiling it is honoured: a shorter budget only returns sooner.
+    write(JSON.stringify({ probeTimeoutMs: 250 }))
+    const honoured = resolveEffectiveConfig(host, resolveLayout(cwd))
+    assert.equal(honoured.config.probeTimeoutMs, 250)
+    assert.equal(effectiveProbeTimeoutMs(honoured.config), 250)
+
+    // A negative / zero / NaN / Infinity / non-number value keeps the profile
+    // value, each with its own problem (never silently replaced).
+    for (const raw of ['-1', '0', 'null', '1e999', '"2000"']) {
+        write(`{"probeTimeoutMs": ${raw}}`)
+        const refused = resolveEffectiveConfig(host, resolveLayout(cwd))
+        assert.equal(refused.config.probeTimeoutMs, 4_000, `profile value kept for ${raw}`)
+        assert.ok(refused.problems.some((problem) => /probeTimeoutMs/.test(problem)), `${raw}: ${JSON.stringify(refused.problems)}`)
+    }
+
+    // The ceiling is host-only: a project may tighten its own budget, never raise
+    // the ceiling (it would otherwise decide how long the self-check may hang).
+    write(JSON.stringify({ probeTimeoutMsMax: 86_400_000, probeTimeoutMs: 5_000 }))
+    const raised = resolveEffectiveConfig(host, resolveLayout(cwd))
+    assert.equal(raised.config.probeTimeoutMsMax, 10_000, 'the host ceiling stays')
+    assert.equal(raised.config.probeTimeoutMs, 5_000)
+    assert.ok(
+        raised.problems.some((problem) => /probeTimeoutMsMax/.test(problem) && /宿主键/.test(problem)),
+        JSON.stringify(raised.problems),
+    )
+})
+
+test('the host budget is clamped through its own ceiling and validated (positive, finite)', () => {
+    const problems: string[] = []
+    const report = (message: string): void => problems.push(message)
+    assert.equal(resolveConfig({ probeTimeoutMs: 60_000, probeTimeoutMsMax: 5_000 }, report).probeTimeoutMs, 5_000)
+    assert.ok(problems.some((problem) => /超过宿主上限 probeTimeoutMsMax=5000ms/.test(problem)), JSON.stringify(problems))
+
+    // A host that lowers the ceiling below the DEFAULT clamps the default too.
+    const tiny = resolveConfig({ probeTimeoutMsMax: 50 })
+    assert.equal(effectiveProbeTimeoutMs(tiny), 50)
+
+    const bad: string[] = []
+    const invalid = resolveConfig({ probeTimeoutMs: -5, probeTimeoutMsMax: Number.NaN }, (message) => bad.push(message))
+    assert.equal(invalid.probeTimeoutMs, undefined)
+    assert.equal(invalid.probeTimeoutMsMax, 10_000)
+    assert.equal(effectiveProbeTimeoutMs(invalid), 2_000)
+    assert.ok(bad.some((problem) => /probeTimeoutMs 必须是正的有限毫秒数/.test(problem)), JSON.stringify(bad))
+    assert.ok(bad.some((problem) => /probeTimeoutMsMax 必须是正的有限毫秒数/.test(problem)), JSON.stringify(bad))
+})
+
+test('the probe stops at the ceiling: a hanging channel reports 探测超时 instead of hanging suite_status', async () => {
+    const cwd = repo({ ignoreTrail: true })
+    // A project that asks for an hour, and a host ceiling of 50ms: the effective
+    // budget is the ceiling (the clamp is reported — see the config test above).
+    fs.writeFileSync(path.join(cwd, '.dsh', 'suite-doctor.json'), JSON.stringify({ probeTimeoutMs: 3_600_000 }))
+    clearProjectConfigCache()
+    const fake = host(
+        cwd,
+        { probeTimeoutMsMax: 50, probeTimeoutMs: 5_000 },
+        {
+            interaction: {
+                describeAll: () => new Promise(() => undefined),
+                pending: () => new Promise(() => undefined),
+                ledgers: () => new Promise(() => undefined),
+            },
+        },
+    )
+    const started = Date.now()
+    const raced = await Promise.race([
+        fake.runTool('suite_status', { json: true }),
+        new Promise<'HUNG'>((resolve) => {
+            const timer = setTimeout(() => resolve('HUNG'), 5_000)
+            timer.unref?.()
+        }),
+    ])
+    assert.notEqual(raced, 'HUNG', 'the report must complete: the ceiling bounds every accessor')
+    const elapsed = Date.now() - started
+    assert.ok(elapsed < 5_000, `a hung channel must not hang the doctor (took ${elapsed}ms)`)
+    const report = reportOf(raced as { value: unknown })
+    const channels = report.checks.find((check) => check.id === 'runtime.channels')
+    assert.equal(channels?.state, 'unknown')
+    assert.match(channels?.detail ?? '', /探测超时（50ms）/, 'the report must say WHY the fact is unknown')
+    const pending = report.checks.find((check) => check.id === 'runtime.pending-asks')
+    assert.equal(pending?.state, 'unknown')
+    assert.match(pending?.detail ?? '', /探测超时（50ms）/)
 })

@@ -31,7 +31,7 @@ import {
     type Logger,
     type MissionStoreRegistry,
 } from 'dsh-eng-core'
-import { DEFAULT_PROBE_TIMEOUT_MS, type SuiteDoctorConfig } from './config.js'
+import { effectiveProbeTimeoutMs, type SuiteDoctorConfig } from './config.js'
 import { probeRuntime, type ProbeContext } from './probe.js'
 
 const TEXT_OUTPUT = { type: 'string' } as const
@@ -136,7 +136,10 @@ export async function buildReport(deps: ToolDeps, agent: AgentLike | undefined, 
         expectedPlugins: config.expectedPlugins,
         stores: deps.stores,
         cwd,
-        probeTimeoutMs: config.probeTimeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS,
+        // The effective budget, not the raw key: a project value is clamped to the
+        // host ceiling in resolveConfig/resolveEffectiveConfig, and the DEFAULT is
+        // clamped here too (a host may lower the ceiling below the default).
+        probeTimeoutMs: effectiveProbeTimeoutMs(config),
         ...(args.missionId === undefined || args.missionId === '' ? {} : { missionId: args.missionId }),
     })
     for (const problem of probe.problems) deps.logger?.warn(problem)

@@ -36,7 +36,7 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import { MissionStoreRegistry, createLogger, expandHome, type AgentLike } from 'dsh-eng-core'
-import { DEFAULT_PROBE_TIMEOUT_MS, resolveConfig, resolveEffectiveConfig, type SuiteDoctorConfig } from './config.js'
+import { effectiveProbeTimeoutMs, resolveConfig, resolveEffectiveConfig, type SuiteDoctorConfig } from './config.js'
 import { PROMPT_SECTION, sectionText } from './prompt.js'
 import { registerTools, type ToolDeps } from './tools.js'
 import type { ProbeContext } from './probe.js'
@@ -46,7 +46,16 @@ export const name = 'dsh-suite-doctor'
 /** Only the two services this plugin actually touches. */
 export const inject = ['tools', 'systemPrompt']
 
-export { PROJECT_OVERRIDABLE_KEYS, SUITE_PLUGINS, resolveConfig, resolveEffectiveConfig } from './config.js'
+export {
+    PROJECT_OVERRIDABLE_KEYS,
+    HOST_ONLY_KEYS,
+    SUITE_PLUGINS,
+    DEFAULT_PROBE_TIMEOUT_MS,
+    DEFAULT_PROBE_TIMEOUT_MS_MAX,
+    resolveConfig,
+    resolveEffectiveConfig,
+    effectiveProbeTimeoutMs,
+} from './config.js'
 export { PLUGIN_SIGNATURES, PHASE_PLUGINS, CORE_PLUGINS, probePlugin, probeRuntime } from './probe.js'
 export { buildReport } from './tools.js'
 export { PROMPT_SECTION, sectionText } from './prompt.js'
@@ -70,13 +79,18 @@ interface ContextLike {
 
 /** Wire the plugin into a host context. */
 export function apply(ctx: Context, config: unknown = {}): void {
-    const resolved = resolveConfig(config)
+    // Configuration problems (an unusable value, a clamp to the host ceiling) are
+    // collected before the logger exists and flushed into it right after: a value
+    // the host wrote and the plugin did not use must never be silent.
+    const startupProblems: string[] = []
+    const resolved = resolveConfig(config, (message) => startupProblems.push(message))
     if (!resolved.enabled) return
     const log = createLogger({
         tag: name,
         file: expandHome(resolved.logFile),
         ...(resolved.logFileTemplate === undefined ? {} : { template: resolved.logFileTemplate }),
     })
+    for (const problem of startupProblems) log.warn(`配置：${problem}`)
     try {
         const context = ctx as unknown as ContextLike
         const stores = new MissionStoreRegistry({ ...resolved.layout, logger: log })
@@ -138,7 +152,7 @@ export function apply(ctx: Context, config: unknown = {}): void {
         log.info(
             `applied (tool: suite_status; expectedPlugins=${resolved.expectedPlugins.join(', ')}; ` +
                 `prompt=${resolved.prompt.enabled ? `on(order ${resolved.prompt.order})` : 'off'}; ` +
-                `probeTimeoutMs=${resolved.probeTimeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS})`,
+                `probeTimeoutMs=${effectiveProbeTimeoutMs(resolved)}（上限 probeTimeoutMsMax=${resolved.probeTimeoutMsMax}）)`,
         )
     } catch (error) {
         log.error('apply failed:', error)

@@ -334,6 +334,8 @@ function specBudgetSourceOf(mission: MissionRecord | undefined): SpecBudgetSourc
                     ...(args.only === undefined ? {} : { only: args.only }),
                     ...(spec === undefined ? {} : { spec }),
                     requireSpecBudgets: effective.config.requireSpecBudgets,
+                    baselineLockRetryMs: effective.config.baselineLockRetryMs,
+                    baselineLockStaleMs: effective.config.baselineLockStaleMs,
                     service: deps.subprocess(),
                     ...((exec as { signal?: AbortSignal }).signal === undefined ? {} : { signal: (exec as { signal?: AbortSignal }).signal }),
                 })

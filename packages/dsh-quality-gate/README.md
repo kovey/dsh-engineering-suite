@@ -138,6 +138,13 @@ budgets:
 - **测不到数字就是拒绝**：正则没匹配、捕获内容不是数字 → `budget_check` **整体拒绝执行**（列出已判定但未写入的预算供修复参考），
   既定的语义是"没有数据"而不是"通过"，也绝不退化成 `0`。基线文件损坏同样按 fail closed 拒绝（当成"没有历史"会让护栏悄悄消失）。
 - 配置里的预算条目**不会被静默丢弃**：写错的条目会被保留并在 `budget_check` 时被拒绝（规则"消失"和"全部通过"看起来一模一样）。
+- **并发写入不会丢测量**：追加是一条"读—改—写"，所以它在一个独占锁（`<基线文件>.lock`，`openSync(path, 'wx')`
+  原子创建）下完成：两个会话（或一个会话加一个子代理）同时跑 `budget_check` 时**排队**，而不是互相覆盖；
+  新文档仍然先写同目录临时文件再 `rename`，崩溃只会留下上一份**完整**的文档，不会留下截断的 JSON。
+  拿不到锁时**大声拒绝**（不是跳过）：等 `baselineLockRetryMs`（默认 2000ms，上限 10000）仍拿不到 → 报出锁路径、
+  占用者 pid/时间与锁的年龄，并给出"确认没有进程在写之后手动删除锁文件"的指令；锁存在时间超过 `baselineLockStaleMs`
+  （默认 30000ms；例如持锁进程被杀死留下的孤儿锁）同样按"过期锁"点名拒绝——**不会自动删锁**（持有者可能只是慢），
+  也**永远不会在没有锁的情况下继续写**。锁在成功、拒绝、文档不可用、写失败等每条路径上都会释放。
 
 ### 预算的第二个来源：mission 的规格（`来源：规格`）
 
@@ -201,6 +208,8 @@ contracts:
   config:
     logFile: '~/.dsh/quality-gate.log'
     defaultTimeoutMs: 300000
+    baselineLockRetryMs: 2000      # 追加基线的独占锁最多等多久（上限 10000）；等不到就拒绝这次运行
+    baselineLockStaleMs: 30000     # 超过这个年龄的锁文件按孤儿锁点名拒绝（人工确认后删除）
     writeTools: ['write', 'edit']
     commands:
       - id: test
@@ -231,6 +240,8 @@ contracts:
 | `contracts[]` | `[]` | 契约表；`id`/`name`/`kind`（`cli`/`http`/`schema`/`command`）+ `command` + `expect`（`exitCode`/`stdoutContains`/`stdoutNotContains`/`jsonPaths`） |
 | `defaultTimeoutMs` | `300000` | 未声明 `timeoutMs` 时的超时（超时按失败处理） |
 | `maxOutputBytes` | `64000` | 单命令输出上限（保留尾部） |
+| `baselineLockRetryMs` | `2000` | **宿主键**：追加基线时等独占锁的上限（毫秒，上限 `10000`，超限收敛到上限）。等不到就**拒绝**这次 `budget_check`（不是跳过测量），错误里报出锁路径、占用者与年龄。不是合法值时**保留宿主的值并报告** |
+| `baselineLockStaleMs` | `30000` | **宿主键**：锁文件存在超过这个年龄（毫秒）就按"过期/孤儿锁"**点名拒绝**，并在指令里要求人工确认后删除该锁——不会自动删、也不会绕过锁继续写 |
 | `limits.maxChangedFiles` | `0`（关闭） | 一次任务的改动文件数上限（docs.md §9）；超限 → `BLOCK`。计数来自 `git status --porcelain`，**排除 `.dsh/` 工程台账自身**（否则任务自己的工件会吃掉预算）；不是 git 仓库时按 fail closed 阻断 |
 | `writeTools` | `['write','edit']` | 触发写后 lint 与 pendingWrites 计数的工具（shell 改动靠收尾时的指纹兜底，不要加 `bash`） |
 | `turnStop.enabled` | `true` | 收尾门禁开关（长测试套件可关掉，改用 `quality_gate_run`） |

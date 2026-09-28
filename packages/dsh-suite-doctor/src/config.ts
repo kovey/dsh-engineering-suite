@@ -47,6 +47,16 @@ export const SUITE_PLUGINS: readonly string[] = [
 /** Default bound on the interaction probe, in milliseconds. */
 export const DEFAULT_PROBE_TIMEOUT_MS = 2_000
 
+/**
+ * Default hard ceiling for `probeTimeoutMs` (host-owned, 10 seconds).
+ *
+ * The probe is a self-check, not a job: without a ceiling a project file could
+ * set `probeTimeoutMs: 86400000` and `suite_status` would hang for a day on a
+ * channel plugin that never answers. The ceiling is the host's (see
+ * {@link HOST_ONLY_KEYS}); a project value above it is CLAMPED and reported.
+ */
+export const DEFAULT_PROBE_TIMEOUT_MS_MAX = 10_000
+
 /** Resolved plugin configuration. */
 export interface SuiteDoctorConfig {
     enabled: boolean
@@ -60,9 +70,15 @@ export interface SuiteDoctorConfig {
     /**
      * Bound on the one probe that can block (the `interaction` service's
      * `describe()` / pending-ask accessors). A hung channel plugin must not hang
-     * the doctor's answer.
+     * the doctor's answer. Always verified against {@link SuiteDoctorConfig.probeTimeoutMsMax}.
      */
     probeTimeoutMs?: number
+    /**
+     * Hard ceiling for `probeTimeoutMs` (host-only, default
+     * {@link DEFAULT_PROBE_TIMEOUT_MS_MAX}): the effective budget is
+     * `min(probeTimeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS, probeTimeoutMsMax)`.
+     */
+    probeTimeoutMsMax: number
     prompt: {
         enabled: boolean
         order: number
@@ -74,7 +90,8 @@ export interface SuiteDoctorConfig {
  *
  * Both are refinements that can only make the report *more* complete:
  * `expectedPlugins` is unioned with the profile's list, and `probeTimeoutMs` is
- * a budget, not a verdict.
+ * a budget, not a verdict — clamped to the host's ceiling
+ * (`probeTimeoutMsMax`), which a project may not raise.
  */
 export const PROJECT_OVERRIDABLE_KEYS: readonly string[] = ['expectedPlugins', 'probeTimeoutMs']
 
@@ -83,7 +100,8 @@ export const PROJECT_OVERRIDABLE_KEYS: readonly string[] = ['expectedPlugins', '
  *
  * A project that could relocate the ledger layout or switch the doctor off could
  * silence its own self-check; `prompt` decides what every session in this
- * profile is told.
+ * profile is told; `probeTimeoutMsMax` is the ceiling on how long a project may
+ * make the self-check wait.
  */
 export const HOST_ONLY_KEYS: Readonly<Record<string, string>> = {
     enabled: '插件开关是部署决定：项目不能关掉对自己工作区的自检',
@@ -93,6 +111,7 @@ export const HOST_ONLY_KEYS: Readonly<Record<string, string>> = {
     rootDir: '台账位置是部署决定：自检必须读宿主认定的那一份台账',
     missionsDir: '台账位置是部署决定：自检必须读宿主认定的那一份台账',
     specsDir: '台账位置是部署决定：自检必须读宿主认定的那一份台账',
+    probeTimeoutMsMax: '探测上限是宿主上限：项目级只能在它之内收紧，不能把自检能等多久抬高',
     prompt: '系统提示词小节由 profile 决定',
 }
 
@@ -142,16 +161,51 @@ function pluginIds(value: unknown, fallback: readonly string[]): { ids: string[]
 }
 
 /**
+ * Read one positive, finite millisecond budget, reporting anything unusable.
+ *
+ * A present-but-unusable value is REPORTED (a value the host wrote and the plugin
+ * ignored is a difference the host must hear about) and the fallback is kept.
+ * @param value - the untrusted value.
+ * @param fallback - the value to keep when it cannot be used.
+ * @param key - the key name, for the message.
+ * @param warn - sink for recoverable problems.
+ */
+function probeBudget(value: unknown, fallback: number, key: string, warn: (message: string) => void): number {
+    if (value === undefined || value === null) return fallback
+    if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
+        warn(`${key} 必须是正的有限毫秒数（收到 ${JSON.stringify(value)}），已按默认值 ${fallback}ms 处理`)
+        return fallback
+    }
+    return Math.max(1, Math.floor(value))
+}
+
+/**
  * Resolve the plugin configuration.
  * @param input - the loader row's `config` value (untrusted).
+ * @param warn - sink for recoverable configuration problems.
  * @returns the resolved configuration with every default applied.
  */
-export function resolveConfig(input: unknown): SuiteDoctorConfig {
+export function resolveConfig(input: unknown, warn: (message: string) => void = () => undefined): SuiteDoctorConfig {
     const raw = isRecord(input) ? input : {}
     const prompt = isRecord(raw['prompt']) ? raw['prompt'] : {}
     const layout = isRecord(raw['layout']) ? raw['layout'] : {}
     const plugins = pluginIds(raw['expectedPlugins'], SUITE_PLUGINS)
-    const timeout = raw['probeTimeoutMs']
+    // The ceiling is resolved FIRST: the host's own probe budget is clamped
+    // through it too ("a host may lower it, not exceed the maximum").
+    const maxCeiling = probeBudget(raw['probeTimeoutMsMax'], DEFAULT_PROBE_TIMEOUT_MS_MAX, 'probeTimeoutMsMax', warn)
+    const declaredTimeout = raw['probeTimeoutMs']
+    let probeTimeoutMs: number | undefined
+    if (declaredTimeout !== undefined && declaredTimeout !== null) {
+        if (typeof declaredTimeout === 'number' && Number.isFinite(declaredTimeout) && declaredTimeout > 0) {
+            const wanted = Math.max(1, Math.floor(declaredTimeout))
+            probeTimeoutMs = Math.min(wanted, maxCeiling)
+            if (wanted > maxCeiling) {
+                warn(`probeTimeoutMs=${wanted}ms 超过宿主上限 probeTimeoutMsMax=${maxCeiling}ms，已按上限使用`)
+            }
+        } else {
+            warn(`probeTimeoutMs 必须是正的有限毫秒数（收到 ${JSON.stringify(declaredTimeout)}），已忽略（回退到默认 ${DEFAULT_PROBE_TIMEOUT_MS}ms）`)
+        }
+    }
     return {
         enabled: bool(raw['enabled'], true),
         logFile: str(raw['logFile'], '~/.dsh/suite-doctor.log'),
@@ -164,12 +218,26 @@ export function resolveConfig(input: unknown): SuiteDoctorConfig {
             ...(typeof layout['specsDir'] === 'string' ? { specsDir: layout['specsDir'] } : {}),
         },
         expectedPlugins: plugins.ids,
-        ...(typeof timeout === 'number' && Number.isFinite(timeout) && timeout > 0 ? { probeTimeoutMs: Math.floor(timeout) } : {}),
+        ...(probeTimeoutMs === undefined ? {} : { probeTimeoutMs }),
+        probeTimeoutMsMax: maxCeiling,
         prompt: {
             enabled: bool(prompt['enabled'], true),
             order: num(prompt['order'], 605),
         },
     }
+}
+
+/**
+ * The probe budget actually handed to the probes.
+ *
+ * `min(probeTimeoutMs ?? DEFAULT, probeTimeoutMsMax)`: the default is clamped
+ * through the ceiling too, or a host that lowered `probeTimeoutMsMax` below
+ * {@link DEFAULT_PROBE_TIMEOUT_MS} would still wait the default.
+ * @param config - the resolved configuration.
+ */
+export function effectiveProbeTimeoutMs(config: SuiteDoctorConfig): number {
+    const ceiling = config.probeTimeoutMsMax > 0 ? config.probeTimeoutMsMax : DEFAULT_PROBE_TIMEOUT_MS_MAX
+    return Math.min(config.probeTimeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS, ceiling)
 }
 
 /** One resolved configuration plus where it came from. */
@@ -238,11 +306,22 @@ export function resolveEffectiveConfig(
         }
     }
 
-    // probeTimeoutMs: a budget, never a verdict.
+    // probeTimeoutMs: a budget, never a verdict — and never longer than the host
+    // allows. A project value above the host ceiling is CLAMPED and reported
+    // (silently honouring it would let a repository hang the self-check), a value
+    // within the ceiling is honoured (a shorter budget only makes the report
+    // return sooner), and an unusable value keeps the profile's value.
     if (raw['probeTimeoutMs'] !== undefined) {
         const value = raw['probeTimeoutMs']
         if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
-            next.probeTimeoutMs = Math.floor(value)
+            const ceiling = next.probeTimeoutMsMax
+            const wanted = Math.max(1, Math.floor(value))
+            if (wanted > ceiling) {
+                next.probeTimeoutMs = ceiling
+                report(`${file.file}: 项目级 probeTimeoutMs=${wanted}ms 超过宿主上限 ${ceiling}ms，已按上限使用`)
+            } else {
+                next.probeTimeoutMs = wanted
+            }
             applied += 1
         } else {
             report(`${file.file}: probeTimeoutMs 必须是正数（毫秒），已忽略（继续使用 profile 的值）`)

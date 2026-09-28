@@ -29,6 +29,21 @@ import { loadProjectConfig, type Layout, type LayoutOptions, type Logger } from 
 /** How an environment counts as "production-like" for the approval default. */
 export const ENVIRONMENT_KINDS: readonly string[] = ['local', 'staging', 'production']
 
+/**
+ * How the HOST decides whether a verification needs a human.
+ *
+ *  - `environment` (default): follow the environment's own rule — the same host
+ *    commands in the same environment must not have two trust requirements;
+ *  - `always`: a human approves every verification, whatever the environment says
+ *    (the strict direction, so a project file may ask for it);
+ *  - `never`: a host decision only — a repository may never switch verification
+ *    approval off for itself.
+ */
+export type VerifyApprovalMode = 'environment' | 'always' | 'never'
+
+/** The values `verifyApproval` accepts. */
+export const VERIFY_APPROVAL_MODES: readonly VerifyApprovalMode[] = ['environment', 'always', 'never']
+
 /** Hard ceiling for `verifyRetries`: verification must not become a wait loop. */
 export const MAX_VERIFY_RETRIES = 10
 
@@ -77,11 +92,22 @@ export interface EnvironmentConfig {
     rollbackCommands?: string[]
     /** Whether a human must approve before this environment is touched. */
     requiresApproval: boolean
+    /**
+     * Whether a human must approve before this environment's `verifyCommands`
+     * run. Default: this environment's own `requiresApproval` — verification
+     * executes the same host commands in the same environment as a deploy, so a
+     * production environment needs a person for both, and a staging environment
+     * needs one for neither unless it asks.
+     */
+    verifyRequiresApproval?: boolean
     /** Optional allowlist file of approvers (one identity per line, `#` comments). */
     approversFile?: string
     /** Optional canary rollout (steps run in order, each verified). */
     canary?: { steps: CanaryStep[] }
 }
+
+/** How an unperformable pending-ask check is treated (see {@link GoNoGoConfig}). */
+export type PendingAsksPolicy = 'block' | 'warn'
 
 /** The go/no-go ceiling. */
 export interface GoNoGoConfig {
@@ -91,6 +117,17 @@ export interface GoNoGoConfig {
     requireGateNewerThanEvidence: boolean
     /** Refuse while a human still has an unanswered question pending. */
     requireNoPendingAsks: boolean
+    /**
+     * What to do when the pending-ask check cannot be performed at all (no
+     * interaction service, an unreadable accessor, or a service that has not
+     * observed this workspace's ledger yet).
+     *
+     * `block` (default): a fact that could not be observed is a FAILED check —
+     * "we could not look" must never authorise a deployment. `warn`: the old
+     * behaviour, an explicit `⚠️` unverified pass, for a host that deliberately
+     * accepts it (host-only: a project file may not write `goNoGo` at all).
+     */
+    pendingAsksUnverifiable: PendingAsksPolicy
     /** Refuse when the quality gate is older than this many minutes (`0` = off). */
     maxGateAgeMinutes: number
     /** Refuse when the workspace has uncommitted changes (the engineering trail excluded). */
@@ -119,6 +156,12 @@ export interface DeployGateConfig {
      * long a deploy turn may hang, it never widens what may be deployed.
      */
     approvalTimeoutMs: number
+    /**
+     * Host rule for verification approval (default `environment`). It may only
+     * make the per-environment rule STRICTER (`always`), and only the host may
+     * switch it off (`never`); a project file writing `never` is refused.
+     */
+    verifyApproval: VerifyApprovalMode
     goNoGo: GoNoGoConfig
     /** Whether a failed deploy runs the environment's own rollback commands. */
     autoRollbackOnFailure: boolean
@@ -136,12 +179,17 @@ export interface DeployGateConfig {
  * How *this* project is released (which commands, to which targets) and how long
  * a command may take are repository knowledge. Everything that decides whether a
  * deploy is allowed at all is the host's call.
+ *
+ * `verifyApproval` is listed because a project may TIGHTEN it (only `'always'`
+ * is accepted from a project file — see {@link resolveEffectiveConfig}); the
+ * loosening value `'never'` is refused there, exactly like `approversFile`.
  */
 export const PROJECT_OVERRIDABLE_KEYS: readonly string[] = [
     'environments',
     'verifyRetries',
     'verifyBackoffMs',
     'commandTimeoutMs',
+    'verifyApproval',
 ]
 
 /** Keys a project file may set to `null` to mean "this repository has none". */
@@ -177,6 +225,42 @@ function num(value: unknown, fallback: number): number {
  */
 export function defaultRequiresApproval(kind: string): boolean {
     return kind !== 'local' && kind !== 'staging'
+}
+
+/**
+ * Whether a verification of this environment needs a human.
+ *
+ * The rule, in order: the host may force it on (`verifyApproval === 'always'`),
+ * the host may switch it off (`'never'`, a host-only decision), and otherwise the
+ * environment decides — its own `verifyRequiresApproval`, defaulting to its
+ * `requiresApproval`. There is deliberately no "verification is cheaper than a
+ * deploy" default: it runs the same host commands in the same environment.
+ * @param config - the effective configuration (the host rule).
+ * @param environment - the environment being verified.
+ */
+export function verifyNeedsApproval(config: DeployGateConfig, environment: EnvironmentConfig): boolean {
+    if (config.verifyApproval === 'always') return true
+    if (config.verifyApproval === 'never') return false
+    return environment.verifyRequiresApproval ?? environment.requiresApproval
+}
+
+/**
+ * One-line provenance of the verification-approval rule, for reports.
+ *
+ * A reader who sees "无需人工批准" has to be able to tell a deliberate host
+ * decision (`verifyApproval: 'never'`) from an environment that simply follows
+ * its `requiresApproval: false`.
+ * @param config - the effective configuration.
+ * @param environment - the environment being verified.
+ */
+export function describeVerifyApproval(config: DeployGateConfig, environment: EnvironmentConfig): string {
+    const needed = verifyNeedsApproval(config, environment)
+    if (config.verifyApproval === 'always') return `verifyApproval='always'：宿主强制所有环境的验证都需要人工批准`
+    if (config.verifyApproval === 'never') return `verifyApproval='never'（宿主专属键）：所有环境的验证都无需人工批准`
+    if (environment.verifyRequiresApproval !== undefined) {
+        return `verifyApproval='environment'，环境声明 verifyRequiresApproval=${String(environment.verifyRequiresApproval)}`
+    }
+    return `verifyApproval='environment'，未声明 verifyRequiresApproval → 跟随 requiresApproval=${String(environment.requiresApproval)}${needed ? '' : '（该环境显式声明无需人工批准）'}`
 }
 
 /** Render a command list as a bounded one-line summary. */
@@ -269,6 +353,17 @@ export function parseEnvironment(
     }
     const requiresApproval = typeof declaredApproval === 'boolean' ? declaredApproval : defaultRequiresApproval(kind)
 
+    // Verification approval: absent means "follow requiresApproval", which is why
+    // the unusable value falls back to ABSENT and not to `false` — an unparsable
+    // `verifyRequiresApproval` must not be the one way to skip the human.
+    const declaredVerifyApproval = value['verifyRequiresApproval']
+    if (declaredVerifyApproval !== undefined && typeof declaredVerifyApproval !== 'boolean') {
+        warn(
+            `${where}: 环境 ${cleanName} 的 verifyRequiresApproval 必须是布尔值（收到 ${JSON.stringify(declaredVerifyApproval)}），` +
+                '已按默认处理（跟随 requiresApproval）',
+        )
+    }
+
     const approversFile = value['approversFile']
     if (approversFile !== undefined && (typeof approversFile !== 'string' || approversFile.trim() === '')) {
         warn(`${where}: 环境 ${cleanName} 的 approversFile 必须是非空字符串，已忽略`)
@@ -298,6 +393,7 @@ export function parseEnvironment(
             ...(verify.items.length === 0 ? {} : { verifyCommands: verify.items }),
             ...(rollback.items.length === 0 ? {} : { rollbackCommands: rollback.items }),
             requiresApproval,
+            ...(typeof declaredVerifyApproval === 'boolean' ? { verifyRequiresApproval: declaredVerifyApproval } : {}),
             ...(typeof approversFile === 'string' && approversFile.trim() !== '' ? { approversFile: approversFile.trim() } : {}),
             ...(canary === undefined ? {} : { canary }),
         },
@@ -342,6 +438,9 @@ export function defaultGoNoGo(): GoNoGoConfig {
         requireReceipt: true,
         requireGateNewerThanEvidence: true,
         requireNoPendingAsks: true,
+        // Fail closed: an unobservable "is anybody waiting?" is a failed check,
+        // not a ⚠️ pass. A host that wants the old behaviour opts in explicitly.
+        pendingAsksUnverifiable: 'block',
         maxGateAgeMinutes: 0,
         requireCleanTree: true,
     }
@@ -355,7 +454,14 @@ export function parseGoNoGo(input: unknown, where: string, warn: (message: strin
         warn(`${where}: goNoGo 必须是对象，已按默认（最严格）处理`)
         return defaults
     }
-    const known = ['requireReceipt', 'requireGateNewerThanEvidence', 'requireNoPendingAsks', 'maxGateAgeMinutes', 'requireCleanTree']
+    const known = [
+        'requireReceipt',
+        'requireGateNewerThanEvidence',
+        'requireNoPendingAsks',
+        'pendingAsksUnverifiable',
+        'maxGateAgeMinutes',
+        'requireCleanTree',
+    ]
     for (const key of Object.keys(input)) {
         if (!known.includes(key)) warn(`${where}: goNoGo.${key} 不是可识别的键（可用：${known.join(', ')}），已忽略`)
     }
@@ -372,13 +478,37 @@ export function parseGoNoGo(input: unknown, where: string, warn: (message: strin
         if (typeof rawAge === 'number' && Number.isFinite(rawAge) && rawAge >= 0) maxGateAgeMinutes = Math.floor(rawAge)
         else warn(`${where}: goNoGo.maxGateAgeMinutes 必须是不小于 0 的数字（0 = 不检查年龄；收到 ${JSON.stringify(rawAge)}），已按 0 处理`)
     }
+    const rawPolicy = input['pendingAsksUnverifiable']
+    let pendingAsksUnverifiable: PendingAsksPolicy = defaults.pendingAsksUnverifiable
+    if (rawPolicy !== undefined) {
+        if (rawPolicy === 'block' || rawPolicy === 'warn') pendingAsksUnverifiable = rawPolicy
+        else
+            warn(
+                `${where}: goNoGo.pendingAsksUnverifiable 必须是 'block' 或 'warn'（收到 ${JSON.stringify(rawPolicy)}），` +
+                    "已按默认 'block'（fail closed）处理",
+            )
+    }
     return {
         requireReceipt: takeBool('requireReceipt'),
         requireGateNewerThanEvidence: takeBool('requireGateNewerThanEvidence'),
         requireNoPendingAsks: takeBool('requireNoPendingAsks'),
+        pendingAsksUnverifiable,
         maxGateAgeMinutes,
         requireCleanTree: takeBool('requireCleanTree'),
     }
+}
+
+/** Parse the host-level verification-approval rule (a profile key). */
+export function parseVerifyApproval(input: unknown, where: string, warn: (message: string) => void): VerifyApprovalMode {
+    if (input === undefined || input === null) return 'environment'
+    if (typeof input === 'string' && (VERIFY_APPROVAL_MODES as readonly string[]).includes(input.trim())) {
+        return input.trim() as VerifyApprovalMode
+    }
+    warn(
+        `${where}: verifyApproval 必须是 ${VERIFY_APPROVAL_MODES.map((mode) => `'${mode}'`).join(' / ')} 之一` +
+            `（收到 ${JSON.stringify(input)}），已按默认 'environment'（跟随环境）处理`,
+    )
+    return 'environment'
 }
 
 /**
@@ -456,6 +586,7 @@ export function resolveConfig(input: unknown, warn: (message: string) => void = 
         commandTimeoutMs: timeout,
         approvalTimeoutMs: approvalTimeout,
         goNoGo: parseGoNoGo(raw['goNoGo'], 'profile 配置', warn),
+        verifyApproval: parseVerifyApproval(raw['verifyApproval'], 'profile 配置', warn),
         autoRollbackOnFailure: bool(raw['autoRollbackOnFailure'], false),
         environments: environments.environments,
         prompt: {
@@ -481,6 +612,7 @@ function rawEnvironment(environment: EnvironmentConfig): Raw {
         ...(environment.verifyCommands === undefined ? {} : { verifyCommands: [...environment.verifyCommands] }),
         ...(environment.rollbackCommands === undefined ? {} : { rollbackCommands: [...environment.rollbackCommands] }),
         requiresApproval: environment.requiresApproval,
+        ...(environment.verifyRequiresApproval === undefined ? {} : { verifyRequiresApproval: environment.verifyRequiresApproval }),
         ...(environment.approversFile === undefined ? {} : { approversFile: environment.approversFile }),
         ...(environment.canary === undefined
             ? {}
@@ -557,6 +689,31 @@ export function resolveEffectiveConfig(
         logger?.warn(message)
     }
 
+    // The verification-approval rule is monotone in the same way `approversFile`
+    // is: a project entry may TIGHTEN it (`always`) but never loosen it. `never`
+    // is a host decision outright — a repository that could write it would be
+    // granting itself permission to run the environment's commands unattended.
+    if (raw['verifyApproval'] !== undefined) {
+        const declared = raw['verifyApproval']
+        const value = typeof declared === 'string' ? declared.trim() : declared
+        if (value === 'always') {
+            if (next.verifyApproval !== 'always') {
+                next.verifyApproval = 'always'
+                applied += 1
+            }
+        } else if (value === 'never') {
+            reject(
+                `${file.file}: verifyApproval 不能设为 'never'（验证审批的关闭是宿主专属决定）：项目级只能收紧为 'always'。` +
+                    `已保持 profile 的 '${host.verifyApproval}'`,
+            )
+        } else {
+            reject(
+                `${file.file}: verifyApproval 只接受收紧值 'always'（收到 ${JSON.stringify(declared)}）：'environment' 会把宿主可能更严的规则放松，` +
+                    `'never' 更是宿主专属。已保持 profile 的 '${host.verifyApproval}'`,
+            )
+        }
+    }
+
     if (raw['environments'] !== undefined) {
         if (raw['environments'] === null) {
             // "this repository declares none" — the profile's environments stay,
@@ -576,6 +733,19 @@ export function resolveEffectiveConfig(
                     )
                 }
                 const requiresApproval = environment.requiresApproval || previous?.requiresApproval === true
+                // The verification's trust requirement is monotone for the same
+                // reason: re-declaring an environment must not turn "a human
+                // approves the health check" into "anyone may run it" — the same
+                // host commands, in the same environment, one trust requirement.
+                const previousVerify = previous === undefined ? undefined : verifyNeedsApproval(host, previous)
+                const nextVerify = verifyNeedsApproval(host, environment)
+                if (previousVerify === true && !nextVerify) {
+                    reject(
+                        `${file.file}: 环境 "${environment.name}" 的 verifyRequiresApproval 不能由项目级配置关闭` +
+                            '（profile 下该环境的验证需要人工批准）——已保持"验证需要人工批准"',
+                    )
+                }
+                const verifyRequiresApproval = previousVerify === true ? true : environment.verifyRequiresApproval
                 // The approver allowlist is monotone for the same reason: the host's
                 // list is the requirement, so a project entry may add one (when the
                 // profile declared none) but may never drop or replace the host's —
@@ -594,6 +764,7 @@ export function resolveEffectiveConfig(
                 const merged: EnvironmentConfig = {
                     ...environment,
                     requiresApproval,
+                    ...(verifyRequiresApproval === undefined ? {} : { verifyRequiresApproval }),
                     ...(approversFile === undefined ? {} : { approversFile }),
                 }
                 const index = next.environments.findIndex((entry) => entry.name === merged.name)

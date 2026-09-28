@@ -164,13 +164,32 @@ export function apply(ctx: Context, config: unknown = {}): void {
     }
 }
 
-export { resolveConfig, resolveEffectiveConfig, environmentByName, defaultRequiresApproval, PROJECT_OVERRIDABLE_KEYS, MAX_VERIFY_RETRIES } from './config.js'
-export type { DeployGateConfig, EnvironmentConfig, CanaryStep, GoNoGoConfig, EffectiveConfig } from './config.js'
+export {
+    resolveConfig,
+    resolveEffectiveConfig,
+    environmentByName,
+    defaultRequiresApproval,
+    verifyNeedsApproval,
+    describeVerifyApproval,
+    PROJECT_OVERRIDABLE_KEYS,
+    VERIFY_APPROVAL_MODES,
+    MAX_VERIFY_RETRIES,
+} from './config.js'
+export type { DeployGateConfig, EnvironmentConfig, CanaryStep, GoNoGoConfig, EffectiveConfig, VerifyApprovalMode, PendingAsksPolicy } from './config.js'
 export { evaluateGoNoGo, compareRevision, newestEvidenceAt, newestReceipt, describeFailures, QUALITY_GATE_SOURCE } from './plan.js'
 export type { GoNoGoInput, GoNoGoResult, PlanCheck, PendingAsk, MissionLike } from './plan.js'
 export { readLedger, appendLedgerRow, summarize, liveDeployment, rollbackTargetOf, findDeployment, deploymentId, DEPLOY_STATES } from './ledger.js'
 export type { LedgerRow, LedgerSummary, LedgerRead, DeployState, EnvironmentLedgerSummary } from './ledger.js'
 export { tokenizeTemplate, checkTemplate, resolveCommands, SHELL_METACHARACTERS, TEMPLATE_VARS } from './command.js'
-export { registerTools, pendingAsksOf, normalizeInteractionReply, approverAllowed, commandChecks, GATE_SOURCE } from './tools.js'
+export {
+    registerTools,
+    pendingAsksOf,
+    normalizeInteractionReply,
+    approverAllowed,
+    commandChecks,
+    GATE_SOURCE,
+    PENDING_ASK_OBSERVABILITY_FIX,
+} from './tools.js'
+export type { PendingAsksQuery } from './tools.js'
 export type { ToolDeps, InteractionLike, InteractionAsk } from './tools.js'
 export { PROMPT_SECTION, sectionText } from './prompt.js'

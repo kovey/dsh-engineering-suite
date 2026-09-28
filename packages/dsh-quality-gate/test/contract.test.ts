@@ -163,6 +163,34 @@ const SMOKE_STDOUT = JSON.stringify({ ok: true, data: { items: [{ id: 7 }], tota
 
 // --- path algebra ---------------------------------------------------------
 
+test('contracts: a dot directly before a bracket (`items.[0]`) is refused, and every real form still parses', () => {
+    // The forms that ARE JSON path notation keep working, dotted indices included.
+    for (const [path, segments] of [
+        ['a', ['a']],
+        ['a.b', ['a', 'b']],
+        ['a.b[0].c', ['a', 'b', 0, 'c']],
+        ['[0].c', [0, 'c']],
+        ['a[0][1]', ['a', 0, 1]],
+        ['a[0].b[2]', ['a', 0, 'b', 2]],
+    ] as const) {
+        assert.deepEqual(parseJsonPath(path), { segments: [...segments] }, `${path} must keep parsing`)
+    }
+    // `.` followed by `[` is not a notation any JSON tool understands.
+    for (const path of ['items.[0]', 'items.[0].id', 'a.[0]', '[0].[1]']) {
+        const parsed = parseJsonPath(path)
+        assert.equal('problem' in parsed, true, `${path} must be refused`)
+        assert.match('problem' in parsed ? parsed.problem : '', /点号后面只能是字段名/)
+    }
+    const parsed = parseJsonPath('items.[0].id')
+    const message = 'problem' in parsed ? parsed.problem : ''
+    assert.match(message, /两种写法是 \.key（对象字段）和 \[index\]（数组下标）/)
+    assert.match(message, /items\[0\]\.id/)
+    // The neighbours of that rule are unchanged: an empty segment and a trailing
+    // dot keep their own messages.
+    assert.match('problem' in parseJsonPath('a..b') ? parseJsonPath('a..b').problem : '', /空的路径段/)
+    assert.match('problem' in parseJsonPath('a.') ? parseJsonPath('a.').problem : '', /以 "\." 结尾/)
+})
+
 test('contracts: json paths are exact, and a shape that cannot be addressed is refused', () => {
     assert.deepEqual(parseJsonPath('data.items[0].id'), { segments: ['data', 'items', 0, 'id'] })
     assert.deepEqual(parseJsonPath('[0].name'), { segments: [0, 'name'] })
