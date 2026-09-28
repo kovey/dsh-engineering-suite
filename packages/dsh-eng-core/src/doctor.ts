@@ -31,6 +31,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { readJson } from './io.js'
 import type { Logger } from './log.js'
+import { archiveFootprint } from './archive.js'
 import { projectConfigFile } from './project-config.js'
 import { resolveLayout, type Layout } from './paths.js'
 
@@ -101,6 +102,9 @@ export interface DoctorRuntimeFacts {
 /** Ledger size and shape: how much the suite has written here. */
 export interface DoctorFootprint {
     missions: number
+    /** Missions already moved to the archive (still findable through its index). */
+    archivedMissions: number
+    archivedBytes: number
     /** Total bytes under the layout root. */
     bytes: number
     gates: number
@@ -581,6 +585,8 @@ export function checkWorkspace(options: DoctorOptions): DoctorReport {
     }
     const footprint: DoctorFootprint = {
         missions: missionNames.length,
+        archivedMissions: 0,
+        archivedBytes: 0,
         bytes: directorySize(layout.rootDir),
         gates: countArtifacts(missionsDir, 'gates'),
         receipts: countArtifacts(missionsDir, 'receipts'),
@@ -592,6 +598,32 @@ export function checkWorkspace(options: DoctorOptions): DoctorReport {
     if (footprint.evidenceRows === 0) {
         footprint.evidenceRows = countArtifacts(missionsDir, '') === 0 ? 0 : countEvidenceLines(missionsDir)
     }
+
+    // Archiving is the answer to "the trail only grows", so the report has to
+    // show the growth and the command that trims it — a 200-mission repository
+    // where every read pays for every old mission is a real problem, and a
+    // silent one.
+    const archived = archiveFootprint(layout)
+    const growthMissions = 50
+    const growthBytes = 64 * 1024 * 1024
+    const oversized = footprint.missions > growthMissions || footprint.bytes > growthBytes
+    add({
+        id: 'ledger.growth',
+        area: 'deliver',
+        state: oversized && archived.missions === 0 ? 'partial' : 'ok',
+        severity: 'recommended',
+        label: '台账规模可控（可归档旧 mission）',
+        detail:
+            (archived.missions > 0 ? `已归档 ${archived.missions} 个 mission / ${(archived.bytes / 1024).toFixed(0)} KiB；` : '') +
+            `当前活跃 mission ${footprint.missions} 个 / ${(footprint.bytes / 1024 / 1024).toFixed(1)} MiB` +
+            (oversized ? `（超过建议水位 ${growthMissions} 个 / ${Math.round(growthBytes / 1024 / 1024)} MiB）` : ''),
+        ...(oversized && archived.missions === 0
+            ? { fix: `bash scripts/archive-missions.sh --keep 20 --days 90 --dry-run（确认清单后再执行）；未交付的 mission 默认不动` }
+            : {}),
+    })
+
+    footprint.archivedMissions = archived.missions
+    footprint.archivedBytes = archived.bytes
 
     const generatedAt = options.now ?? Date.now()
     return {
@@ -716,7 +748,8 @@ export function renderDoctor(report: DoctorReport): string {
             `；建议项 ${report.advice.length} 条待处理（共 ${report.checks.length} 项检查）`,
     )
     lines.push(
-        `规模：mission ${report.footprint.missions} 个、门禁记录 ${report.footprint.gates} 条、回执 ${report.footprint.receipts} 个、证据行 ${report.footprint.evidenceRows} 条、台账 ${(report.footprint.bytes / 1024).toFixed(0)} KiB`,
+        `规模：mission ${report.footprint.missions} 个（已归档 ${report.footprint.archivedMissions} 个）、门禁记录 ${report.footprint.gates} 条、` +
+            `回执 ${report.footprint.receipts} 个、证据行 ${report.footprint.evidenceRows} 条、台账 ${(report.footprint.bytes / 1024).toFixed(0)} KiB`,
     )
     for (const phase of PHASES) {
         const items = report.checks.filter((check) => check.area === phase)
