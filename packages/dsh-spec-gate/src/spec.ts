@@ -15,6 +15,14 @@ import {
     type TestCase,
     type TestDesign,
 } from 'dsh-eng-core'
+import {
+    declareBudgets,
+    readSpecBudgets,
+    renderBudgetSection,
+    specWithBudgetPlan,
+    type SpecBudgetInput,
+    type SpecRecordWithBudgets,
+} from './budgets.js'
 
 /** What the model supplies when creating a specification. */
 export interface SpecDraft {
@@ -33,6 +41,15 @@ export interface SpecDraft {
      * groups requirements across missions in `plan_status`.
      */
     milestone?: string
+    /**
+     * 非功能预算（p95、包体积、迁移耗时…）。
+     *
+     * 省略表示「不改动已有声明」——重写一次规格不会悄悄删掉一条已审批的非功能要求；
+     * 传 `[]` 才是明确地删掉全部（被删的编号进入 retired，永不复用）。
+     */
+    budgets?: readonly SpecBudgetInput[]
+    /** 变更理由（记进预算/需求变更历史）。 */
+    note?: string
     /** The `## 测试设计` chapter body, written as Markdown tables. */
     testDesignMarkdown: string
 }
@@ -158,20 +175,28 @@ export function allocateCriteria(texts: readonly string[], previous?: SpecRecord
 
 /**
  * Build (or revise) the structured specification record.
+ *
+ * 预算随规格走：`draft.budgets` 省略时沿用上一版的声明（重写规格不等于删掉非功能
+ * 要求），给了就按「声明即现状」对账（新增 / 修改 / 删除并作废编号）。声明有任何问题
+ * 都在这里抛出 —— 调用方必须在写任何文件之前调用本函数。
  * @param draft - the validated draft.
  * @param previous - the existing record, when this is a revision.
+ * @throws when a budget declaration cannot be used (the message carries the fix).
  */
-export function buildSpec(draft: SpecDraft, previous?: SpecRecord): SpecRecord {
+export function buildSpec(draft: SpecDraft, previous?: SpecRecord): SpecRecordWithBudgets {
     const now = Date.now()
-    return {
+    const requirements = allocateRequirements(
+        draft.requirements.map((entry) => entry.trim()).filter((entry) => entry !== ''),
+        previous?.requirements ?? [],
+        previous?.retired ?? [],
+    )
+    const acceptanceCriteria = allocateCriteria(draft.acceptanceCriteria, previous)
+    const previousWithBudgets = previous as SpecRecordWithBudgets | undefined
+    const base: SpecRecordWithBudgets = {
         title: draft.title.trim(),
         background: draft.background.trim(),
-        requirements: allocateRequirements(
-            draft.requirements.map((entry) => entry.trim()).filter((entry) => entry !== ''),
-            previous?.requirements ?? [],
-            previous?.retired ?? [],
-        ),
-        acceptanceCriteria: allocateCriteria(draft.acceptanceCriteria, previous),
+        requirements,
+        acceptanceCriteria,
         fileBoundaries: draft.fileBoundaries.map((entry) => entry.trim()).filter((entry) => entry !== ''),
         negativeConstraints: draft.negativeConstraints.map((entry) => entry.trim()).filter((entry) => entry !== ''),
         revision: (previous?.revision ?? 0) + 1,
@@ -181,9 +206,35 @@ export function buildSpec(draft: SpecDraft, previous?: SpecRecord): SpecRecord {
         // forgot them would let a retired id come back (and lose the audit trail).
         ...(previous?.retired === undefined ? {} : { retired: previous.retired }),
         ...(previous?.changes === undefined ? {} : { changes: previous.changes }),
+        // 预算同样随修订保留：删掉一条已声明的非功能要求只能通过显式的声明（并作废编号），
+        // 不能因为「这次重写没提它」而消失。
+        ...(previousWithBudgets?.budgets === undefined ? {} : { budgets: previousWithBudgets.budgets }),
+        ...(previousWithBudgets?.retiredBudgets === undefined ? {} : { retiredBudgets: previousWithBudgets.retiredBudgets }),
+        ...(previousWithBudgets?.budgetChanges === undefined ? {} : { budgetChanges: previousWithBudgets.budgetChanges }),
         // A revision invalidates a previous approval: the human approved a
         // different document.
     }
+    if (draft.budgets === undefined) return base
+    const prior = readSpecBudgets(previous)
+    const declared = declareBudgets(prior.budgets, draft.budgets, {
+        requirementIds: requirements.map((requirement) => requirement.id),
+        criterionIds: acceptanceCriteria.map((criterion) => criterion.id),
+        retiredBudgets: prior.retired,
+        retiredSpecIds: previous?.retired ?? [],
+        by: 'spec_create',
+        now,
+        ...(draft.note === undefined ? {} : { note: draft.note }),
+    })
+    if (!declared.ok) {
+        throw new Error(
+            [
+                '非功能预算声明无法使用，未写入任何文件：',
+                ...declared.problems.map((problem) => `- ${problem}`),
+                '修正后重新调用 spec_create（省略 budgets 参数表示不改动已有预算）。',
+            ].join('\n'),
+        )
+    }
+    return specWithBudgetPlan(base, declared.plan)
 }
 
 const SCENARIO_LABEL: Record<TestCase['kind'], string> = {
@@ -235,9 +286,18 @@ export function parseDraftTestDesign(draft: SpecDraft): TestDesign | undefined {
     return design
 }
 
-/** Render the mission's specification artifact. */
+/**
+ * Render the mission's specification artifact.
+ *
+ * `dsh-eng-core` renders the canonical chapters; the `## 非功能预算` table is
+ * appended here because `SpecRecord` (the shared contract) has no budget field —
+ * see the module docs of `./budgets.js`. A spec without budgets renders exactly
+ * as before (no empty section).
+ */
 export function renderSpec(mission: MissionRecord): string {
-    return renderSpecMarkdown(mission)
+    const canonical = renderSpecMarkdown(mission)
+    const section = renderBudgetSection(mission.spec)
+    return section === '' ? canonical : `${canonical}\n${section}\n`
 }
 
 /** One-line status of a mission for tool output. */

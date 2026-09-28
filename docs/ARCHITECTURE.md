@@ -404,7 +404,7 @@ IM 侧的职责（不在本仓库）：卡片按钮不可伪造且一次性、�
 
 | 阶段 | 承担者 | 产物 | 门禁 |
 |---|---|---|---|
-| 规划 | spec-gate（需求/AC/边界/负面约束/增改删）、test-design-gate、impact-gate | `specs/<id>.md`、`mission.json` | `spec-approved`、`test-design` |
+| 规划 | spec-gate（需求/AC/边界/负面约束/增改删/**非功能预算**/里程碑/ADR）、test-design-gate、impact-gate | `specs/<id>.md`、`mission.json`、`plan.jsonl` | `spec-approved`、`test-design` |
 | 实现 | role-guard（权限/模型/派发）、standards-gate、quality-gate（写后 lint）、supply-chain-gate、audit-trail | 代码、审计 JSONL、门禁记录 | `standards-pass`（可选） |
 | 测试 | quality-gate（跑命令）、coverage-gate、impact-gate（最小回归集）、test-design-gate | 覆盖率/flaky 工件、证据行 | `quality-pass` |
 | 交互 | interaction-gate（ask/notify/progress + 通道注册）、宿主的 approval 接缝 | 决定台账 `interaction.jsonl` | 无（它是横切的） |
@@ -451,11 +451,40 @@ IM 侧的职责（不在本仓库）：卡片按钮不可伪造且一次性、�
 - **指标预算**（`quality-gate` 的 `budget_check`）：测量命令耗时，或用正则从输出里取一个数（取不到 = 拒绝，绝不按 0 计），
   支持绝对上下限与 `maxRegressionPercent`（对比**历史最好值**，消息里点名那个值和它的时间）。
   第一次运行只是**记录基线**并如实说"还没有数据"——没有测量就不是通过。
+  **预算有两个来源**：宿主配置（部署上限）与**规格声明**（非功能需求，随规格审批、带 `requirementIds` 追溯）。
+  同 id 时宿主生效，但两个值都会被写进报告与裁决 reason（绝不静默取其一）；`requireSpecBudgets: true`（宿主键，默认关）
+  让"规格声明了、这次却没验证"的预算直接拒绝交付。
 - **契约冒烟**（`quality-gate` 的 `contract_check`）：按声明跑命令并逐条断言（退出码/stdout 包含与不包含/JSON 路径的
   值与类型），每条期望一行结果；**路径不存在就是失败**（点名路径），不是"跳过"。
 - **flaky 隔离计划**（`impact-gate` 的 `flaky_plan`/`flaky_status`）：把不稳定测试分类为 quarantine/investigate/
   suspect-instrumentation，并且**隔离是一笔有期限的借款**——必须写 owner 与到期时间，过期即升级为"要么修、要么删"；
   隔离后长期没再出现的测试会被单独指出（那等于静默丢覆盖）。
+
+**怎么门禁一次数据库迁移**（目标里的"迁移等预算"，用已有原语表达，不另造门禁）：
+
+```jsonc
+// .dsh/quality-gate.json
+{
+  "contracts": [
+    { "id": "migrate-up",   "name": "迁移可执行",   "kind": "command",
+      "command": "npm run migrate -- up",   "expect": { "exitCode": 0 } },
+    { "id": "migrate-down", "name": "迁移可回滚",   "kind": "command",
+      "command": "npm run migrate -- down", "expect": { "exitCode": 0 } },   // 回滚没验证过 = 没回滚
+    { "id": "old-client",   "name": "旧客户端仍可用", "kind": "command",
+      "command": "node scripts/smoke-old-client.mjs",
+      "expect": { "exitCode": 0, "stdoutNotContains": ["column does not exist"] } }   // 向后兼容
+  ],
+  "budgets": [
+    { "id": "migrate-time", "name": "迁移耗时", "metric": "durationMs",
+      "command": "npm run migrate -- up", "max": 2000 }
+  ]
+}
+```
+
+三条约束缺一不可：**可执行**（up 退出码 0）、**可回滚**（down 退出码 0，否则"回滚"只是口号）、
+**向后兼容**（旧客户端/旧数据仍能跑）。部署侧再叠一层：`deploy-gate` 的环境**没有声明
+`rollbackCommands` 就不判 go**（见 §5.14），所以"迁移回滚"必须作为环境的回滚步骤被声明出来，
+而不是留在某人的记忆里。
 
 **信任模型上的一条硬约束**（P4 实现时发现并固化）：辅助裁决（预算/契约）记录门禁时用
 `scope.full = false`、不清 `pendingWrites`、reason 带前缀。否则"source 撞车 + full=true"就能在没有跑过宿主命令集的情况下

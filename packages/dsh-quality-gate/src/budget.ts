@@ -78,6 +78,18 @@ export interface BudgetConfig {
     maxRegressionPercent?: number
     /** Baseline history file override (default `<rootDir>/budgets.json`). */
     baselineFile?: string
+    /**
+     * Where this budget was declared: the host's configuration (default) or the
+     * mission's specification. A spec-sourced budget is reported as `来源：规格`
+     * and can never be edited from here — the specification owns it.
+     */
+    origin?: 'config' | 'spec'
+    /**
+     * The requirements/criteria the budget guards (`AC-003`), when the declaring
+     * source named them. They ride into the verdict's reason and rows so a
+     * delivery can show "需求 AC-003 的性能预算已按规格验证".
+     */
+    requirementIds?: string[]
 }
 
 /** One recorded measurement in a budget's append-only history. */
@@ -122,6 +134,10 @@ export interface BudgetEvaluation {
     /** One-line, machine-stable reason (also goes into the gate record). */
     reason: string
     checks: BudgetCheck[]
+    /** Where the rule came from: the host's configuration or the mission's spec. */
+    origin: 'config' | 'spec'
+    /** The requirements/criteria the budget guards (`AC-003`), when declared. */
+    requirementIds?: string[]
     baseline: {
         file: string
         /** `true` when this run appended a new history entry. */
@@ -153,6 +169,18 @@ export interface BudgetRunOptions {
     rootDir: string
     /** Restrict to these budget ids. */
     only?: readonly string[]
+    /**
+     * The budgets the mission's SPECIFICATION declares (structurally read from the
+     * mission record). They are used when the host config declares no budget with
+     * the same id; when both do, the host wins and the difference is reported.
+     */
+    spec?: SpecBudgetSource
+    /**
+     * Host opt-in (`config.requireSpecBudgets`): refuse the run when the
+     * specification declares budgets and this run covered none of them. Default
+     * `false` — no existing behaviour changes.
+     */
+    requireSpecBudgets?: boolean
     /** Injected clock (the recorded timestamp; tests). */
     now?: () => number
     /** Injected command runner; defaults to `dsh-eng-core`'s `runCommand`. */
@@ -161,6 +189,18 @@ export interface BudgetRunOptions {
     service?: unknown
     /** Cancellation (the turn signal). */
     signal?: AbortSignal
+}
+
+/** What one run covered of the specification's declaration. */
+export interface SpecCoverage {
+    /** Budgets the specification declares (after validation). */
+    declared: number
+    /** How many of them this run measured. */
+    covered: number
+    missionId?: string
+    revision?: number
+    /** Whether the declaring specification revision was approved. */
+    approved?: boolean
 }
 
 /**
@@ -182,6 +222,10 @@ export type BudgetRun =
           baselineFiles: string[]
           /** How many measurements were appended to a history. */
           recorded: number
+          /** Same-id declarations where the specification and the host disagree. */
+          conflicts: BudgetConflict[]
+          /** What this run covered of the specification's declaration. */
+          spec: SpecCoverage
       }
     | { ok: false; problem: string }
 
@@ -276,9 +320,305 @@ export function parseBudget(input: unknown, index: number): { budget: BudgetConf
     return problems.length === 0 ? { budget } : { budget, problem: problems.join('；') }
 }
 
+/**
+ * The label every spec-sourced budget row carries.
+ *
+ * `dsh-spec-gate`'s `plan_status` looks for exactly this string to tell whether a
+ * recorded verdict measured the SPEC's budget or a host override (see
+ * `dsh-spec-gate/plan-ledger`). The two plugins never import each other, so this
+ * literal is part of the contract — renaming it degrades that report to
+ * "来源未知", never to a false claim.
+ */
+export const SPEC_ORIGIN_LABEL = '来源：规格'
+
+/**
+ * One budget as the mission's specification declares it (structurally read).
+ *
+ * The shape is owned by `dsh-spec-gate` (`SpecBudget`); this package reads it out
+ * of the mission record instead of importing that plugin (the suite's plugins stay
+ * independently mountable). Every field is `unknown` here on purpose: a spec
+ * record can be hand-edited, and {@link parseSpecBudgets} re-validates everything
+ * it uses rather than trusting the type.
+ */
+export interface SpecBudgetSource {
+    /** The raw `spec.budgets` array from the mission record. */
+    budgets: readonly unknown[]
+    /** Budget ids the specification retired — never reusable. */
+    retired?: readonly string[]
+    /** Mission the declaration belongs to (reported). */
+    missionId?: string
+    /** Specification revision the declaration belongs to (reported). */
+    revision?: number
+    /** Whether that revision was approved (reported; not a gate here). */
+    approved?: boolean
+}
+
+/** What one read of a specification's budgets produced. */
+export interface SpecBudgetParse {
+    budgets: BudgetConfig[]
+    /** Set when the declaration cannot be used — the caller must refuse the run. */
+    problems: string[]
+}
+
+const METRIC_NAMES = METRICS.join(' / ')
+
+/** Whether a pattern declares a capturing group (`(?:` `(?=` `(?!` do not). */
+function declaresCaptureGroup(source: string): boolean {
+    let inClass = false
+    for (let index = 0; index < source.length; index += 1) {
+        const character = source[index]
+        if (character === '\\') {
+            index += 1
+            continue
+        }
+        if (inClass) {
+            if (character === ']') inClass = false
+            continue
+        }
+        if (character === '[') {
+            inClass = true
+            continue
+        }
+        if (character !== '(') continue
+        if (source[index + 1] !== '?') return true
+        if (source[index + 2] === '<' && source[index + 3] !== '=' && source[index + 3] !== '!') return true
+    }
+    return false
+}
+
+/**
+ * Turn the specification's budget declarations into runnable budgets.
+ *
+ * This is a SECOND validation, not a copy of trust: `dsh-spec-gate` refuses these
+ * same shapes at `spec_create`/`spec_amend` time, but a hand-edited mission record
+ * (or a spec written by an older version) must never be able to buy a measurement
+ * with a rule this run cannot actually judge. Anything unusable is a PROBLEM for
+ * the whole call — a silently dropped spec budget is exactly the "rule that
+ * stopped existing" failure the report cannot show.
+ * @param source - the structurally read declaration, or `undefined` when the
+ *   mission's specification declares none.
+ */
+export function parseSpecBudgets(source: SpecBudgetSource | undefined): SpecBudgetParse {
+    if (source === undefined) return { budgets: [], problems: [] }
+    const problems: string[] = []
+    const budgets: BudgetConfig[] = []
+    const retired = (source.retired ?? []).map((id) => id.toLowerCase())
+    if (!Array.isArray(source.budgets)) {
+        return {
+            budgets: [],
+            problems: [
+                `规格里的 budgets 不是数组（收到 ${JSON.stringify(source.budgets)}）：无法确认这条 mission 声明了哪些非功能预算。` +
+                    '下一步：用 spec_amend 重声明预算（`budgets: [...]`），或修复 .dsh/missions/<id>/mission.json。',
+            ],
+        }
+    }
+    const seen = new Set<string>()
+    for (const [index, entry] of source.budgets.entries()) {
+        const label = `规格预算 budgets[${index}]`
+        if (!isRecord(entry)) {
+            problems.push(`${label}: 不是对象（收到 ${JSON.stringify(entry)}）。下一步：在你的任务里用 spec_amend 重声明预算。`)
+            continue
+        }
+        const id = optionalText(entry['id']) ?? ''
+        const named = id === '' ? `${label}` : `${label} ("${id}")`
+        if (id === '') {
+            problems.push(`${label}: 缺少 id。下一步：用 spec_amend 给这条预算一个 id（字母/数字/-/_）。`)
+            continue
+        }
+        if (!/^[a-z0-9][a-z0-9-_]*$/i.test(id)) {
+            problems.push(`${named}: id 不合法（只能字母数字与 - _，以字母数字开头）。下一步：用 spec_amend 改成一个合法 id。`)
+            continue
+        }
+        if (retired.includes(id.toLowerCase())) {
+            problems.push(
+                `${named}: 这条 id 已经作废（retired，编号不复用），却仍然出现在规格的活预算里。` +
+                    '下一步：用 spec_amend 删掉它或换一个新 id —— 基线历史按 id 存，复活旧 id 会让旧历史冒充新预算。',
+            )
+            continue
+        }
+        if (seen.has(id.toLowerCase())) {
+            problems.push(`${named}: 同一个 id 在规格里出现了两次：它们会共用同一份基线历史。下一步：用 spec_amend 合并成一条。`)
+            continue
+        }
+
+        const metricRaw = entry['metric']
+        if (!METRICS.includes(metricRaw as BudgetMetric)) {
+            problems.push(`${named}: metric 必须是 ${METRIC_NAMES} 之一（收到 ${JSON.stringify(metricRaw)}）。下一步：用 spec_amend 修正这条预算。`)
+            continue
+        }
+        const metric = metricRaw as BudgetMetric
+        const command = optionalText(entry['command'])
+        if (command === undefined) {
+            problems.push(
+                `${named}: 没有可执行的 command（缺配置绝不能悄悄变成"通过"）。` +
+                    '下一步：用 spec_amend 给这条预算写上要测的命令，或删掉这条声明。',
+            )
+            continue
+        }
+        const regex = optionalText(entry['regex'])
+        if (metric !== 'durationMs' && regex === undefined) {
+            problems.push(
+                `${named}: metric=${metric} 需要 regex（第一个捕获组必须是纯数字）。` +
+                    '下一步：用 spec_amend 补上 regex（例如 "size=(\\\\d+)"），或把 metric 改成 durationMs。',
+            )
+            continue
+        }
+        if (metric === 'durationMs' && regex !== undefined) {
+            problems.push(
+                `${named}: metric=durationMs 与 regex 不能同时出现（durationMs 测的是命令耗时，与输出无关）。` +
+                    '下一步：用 spec_amend 删掉 regex，或把 metric 改成 number。',
+            )
+            continue
+        }
+        if (regex !== undefined) {
+            try {
+                const compiled = new RegExp(regex)
+                if (!declaresCaptureGroup(compiled.source)) {
+                    problems.push(
+                        `${named}: regex /${regex}/ 没有捕获组（取数只认第一个捕获组）。` +
+                            '下一步：用 spec_amend 给数字加上括号，例如 "size=(\\\\d+)"。',
+                    )
+                    continue
+                }
+            } catch (error) {
+                problems.push(
+                    `${named}: regex 不是合法正则（${error instanceof Error ? error.message : String(error)}）：${regex}。` +
+                        '下一步：用 spec_amend 修正正则。',
+                )
+                continue
+            }
+        }
+        const thresholdRaw = entry['threshold']
+        const threshold: { max?: number; min?: number; maxRegressionPercent?: number } = {}
+        if (isRecord(thresholdRaw)) {
+            for (const key of ['max', 'min', 'maxRegressionPercent'] as const) {
+                const value = optionalNumber(thresholdRaw[key])
+                if (value !== undefined) threshold[key] = value
+                else if (thresholdRaw[key] !== undefined) {
+                    problems.push(`${named}: threshold.${key} 必须是有限数字（收到 ${JSON.stringify(thresholdRaw[key])}）。下一步：用 spec_amend 修正这条预算。`)
+                }
+            }
+            if (threshold.maxRegressionPercent !== undefined && threshold.maxRegressionPercent < 0) {
+                problems.push(`${named}: threshold.maxRegressionPercent 不能是负数（收到 ${threshold.maxRegressionPercent}）。下一步：用 spec_amend 改成 0 或正数。`)
+                delete threshold.maxRegressionPercent
+            }
+        }
+        if (Object.keys(threshold).length === 0) {
+            problems.push(
+                `${named}: 没有任何界限（threshold 里的 max / min / maxRegressionPercent 至少要有一种）。` +
+                    '下一步：用 spec_amend 补一个界限，否则这条预算永远无法判定。',
+            )
+            continue
+        }
+        const requirementIds = Array.isArray(entry['requirementIds'])
+            ? entry['requirementIds'].filter((value): value is string => typeof value === 'string' && value.trim() !== '').map((value) => value.trim())
+            : undefined
+        seen.add(id.toLowerCase())
+        budgets.push({
+            id,
+            name: optionalText(entry['name']) ?? id,
+            metric,
+            command,
+            ...(regex === undefined ? {} : { regex }),
+            ...(optionalText(entry['unit']) === undefined ? {} : { unit: optionalText(entry['unit']) as string }),
+            ...threshold,
+            origin: 'spec',
+            ...(requirementIds === undefined || requirementIds.length === 0 ? {} : { requirementIds }),
+        })
+    }
+    return { budgets, problems }
+}
+
+/** A budget id that exists in both sources with a different rule. */
+export interface BudgetConflict {
+    id: string
+    /** What the applied (host) rule says, rendered for the report. */
+    applied: string
+    /** What the specification declared, rendered for the report. */
+    declared: string
+}
+
+/** The merged budget set one run measures. */
+export interface MergedBudgets {
+    budgets: BudgetConfig[]
+    /** Same-id declarations whose rules differ (host wins; reported, never merged). */
+    conflicts: BudgetConflict[]
+}
+
+/** One budget's rule as a comparable string (the fields a conflict can differ in). */
+function ruleSignature(budget: BudgetConfig): string {
+    const unit = budget.unit ?? defaultUnit(budget.metric)
+    return JSON.stringify({
+        metric: budget.metric,
+        unit,
+        command: budget.command ?? (budget.commandId === undefined ? null : `commandId:${budget.commandId}`),
+        regex: budget.regex ?? null,
+        max: budget.max ?? null,
+        min: budget.min ?? null,
+        maxRegressionPercent: budget.maxRegressionPercent ?? null,
+    })
+}
+
+/** Render the differing bound values of a spec/host pair (both sides, always). */
+function describeRule(budget: BudgetConfig): string {
+    const unit = budget.unit ?? defaultUnit(budget.metric)
+    const bounds: string[] = []
+    if (budget.max !== undefined) bounds.push(`max=${budget.max} ${unit}`)
+    if (budget.min !== undefined) bounds.push(`min=${budget.min} ${unit}`)
+    if (budget.maxRegressionPercent !== undefined) bounds.push(`回归≤${budget.maxRegressionPercent}%`)
+    const command = budget.command ?? (budget.commandId === undefined ? '(无命令)' : `commandId=${budget.commandId}`)
+    return `${bounds.join('、') || '(无界限)'}；命令 ${command}${budget.regex === undefined ? '' : `；regex /${budget.regex}/`}`
+}
+
+/**
+ * Combine the host's configured budgets with the mission's specification.
+ *
+ * Two rules, both deliberate:
+ *
+ *  1. **a spec budget is used when the host declares no budget with that id** —
+ *     the specification is the authority for what the mission promised, and the
+ *     report marks those rows `来源：规格`;
+ *  2. **when both declare one id, the HOST wins** (it is the deployment's ceiling:
+ *     the machine, the toolchain and the timeouts are the host's) — but a
+ *     differing rule is never resolved silently: it comes back as a conflict that
+ *     names BOTH values and which one was applied, so a delivery cannot claim a
+ *     requirement was verified under a threshold nobody used.
+ * @param config - the host's budgets (already parsed).
+ * @param spec - the specification's budgets (already validated).
+ */
+export function mergeBudgets(config: readonly BudgetConfig[], spec: readonly BudgetConfig[]): MergedBudgets {
+    const conflicts: BudgetConflict[] = []
+    const hostIds = new Map(config.map((budget) => [budget.id.toLowerCase(), budget]))
+    const fromSpec: BudgetConfig[] = []
+    for (const budget of spec) {
+        const host = hostIds.get(budget.id.toLowerCase())
+        if (host === undefined) {
+            fromSpec.push(budget)
+            continue
+        }
+        if (ruleSignature(host) !== ruleSignature(budget)) {
+            conflicts.push({
+                id: host.id,
+                applied: describeRule(host),
+                declared: describeRule(budget),
+            })
+        }
+    }
+    return { budgets: [...config, ...fromSpec], conflicts }
+}
+
+/** The ids of the spec-sourced budgets inside a merged set. */
+export function specBudgetIds(budgets: readonly BudgetConfig[]): string[] {
+    return budgets.filter((budget) => budget.origin === 'spec').map((budget) => budget.id)
+}
+
+/** The requirement ids one budget's verdict should name (`AC-003`…). */
+export function requirementIdsOf(budget: BudgetConfig): string[] {
+    return [...(budget.requirementIds ?? [])]
+}
+
 /** Resolve the command a budget measures, or name what it is missing. */
-export function resolveTarget(
-    budget: BudgetConfig,
+export function resolveTarget(    budget: BudgetConfig,
     config: QualityGateConfig,
     cwd: string,
 ): { target: BudgetTarget } | { problem: string } {
@@ -332,6 +672,19 @@ export function preflightBudgets(budgets: readonly BudgetConfig[], config: Quali
     for (const budget of budgets) {
         const resolved = resolveTarget(budget, config, cwd)
         if ('problem' in resolved) problems.push(resolved.problem)
+        // A command that cannot be tokenised would be spawned as something nobody
+        // wrote (or fail with a message about argv[0]) — refuse it here, where the
+        // message can name the budget and the fix.
+        if (budget.command !== undefined) {
+            const argv = splitCommand(budget.command)
+            if (argv.length === 0 || (argv[0] ?? '').trim() === '') {
+                problems.push(
+                    `预算 "${budget.id}" 的 command 无法切分为 argv（${JSON.stringify(budget.command)}）：` +
+                        `命令不能是空的、只有空白，也不能只由引号组成。` +
+                        `下一步：写成 "node scripts/size.mjs" 这样的完整命令行（argv 形式，不经 shell）。`,
+                )
+            }
+        }
         if (budget.metric !== 'durationMs' && budget.regex === undefined) {
             problems.push(
                 `预算 "${budget.id}" 的 metric=${budget.metric} 需要 regex：数字只从命令输出里按你给的正则取（第一个捕获组）。` +
@@ -348,19 +701,40 @@ export function preflightBudgets(budgets: readonly BudgetConfig[], config: Quali
     return problems
 }
 
-/** Select the budgets a run should measure (`only` names budget ids). */
-export function selectBudgets(config: QualityGateConfig, only?: readonly string[]): { budgets: BudgetConfig[] } | { problem: string } {
-    if (only === undefined || only.length === 0) return { budgets: [...config.budgets] }
-    const known = new Set(config.budgets.map((budget) => budget.id))
+/**
+ * Select the budgets a run should measure out of one already-merged set.
+ * @param budgets - the merged set (host configuration + specification).
+ * @param only - budget ids the caller asked for; unknown ids are a refusal.
+ */
+export function selectFromBudgets(
+    budgets: readonly BudgetConfig[],
+    only?: readonly string[],
+): { budgets: BudgetConfig[] } | { problem: string } {
+    if (only === undefined || only.length === 0) return { budgets: [...budgets] }
+    const known = new Set(budgets.map((budget) => budget.id))
     const unknown = only.filter((id) => !known.has(id))
     if (unknown.length > 0) {
         return {
             problem:
-                `请求的预算不存在：${unknown.join(', ')}（可用：${config.budgets.map((budget) => budget.id).join(', ') || '(无)'}）。` +
-                `下一步：用 budget_check 的 only 只选已配置的预算 id，或把该预算写进 quality-gate 的 config.budgets。`,
+                `请求的预算不存在：${unknown.join(', ')}（可用：${budgets.map((budget) => budget.id).join(', ') || '(无)'}）。` +
+                `下一步：用 budget_check 的 only 只选已声明的预算 id —— 宿主的 config.budgets，或这条 mission 的规格里声明的预算；` +
+                `两者都没有的 id 不会被执行。`,
         }
     }
-    return { budgets: config.budgets.filter((budget) => only.includes(budget.id)) }
+    return { budgets: budgets.filter((budget) => only.includes(budget.id)) }
+}
+
+/**
+ * Select the budgets a run should measure (`only` names budget ids).
+ *
+ * Kept for callers that hold the raw configuration; a run passes the MERGED set
+ * (host configuration + the mission's specification) to
+ * {@link selectFromBudgets} instead.
+ * @param config - the resolved plugin configuration.
+ * @param only - budget ids the caller asked for.
+ */
+export function selectBudgets(config: QualityGateConfig, only?: readonly string[]): { budgets: BudgetConfig[] } | { problem: string } {
+    return selectFromBudgets(config.budgets, only)
 }
 
 /** The baseline file one budget records into. */
@@ -651,6 +1025,8 @@ async function measureBudget(
                 name: budget.name,
                 metric: budget.metric,
                 unit,
+                origin: budget.origin ?? 'config',
+                ...(requirementIdsOf(budget).length === 0 ? {} : { requirementIds: requirementIdsOf(budget) }),
                 command: target.command,
                 exitCode: outcome.exitCode,
                 durationMs: outcome.durationMs,
@@ -678,6 +1054,8 @@ async function measureBudget(
                 name: budget.name,
                 metric: budget.metric,
                 unit,
+                origin: budget.origin ?? 'config',
+                ...(requirementIdsOf(budget).length === 0 ? {} : { requirementIds: requirementIdsOf(budget) }),
                 value: outcome.durationMs,
                 command: target.command,
                 exitCode: outcome.exitCode,
@@ -736,6 +1114,8 @@ async function measureBudget(
             name: budget.name,
             metric: budget.metric,
             unit,
+            origin: budget.origin ?? 'config',
+            ...(requirementIdsOf(budget).length === 0 ? {} : { requirementIds: requirementIdsOf(budget) }),
             value,
             command: target.command,
             exitCode: outcome.exitCode,
@@ -772,16 +1152,48 @@ export async function runBudgets(options: BudgetRunOptions): Promise<BudgetRun> 
     const config = options.config
     const now = options.now ?? (() => Date.now())
     const runner = options.runner ?? runCommand
-    const selected = selectBudgets(config, options.only)
+    // The mission's specification is a SECOND source of budgets. It is validated
+    // here (fail closed): a declaration this run cannot judge refuses the whole
+    // call, because "the rule quietly disappeared" is indistinguishable from
+    // "everything passed" in a report.
+    const parsedSpec = parseSpecBudgets(options.spec)
+    if (parsedSpec.problems.length > 0) {
+        return {
+            ok: false,
+            problem: [
+                `规格里声明的 ${parsedSpec.problems.length} 条非功能预算无法执行（没有跑任何命令，也没有写入基线）：`,
+                ...parsedSpec.problems.map((problem) => `- ${problem}`),
+            ].join('\n'),
+        }
+    }
+    const merged = mergeBudgets(config.budgets, parsedSpec.budgets)
+    const selected = selectFromBudgets(merged.budgets, options.only)
     if ('problem' in selected) return { ok: false, problem: selected.problem }
     const budgets = selected.budgets
     if (budgets.length === 0) {
         return {
             ok: false,
             problem:
-                '没有配置任何预算（config.budgets 为空）：预算门禁无法证明任何东西。' +
-                '下一步：在 quality-gate 的 config.budgets 里声明至少一条，例如 ' +
+                (config.budgets.length === 0 && parsedSpec.budgets.length === 0
+                    ? '没有配置任何预算（config.budgets 为空，这条 mission 的规格也没有声明预算）：预算门禁无法证明任何东西。'
+                    : '本次选中的预算集合为空：预算门禁无法证明任何东西。') +
+                '下一步：在 quality-gate 的 config.budgets 里声明至少一条，或在规格里声明（spec_create / spec_amend 的 budgets 参数），例如 ' +
                 '{"id":"bundle","name":"前端包体积","metric":"bytes","command":"node scripts/size.mjs","regex":"size=(\\\\d+)","max":200000,"maxRegressionPercent":10}。',
+        }
+    }
+    // Host opt-in: a declared, approved non-functional requirement that nobody
+    // verified must not pass silently into delivery.
+    if (options.requireSpecBudgets === true && parsedSpec.budgets.length > 0 && budgets.every((budget) => budget.origin !== 'spec')) {
+        return {
+            ok: false,
+            problem: [
+                `本仓库要求交付前验证规格里声明的非功能预算（config.requireSpecBudgets=true），但本次运行没有覆盖任何一条：`,
+                `- 规格声明的预算：${parsedSpec.budgets.map((budget) => budget.id).join('、')}`,
+                `- 本次选中的预算：${budgets.map((budget) => budget.id).join('、')}`,
+                '下一步：去掉 only 参数（或把规格里声明的预算 id 加进 only），让本次运行至少覆盖一条规格预算；' +
+                    '要放弃一条声明请用 spec_amend 改规格（删除会作废编号），不要在宿主配置里静默改口径。',
+                '（本次没有跑任何命令，也没有写入基线。）',
+            ].join('\n'),
         }
     }
     const problems = preflightBudgets(budgets, config, options.cwd)
@@ -842,31 +1254,58 @@ export async function runBudgets(options: BudgetRunOptions): Promise<BudgetRun> 
     const blocked = evaluations.filter((evaluation) => evaluation.state === 'BLOCK')
     const state: GateState = blocked.length === 0 ? 'PASS' : 'BLOCK'
     const firstRun = evaluations.every((evaluation) => evaluation.baseline.history === 0)
+    const specEvaluations = evaluations.filter((evaluation) => evaluation.origin === 'spec')
+    const specNote =
+        specEvaluations.length === 0
+            ? ''
+            : `；${specEvaluations
+                  .map(
+                      (evaluation) =>
+                          `规格预算 ${evaluation.id} ${evaluation.state === 'PASS' ? '已按规格验证' : '未通过'}` +
+                          `（关联需求：${evaluation.requirementIds === undefined || evaluation.requirementIds.length === 0 ? '(未关联需求)' : evaluation.requirementIds.join('、')}）`,
+                  )
+                  .join('；')}`
+    const conflictNote = merged.conflicts.length === 0 ? '' : `；宿主配置与规格有 ${merged.conflicts.length} 处阈值冲突（宿主配置生效，见报告）`
     return {
         ok: true,
         evaluations,
         state,
         reason:
-            state === 'PASS'
-                ? `预算裁决：${evaluations.length}/${config.budgets.length} 条全部在界限内${firstRun ? '；基线已记录（均为首次测量）' : ''}`
-                : `预算裁决：${blocked.map((evaluation) => evaluation.id).join(', ')} 越界`,
+            (state === 'PASS'
+                ? `预算裁决：${evaluations.length}/${merged.budgets.length} 条全部在界限内${firstRun ? '；基线已记录（均为首次测量）' : ''}`
+                : `预算裁决：${blocked.map((evaluation) => evaluation.id).join(', ')} 越界`) +
+            specNote +
+            conflictNote,
         results: evaluations.map((evaluation) => budgetResult(evaluation)),
         scope: {
             selected: budgets.map((budget) => budget.id),
-            total: config.budgets.length,
+            total: merged.budgets.length,
             // A budget run never executes the host's gate command set, so it can
             // never authorise a delivery (see the module docs / README).
             full: false,
         },
         baselineFiles: [...new Set(evaluations.map((evaluation) => evaluation.baseline.file))],
         recorded: pending.length,
+        conflicts: merged.conflicts,
+        spec: {
+            declared: parsedSpec.budgets.length,
+            covered: specEvaluations.length,
+            ...(options.spec?.missionId === undefined ? {} : { missionId: options.spec.missionId }),
+            ...(options.spec?.revision === undefined ? {} : { revision: options.spec.revision }),
+            ...(options.spec?.approved === undefined ? {} : { approved: options.spec.approved }),
+        },
     }
 }
 
 /** One budget as a `GateCommandResult` row (the shape the gate ledger stores). */
 export function budgetResult(evaluation: BudgetEvaluation): GateCommandResult {
+    const requirements = evaluation.requirementIds ?? []
     const output = [
         `预算：${evaluation.name}（${evaluation.id}）— metric=${evaluation.metric}，单位 ${evaluation.unit}`,
+        evaluation.origin === 'spec' ? SPEC_ORIGIN_LABEL : '来源：宿主配置',
+        // The linked requirement ids ride in the ROW, not only in the report: a
+        // delivery receipt's traceability is read back from the recorded rows.
+        `关联需求：${requirements.length === 0 ? '(未关联)' : requirements.join('、')}`,
         `测量值：${evaluation.value === undefined ? '无（命令未成功执行）' : `${evaluation.value} ${evaluation.unit}`}`,
         ...evaluation.checks.map((check) => `[${check.state}] ${check.name}：${check.detail}`),
         `基线：${evaluation.baseline.file}（此前 ${evaluation.baseline.history} 次记录；本次${
@@ -896,6 +1335,29 @@ export function renderBudgets(run: Extract<BudgetRun, { ok: true }>, options: { 
         `范围：${run.scope.selected.length}/${run.scope.total} 条预算（${run.scope.selected.join('、')}）；` +
             '预算裁决的 `scope.full` 恒为 false —— 它执行的不是宿主的门禁命令集，因此**不构成交付依据**。',
     )
+    if (run.spec.declared > 0) {
+        lines.push(
+            `规格预算：声明 ${run.spec.declared} 条，本次覆盖 ${run.spec.covered} 条` +
+                `${run.spec.missionId === undefined ? '' : `（mission ${run.spec.missionId}`}` +
+                `${run.spec.revision === undefined ? '' : `，规格 revision ${run.spec.revision}`}` +
+                `${run.spec.approved === undefined ? '' : run.spec.approved ? '，已审批' : '，⚠️ 尚未审批'}` +
+                `${run.spec.missionId === undefined ? '' : '）'}` +
+                `${run.spec.covered === 0 ? '：⚠️ 一条规格预算都没有被验证（未验证 ≠ 通过）' : ''}`,
+        )
+    }
+    // A host/spec disagreement is REPORTED here, in full, and never resolved
+    // silently: both values, and which one was applied.
+    if (run.conflicts.length > 0) {
+        lines.push(
+            `⚠️ 规格与宿主配置冲突（${run.conflicts.length} 条；按"宿主是部署上限"处理，本次使用**宿主配置**的阈值）：`,
+        )
+        for (const conflict of run.conflicts) {
+            lines.push(`  - 预算 "${conflict.id}"：规格声明 ${conflict.declared}；宿主配置 ${conflict.applied} —— 本次按宿主配置判定。`)
+        }
+        lines.push(
+            '  这条要求可能已经被放宽：请人工确认（要改口径就改规格——`spec_amend`，改完重新审批；不要只改宿主配置，否则规格里写的阈值没人再核对）。',
+        )
+    }
     if ((options.problems ?? 0) > 0) {
         lines.push(
             `⚠️ 配置另有 ${options.problems} 条问题（见插件日志）：被跳过的规则不会执行，而"规则变少"看起来和"全部通过"一模一样。`,
@@ -905,9 +1367,11 @@ export function renderBudgets(run: Extract<BudgetRun, { ok: true }>, options: { 
         lines.push('')
         lines.push(
             `[${evaluation.state === 'PASS' ? 'PASS' : 'BLOCK'}] ${evaluation.id}（${evaluation.name}）— ` +
-                `${evaluation.value === undefined ? '未测到数值' : `${evaluation.value} ${evaluation.unit}`}，命令耗时 ${evaluation.durationMs}ms`,
+                `${evaluation.value === undefined ? '未测到数值' : `${evaluation.value} ${evaluation.unit}`}，命令耗时 ${evaluation.durationMs}ms` +
+                `；${evaluation.origin === 'spec' ? SPEC_ORIGIN_LABEL : '来源：宿主配置'}`,
         )
         lines.push(`  $ ${evaluation.command}`)
+        if ((evaluation.requirementIds ?? []).length > 0) lines.push(`  关联需求：${(evaluation.requirementIds ?? []).join('、')}`)
         for (const check of evaluation.checks) lines.push(`  - [${check.state}] ${check.name}：${check.detail}`)
         lines.push(
             `  基线：${evaluation.baseline.file}（此前 ${evaluation.baseline.history} 次记录；本次${
@@ -920,7 +1384,7 @@ export function renderBudgets(run: Extract<BudgetRun, { ok: true }>, options: { 
     lines.push(
         run.state === 'PASS'
             ? '下一步：预算在界限内 ≠ 门禁通过——交付前仍需不带 only/phase 跑一次完整的 quality_gate_run，再 evidence_record → mission_complete。'
-            : '下一步：先分辨"真实回归"还是"口径该改"：真实回归就修代码；口径要改就改 config.budgets（改口径是宿主/人的决定，不是这次调用的参数）。改完重跑 budget_check。',
+            : '下一步：先分辨"真实回归"还是"口径该改"：真实回归就修代码；口径要改就改宿主 config.budgets（宿主的决定），或改规格里声明的阈值（`spec_amend`，会撤销审批、需要重新审批）。改完重跑 budget_check。',
     )
     return lines.join('\n')
 }

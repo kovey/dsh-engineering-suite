@@ -158,6 +158,45 @@ function isGitIgnored(cwd: string, relative: string): boolean | undefined {
     return undefined
 }
 
+/**
+ * Count the rows of the `## 非功能预算` table across a specs directory.
+ *
+ * Deliberately lexical: this is an offline sanity count for the self-check, not
+ * a second spec parser. A spec that says nothing reports zero rows, and a file
+ * that cannot be read contributes nothing (the report stays honest because the
+ * detail line names how many files were inspected).
+ */
+function countSpecBudgets(specsDir: string): { files: number; total: number } {
+    let files = 0
+    let total = 0
+    let entries: string[]
+    try {
+        entries = fs.readdirSync(specsDir).filter((name) => name.endsWith('.md'))
+    } catch {
+        return { files: 0, total: 0 }
+    }
+    for (const name of entries) {
+        files += 1
+        let text: string
+        try {
+            text = fs.readFileSync(path.join(specsDir, name), 'utf8')
+        } catch {
+            continue
+        }
+        const lines = text.split('\n')
+        const heading = lines.findIndex((line) => /^##\s*非功能预算\s*$/.test(line.trim()))
+        if (heading < 0) continue
+        for (let index = heading + 1; index < lines.length; index += 1) {
+            const line = lines[index]?.trim() ?? ''
+            if (line.startsWith('## ') || line.startsWith('# ')) break
+            if (!line.startsWith('|')) continue
+            if (/^\|\s*-{2,}/.test(line) || /^\|\s*id\s*\|/i.test(line) || /^\|\s*预算\s*\|/.test(line)) continue
+            total += 1
+        }
+    }
+    return { files, total }
+}
+
 /** Root-level `*.jsonl` ledgers that exist under the trail, as repo-relative paths. */
 function existingLedgerFiles(rootDir: string, trail: string): string[] {
     try {
@@ -571,6 +610,35 @@ export function checkWorkspace(options: DoctorOptions): DoctorReport {
                   : `已配置（隔离期 ${String(quarantineDays ?? 14)} 天）`,
         ...(quarantineDays === 0 ? { fix: '把 flaky.quarantineMaxDays 设为正数（例如 14），否则隔离形同虚设' } : {}),
     })
+
+    // Spec-declared budgets live in the mission record, not in `.dsh/*.json`, so
+    // the only offline trace is the rendered specification. Counting the rows is
+    // enough to answer the question that matters: "we declared non-functional
+    // requirements — is anything enforcing them, or can they pass silently?"
+    const specBudgets = countSpecBudgets(layout.specsDir)
+    const requireSpecBudgets = quality.value?.['requireSpecBudgets'] === true
+    if (specBudgets.files > 0) {
+        const loose = specBudgets.total > 0 && !requireSpecBudgets && budgets.length === 0
+        add({
+            id: 'config.spec-budgets',
+            area: 'test',
+            state: specBudgets.total === 0 ? 'ok' : loose ? 'partial' : 'ok',
+            severity: 'recommended',
+            label: '规格里声明的非功能预算（## 非功能预算）',
+            detail:
+                specBudgets.total === 0
+                    ? `规格文件 ${specBudgets.files} 份，未声明非功能预算`
+                    : `${specBudgets.total} 条（${specBudgets.files} 份规格）` +
+                      (requireSpecBudgets
+                          ? '；requireSpecBudgets=true：声明了却没被验证的预算会被 budget_check 拒绝'
+                          : budgets.length > 0
+                            ? '；宿主配置里也有预算，两者同 id 时宿主生效、差异会被报告'
+                            : '；宿主未开 requireSpecBudgets，声明了但没人验证的预算不会拦住交付'),
+            ...(loose
+                ? { fix: '打开 .dsh/quality-gate.json 的 requireSpecBudgets: true（宿主键），让"规格声明了、但这次没验证"的非功能需求无法静默通过交付' }
+                : {}),
+        })
+    }
 
     // ---- interact ---------------------------------------------------------
     const interaction = readProjectConfig(layout, 'interaction-gate')

@@ -45,6 +45,17 @@ export interface QualityGateConfig {
      * get worse, measured from host-configured commands.
      */
     budgets: readonly BudgetConfig[]
+    /**
+     * Host opt-in: refuse a `budget_check` that covers NONE of the budgets the
+     * mission's specification declares (default `false`).
+     *
+     * A declared, approved non-functional requirement that nobody verified must
+     * not pass silently into delivery — but the coupling is opt-in, because
+     * turning it on changes what a run accepts. It is a HOST key on purpose
+     * (like `enabled` / `logFile`): a workspace may declare its own budgets, yet
+     * it may not switch the host's compliance requirement off.
+     */
+    requireSpecBudgets: boolean
     /** Smoke contracts: declared interface expectations, asserted one by one. */
     contracts: readonly ContractConfig[]
     readonly writeTools: readonly string[]
@@ -110,6 +121,10 @@ export const EXAMPLE_BUDGETS: string = [
     '#     max: 200000              # 绝对上限',
     '#     min: 0                   # 绝对下限',
     '#     maxRegressionPercent: 10 # 相对"历史最佳值"允许的变差幅度',
+    '#',
+    '# 预算也可以声明在规格里（spec_create / spec_amend 的 budgets 参数）：两者同 id 时宿主配置优先，',
+    '# 差别会作为冲突列在 budget_check 的报告里（绝不会静默取其一）。requireSpecBudgets: true 时，',
+    '# 规格声明了预算而本次一条都没覆盖，budget_check 直接拒绝（默认 false，不改变既有行为）。',
 ].join('\n')
 
 /** Example contracts, shown when the host configures none. */
@@ -146,9 +161,9 @@ export const EXAMPLE_COMMANDS: string = [
  *
  * The profile is the ceiling: a project may choose WHICH commands run here (a
  * Rust repo has no `pnpm test`) and tighten limits, but it may not switch the
- * gate off, relocate the log, or change where artifacts live — those are host
- * decisions, and a model-writable escape hatch is exactly what this suite
- * exists to prevent.
+ * gate off, relocate the log, change where artifacts live, or turn
+ * `requireSpecBudgets` off — those are host decisions, and a model-writable
+ * escape hatch is exactly what this suite exists to prevent.
  */
 export const PROJECT_OVERRIDABLE_KEYS: readonly string[] = [
     'commands',
@@ -437,6 +452,7 @@ export function resolveConfig(input: unknown, warn: (message: string) => void = 
         },
         commands: unique,
         budgets,
+        requireSpecBudgets: bool(raw['requireSpecBudgets'], false),
         contracts,
         writeTools: strList(raw['writeTools'], DEFAULT_WRITE_TOOLS),
         turnStop: {

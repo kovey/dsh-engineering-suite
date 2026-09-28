@@ -162,6 +162,42 @@ mission <id> · rev <n> · 摘要 <digest>
 `spec_create` 不带就直接拒绝并给出下一步）。里程碑存在 mission 的 label `milestone:<名称>` 上 ——
 `MissionRecord` 是套件的共享契约，本包不扩展它 —— `spec_status` 显示当前值，`plan_status` 用它分组。
 
+## 非功能预算：把"p95 < 50ms""包体积 ≤ 200KiB"写进规格
+
+非功能要求以前只能写在宿主 quality-gate 的配置里：于是它不随规格审批、无法追溯到需求编号，也没人
+能回答"我们哪些要求是预算、验证过没有"。`spec_create` / `spec_amend` 现在接受 `budgets`，
+把它们变成规格的一部分：
+
+```jsonc
+// spec_create({ …, budgets: [ … ] })
+{
+  "id": "p95-health",                    // 稳定编号（同时是 quality-gate 基线历史的键），永不复用
+  "name": "健康检查 p95",
+  "metric": "durationMs",                // durationMs | number | bytes
+  "command": "node scripts/p95.mjs",     // 不经 shell，按 argv 切分
+  "regex": "p95=(\\d+)",                 // number/bytes 必填（第一个捕获组是数字）；durationMs 禁止
+  "unit": "ms",
+  "threshold": { "max": 50, "maxRegressionPercent": 10 },   // 至少一种界限
+  "requirementIds": ["AC-003"]           // 必须存在于同一份规格；未知编号直接拒绝
+}
+```
+
+- **渲染进工件**：规格 Markdown 多一节 `## 非功能预算`（表头固定：编号 / 名称 / 指标 / 阈值 / 命令 / 关联需求）。
+  **没有声明就不渲染这一节**（空表格看起来像"声明过但一条都没有"）；审批提示里也会列出预算，人审批的就是这份文档。
+- **fail closed，且每条拒绝都带修法**：id 不合法 / 同一份声明里重复 / 复用已作废编号 / name、command 缺失 /
+  `metric` 不认识 / `number|bytes` 缺 `regex`（或 `durationMs` 带 `regex`）/ 正则无捕获组或不可编译 /
+  `threshold` 一个界限都没有 / 未知字段 / `requirementIds` 指向不存在的编号 —— 任一问题都**整份拒绝**，
+  且在写任何文件之前（不会留下空 mission）。`requirementIds` 可以指向需求（`R-00n`）或验收标准（`AC-00n`）。
+- **编号与需求同等严格**：`spec_amend({ part: "budget", action: … })` 改 / 删单条；删除会作废编号
+  （`retiredBudgets`），之后任何一次声明再用这个 id 都被拒绝（基线历史按 id 存，复用等于让旧历史冒充新预算）；
+  `spec_amend({ budgets: [...] })` 是**整组重声明**（声明即现状：没列出的活预算会被删除并作废；`[]` = 全部删除；
+  省略 `budgets` = 不改动）。每次改动都记进 `budgetChanges`（who/when/before→after）并**撤销审批**。
+- **台账带着预算走**：每一行台账都记下那一版的 `budgetIds`（还有 `retiredBudgetIds`），
+  所以"最新行胜出"不会丢掉声明；`plan_status` 按 mission 报出预算 id 与**验证状态**
+  （有记录在案的预算裁决覆盖 = 已验证并给出状态/时间/来源；没有 = `未验证`）。
+- **只报告，不判定**：本包不跑预算命令。真正的测量在 `dsh-quality-gate` 的 `budget_check`，
+  它读本 mission 的规格、标注 `来源：规格`，并在裁决的 reason 与行里带上关联需求编号。
+
 ## 架构决策记录（`adr_record` / `adr_list`）
 
 "选了 X 而不是 Y，因为 Z"以前只活在对话里，会话一结束就丢了。ADR 把它落成工件：
@@ -209,6 +245,13 @@ mission <id> · rev <n> · 摘要 <digest>
 - ADR 的 `状态` 章写的是**记录时**的状态；被取代后不回写旧文件（只增不改），
   是否被取代以 `adr_list` / index 的 `supersededBy` 为准。
 - `plan_status` / `adr_list` 只读且不落盘（测试用 `.dsh` 的前后快照守住这一点）。
+- **非功能预算不在 core 的共享类型里**：`budgets` / `retiredBudgets` / `budgetChanges` 是附加在
+  `mission.spec` 上的字段（本包不改 `dsh-eng-core` 的 `SpecRecord`）。读的一方必须结构性地读取，
+  并在读不出来时 fail closed；规格 Markdown 里的 `## 非功能预算` 表是**渲染结果**，权威是 mission 记录。
+- **`plan_status` 的"已验证"是 join 出来的**：它靠 `dsh-quality-gate` 写进 gate 行的两个字符串
+  （reason 里的 `预算裁决`、预算行里的 `来源：规格`）判断"这条预算被测量过没有"。措辞变了只会退化成
+  `未验证`（少一次声明），不会出现假的"已验证"；本包**不判断**预算是否达标 —— 那是测量的事。
+- **预算的"验证"与"达标"是两件事**：`已验证：BLOCK` 表示测过且没过，`未验证` 表示没人测过。
 
 ## 项目级配置（同一个 dsh 进程服务多个仓库）
 
@@ -229,11 +272,11 @@ profile 是上限，每个仓库可以用 `.dsh/spec-gate.json` 决定**自己**
 
 | 工具 | 参数 | 说明 |
 |---|---|---|
-| `spec_create` | `title`(必填) `background` `requirements[]`(必填) `acceptanceCriteria[]`(必填) `fileBoundaries[]`(必填) `negativeConstraints[]`(必填) `testDesign` `milestone` `missionId` | 新建或修订规格；缺项直接报错且**不写任何文件**；`milestoneRequired` 时缺 `milestone` 同样拒绝 |
-| `spec_approve` | `missionId` `note` | 走审批 seam；被拒绝/通道缺失时 fail closed |
-| `spec_status` | `missionId` | 只读汇总（含里程碑与台账路径） |
-| `spec_amend` | **增 / 改 / 删单条需求或验收标准**：编号稳定（改写不改号、插入不打乱、删除后作废不复用）、删除被用例引用的验收标准会被拒绝（除非 `cascade: true` 连同用例移除）、变更记入历史并渲染进审批文档、**修订即撤销审批**（回到 test_design_review → spec_approve 的标准流程）；可选 `milestone` 同时改里程碑 |
-| `plan_status` | `milestone`（`无里程碑` 表示空里程碑组） `missionId` `json` | **只读**跨 mission 规划视图：按里程碑分组的编号（owner mission / 规格状态 / 交付状态）、未交付、已作废、编号→mission 反查与冲突；台账缺失时如实说明 |
+| `spec_create` | `title`(必填) `background` `requirements[]`(必填) `acceptanceCriteria[]`(必填) `fileBoundaries[]`(必填) `negativeConstraints[]`(必填) `testDesign` `milestone` `budgets[]` `note` `missionId` | 新建或修订规格；缺项直接报错且**不写任何文件**；`milestoneRequired` 时缺 `milestone` 同样拒绝；`budgets` 是非功能预算（省略 = 不改动已有声明，`[]` = 全部删除并作废编号） |
+| `spec_approve` | `missionId` `note` | 走审批 seam；被拒绝/通道缺失时 fail closed；审批提示里列出验收标准、测试用例与**非功能预算** |
+| `spec_status` | `missionId` | 只读汇总（含里程碑、台账路径、**非功能预算及其验证状态**） |
+| `spec_amend` | **增 / 改 / 删单条需求、验收标准或非功能预算**（`part`+`action`），或 **`budgets[]` 整组重声明**：编号稳定（改写不改号、插入不打乱、删除后作废不复用）、删除被用例引用的验收标准会被拒绝（除非 `cascade: true` 连同用例移除）、变更记入历史并渲染进审批文档、**修订即撤销审批**（回到 test_design_review → spec_approve 的标准流程）；可选 `milestone` 同时改里程碑。`part`/`action` 与 `budgets` 不能同时给（一次只做一件事） |
+| `plan_status` | `milestone`（`无里程碑` 表示空里程碑组） `missionId` `json` | **只读**跨 mission 规划视图：按里程碑分组的编号（owner mission / 规格状态 / 交付状态）、未交付、已作废、编号→mission 反查与冲突、每个 mission 的**非功能预算与验证状态**；台账缺失时如实说明 |
 | `adr_record` | `title`(必填) `decision`(必填) `alternatives` `consequences` `missionId` `supersedes` | 记录一条架构决策（追加 `adr/<NNNN>-<slug>.md` + index 行）；编号只增不改，已存在的路径拒绝，`supersedes` 必须指向已有编号 |
 | `adr_list` | `query` `missionId` | **只读**列出决策（最新在前），`query` 匹配标题与「决定」正文（大小写不敏感） |
 

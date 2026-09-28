@@ -30,6 +30,8 @@ import {
     formatTime,
     readText,
     resolvePath,
+    type GateRecord,
+    type GateState,
     type Layout,
     type Logger,
     type MissionRecord,
@@ -37,9 +39,10 @@ import {
 } from 'dsh-eng-core'
 import type { SpecGateConfig } from './config.js'
 import { milestoneOf } from './spec.js'
+import { readSpecBudgets } from './budgets.js'
 
 /** The transitions a plan row can record. */
-export type PlanRowKind = 'spec-created' | 'spec-approved' | 'spec-amended' | 'requirement-retired' | 'milestone-changed'
+export type PlanRowKind = 'spec-created' | 'spec-approved' | 'spec-amended' | 'requirement-retired' | 'milestone-changed' | 'budget-retired'
 
 /**
  * One appended planning transition.
@@ -61,6 +64,15 @@ export interface PlanRow {
     requirementIds: string[]
     /** `AC-00n` ids of the acceptance criteria after the transition. */
     criteriaIds: string[]
+    /**
+     * 非功能预算的 id（转换之后那一版的活预算）。
+     *
+     * 与 `requirementIds` 同一条规则：每一行都带上完整清单，所以「后一行覆盖前一行」
+     * 不会丢掉任何一条声明。旧版本写的行没有这个字段，读的一方按「未记录」处理。
+     */
+    budgetIds?: string[]
+    /** 本次转换作废掉的预算编号（`budget-retired` 行会带上）。 */
+    retiredBudgetIds?: string[]
     /** Ids this transition RETIRED (a `requirement-retired` row carries them). */
     retiredRequirementIds?: string[]
     approvedBy?: string
@@ -123,6 +135,8 @@ function isPlanRow(value: unknown): boolean {
     if (typeof value['title'] !== 'string' || typeof value['summary'] !== 'string') return false
     if (stringList(value['requirementIds']) === undefined) return false
     if (stringList(value['criteriaIds']) === undefined) return false
+    if (value['budgetIds'] !== undefined && stringList(value['budgetIds']) === undefined) return false
+    if (value['retiredBudgetIds'] !== undefined && stringList(value['retiredBudgetIds']) === undefined) return false
     if (value['retiredRequirementIds'] !== undefined && stringList(value['retiredRequirementIds']) === undefined) return false
     if (value['milestone'] !== undefined && typeof value['milestone'] !== 'string') return false
     if (value['approvedBy'] !== undefined && typeof value['approvedBy'] !== 'string') return false
@@ -225,6 +239,30 @@ export interface PlanRequirementState {
     conflicts: string[]
 }
 
+/**
+ * 一条非功能预算在台账报告里的状态。
+ *
+ * 「验证过没有」是这份报告存在的理由之一：规格可以声明一条 p95 预算，但只有
+ * `budget_check` 真的跑过它，才谈得上验证。没有记录 = **未验证**（不是「通过」，也不
+ * 是「不存在」）。
+ */
+export interface PlanBudgetState {
+    id: string
+    missionId: string
+    /** 有一条记录在案的预算裁决覆盖了它（`false` = 未验证）。 */
+    verified: boolean
+    /** 覆盖它的那条裁决的状态（BLOCK 也是「验证过」：测了，没过）。 */
+    state?: GateState
+    at?: number
+    gateId?: string
+    /** 那条裁决的行里标注了「来源：规格」（即这次测量用的是规格声明的那条预算）。 */
+    fromSpec?: boolean
+    /** 规格里声明的关联编号（`R-00n` / `AC-00n`）。 */
+    requirementIds?: string[]
+    /** 这条 id 来自台账行而不是 mission 记录（记录已丢失时的兜底）。 */
+    fromLedger?: boolean
+}
+
 /** One mission as the ledger report shows it. */
 export interface PlanMissionState {
     id: string
@@ -234,6 +272,10 @@ export interface PlanMissionState {
     delivered: boolean
     milestone?: string
     requirements: number
+    /** 该 mission 声明的非功能预算及其验证状态。 */
+    budgets: PlanBudgetState[]
+    /** 该 mission 已作废的预算编号（不会复用）。 */
+    retiredBudgetIds: string[]
 }
 
 /** Requirements of one milestone (`milestone` unset = the 无里程碑 group). */
@@ -254,6 +296,10 @@ export interface PlanReport {
     groups: PlanMilestoneGroup[]
     undelivered: PlanRequirementState[]
     retired: PlanRequirementState[]
+    /** 所有声明过的非功能预算（按 mission 过滤之后）。 */
+    budgets: PlanBudgetState[]
+    /** 其中没有任何预算裁决覆盖的那些。 */
+    unverifiedBudgets: PlanBudgetState[]
     /** Ids in more than one mission: reported, never merged. */
     conflicts: { id: string; missions: string[] }[]
     /** Missions the ledger mentions but the store no longer has. */
@@ -308,12 +354,132 @@ function textOf(record: MissionRecord | undefined, id: string): string | undefin
 }
 
 /**
+ * How the recorded budget verdicts are recognised.
+ *
+ * `dsh-quality-gate` writes `${reason}（预算裁决；scope.full=false，不构成交付依据）`
+ * into every budget gate row, and every row of that verdict is one budget. These two
+ * literals are the whole join key between the two plugins — they talk through the
+ * mission store, never by importing each other (see the module docs of
+ * `dsh-quality-gate/budget`). If either side ever renames them, the report degrades
+ * to "未验证" (a missing claim), never to a false "已验证".
+ */
+const BUDGET_VERDICT_MARK = '预算裁决'
+
+/** The label `dsh-quality-gate` puts on a row whose budget came from the spec. */
+const SPEC_ORIGIN_MARK = '来源：规格'
+
+/** The recorded budget verdicts of one mission (`budget_check` only). */
+function budgetVerdicts(store: MissionStore, missionId: string): GateRecord[] {
+    try {
+        return store.readGates(missionId).filter((gate) => gate.source === 'dsh-quality-gate' && gate.reason.includes(BUDGET_VERDICT_MARK))
+    } catch {
+        // An unreadable gate directory must not crash the report; "verified" simply
+        // stays unproven, which is the honest reading.
+        return []
+    }
+}
+
+/** Whether one budget id was measured by a recorded budget verdict. */
+export interface BudgetVerification {
+    verified: boolean
+    state?: GateState
+    at?: number
+    gateId?: string
+    /** The recorded row said the budget came from the specification. */
+    fromSpec?: boolean
+}
+
+/**
+ * Look up one budget id in the mission's recorded budget verdicts.
+ *
+ * READ-ONLY. "Verified" means a recorded verdict actually contains a row for this id
+ * — the absence of a verdict is `未验证`, never a pass. The newest verdict wins.
+ * @param store - the workspace store.
+ * @param missionId - the mission whose gate records are searched.
+ * @param budgetId - the budget id to look up.
+ * @param verdicts - pre-fetched verdicts (the report reads them once per mission).
+ */
+export function budgetVerification(
+    store: MissionStore,
+    missionId: string,
+    budgetId: string,
+    verdicts?: readonly GateRecord[],
+): BudgetVerification {
+    const gates = verdicts ?? budgetVerdicts(store, missionId)
+    let newest: { gate: GateRecord; fromSpec: boolean } | undefined
+    for (const gate of gates) {
+        const result = gate.results.find((entry) => entry.id === budgetId)
+        if (result === undefined) continue
+        if (newest === undefined || gate.checkedAt >= newest.gate.checkedAt) {
+            newest = { gate, fromSpec: result.output.includes(SPEC_ORIGIN_MARK) }
+        }
+    }
+    if (newest === undefined) return { verified: false }
+    return { verified: true, state: newest.gate.state, at: newest.gate.checkedAt, gateId: newest.gate.id, fromSpec: newest.fromSpec }
+}
+
+/** One budget id's verification state, as `spec_status` / `plan_status` print it. */
+export function describeBudgetVerification(verification: BudgetVerification): string {
+    if (!verification.verified) return '未验证（没有任何记录在案的预算裁决提到它）'
+    return (
+        `已验证：${verification.state ?? '(状态未知)'}` +
+        `${verification.at === undefined ? '' : ` @ ${formatTime(verification.at)}`}` +
+        `${verification.fromSpec === true ? '，来源：规格' : ''}` +
+        `${verification.gateId === undefined ? '' : `（${verification.gateId}）`}`
+    )
+}
+
+/**
+ * One mission's declared budgets plus whether anything ever measured them.
+ *
+ * The mission record is the authority for WHAT is declared (the specification owns
+ * it); the ledger rows are the fallback when the record is gone, and the quality
+ * gate's recorded verdicts are the only evidence of verification. A budget id that
+ * appears in no verdict is reported `未验证` — never as verified-by-absence.
+ * @param store - the workspace store (gate records live in the mission directory).
+ * @param missionId - the mission whose budgets are described.
+ * @param record - the mission record, when it still exists.
+ * @param rows - every ledger row (filtered here to this mission).
+ */
+function budgetStatesOf(
+    store: MissionStore,
+    missionId: string,
+    record: MissionRecord | undefined,
+    rows: readonly PlanRow[],
+): { budgets: PlanBudgetState[]; retired: string[] } {
+    const declared = readSpecBudgets(record?.spec)
+    const mine = rows.filter((row) => row.missionId === missionId)
+    const retired = new Set(declared.retired)
+    for (const row of mine) for (const id of row.retiredBudgetIds ?? []) retired.add(id)
+    const latestRow = [...mine].sort((left, right) => left.at - right.at).at(-1)
+    const liveIds = declared.budgets.length > 0 ? declared.budgets.map((budget) => budget.id) : (latestRow?.budgetIds ?? [])
+    const verdicts = budgetVerdicts(store, missionId)
+    const budgets: PlanBudgetState[] = []
+    for (const id of liveIds) {
+        if (retired.has(id)) continue
+        const budget = declared.budgets.find((entry) => entry.id === id)
+        const verification = budgetVerification(store, missionId, id, verdicts)
+        budgets.push({
+            id,
+            missionId,
+            verified: verification.verified,
+            ...(verification.verified === false
+                ? {}
+                : { state: verification.state, at: verification.at, gateId: verification.gateId, fromSpec: verification.fromSpec }),
+            ...(budget?.requirementIds === undefined ? {} : { requirementIds: [...budget.requirementIds] }),
+            ...(budget === undefined ? { fromLedger: true } : {}),
+        })
+    }
+    return { budgets, retired: [...retired] }
+}
+
+/**
  * Join the ledger with the mission store.
  *
- * READ-ONLY: it reads the ledger, the mission records and the receipts, and
- * writes nothing. The mission store is the authority for the CURRENT state (spec
- * status, delivery, milestone), while the ledger decides which ids exist and
- * which mission first mentioned them.
+ * READ-ONLY: it reads the ledger, the mission records, the recorded gate runs and
+ * the receipts, and writes nothing. The mission store is the authority for the
+ * CURRENT state (spec status, delivery, milestone, declared budgets), while the
+ * ledger decides which ids exist and which mission first mentioned them.
  * @param options - store, ledger path and the optional filters.
  */
 export function buildPlanReport(options: PlanReportOptions): PlanReport {
@@ -332,6 +498,8 @@ export function buildPlanReport(options: PlanReportOptions): PlanReport {
             groups: [],
             undelivered: [],
             retired: [],
+            budgets: [],
+            unverifiedBudgets: [],
             conflicts: [],
             orphans: [],
             generatedAt: now,
@@ -389,6 +557,7 @@ export function buildPlanReport(options: PlanReportOptions): PlanReport {
         }
         const newestTitle = [...ledger.rows].reverse().find((row) => row.missionId === id)?.title ?? id
         const milestone = record === undefined ? undefined : milestoneOf(record)
+        const budgetState = budgetStatesOf(options.store, id, record, ledger.rows)
         missions.push({
             id,
             title: record?.title ?? newestTitle,
@@ -397,6 +566,8 @@ export function buildPlanReport(options: PlanReportOptions): PlanReport {
             delivered,
             ...(milestone === undefined ? {} : { milestone }),
             requirements: [...instances.values()].filter((entry) => entry.missionId === id).length,
+            budgets: budgetState.budgets,
+            retiredBudgetIds: budgetState.retired,
         })
     }
 
@@ -455,16 +626,21 @@ export function buildPlanReport(options: PlanReportOptions): PlanReport {
             return left.milestone.localeCompare(right.milestone)
         })
 
+    const visibleMissions = options.missionId === undefined ? missions : missions.filter((mission) => mission.id === options.missionId)
+    const budgets = visibleMissions.flatMap((mission) => mission.budgets)
+
     return {
         file: options.file,
         relativeFile,
         exists: true,
         rows: ledger.rows.length,
         unparsable: ledger.unparsable,
-        missions: options.missionId === undefined ? missions : missions.filter((mission) => mission.id === options.missionId),
+        missions: visibleMissions,
         groups,
         undelivered: selected.filter((entry) => !entry.retired && !entry.delivered),
         retired: selected.filter((entry) => entry.retired),
+        budgets,
+        unverifiedBudgets: budgets.filter((budget) => !budget.verified),
         // Conflicts are filter-independent on purpose: the warning "this id lives
         // in two missions" must survive the very filter that hid the other one.
         conflicts: [...byId.entries()]
@@ -494,6 +670,21 @@ function requirementLine(requirement: PlanRequirementState): string {
 }
 
 /**
+ * How one budget's verification state reads.
+ *
+ * "未验证" is spelled out with its evidence rule, because a bare dash next to a
+ * budget looks like a passing grade.
+ * @param budget - the budget state from the report.
+ */
+export function budgetStateLine(budget: PlanBudgetState): string {
+    const requirements = budget.requirementIds === undefined || budget.requirementIds.length === 0 ? '' : `，关联 ${budget.requirementIds.join('、')}`
+    if (!budget.verified) {
+        return `未验证（没有任何记录在案的预算裁决提到它${requirements}）`
+    }
+    return `${describeBudgetVerification(budget)}${requirements}`
+}
+
+/**
  * Render the report for the model.
  *
  * A missing ledger gets its own sentence instead of an empty table: "no
@@ -516,6 +707,7 @@ export function renderPlanReport(report: PlanReport): string {
         `台账：${report.relativeFile}`,
         `行数：${report.rows}${report.unparsable === 0 ? '' : `（另有 ${report.unparsable} 行无法解析，已跳过：崩溃留下的截断尾行按预期忽略）`}`,
         `mission：${report.missions.length} 个；编号：${ids} 个（已作废 ${report.retired.length} 个）`,
+        `非功能预算：${report.budgets.length} 条（未验证 ${report.unverifiedBudgets.length} 条 —— 未验证 ≠ 通过）`,
         '（编号在 mission 内稳定：每个 mission 都从 R-001 / AC-001 开始，跨 mission 用 mission id 区分。）',
         '',
     ]
@@ -527,8 +719,15 @@ export function renderPlanReport(report: PlanReport): string {
                 `- \`${mission.id}\` ${mission.title} — ${mission.status}；` +
                     `${mission.specStatus === 'approved' ? '规格已审批' : mission.specStatus === 'draft' ? '规格 draft' : '规格状态未知'}；` +
                     `${mission.delivered ? '已交付' : '未交付'}；编号 ${mission.requirements} 个` +
-                    `${mission.milestone === undefined ? '' : `；里程碑 ${mission.milestone}`}`,
+                    `${mission.milestone === undefined ? '' : `；里程碑 ${mission.milestone}`}` +
+                    `${mission.budgets.length === 0 ? '' : `；预算 ${mission.budgets.length} 条`}`,
             )
+            for (const budget of mission.budgets) {
+                lines.push(`  · 预算 \`${budget.id}\`：${budgetStateLine(budget)}`)
+            }
+            if (mission.retiredBudgetIds.length > 0) {
+                lines.push(`  · 已作废预算编号（不会复用）：${mission.retiredBudgetIds.map((id) => `\`${id}\``).join('、')}`)
+            }
         }
         lines.push('')
     }
@@ -558,6 +757,24 @@ export function renderPlanReport(report: PlanReport): string {
             `- \`${requirement.id}\` ${text}（mission \`${requirement.missionId}\`，` +
                 `作废于 ${requirement.retiredAt === undefined ? '(未知时间)' : formatTime(requirement.retiredAt)}，编号不会复用）`,
         )
+    }
+    lines.push('')
+
+    lines.push(`### 非功能预算（${report.budgets.length} 条，未验证 ${report.unverifiedBudgets.length} 条）`, '')
+    if (report.budgets.length === 0) {
+        lines.push('(无：没有任何 mission 的规格声明非功能预算 —— 声明过的预算会出现在这里，连同它验证过没有)')
+    } else {
+        for (const budget of report.budgets) {
+            lines.push(`- \`${budget.id}\`（mission \`${budget.missionId}\`）${budgetStateLine(budget)}`)
+        }
+        if (report.unverifiedBudgets.length > 0) {
+            lines.push(
+                '',
+                '未验证 = 没有任何记录在案的预算裁决覆盖它（不是通过，也不是不存在）：规格声明的非功能要求只有在 `budget_check` 真跑过之后才算验证。',
+                '下一步：在 quality-gate 里装配这些预算的命令并跑 `budget_check`（规格声明的预算会被自动读取，报告里标注「来源：规格」）；',
+                '要改或删一条声明请用 `spec_amend`（删除会作废编号，永不复用），不要在宿主配置里静默改口径。',
+            )
+        }
     }
     lines.push('')
 

@@ -29,12 +29,15 @@ spec-gate  test-design-  spec-gate  role-  quality-   evidence-gate
 
 | 阶段 | 承担者 | 收口门禁 |
 |---|---|---|
-| 规划 | spec-gate（需求/验收标准/边界/负面约束/增改删/里程碑/跨 mission 台账/ADR）、test-design-gate、impact-gate | `spec-approved`、`test-design` |
+| 规划 | spec-gate（需求/验收标准/边界/负面约束/增改删/里程碑/跨 mission 台账/ADR/**非功能预算**）、test-design-gate、impact-gate | `spec-approved`、`test-design` |
 | 实现 | role-guard（权限/模型/派发）、standards-gate（规范棘轮）、quality-gate（写后 lint）、supply-chain-gate、audit-trail | `standards-pass`（可选） |
 | 测试 | quality-gate（跑命令 + 指标预算 + 契约冒烟）、coverage-gate（覆盖率/增量/flaky/变异）、impact-gate（最小回归集 + flaky 隔离计划）、test-design-gate | `quality-pass` |
 | 交互 | interaction-gate（ask/notify/progress + 通道注册 + 决定台账）、宿主的 approval 接缝 | 横切，无阶段门禁 |
 | 交付 | evidence-gate（证据→门禁→回执/发布台账）、audit-trail、orchestrator（回执门禁） | `receipt` |
 | 部署 | deploy-gate（环境清单 → go/no-go → 人工批准 → 执行 → 上线后验证 → 回滚） | `deploy-go`、`deploy-verified` |
+
+非功能预算（p95、包体积、迁移耗时）写在**规格**里：随规格一起审批、能追溯到需求 ID、由 `budget_check` 测量；
+宿主配置与规格声明同 id 时**宿主生效但差异会被报告**，`requireSpecBudgets` 打开后"声明了却没验证"的预算会拦住交付。
 
 **先问"我们在哪、缺什么"**：`bash scripts/doctor.sh`（人/CI，必需项缺失时退出码 1）或会话里的
 `suite_status`（同一份判定，另加运行时事实：哪些插件挂载、当前阶段、待审批、通道能力）。
@@ -46,7 +49,7 @@ spec-gate  test-design-  spec-gate  role-  quality-   evidence-gate
 |---|---|---|---|
 | `dsh-eng-core` | —（库） | 共享运行时：mission 工件、确定性命令执行、git 指纹、审计 JSONL、日志、扫描器、代码度量、变更影响、审批契约、fake host 测试夹具 | — |
 | `dsh-role-guard` | `role-guard` | 角色文件（persona/模型/工具/技能白名单）+ 最小权限派发 + 只读评审服务 | `team_delegate`、`role_list` |
-| `dsh-spec-gate` | `spec-gate` | 结构化规格 + 人工审批 + 写操作前置拦截 + 需求增改删 + 存量仓库规格接入 | `spec_create`、`spec_approve`、`spec_amend`、`spec_status`、`spec_bootstrap` |
+| `dsh-spec-gate` | `spec-gate` | 结构化规格 + 人工审批 + 写操作前置拦截 + 需求增改删 + **非功能预算（p95/体积/迁移耗时）** + 跨 mission 规划台账 + 里程碑 + ADR | `spec_create`、`spec_approve`、`spec_amend`、`spec_status`、`spec_bootstrap`、`plan_status`、`adr_record`、`adr_list` |
 | `dsh-test-design-gate` | `test-design-gate` | 把测试设计嵌进规格并自动评审（覆盖度/场景完整性/可执行性） | `test_design_review`、`test_design_template` |
 | `dsh-quality-gate` | `quality-gate` | 宿主配置命令的三态门禁 + 写后 lint 回路 + 收尾阻断 + **指标预算与契约冒烟** | `quality_gate_run`、`quality_gate_status`、`budget_check`、`contract_check` |
 | `dsh-evidence-gate` | `evidence-gate` | Mission → Evidence → Gate → Receipt，缺失证据 fail closed | `evidence_record`、`evidence_status`、`mission_complete` |

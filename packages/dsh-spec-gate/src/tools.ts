@@ -52,8 +52,23 @@ import {
 } from './spec.js'
 import { amendMissionSpec } from './amend.js'
 import {
+    applyBudgetEdit,
+    declareBudgets,
+    defaultBudgetUnit,
+    describeThreshold,
+    readSpecBudgets,
+    renderBudgetChangeLine,
+    renderBudgetLine,
+    specWithBudgetPlan,
+    type BudgetPlan,
+    type SpecBudgetInput,
+    type SpecRecordWithBudgets,
+} from './budgets.js'
+import {
     appendPlanRows,
+    budgetVerification,
     buildPlanReport,
+    describeBudgetVerification,
     describePlanFile,
     logPlanAppend,
     NO_MILESTONE_LABEL,
@@ -176,6 +191,13 @@ interface CreateArgs {
     testDesign?: string
     /** Milestone the requirements belong to (required when `milestoneRequired`). */
     milestone?: string
+    /**
+     * 非功能预算（p95、包体积、迁移耗时…）。省略 = 不改动已有声明；`[]` = 明确删掉全部
+     * （被删的编号进入 retired，永不复用）。
+     */
+    budgets?: SpecBudgetInput[]
+    /** 变更理由（记进预算变更历史）。 */
+    note?: string
     missionId?: string
 }
 
@@ -195,10 +217,16 @@ interface PlanStatusArgs {
 }
 
 interface AmendArgs {
-    part: 'requirement' | 'criterion'
-    action: 'add' | 'update' | 'remove'
+    /** Which list the edit addresses. Omitted only when `budgets` declares the whole set. */
+    part?: 'requirement' | 'criterion' | 'budget'
+    /** `add` / `update` / `remove`; required whenever `part` is given. */
+    action?: 'add' | 'update' | 'remove'
     target?: string
     text?: string
+    /** `part: 'budget'` 的新定义（完整替换，不是补丁）。 */
+    budget?: SpecBudgetInput
+    /** 整组重声明非功能预算（声明即现状：不在列表里的活预算会被删除并作废编号）。 */
+    budgets?: SpecBudgetInput[]
     note?: string
     cascade?: boolean
     /** Milestone to set/change along with this amendment. */
@@ -371,7 +399,9 @@ function milestoneArg(value: unknown): string | undefined {
  *
  * Every row carries the full id list, which is what makes "the newest row wins"
  * safe: a later `milestone-changed` row cannot lose the requirements an earlier
- * `spec-created` row had recorded.
+ * `spec-created` row had recorded. The same holds for the non-functional budgets:
+ * `budgetIds` is the complete list of live budget ids after the transition (and is
+ * always present, so a later row never drops an earlier row's declaration).
  */
 function planRowFor(
     mission: MissionRecord,
@@ -379,8 +409,14 @@ function planRowFor(
     kind: PlanRowKind,
     at: number,
     summary: string,
-    extra: { milestone?: string; approvedBy?: string; retired?: readonly string[] } = {},
+    extra: {
+        milestone?: string
+        approvedBy?: string
+        retired?: readonly string[]
+        retiredBudgets?: readonly string[]
+    } = {},
 ): PlanRow {
+    const budgets = readSpecBudgets(spec).budgets.map((budget) => budget.id)
     return {
         at,
         kind,
@@ -392,10 +428,32 @@ function planRowFor(
         ...(extra.milestone === undefined ? {} : { milestone: extra.milestone }),
         requirementIds: spec.requirements.map((entry) => entry.id),
         criteriaIds: spec.acceptanceCriteria.map((entry) => entry.id),
+        budgetIds: budgets,
         ...(extra.retired === undefined || extra.retired.length === 0 ? {} : { retiredRequirementIds: [...extra.retired] }),
+        ...(extra.retiredBudgets === undefined || extra.retiredBudgets.length === 0
+            ? {}
+            : { retiredBudgetIds: [...extra.retiredBudgets] }),
         ...(extra.approvedBy === undefined ? {} : { approvedBy: extra.approvedBy }),
         summary,
     }
+}
+
+/** The budget ids a transition retired (the difference between two retired lists). */
+function newlyRetiredBudgets(before: readonly string[], after: readonly string[]): string[] {
+    return after.filter((id) => !before.some((entry) => entry.toLowerCase() === id.toLowerCase()))
+}
+
+/** One line naming the budgets a specification revision carries. */
+function describeBudgetsOf(spec: SpecRecord | undefined): string {
+    const read = readSpecBudgets(spec)
+    const declared =
+        read.budgets.length === 0
+            ? '未声明'
+            : `${read.budgets.length} 条 —— ${read.budgets
+                  .map((budget) => `${budget.id}（${describeThreshold(budget.threshold, budget.unit ?? defaultBudgetUnit(budget.metric))}）`)
+                  .join('、')}`
+    const retired = read.retired.length === 0 ? '' : `；已作废预算编号（不会复用）：${read.retired.join('、')}`
+    return `非功能预算：${declared}${retired}`
 }
 
 /**
@@ -492,6 +550,39 @@ export function registerTools(
                     description:
                         'Optional planning milestone these requirements belong to (`v1.2`, `M3`; ≤64 chars, no control characters). `plan_status` groups every mission\'s requirements by it. Omitted = keep the mission\'s current milestone unchanged; a mission without one is REFUSED when the workspace sets milestoneRequired.',
                 },
+                budgets: {
+                    type: 'array',
+                    items: {
+                        type: 'object',
+                        additionalProperties: true,
+                        properties: {
+                            id: { type: 'string', description: 'Stable id (`p95-health`; letters/digits/-/_ only) — also the baseline key in the quality gate, so it is never reused.' },
+                            name: { type: 'string', description: 'Human-readable name shown in reports (e.g. 健康检查 p95).' },
+                            metric: { type: 'string', enum: ['durationMs', 'number', 'bytes'], description: 'durationMs = the command\'s wall time; number/bytes = a number extracted from its output via regex.' },
+                            unit: { type: 'string', description: 'Display unit; defaults to ms / bytes / count by metric.' },
+                            command: { type: 'string', description: 'The exact command line to measure (argv, no shell).' },
+                            regex: { type: 'string', description: 'Required for number/bytes, refused for durationMs: the FIRST CAPTURING GROUP must be a plain number.' },
+                            threshold: {
+                                type: 'object',
+                                additionalProperties: true,
+                                properties: {
+                                    max: { type: 'number', description: 'Upper bound: the value must be ≤ max.' },
+                                    min: { type: 'number', description: 'Lower bound: the value must be ≥ min.' },
+                                    maxRegressionPercent: { type: 'number', description: 'Allowed regression against the best recorded value, in percent.' },
+                                },
+                                description: 'At least one bound is required: without a bound the budget can never be judged.',
+                            },
+                            requirementIds: {
+                                type: 'array',
+                                items: { type: 'string' },
+                                description: 'The requirements/criteria this budget guards (`AC-003`); every id must exist in THIS specification (an unknown id is refused, never ignored).',
+                            },
+                        },
+                    },
+                    description:
+                        'Non-functional requirements as measurable budgets (p95 < 50ms, bundle ≤ 200KiB, migration < 2s). They are part of the specification: approved with it, rendered in the 非功能预算 table, indexed in the plan ledger, and measured by the quality gate (which reports them as 来源：规格). Omitted = keep the mission\'s current declarations unchanged; `[]` = explicitly remove them all (the ids are RETIRED and never reused).',
+                },
+                note: { type: 'string', description: 'Why the budgets changed (recorded in the budget change history).' },
                 missionId: { type: 'string', description: 'Revise an existing mission instead of creating one.' },
             },
             output: { schema: TEXT_OUTPUT, render: (_args, value) => [{ type: 'text', text: value }] },
@@ -507,6 +598,8 @@ export function registerTools(
                     fileBoundaries: args.fileBoundaries ?? [],
                     negativeConstraints: args.negativeConstraints ?? [],
                     ...(milestone === undefined ? {} : { milestone }),
+                    ...(args.budgets === undefined ? {} : { budgets: args.budgets }),
+                    ...(args.note === undefined ? {} : { note: args.note }),
                     testDesignMarkdown: args.testDesign ?? '',
                 }
                 const issues = validateDraft(draft)
@@ -540,6 +633,10 @@ export function registerTools(
                         ].join('\n'),
                     )
                 }
+                // 预算校验与测试设计解析都在写任何文件之前完成：声明有问题就什么都不写
+                //（否则会留下一个没有规格的 mission 目录）。
+                const design = parseDraftTestDesign(draft)
+                const spec = buildSpec(draft, existing?.spec)
                 const mission =
                     existing ??
                     store.create({
@@ -547,10 +644,8 @@ export function registerTools(
                         cwd,
                         ...(sessionId === undefined ? {} : { sessionId }),
                     })
-                const design = parseDraftTestDesign(draft)
-                const spec = buildSpec(draft, mission.spec)
-                const revised = mission.spec !== undefined
-                const previousMilestone = milestoneOf(mission)
+                const revised = existing !== undefined
+                const previousMilestone = milestoneOf(existing)
                 const updated = store.update(mission.id, (record) => ({
                     title: draft.title.trim(),
                     // A revision always revokes the previous approval, and a
@@ -571,16 +666,29 @@ export function registerTools(
                 const file = store.writeSpec(mission.id, markdown)
                 if (sessionId !== undefined) store.bindSession(sessionId, mission.id)
                 const now = Date.now()
+                const retiredBudgets = newlyRetiredBudgets(readSpecBudgets(existing?.spec).retired, readSpecBudgets(spec).retired)
                 const ledgerRows: PlanRow[] = [
                     planRowFor(
                         updated,
                         spec,
                         'spec-created',
                         now,
-                        `${revised ? '重写' : '新建'}规格 revision ${spec.revision}：需求 ${spec.requirements.length} 条、验收标准 ${spec.acceptanceCriteria.length} 条`,
-                        { ...(milestone === undefined ? {} : { milestone }) },
+                        `${revised ? '重写' : '新建'}规格 revision ${spec.revision}：需求 ${spec.requirements.length} 条、验收标准 ${spec.acceptanceCriteria.length} 条` +
+                            `、非功能预算 ${readSpecBudgets(spec).budgets.length} 条`,
+                        {
+                            ...(milestone === undefined ? {} : { milestone }),
+                            ...(retiredBudgets.length === 0 ? {} : { retiredBudgets }),
+                        },
                     ),
                 ]
+                if (retiredBudgets.length > 0) {
+                    ledgerRows.push(
+                        planRowFor(updated, spec, 'budget-retired', now, `作废预算 ${retiredBudgets.join('、')}（编号不复用）`, {
+                            ...(milestone === undefined ? {} : { milestone }),
+                            retiredBudgets,
+                        }),
+                    )
+                }
                 if (milestone !== undefined && milestone !== previousMilestone) {
                     // Only the transitions that actually happened are recorded.
                     ledgerRows.push(
@@ -599,6 +707,7 @@ export function registerTools(
                     `mission: ${mission.id}（revision ${spec.revision}，状态 draft）`,
                     `验收标准：${spec.acceptanceCriteria.map((criterion) => criterion.id).join(', ')}`,
                     ...(milestone === undefined ? [] : [`里程碑：${milestone}`]),
+                    describeBudgetsOf(spec),
                     designNote,
                     constraintNote,
                     ...recordPlan(deps, store.layout, effective, ledgerRows),
@@ -738,23 +847,75 @@ export function registerTools(
         defineTool({
             name: 'spec_amend',
             description:
-                'Add, reword or remove ONE requirement or acceptance criterion of an existing specification, without losing the standard process. Ids are stable: an edit keeps them attached to their text (a test case citing AC-003 keeps meaning the same statement), a removed id is RETIRED and never reused, and the change is recorded (who/when/before→after) in the specification a human approves. The revision invalidates the approval, so the mission goes back to the specification stage: update the affected test cases, run test_design_review again, then spec_approve. Removing a criterion that test cases cover is REFUSED unless `cascade: true`, which also drops those cases (and forces a re-review) — a deletion must never leave coverage pointing at nothing.',
+                'Add, reword or remove ONE requirement, acceptance criterion or non-functional budget of an existing specification, without losing the standard process — or re-declare the whole budget set at once with `budgets`. Ids are stable: an edit keeps them attached to their text (a test case citing AC-003 keeps meaning the same statement), a removed id is RETIRED and never reused (a retired budget id is refused even in a later declaration), and the change is recorded (who/when/before→after) in the specification a human approves. The revision invalidates the approval, so the mission goes back to the specification stage: update the affected test cases, run test_design_review again, then spec_approve. Removing a criterion that test cases cover is REFUSED unless `cascade: true`, which also drops those cases (and forces a re-review) — a deletion must never leave coverage pointing at nothing.',
             parameters: {
                 part: {
                     type: 'string',
-                    enum: ['requirement', 'criterion'],
-                    required: true,
-                    description: 'requirement = the 需求 list (R-00n); criterion = the 验收标准 table (AC-00n).',
+                    enum: ['requirement', 'criterion', 'budget'],
+                    description:
+                        'requirement = the 需求 list (R-00n); criterion = the 验收标准 table (AC-00n); budget = the 非功能预算 table (a declared budget id). Required together with `action`, unless `budgets` re-declares the whole budget set.',
                 },
                 action: {
                     type: 'string',
                     enum: ['add', 'update', 'remove'],
-                    required: true,
-                    description: 'add (needs text) / update (needs target + text) / remove (needs target).',
+                    description:
+                        'add (needs text, or a full `budget`) / update (needs target + text or `budget`) / remove (needs target). Required together with `part`.',
                 },
-                target: { type: 'string', description: 'The id to change, e.g. `AC-003`; omitted for add.' },
-                text: { type: 'string', description: 'The new statement; required for add and update.' },
-                note: { type: 'string', description: 'Why the change; recorded in the change history.' },
+                target: { type: 'string', description: 'The id to change, e.g. `AC-003` or a budget id; omitted for add (a budget may also carry its id in `budget.id`).' },
+                text: { type: 'string', description: 'The new statement; required for add and update of a requirement/criterion.' },
+                budget: {
+                    type: 'object',
+                    additionalProperties: true,
+                    properties: {
+                        id: { type: 'string', description: 'Budget id (letters/digits/-/_); must match `target` when both are given, and can never reuse a retired id.' },
+                        name: { type: 'string', description: 'Human-readable name shown in reports.' },
+                        metric: { type: 'string', enum: ['durationMs', 'number', 'bytes'], description: 'What is measured.' },
+                        unit: { type: 'string', description: 'Display unit; defaults to ms / bytes / count by metric.' },
+                        command: { type: 'string', description: 'The exact command line to measure (argv, no shell).' },
+                        regex: { type: 'string', description: 'Required for number/bytes, refused for durationMs; first capturing group = the number.' },
+                        threshold: {
+                            type: 'object',
+                            additionalProperties: true,
+                            properties: {
+                                max: { type: 'number', description: 'Upper bound (≤ max).' },
+                                min: { type: 'number', description: 'Lower bound (≥ min).' },
+                                maxRegressionPercent: { type: 'number', description: 'Allowed regression vs the best recorded value, in percent.' },
+                            },
+                            description: 'At least one bound is required.',
+                        },
+                        requirementIds: { type: 'array', items: { type: 'string' }, description: 'The requirements/criteria this budget guards; every id must exist in this specification.' },
+                    },
+                    description: 'part:"budget" 的新定义（完整替换，不是补丁）：id/name/metric/command/threshold 都要写全。',
+                },
+                budgets: {
+                    type: 'array',
+                    items: {
+                        type: 'object',
+                        additionalProperties: true,
+                        properties: {
+                            id: { type: 'string', description: 'Stable budget id; never a retired one.' },
+                            name: { type: 'string', description: 'Human-readable name.' },
+                            metric: { type: 'string', enum: ['durationMs', 'number', 'bytes'], description: 'What is measured.' },
+                            unit: { type: 'string', description: 'Display unit.' },
+                            command: { type: 'string', description: 'The exact command line to measure.' },
+                            regex: { type: 'string', description: 'Required for number/bytes; first capturing group = the number.' },
+                            threshold: {
+                                type: 'object',
+                                additionalProperties: true,
+                                properties: {
+                                    max: { type: 'number', description: 'Upper bound (≤ max).' },
+                                    min: { type: 'number', description: 'Lower bound (≥ min).' },
+                                    maxRegressionPercent: { type: 'number', description: 'Allowed regression vs the best recorded value, in percent.' },
+                                },
+                                description: 'At least one bound is required.',
+                            },
+                            requirementIds: { type: 'array', items: { type: 'string' }, description: 'The requirements/criteria this budget guards.' },
+                        },
+                    },
+                    description:
+                        'Re-declare the WHOLE budget set: what is listed is live (same id = same budget, changed content = update), every live budget that is NOT listed is removed and its id RETIRED. `[]` removes them all; omitted = leave the budgets untouched. Cannot be combined with part/action in one call.',
+                },
+                note: { type: 'string', description: 'Why the change; recorded in the change history (requirements and budgets alike).' },
                 cascade: {
                     type: 'boolean',
                     description: 'Allow removing a criterion that test cases cover (the cases are dropped too and must be re-reviewed).',
@@ -780,9 +941,169 @@ export function registerTools(
                         '下一步：先 `spec_create` 建立规格；已有规格的 mission 请显式传 missionId。',
                     ].join('\n')
                 }
+                const by = sessionIdOf(agent) ?? 'spec_amend'
+                const spec = mission.spec
+                if (spec === undefined) {
+                    return [
+                        `## 未改动（mission ${mission.id} 还没有规格）`,
+                        '',
+                        '下一步：先调用 `spec_create` 建立规格（增删改是在已有规格上做的编辑）。',
+                    ].join('\n')
+                }
+                const hasEdit = args.part !== undefined || args.action !== undefined
+                if (args.budgets !== undefined && hasEdit) {
+                    return [
+                        '## 未改动（budgets 与 part/action 同时给出）',
+                        '',
+                        '一次调用只做一件事：要么用 part + action 改一条（requirement / criterion / budget），要么用 budgets 整组重声明非功能预算。',
+                        '同时给出会写出两段语义不同的变更，无法在一次修订里讲清楚。',
+                        '',
+                        '### 下一步',
+                        '',
+                        '分两次调用：先改那一条，再整组重声明预算（或反过来）。',
+                    ].join('\n')
+                }
+                if (args.budgets === undefined && (args.part === undefined || args.action === undefined)) {
+                    return [
+                        '## 未改动（缺少 part/action）',
+                        '',
+                        'spec_amend 需要二选一：`part`（requirement / criterion / budget）+ `action`（add / update / remove）改一条，',
+                        '或者 `budgets` 整组重声明非功能预算（声明即现状，未列出的会被删除并作废编号）。',
+                        '',
+                        '### 下一步',
+                        '',
+                        '例：`spec_amend({ part: "criterion", action: "update", target: "AC-002", text: "…" })`，',
+                        '或 `spec_amend({ budgets: [{ id: "p95-health", … }] })`。',
+                    ].join('\n')
+                }
+
+                // --- 预算：整组重声明或单条编辑（都不经过 core 的 planAmendment） -----
+                if (args.budgets !== undefined || args.part === 'budget') {
+                    const read = readSpecBudgets(spec)
+                    const context = {
+                        requirementIds: spec.requirements.map((requirement) => requirement.id),
+                        criterionIds: spec.acceptanceCriteria.map((criterion) => criterion.id),
+                        retiredBudgets: read.retired,
+                        retiredSpecIds: spec.retired ?? [],
+                    }
+                    let plan: BudgetPlan
+                    let summary: string
+                    if (args.budgets !== undefined) {
+                        const declared = declareBudgets(read.budgets, args.budgets, {
+                            ...context,
+                            by,
+                            ...(args.note === undefined ? {} : { note: args.note }),
+                        })
+                        if (!declared.ok) {
+                            return [
+                                '## 未改动（重声明非功能预算）',
+                                '',
+                                ...declared.problems.map((problem) => `- ${problem}`),
+                                '',
+                                '预算声明没有任何改动，规格也没有升版本（失败不会留下半份文档）。',
+                            ].join('\n')
+                        }
+                        plan = declared.plan
+                        summary = declared.plan.summary
+                    } else {
+                        const edited = applyBudgetEdit(
+                            read.budgets,
+                            { ...context, by },
+                            {
+                                action: args.action as 'add' | 'update' | 'remove',
+                                ...(args.target === undefined || args.target === '' ? {} : { target: args.target }),
+                                ...(args.budget === undefined ? {} : { budget: args.budget }),
+                                ...(args.note === undefined ? {} : { note: args.note }),
+                            },
+                        )
+                        if (!edited.ok) {
+                            return [
+                                `## 未改动（${args.action} budget${args.target === undefined ? '' : ` ${args.target}`}）`,
+                                '',
+                                edited.problem,
+                                ...(edited.nextSteps === undefined ? [] : ['', '### 下一步', '', edited.nextSteps]),
+                                '',
+                                '预算声明没有任何改动，规格也没有升版本（失败不会留下半份文档）。',
+                            ].join('\n')
+                        }
+                        plan = edited.plan
+                        summary = edited.summary
+                    }
+                    const now = Date.now()
+                    // The milestone is applied FIRST, so every row below records the
+                    // state after this call.
+                    let milestoneNote: string | undefined
+                    if (requestedMilestone !== undefined) {
+                        const before = milestoneOf(mission)
+                        if (before !== requestedMilestone) {
+                            store.update(mission.id, (record) => ({ labels: labelsWithMilestone(record.labels, requestedMilestone) }))
+                            milestoneNote = `里程碑：${before ?? '(无)'} → ${requestedMilestone}`
+                        }
+                    }
+                    const updated = store.update(mission.id, (record) => {
+                        const current = record.spec ?? spec
+                        const next: SpecRecordWithBudgets = specWithBudgetPlan(current, plan)
+                        return {
+                            // A budget is part of the document a human approved: the
+                            // revision revokes the approval (and only the approval —
+                            // the test design still covers the same criteria/cases).
+                            status: 'draft',
+                            spec: {
+                                ...next,
+                                revision: current.revision + 1,
+                                updatedAt: now,
+                                approvedAt: undefined,
+                                approvedBy: undefined,
+                                approvedSource: undefined,
+                                approvalMessageId: undefined,
+                            },
+                        }
+                    })
+                    if (updated === undefined) return `mission ${mission.id} 在写入时消失。`
+                    const file = store.writeSpec(mission.id, renderSpec(updated))
+                    const amended = store.read(mission.id) ?? updated
+                    const amendedSpec = amended.spec ?? spec
+                    const retiredNow = newlyRetiredBudgets(read.retired, readSpecBudgets(amendedSpec).retired)
+                    const milestoneRow = milestoneOf(amended)
+                    const milestoneField = milestoneRow === undefined ? {} : { milestone: milestoneRow }
+                    const ledgerRows: PlanRow[] = []
+                    if (plan.changes.length > 0 || args.budgets !== undefined) {
+                        ledgerRows.push(planRowFor(amended, amendedSpec, 'spec-amended', now, summary, milestoneField))
+                    }
+                    if (milestoneNote !== undefined) {
+                        ledgerRows.push(planRowFor(amended, amendedSpec, 'milestone-changed', now, milestoneNote, milestoneField))
+                    }
+                    if (retiredNow.length > 0) {
+                        ledgerRows.push(
+                            planRowFor(amended, amendedSpec, 'budget-retired', now, `作废预算 ${retiredNow.join('、')}（编号不复用）`, {
+                                ...milestoneField,
+                                retiredBudgets: retiredNow,
+                            }),
+                        )
+                    }
+                    const budgetHistory = readSpecBudgets(amendedSpec).changes.slice(-5)
+                    return [
+                        `## 已改动规格（revision ${amendedSpec.revision}）`,
+                        '',
+                        summary,
+                        `需求文档：${path.relative(mission.cwd, path.join(store.layout.missionsDir, mission.id, 'spec.md'))}（已重新渲染）`,
+                        describeBudgetsOf(amendedSpec),
+                        ...(milestoneNote === undefined ? [] : [`里程碑：${milestoneRow ?? requestedMilestone}`]),
+                        ...recordPlan(deps, store.layout, effectiveFor(deps, agent), ledgerRows),
+                        '',
+                        '### 预算变更历史（最近 5 条，无变更时为空）',
+                        '',
+                        ...(budgetHistory.length === 0 ? ['(无)'] : budgetHistory.map(renderBudgetChangeLine)),
+                        '',
+                        '### 下一步（标准流程）',
+                        '',
+                        nextStepsAfter(amendedSpec, [summary]),
+                    ].join('\n')
+                }
+
                 const request: AmendRequest = {
-                    part: args.part,
-                    action: args.action,
+                    part: args.part as 'requirement' | 'criterion',
+                    action: args.action as 'add' | 'update' | 'remove',
                     ...(args.target === undefined || args.target === '' ? {} : { target: args.target }),
                     ...(args.text === undefined ? {} : { text: args.text }),
                     ...(args.note === undefined ? {} : { note: args.note }),
@@ -792,7 +1113,7 @@ export function registerTools(
                     { store, ...(args.missionId === undefined ? {} : {}) },
                     mission.id,
                     request,
-                    sessionIdOf(agent) ?? 'spec_amend',
+                    by,
                 )
                 if (!outcome.ok) {
                     return [
@@ -900,6 +1221,24 @@ export function registerTools(
                         `；规划台账: ${describePlanFile(store.layout, planLedgerFile(store.layout, statusConfig))}`,
                 )
                 lines.push(`负面约束：${describeConstraints(mission.spec?.negativeConstraints ?? [])}`)
+                // 非功能预算：声明 + 验证状态。未验证要写清楚含义 —— 一个预算旁边空着，
+                // 看起来像"通过了"。
+                const declaredBudgets = readSpecBudgets(mission.spec)
+                lines.push(
+                    declaredBudgets.budgets.length === 0
+                        ? `非功能预算: 未声明${declaredBudgets.retired.length === 0 ? '（spec_create / spec_amend 的 budgets 参数可声明 p95、包体积这类要求）' : `；已作废编号（不会复用）：${declaredBudgets.retired.join('、')}`}`
+                        : `非功能预算: ${declaredBudgets.budgets.length} 条（未验证 ${declaredBudgets.budgets.filter((budget) => !budgetVerification(store, mission.id, budget.id).verified).length} 条 —— 未验证 ≠ 通过）`,
+                )
+                for (const budget of declaredBudgets.budgets) {
+                    const unit = budget.unit ?? defaultBudgetUnit(budget.metric)
+                    lines.push(
+                        `  · ${renderBudgetLine(budget)}；验证：${describeBudgetVerification(budgetVerification(store, mission.id, budget.id))}`,
+                    )
+                }
+                if (declaredBudgets.budgets.length > 0 && declaredBudgets.retired.length > 0) {
+                    lines.push(`  已作废预算编号（不会复用）：${declaredBudgets.retired.join('、')}`)
+                }
+                for (const problem of declaredBudgets.problems) lines.push(`  ⚠️ ${problem}`)
                 lines.push(...configLines)
                 lines.push(
                     `latest gate: ${gate === undefined ? '(none)' : `${gate.state} by ${gate.source} — ${gate.reason}`}`,
@@ -1390,6 +1729,7 @@ export function renderApprovalPrompt(mission: MissionRecord, round: number, miss
     const criteria = spec?.acceptanceCriteria ?? []
     const cases = mission.testDesign?.cases ?? []
     const uncovered = mission.testDesign?.uncovered ?? []
+    const budgets = readSpecBudgets(spec)
     const relativeMissions = path.relative(mission.cwd, missionsDir) || missionsDir
     const specFile = relativePathOf(mission, mission.specPath ?? `.dsh/specs/${mission.id}.md`)
     const designFile = `${relativeMissions}/${mission.id}/test-design-review.md`
@@ -1401,6 +1741,14 @@ export function renderApprovalPrompt(mission: MissionRecord, round: number, miss
         `需求文档: ${specFile}（验收标准 ${criteria.length} 条）`,
         ...criteria.slice(0, 6).map((criterion) => `  · ${criterion.id} ${criterion.text}`),
         ...(criteria.length > 6 ? [`  · …另有 ${criteria.length - 6} 条`] : []),
+        '',
+        // 非功能要求也在被审批的文档里：审的人必须看见它们，否则"预算"又变成了事后补的口径。
+        `非功能预算: ${budgets.budgets.length} 条${budgets.retired.length === 0 ? '' : `（已作废编号：${budgets.retired.join('、')}，不会复用）`}`,
+        ...budgets.budgets.slice(0, 6).map((budget) => {
+            const unit = budget.unit ?? defaultBudgetUnit(budget.metric)
+            return `  · ${budget.id} ${budget.name}：${budget.metric} ${describeThreshold(budget.threshold, unit)}（命令 \`${budget.command}\`，关联 ${(budget.requirementIds ?? []).join('、') || '(未关联)'}）`
+        }),
+        ...(budgets.budgets.length > 6 ? [`  · …另有 ${budgets.budgets.length - 6} 条`] : []),
         '',
         `测试用例目录: ${relativeMissions}/${mission.id}/`,
         `测试用例: ${designFile}（用例 ${cases.length} 条${uncovered.length === 0 ? '，覆盖全部验收标准' : `，未覆盖 ${uncovered.join('、')}`}）`,
@@ -1482,6 +1830,7 @@ async function requestApproval(
                 验收标准: mission.spec?.acceptanceCriteria.length ?? 0,
                 测试用例: mission.testDesign?.cases.length ?? 0,
                 未覆盖: mission.testDesign?.uncovered?.length ?? 0,
+                非功能预算: readSpecBudgets(mission.spec).budgets.length,
                 送审轮次: round,
             },
             channelHints: { buttons: ['通过', '打回'], requiresReason: true },

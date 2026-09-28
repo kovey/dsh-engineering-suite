@@ -34,7 +34,12 @@
 - **契约冒烟**（`quality-gate` 的 `contract_check`）：逐条断言退出码/stdout/JSON 路径（路径缺失 = 失败，不是跳过）。
 - **flaky 隔离计划**（`impact-gate` 的 `flaky_plan`/`flaky_status`）：分类 + 必须有 owner 与到期时间 + 过期升级 +
   "隔离后长期未出现"提醒。
-- **自检同步**：`suite_status`/`doctor.sh` 新增四项配置检查（变异/预算/契约/flaky），未配置时如实说明"可选"。
+- **非功能预算进规格**：`spec_create`/`spec_amend` 接受 `budgets[]`（p95/包体积/迁移耗时…），
+  随规格一起**审批**、渲染进 `## 非功能预算` 表、可关联 `requirementIds`；`spec_amend` 支持整组重声明与
+  单条增改（删除作废、编号不复用）；`plan_status`/`spec_status` 显示"已验证/未验证"。
+  宿主配置与规格同 id 时**宿主生效但差异被报告**（两个值都写出来）；`requireSpecBudgets`（宿主键，默认关）
+  让"声明了却没验证"的预算拦住交付。
+- **自检同步**：`suite_status`/`doctor.sh` 新增五项配置检查（变异/预算/契约/flaky/规格预算），未配置时如实说明"可选"。
 
 ### 修复
 

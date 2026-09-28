@@ -151,3 +151,48 @@ test('the rendered report groups by phase and lists the fixes (regression)', () 
     assert.match(text, /## 建议的处理顺序/)
     assert.match(text, /→ 下一步：/)
 })
+
+test('spec-declared budgets are counted, and the loose case is advised (regression)', () => {
+    const cwd = repo({ ignoreTrail: true })
+    fs.mkdirSync(path.join(cwd, '.dsh', 'specs'), { recursive: true })
+    fs.writeFileSync(
+        path.join(cwd, '.dsh', 'specs', 'M-1.md'),
+        [
+            '# 规格',
+            '',
+            '## 验收标准',
+            '',
+            '| ID | 标准 |',
+            '|----|------|',
+            '| AC-001 | 返回 200 |',
+            '',
+            '## 非功能预算',
+            '',
+            '| 预算 | 名称 | 指标 | 阈值 | 命令 | 关联需求 |',
+            '|------|------|------|------|------|----------|',
+            '| B-001 | p95 | durationMs | max=50ms | curl -w %{time_total} | AC-001 |',
+            '| B-002 | 包体积 | bytes | max=200000 | node size.mjs | AC-001 |',
+            '',
+        ].join('\n'),
+    )
+    const check = checkWorkspace({ cwd, now: 0 }).checks.find((item) => item.id === 'config.spec-budgets')
+    assert.equal(check?.state, 'partial', 'declared but nothing enforces them without the host switch')
+    assert.match(check?.detail ?? '', /2 条（1 份规格）/)
+    assert.match(check?.fix ?? '', /requireSpecBudgets/)
+
+    // With the host switch on, the advice disappears (the gate now refuses
+    // silently unverified budgets).
+    fs.writeFileSync(path.join(cwd, '.dsh', 'quality-gate.json'), JSON.stringify({ requireSpecBudgets: true, commands: [{ id: 't', command: 'true', required: true }] }))
+    const strict = checkWorkspace({ cwd, now: 0 }).checks.find((item) => item.id === 'config.spec-budgets')
+    assert.equal(strict?.state, 'ok')
+    assert.match(strict?.detail ?? '', /requireSpecBudgets=true/)
+})
+
+test('a spec without the budget section contributes no rows (regression)', () => {
+    const cwd = repo({ ignoreTrail: true })
+    fs.mkdirSync(path.join(cwd, '.dsh', 'specs'), { recursive: true })
+    fs.writeFileSync(path.join(cwd, '.dsh', 'specs', 'M-2.md'), '# 规格\n\n## 验收标准\n\n| ID | 标准 |\n|----|------|\n| AC-001 | x |\n')
+    const check = checkWorkspace({ cwd, now: 0 }).checks.find((item) => item.id === 'config.spec-budgets')
+    assert.equal(check?.state, 'ok')
+    assert.match(check?.detail ?? '', /未声明非功能预算/)
+})

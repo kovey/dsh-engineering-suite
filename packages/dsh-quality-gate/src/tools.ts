@@ -18,7 +18,7 @@ import {
 } from 'dsh-eng-core'
 import type { Logger } from 'dsh-eng-core'
 import { EXAMPLE_BUDGETS, EXAMPLE_CONTRACTS, type QualityGateConfig } from './config.js'
-import { renderBudgets, runBudgets } from './budget.js'
+import { renderBudgets, runBudgets, type SpecBudgetSource } from './budget.js'
 import { renderContracts, runContracts } from './contract.js'
 import { describeScope, renderVerdict, runGate, selectCommands } from './gate.js'
 import { declaredCwdOf, type GateSessions } from './hooks.js'
@@ -103,8 +103,29 @@ function missionOrRefusal(store: MissionStore, agent: AgentLike | undefined, exp
     return mission
 }
 
-/** Register the quality-gate tools. */
-export function registerTools(
+/**
+ * The budget declaration of a mission's specification, read structurally.
+ *
+ * `dsh-spec-gate` persists the declarations additively on `mission.spec`
+ * (`budgets` / `retiredBudgets`) because `SpecRecord` — the shared contract —
+ * has no budget field; this package never imports that plugin, so it reads the
+ * shape out of the record and re-validates every field it uses (see
+ * `parseSpecBudgets`). A record without the fields declares no budgets.
+ * @param mission - the mission whose specification is consulted.
+ */
+function specBudgetSourceOf(mission: MissionRecord | undefined): SpecBudgetSource | undefined {
+    const spec = mission?.spec as { budgets?: unknown; retiredBudgets?: unknown } | undefined
+    if (spec?.budgets === undefined) return undefined
+    return {
+        budgets: Array.isArray(spec.budgets) ? spec.budgets : [spec.budgets],
+        ...(Array.isArray(spec.retiredBudgets) ? { retired: spec.retiredBudgets.filter((id): id is string => typeof id === 'string') } : {}),
+        ...(mission === undefined ? {} : { missionId: mission.id }),
+        ...(mission?.spec?.revision === undefined ? {} : { revision: mission.spec.revision }),
+        ...(mission?.spec?.approvedAt === undefined ? { approved: false } : { approved: true }),
+    }
+}
+
+/** Register the quality-gate tools. */export function registerTools(
     ctx: { tools: { register: (definition: never) => () => void } },
     deps: ToolDeps,
 ): { disposers: (() => void)[]; registered: string[]; failed: string[] } {
@@ -292,10 +313,10 @@ export function registerTools(
         defineTool({
             name: 'budget_check',
             description:
-                'Measure the host-configured regression budgets and answer "did this get worse", which a PASS/BLOCK test verdict cannot: a duration, a bundle size, a count. Each budget runs its configured command (or a configured gate command via commandId) and compares the measured number against its absolute bounds (max/min) and against the BEST value ever recorded in the append-only baseline (<rootDir>/budgets.json) within maxRegressionPercent. The first measurement records the baseline and says so (that is "no data yet", not a pass). A command that did not succeed BLOCKs its own budget and records no measurement; a regex that matches nothing, or a capture that does not parse, is a REFUSAL that writes nothing at all — never a silent pass. Records a gate row on the mission with scope.full=false: a budget run is not the host gate command set and never authorises a delivery.',
+                'Measure the regression budgets and answer "did this get worse", which a PASS/BLOCK test verdict cannot: a duration, a bundle size, a count. Budgets come from TWO sources: the host configuration (config.budgets) and the MISSION\'S SPECIFICATION (declared by spec_create / spec_amend). A spec budget is used when the host declares no budget with that id (the report marks it 来源：规格); when both declare one id the HOST wins (it is the deployment\'s ceiling) and the differing threshold is REPORTED as a conflict naming both values and which one was applied — never resolved silently. Each budget runs its configured command (or a configured gate command via commandId) and compares the measured number against its absolute bounds (max/min) and against the BEST value ever recorded in the append-only baseline (<rootDir>/budgets.json) within maxRegressionPercent. The verdict\'s reason and rows name the linked requirement ids (关联需求：AC-003), so a delivery can show that requirement\'s budget was verified against the spec. The first measurement records the baseline and says so (that is "no data yet", not a pass). A command that did not succeed BLOCKs its own budget and records no measurement; a regex that matches nothing, or a capture that does not parse, is a REFUSAL that writes nothing at all — never a silent pass. With config.requireSpecBudgets=true the call also REFUSES when the specification declares budgets and this run covered none of them. Records a gate row on the mission with scope.full=false: a budget run is not the host gate command set and never authorises a delivery.',
             parameters: {
-                missionId: { type: 'string', description: 'Mission to record the budget verdict against (default: the session mission).' },
-                only: { type: 'array', items: { type: 'string' }, description: 'Measure only these budget ids (must exist).' },
+                missionId: { type: 'string', description: 'Mission to record the budget verdict against (default: the session mission). Its specification is the second source of budgets.' },
+                only: { type: 'array', items: { type: 'string' }, description: 'Measure only these budget ids (must exist in the host configuration or in the mission\'s specification).' },
             },
             output: { schema: TEXT_OUTPUT, render: (_args, value) => [{ type: 'text', text: value }] },
             async execute(args: BudgetArgs = {} as BudgetArgs, exec) {
@@ -305,11 +326,14 @@ export function registerTools(
                 const logger = deps.logger.for(cwd)
                 const effective = deps.configFor(cwd)
                 const mission = missionOrRefusal(store, agent, args.missionId)
+                const spec = specBudgetSourceOf(mission)
                 const run = await runBudgets({
                     cwd,
                     config: effective.config,
                     rootDir: store.layout.rootDir,
                     ...(args.only === undefined ? {} : { only: args.only }),
+                    ...(spec === undefined ? {} : { spec }),
+                    requireSpecBudgets: effective.config.requireSpecBudgets,
                     service: deps.subprocess(),
                     ...((exec as { signal?: AbortSignal }).signal === undefined ? {} : { signal: (exec as { signal?: AbortSignal }).signal }),
                 })
@@ -349,9 +373,15 @@ export function registerTools(
                 return [
                     renderBudgets(run, { problems: effective.problems.length }),
                     '',
-                    `预算来源：${effective.source === 'project' ? effective.file ?? '项目级配置' : 'profile 配置'}（${run.scope.total} 条已配置）`,
+                    `预算来源：宿主配置 ${effective.source === 'project' ? effective.file ?? '项目级配置' : 'profile 配置'}（${effective.config.budgets.length} 条）` +
+                        `；规格 ${run.spec.declared} 条${run.spec.missionId === undefined ? '' : `（mission ${run.spec.missionId}${run.spec.revision === undefined ? '' : `，revision ${run.spec.revision}`}）`}` +
+                        `；本次共 ${run.scope.total} 条可用`,
+                    ...(run.conflicts.length === 0
+                        ? []
+                        : [`⚠️ 宿主配置与规格的阈值冲突 ${run.conflicts.length} 条：${run.conflicts.map((conflict) => conflict.id).join('、')}（按宿主配置判定，两个值都写在报告里）`]),
                     `mission: ${mission === undefined ? '(无 — 基线照记，但裁决不会落到任何 mission 上)' : mission.id}`,
                     `gate record: ${gateId ?? '(未记录)'}`,
+                    `requireSpecBudgets: ${effective.config.requireSpecBudgets === true ? 'true（规格声明了预算时必须至少覆盖一条）' : 'false'}`,
                     '说明：这次裁决只覆盖预算，不会清零本会话的"待验证写"计数——交付前仍需不带 only/phase 跑一次完整的 quality_gate_run。',
                 ].join('\n')
             },

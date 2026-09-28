@@ -139,6 +139,34 @@ budgets:
   既定的语义是"没有数据"而不是"通过"，也绝不退化成 `0`。基线文件损坏同样按 fail closed 拒绝（当成"没有历史"会让护栏悄悄消失）。
 - 配置里的预算条目**不会被静默丢弃**：写错的条目会被保留并在 `budget_check` 时被拒绝（规则"消失"和"全部通过"看起来一模一样）。
 
+### 预算的第二个来源：mission 的规格（`来源：规格`）
+
+非功能要求（"健康检查 p95 < 50ms"、"包体积 ≤ 200KiB"、"迁移必须在 2s 内跑完"）如果只写在宿主配置里，
+就既不随规格审批、也无法追溯到需求编号。所以 `dsh-spec-gate` 让它们成为规格的一部分
+（`spec_create` / `spec_amend` 的 `budgets` 参数，渲染成规格工件的 `## 非功能预算` 表），
+`budget_check` 读**本 mission 的规格**作为第二来源：
+
+- **规格声明的预算照常执行**：宿主配置里没有同 id 时直接采用，报告与门禁行里标 `来源：规格`；
+- **同 id 时宿主配置优先**（它是部署上限：机器、工具链、超时都是宿主的），但阈值不一致会作为
+  **冲突**列出来——两个值都写、并说明本次用了哪个，绝不静默取其一；
+- 裁决的 `reason` 与门禁行里带上该预算关联的需求编号（`关联需求：AC-003`），
+  于是 `plan_status` 能回答"哪些要求是预算、验证过没有"（未验证 ≠ 通过）；
+- **规格预算和宿主预算一样严格**：命令切不出 argv、`regex` 没匹配到数字、声明没有界限 / 没有捕获组 /
+  用了已作废的 id，都是**整次拒绝**（不跑命令、不写基线、不记门禁）；
+- `requireSpecBudgets: true`（宿主 opt-in，默认 `false`）时，规格声明了预算而本次运行**一条都没覆盖** → 拒绝：
+  一条已声明、已审批的非功能要求不该在没人验证的情况下悄悄进入交付。默认关闭，所以既有行为不变。
+
+```yaml
+# 规格侧（spec_create / spec_amend 的 budgets 参数，写进规格、随规格审批）
+budgets:
+  - id: p95-health
+    name: 健康检查 p95
+    metric: durationMs            # durationMs | number | bytes
+    command: node scripts/p95.mjs
+    threshold: { max: 50, maxRegressionPercent: 10 }
+    requirementIds: [AC-003]      # 必须存在于同一份规格（写错即拒绝）
+```
+
 ## 契约冒烟（`contract_check`）
 
 ```yaml
@@ -197,7 +225,8 @@ contracts:
 | `commands[]` | `[]` | 命令表；`phase: gate` 默认必需，`phase: lint` 默认非必需 |
 | `commands[].cwd` | 会话工作区 | 子目录里跑命令 |
 | `commands[].env` | — | 追加环境变量 |
-| `budgets[]` | `[]` | 回归预算表；`id`/`name`/`metric`（`durationMs`/`number`/`bytes`）+ `command` 或 `commandId` + `regex`（非 durationMs 必填）+ `max`/`min`/`maxRegressionPercent` + `unit`/`baselineFile` |
+| `budgets[]` | `[]` | 回归预算表；`id`/`name`/`metric`（`durationMs`/`number`/`bytes`）+ `command` 或 `commandId` + `regex`（非 durationMs 必填）+ `max`/`min`/`maxRegressionPercent` + `unit`/`baselineFile`。**与规格里声明的预算同 id 时，这里的定义生效**（部署上限），差别会作为冲突报出来 |
+| `requireSpecBudgets` | `false` | 宿主 opt-in：`true` 时，规格声明了非功能预算而本次 `budget_check` 一条都没覆盖 → **拒绝执行**。它是**宿主键**（不可被项目级配置覆盖），因为项目可以声明自己的预算，但不能把宿主的合规要求关掉 |
 | `budgets[].baselineFile` | `<rootDir>/budgets.json` | 该预算的基线历史文件（相对路径按会话工作区解析；默认文件是所有预算共享的一份，每个 id 一条历史） |
 | `contracts[]` | `[]` | 契约表；`id`/`name`/`kind`（`cli`/`http`/`schema`/`command`）+ `command` + `expect`（`exitCode`/`stdoutContains`/`stdoutNotContains`/`jsonPaths`） |
 | `defaultTimeoutMs` | `300000` | 未声明 `timeoutMs` 时的超时（超时按失败处理） |
@@ -235,6 +264,9 @@ contracts:
 ## 与其它插件的协作
 
 - `dsh-spec-gate`：规格的验收标准是门禁要证明的东西；未审批规格下写操作根本不会发生。
+  **规格也是预算的第二个来源**：本插件不 import 它，而是从 mission 记录里**结构性读取**它附加在
+  `mission.spec` 上的 `budgets` / `retiredBudgets`（core 的 `SpecRecord` 里没有这两个字段，见下），
+  并对自己用到的每个字段**重新校验一遍**（fail closed）。
 - `dsh-evidence-gate`：`mission_complete` 要求存在一条 `source: dsh-quality-gate`、`state: PASS`
   且**覆盖完整**（`scope.full === true`）的门禁记录，并且必须晚于最新的 `command`/`test` 证据
   （否则算“证据陈旧”并阻断）。因此正确顺序是 `evidence_record` → `quality_gate_run`（不带
@@ -244,3 +276,16 @@ contracts:
 - **预算 / 契约裁决不是交付依据**：它们以 `source: dsh-quality-gate`、`scope.full=false` 记录（理由写在 `reason` 里），
   `dsh-evidence-gate` 的 `gate-scope` 检查会因此拒绝只拿它们放行。预算/契约失败时修代码；要交付仍然要跑完整的
   `quality_gate_run`。
+
+### 诚实的边界（规格预算）
+
+- **规格预算不在 core 的共享类型里**：`dsh-spec-gate` 把 `budgets` / `retiredBudgets` / `budgetChanges`
+  附加在 `mission.spec` 上（插件不改 `dsh-eng-core` 的 `SpecRecord`）。本插件因此**结构性读取**它，
+  读不出来（字段不是数组、条目缺字段、用了已作废的 id）就是**拒绝**，不会当作"这条 mission 没有预算"。
+- **`plan_status` 的"已验证"靠两个字符串对齐**：`budget_check` 写进 gate 行的 `预算裁决`（在 `reason` 里）
+  与 `来源：规格`（在预算行里）。这两处是本插件与 `dsh-spec-gate` 之间唯一的连接键（两个插件不互相 import）；
+  任何一边改了措辞，`plan_status` 只会退化成"未验证"（少一次声明），不会出现假的"已验证"。
+- **读的是当前规格修订，不看审批状态**：`budget_check` 会执行当前规格里声明的预算，并在报告里标出
+  `已审批 / 尚未审批`。真正的交付闸门在别处（`dsh-evidence-gate` 要求已审批的规格），这里只是如实报告。
+- **宿主与规格冲突只报告、不阻断**：宿主配置生效（部署上限），冲突写在报告与裁决 reason 里。要改口径就改规格
+  （`spec_amend`，会撤销审批、需要重新审批）；本插件不会替任何人"合并"两个阈值。
