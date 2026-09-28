@@ -17,7 +17,15 @@
 #     --spec on   → {"enforce": true}（显式声明，便于 review）
 #     --spec skip → 不写 spec-gate.json（默认）
 #   --force      覆盖同名文件（默认拒绝）
+#   --interaction on|skip  → 写 .dsh/interaction-gate.json（交互层骨架）
+#   --deploy on|skip       → 写 .dsh/deploy-gate.json（环境清单骨架，默认空 = 拒绝部署）
+#   --no-gitignore        不自动补 .dsh 运行时忽略规则（见下）
 #   --json       只打印将写入的内容
+#
+# 写入时会顺带保证 `.gitignore` 忽略**运行时台账**（.dsh/missions/、audit/、state/、
+# specs/ 以及已存在的根级 *.jsonl）：不忽略的话，每次门禁运行都会改动工作区，
+# 交付时的 requireCleanTree 会报"与门禁观测的指纹不一致"（两个 diff 摘要不同）。
+# 配置类文件（.dsh/*.json、roles/）属于信任根，**不**会被忽略，请照常提交评审。
 set -euo pipefail
 
 WS="$PWD"
@@ -26,6 +34,9 @@ FORCE=0
 JSON_ONLY=0
 SPEC="skip"
 STANDARDS="skip"
+INTERACTION="skip"
+DEPLOY="skip"
+GITIGNORE=1
 TEST_CMD=""
 LINT_CMD=""
 
@@ -37,6 +48,9 @@ while [ $# -gt 0 ]; do
     --json) JSON_ONLY=1; shift ;;
     --spec) SPEC="${2:-skip}"; shift 2 ;;
     --standards) STANDARDS="${2:-skip}"; shift 2 ;;
+    --interaction) INTERACTION="${2:-skip}"; shift 2 ;;
+    --deploy) DEPLOY="${2:-skip}"; shift 2 ;;
+    --no-gitignore) GITIGNORE=0; shift ;;
     --test) TEST_CMD="${2:-}"; shift 2 ;;
     --lint) LINT_CMD="${2:-}"; shift 2 ;;
     -h|--help) sed -n '3,29p' "$0"; exit 0 ;;
@@ -157,6 +171,27 @@ PY2
   *) echo "--standards 只能是 on / skip" >&2; exit 2 ;;
 esac
 
+# --- interaction / deploy (optional skeletons) ------------------------------
+INTERACTION_JSON=""
+case "$INTERACTION" in
+  on) INTERACTION_JSON='{
+  "askTimeoutMs": 900000,
+  "requireApproverList": false,
+  "preferredChannels": []
+}' ;;
+  skip) ;;
+  *) echo "--interaction 只能是 on / skip" >&2; exit 2 ;;
+esac
+
+DEPLOY_JSON=""
+case "$DEPLOY" in
+  on) DEPLOY_JSON='{
+  "environments": []
+}' ;;
+  skip) ;;
+  *) echo "--deploy 只能是 on / skip" >&2; exit 2 ;;
+esac
+
 # --- report / write ---------------------------------------------------------
 report() {
   local target="$1" body="$2"
@@ -168,6 +203,8 @@ if [ "$JSON_ONLY" = "1" ]; then
   report "quality-gate.json" "$QUALITY"
   [ -n "$SPEC_JSON" ] && report "spec-gate.json" "$SPEC_JSON"
   [ -n "$STANDARDS_JSON" ] && report "standards.json" "$STANDARDS_JSON"
+  [ -n "$INTERACTION_JSON" ] && report "interaction-gate.json" "$INTERACTION_JSON"
+  [ -n "$DEPLOY_JSON" ] && report "deploy-gate.json" "$DEPLOY_JSON"
   exit 0
 fi
 
@@ -179,6 +216,8 @@ echo "spec-gate : $SPEC"
 report "$WS/.dsh/quality-gate.json" "$QUALITY"
 [ -n "$SPEC_JSON" ] && report "$WS/.dsh/spec-gate.json" "$SPEC_JSON"
 [ -n "$STANDARDS_JSON" ] && report "$WS/.dsh/standards.json" "$STANDARDS_JSON"
+[ -n "$INTERACTION_JSON" ] && report "$WS/.dsh/interaction-gate.json" "$INTERACTION_JSON"
+[ -n "$DEPLOY_JSON" ] && report "$WS/.dsh/deploy-gate.json" "$DEPLOY_JSON"
 
 if [ "$WRITE" != "1" ]; then
   printf '\n(dry-run：加 --write 才会写入 .dsh/)\n'
@@ -198,5 +237,33 @@ write_one() {
 write_one "$WS/.dsh/quality-gate.json" "$QUALITY"
 [ -n "$SPEC_JSON" ] && write_one "$WS/.dsh/spec-gate.json" "$SPEC_JSON"
 [ -n "$STANDARDS_JSON" ] && write_one "$WS/.dsh/standards.json" "$STANDARDS_JSON"
+[ -n "$INTERACTION_JSON" ] && write_one "$WS/.dsh/interaction-gate.json" "$INTERACTION_JSON"
+[ -n "$DEPLOY_JSON" ] && write_one "$WS/.dsh/deploy-gate.json" "$DEPLOY_JSON"
+if [ -n "$DEPLOY_JSON" ]; then
+  echo "注意：deploy-gate.json 的 environments 为空 → deploy_plan / deploy_run 会拒绝执行（fail closed）；"
+  echo "      声明了环境与命令之后才可能部署，生产环境默认需要人工批准。"
+fi
+
+# --- .gitignore：只忽略运行时台账 -------------------------------------------
+if [ "$GITIGNORE" = "1" ] && [ -d "$WS/.git" ]; then
+  ADDED=()
+  for target in ".dsh/missions/" ".dsh/audit/" ".dsh/state/" ".dsh/specs/"; do
+    if ! git -C "$WS" check-ignore -q "$target" 2>/dev/null; then ADDED+=("$target"); fi
+  done
+  # 已存在但未忽略的根级台账（只处理真实存在的文件，避免给每个仓库塞四行）
+  if [ -d "$WS/.dsh" ]; then
+    while IFS= read -r ledger; do
+      [ -n "$ledger" ] || continue
+      if ! git -C "$WS" check-ignore -q "$ledger" 2>/dev/null; then ADDED+=("$ledger"); fi
+    done < <(cd "$WS/.dsh" && ls *.jsonl 2>/dev/null | sed 's|^|.dsh/|' || true)
+  fi
+  if [ "${#ADDED[@]}" -gt 0 ]; then
+    if [ ! -f "$WS/.gitignore" ]; then printf '' > "$WS/.gitignore"; fi
+    printf '%s\n' "${ADDED[@]}" >> "$WS/.gitignore"
+    echo "已补 .gitignore 运行时忽略：${ADDED[*]}"
+    echo "（配置类文件不会被忽略：它们是信任根，请提交评审。加 --no-gitignore 可跳过本步骤。）"
+  fi
+fi
+
 echo
 echo "这些文件属于信任根（.dsh/** 对写类工具关闭），请提交到仓库；插件会在下一次门禁运行时读取。"
