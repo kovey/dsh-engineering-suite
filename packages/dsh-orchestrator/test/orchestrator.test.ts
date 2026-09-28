@@ -1782,3 +1782,78 @@ test('a NEWER standards BLOCK closes the gate again (regression: fail-open)', as
     assert.match(tie, /同一毫秒/)
     assert.equal(store.read(id)?.stage, 'build')
 })
+
+test('a deploy stage needs a deployment verdict from THIS round (regression)', async () => {
+    disposeHosts()
+    const cwd = tempWorkspace('orchestrator-deploy-gate-')
+    const fake = host({
+        cwd,
+        config: {
+            defaultMaxAttempts: 8,
+            stages: [
+                { id: 'build', prompt: '实现', requiredPlugins: [] },
+                {
+                    id: 'deploy',
+                    prompt: '部署',
+                    requiredPlugins: [],
+                    gate: { kind: 'deploy-go', phase: 'exit', label: '部署已执行' },
+                    next: 'verify',
+                    onFail: 'build',
+                },
+                {
+                    id: 'verify',
+                    prompt: '上线后验证',
+                    requiredPlugins: [],
+                    gate: { kind: 'deploy-verified', phase: 'exit', label: '验证通过' },
+                    next: 'done',
+                    onFail: 'deploy',
+                },
+                { id: 'done', prompt: '收尾', requiredPlugins: [] },
+            ],
+        },
+    })
+    const store = storeFor(cwd)
+    await orchestrate(fake, { action: 'start' })
+    const id = missionIdOf(cwd)
+    await orchestrate(fake, { action: 'advance' }) // → deploy (entry gate is unrestricted)
+    assert.equal(store.read(id)?.stage, 'deploy')
+
+    // No deploy record at all: the exit gate cannot open, and it names the tool.
+    const blocked = await orchestrate(fake, { action: 'advance', verdict: 'PASS' })
+    assert.match(blocked, /没有任何部署门禁记录/)
+    assert.match(blocked, /deploy_run/)
+    assert.match(blocked, /回退目标：build/)
+    assert.equal(store.read(id)?.stage, 'build', 'a failed exit gate rolls back to onFail')
+
+    // Re-enter and record a BLOCK: a failed deployment must not open the gate.
+    await orchestrate(fake, { action: 'advance' })
+    store.recordGate(id, { source: 'dsh-deploy-gate', state: 'BLOCK', reason: 'deployCommands 第 1 条退出码 1', results: [] })
+    const failed = await orchestrate(fake, { action: 'advance', verdict: 'PASS' })
+    assert.match(failed, /最近一次部署门禁是 BLOCK/)
+    assert.match(failed, /退出码 1/)
+
+    // A deploy recorded in an EARLIER round must not open this one: the gate
+    // compares against the stage entry time. `recordGate` stamps its own clock,
+    // so the way to produce a stale record is to record it BEFORE re-entering.
+    store.recordGate(id, { source: 'dsh-deploy-gate', state: 'PASS', reason: '上一轮的部署', results: [] })
+    await orchestrate(fake, { action: 'advance' }) // re-enter deploy: entry is now newer
+    assert.equal(store.read(id)?.stage, 'deploy')
+    const stale = await orchestrate(fake, { action: 'advance', verdict: 'PASS' })
+    assert.match(stale, /早于本阶段进入时间/)
+    assert.match(stale, /上一轮的部署/)
+    assert.match(stale, /回退目标：build/)
+
+    // A deploy recorded AFTER this round's entry opens the gate and moves on.
+    await orchestrate(fake, { action: 'advance' })
+    await new Promise((resolve) => setTimeout(resolve, 5))
+    store.recordGate(id, { source: 'dsh-deploy-gate', state: 'PASS', reason: '部署成功', results: [] })
+    const moved = await orchestrate(fake, { action: 'advance', verdict: 'PASS' })
+    assert.match(moved, /部署已执行并通过/)
+    assert.equal(store.read(id)?.stage, 'verify')
+
+    // deploy-verified reads the same source: the run's PASS is now stale for this
+    // stage, so verification has to be recorded to leave it.
+    const verifyBlocked = await orchestrate(fake, { action: 'advance', verdict: 'PASS' })
+    assert.match(verifyBlocked, /早于本阶段进入时间|没有任何部署门禁记录/)
+    assert.match(verifyBlocked, /deploy_verify/)
+})
