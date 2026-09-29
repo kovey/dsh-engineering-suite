@@ -1,9 +1,9 @@
 # 验证记录（2026-09-17）
 
-> **兼容基线（本文件全部结论的宿主版本）**：`@deepseek-ai/dsh-*` **0.1.7-rc.2**（`cordis ~4.0.4`）。
-> 11 个插件的 `peerDependencies` 用**同一 0.1.7 线**的范围 `>=0.1.7-rc.2 <0.1.8-0`。
+> **兼容基线（本文件全部结论的宿主版本）**：`@deepseek-ai/dsh-*` **0.2.0-rc.1**（`cordis ~4.0.4`）。
+> 14 个插件的 `peerDependencies` 用**同一 0.2.0 线**的范围 `>=0.2.0-rc.1 <0.2.1-0`。
 >
-> **0.1.7-rc.2 会在加载时强制校验 peer 版本**（`dsh-app-boot` 的 `evaluatePluginCompatibility`，
+> **0.1.7-rc.2 起，宿主在加载时强制校验 peer 版本**（`dsh-app-boot` 的 `evaluatePluginCompatibility`，
 > 判定用 `semver.satisfies(runtime, requirement, { includePrerelease: true })`）：锁 `0.1.7-rc.1` 的插件
 > 在 rc.2 下会被**整包跳过**（真机日志：`skipping profile bundle "dsh-role-guard": … is incompatible with dsh 0.1.7-rc.2`，
 > 11 个插件 0 挂载 → 端到端全红），可用 `dsh plugin allow-version` 为 exact 版本开豁免。
@@ -35,6 +35,14 @@
 >    协议再漂移时的排查入口：`STUB_DUMP_DIR=/tmp/x bash scripts/e2e-mission.sh` 会把每个请求体落盘（原始 body 是唯一权威）。
 > 3. **peer 从"精确锁版"改为"同线范围"**：rc.1 时锁 `0.1.7-rc.1`（官方与生态包的做法）；rc.2 起加载时强制校验，
 >    精确锁版会让每个 rc 都变成"必须先发插件"，于是改用 `>=0.1.7-rc.2 <0.1.8-0`（真值表见本节开头）。
+>
+> **0.2.0-rc.1 适配记录**（本轮）：15 个包**零编译错误**（消息来源 kind、`createUserMessage` 用法均未变）；
+> `ApprovalOutcome` 仍是四个字符串；委派策略捕获仍在；我们**不依赖**宿主的会话文件格式
+> （0.2.0 引入 v4 迁移，我们的 `.dsh/state/sessions/*.json` 是自己的 mission 绑定文件）。
+> 唯一必改的是 **peer 范围**（加载时门禁会拒绝旧锁版：`skipping profile bundle … is incompatible with dsh 0.2.0-rc.1`），
+> 改为 `>=0.2.0-rc.1 <0.2.1-0`。为**在安装前验证候选 harness**，`scripts/e2e-mission.sh` 新增两个环境变量
+> （默认行为不变）：`DSH_HARNESS_ROOT=<候选 node_modules>` 与 `DSH_BIN=<候选 dsh>`；本轮即用 `/tmp/dsh020`
+> 的 rc1 安装跑出 E2E GREEN。
 >
 > 顺带核实的 rc1 新能力（本套件暂未依赖，记录备查）：`dsh-fs-sandbox` / `dsh-bash-sandbox` / `dsh-pwsh-sandbox`
 > （沙箱策略服务）、`dsh-permission-presets`（权限预设）、`dsh-mcp-client`（MCP 客户端）、

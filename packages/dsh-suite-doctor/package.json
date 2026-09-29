@@ -1,6 +1,6 @@
 {
   "name": "dsh-suite-doctor",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Runtime half of the engineering suite's self-check for DeepSeek Harness: which plugins are actually mounted, where the session's mission stands, which interaction channels can reach a human and which phases this build does not implement — merged into dsh-eng-core's offline doctor report behind one read-only tool (suite_status).",
   "type": "module",
   "main": "./dist/index.js",
@@ -34,8 +34,8 @@
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "~4.0.4",
-    "@deepseek-ai/dsh-agent": ">=0.1.7-rc.2 <0.1.8-0",
-    "@deepseek-ai/dsh-tools": ">=0.1.7-rc.2 <0.1.8-0"
+    "@deepseek-ai/dsh-agent": ">=0.2.0-rc.1 <0.2.1-0",
+    "@deepseek-ai/dsh-tools": ">=0.2.0-rc.1 <0.2.1-0"
   },
   "dsh": {
     "runtime": "host",

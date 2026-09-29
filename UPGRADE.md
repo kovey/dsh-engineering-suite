@@ -103,6 +103,31 @@ declare module '@deepseek-ai/dsh-llm' {
 
 ---
 
+### 1.6 从 0.1.7-rc.2 到 0.2.0-rc.1（v0.2.0 的基线）
+
+**必改的只有一件事：peer 范围。** 0.2.0 的加载时门禁会拒绝针对 0.1.7 线声明的插件
+（`skipping profile bundle "<插件>": … is incompatible with dsh 0.2.0-rc.1`）。把每个 `@deepseek-ai/dsh*` peer
+改为同一 0.2.0 线的范围 `>=0.2.0-rc.1 <0.2.1-0`（本项目 v0.2.0 已如此声明并验证）。
+
+其余接缝**本轮实测未变**：`ApprovalOutcome` 仍是 `allowed-once | rejected | cancelled | unavailable`；
+`MessageSourceMap` 仍要求"每个生产者声明自己的 kind、没有 `plugin` 兜底"（我们自有 kind 无需改动）；
+子代理委派仍自动继承 preset/sandbox 并把审批策略钉成 `never`；DeepSeek provider 仍是 Messages 协议
+（`scripts/stub-llm.mjs` 无需改动）。
+
+**在安装前验证候选 harness**（本轮新增，默认行为不变）：
+
+```bash
+DSH_HARNESS_ROOT=/tmp/dsh020/node_modules DSH_BIN=/tmp/dsh020/node_modules/.bin/dsh \
+  bash scripts/e2e-mission.sh
+```
+
+0.2.0-rc.1 比 0.1.7-rc.2 多 53 个包，其中与"工程治理"相邻、值得后续评估的有：
+**`dsh-experimental-agent-team`（官方 agent 团队）**、`dsh-experimental-auto-review`（自动评审）、
+`dsh-workflow-ptc` / `dsh-ptc-runtime`（程序化工具调用）、`dsh-plugin-manager` / `dsh-config-editor`、
+`dsh-workspace-changes` / `dsh-tool-workspace-dependencies`，以及 **session 格式 v4
+（`dsh-session-format-v3-to-v4`，我们不受影响）**。本套件暂未依赖它们——接入（例如让 role-guard 复用官方
+agent-team）需要单独一轮评估。
+
 ## 2. 使用套件 0.1.0（首次发布）
 
 ### 2.1 新增的插件（挂上去即可，默认不打扰）

@@ -1,6 +1,6 @@
 {
   "name": "dsh-interaction-gate",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Interaction layer for DeepSeek Harness's engineering suite: ask / notify / progress over pluggable channels, with one-shot tokens, a decision ledger and fail-closed timeouts — the suite's own seam for the decisions that need a human, so a phone or headless session can answer them.",
   "type": "module",
   "main": "./dist/index.js",
@@ -34,8 +34,8 @@
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "~4.0.4",
-    "@deepseek-ai/dsh-agent": ">=0.1.7-rc.2 <0.1.8-0",
-    "@deepseek-ai/dsh-tools": ">=0.1.7-rc.2 <0.1.8-0"
+    "@deepseek-ai/dsh-agent": ">=0.2.0-rc.1 <0.2.1-0",
+    "@deepseek-ai/dsh-tools": ">=0.2.0-rc.1 <0.2.1-0"
   },
   "dsh": {
     "runtime": "host",

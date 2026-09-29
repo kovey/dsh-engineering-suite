@@ -1,6 +1,6 @@
 # dsh-engineering-suite
 
-**v0.1.0** · 兼容基线 `@deepseek-ai/dsh-*` **`>=0.1.7-rc.2 <0.1.8-0`**（cordis `~4.0.4`）
+**v0.2.0** · 兼容基线 `@deepseek-ai/dsh-*` **`>=0.2.0-rc.1 <0.2.1-0`**（cordis `~4.0.4`）
 · [变更记录](./CHANGELOG.md) · [升级指南](./UPGRADE.md) · [验证证据](./docs/VERIFICATION.md)
 
 > 把 [docs.md](./docs.md) 描述的「Agent 时代软件工程落地方案」实现为一组可独立挂载的

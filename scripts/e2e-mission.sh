@@ -357,7 +357,13 @@ YAML
 
 # Module resolution: the shipped @deepseek-ai packages come from the real
 # profile, the suite from this working tree. The launcher heals the rest.
-ln -sfn "$HOME/.dsh/profiles/node_modules/@deepseek-ai" "$E2E_HOME/profiles/node_modules/@deepseek-ai"
+# Defaults reproduce the harness installed on this machine. Overriding these two
+# lets a CANDIDATE harness be verified BEFORE it is installed globally:
+#   DSH_HARNESS_ROOT=/tmp/dsh020/node_modules DSH_BIN=/tmp/dsh020/node_modules/.bin/dsh \
+#     bash scripts/e2e-mission.sh
+HARNESS_ROOT="${DSH_HARNESS_ROOT:-$HOME/.dsh/profiles/node_modules}"
+DSH_BIN="${DSH_BIN:-dsh}"
+ln -sfn "$HARNESS_ROOT/@deepseek-ai" "$E2E_HOME/profiles/node_modules/@deepseek-ai"
 for pkg in "${SUITE[@]}" dsh-eng-core; do
   ln -sfn "$ROOT/packages/$pkg" "$E2E_HOME/profiles/node_modules/$pkg"
 done
@@ -575,7 +581,7 @@ set +e
   DEEPSEEK_API_KEY="stub-key-not-a-secret" \
   DEEPSEEK_ALLOW_INSECURE_HTTP=1 \
   DSH_PERMISSION_MODE="$PERMISSION_MODE" \
-  dsh --profile "$PROFILE" "$TASK"
+  "$DSH_BIN" --profile "$PROFILE" "$TASK"
 ) >"$DSH_LOG" 2>&1 &
 DSH_PID=$!
 watchdog &
