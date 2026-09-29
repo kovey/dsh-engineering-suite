@@ -3,6 +3,34 @@
 本文件的格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；
 版本号遵循语义化版本。**harness 版本与套件版本是两个数字**：本版本声明并验证于 `@deepseek-ai/dsh-*` **0.2.0-rc.1**（cordis `~4.0.4`）。
 
+## [未发布]
+
+### 兼容与组合（官方 0.2.0 能力的采纳边界）
+
+- **采纳**：`impact-gate` 的变更事实改用官方 `workspaceChanges`（`changeSource: 'auto' | 'workspaceChanges' | 'git'`，宿主键）。
+  语义是**按轮**的：靠 `workspace/changes` 事件的 `seq` 定位、无变更的轮不产生事件、记录随会话消失。输出与工件**处处标注来源**
+  （`workspaceChanges（会话 … 第 N 轮）` / `git` / `git（回退：<原因>）`）；不可用一律回退 git 并说明原因；
+  与 `git diff <base>` 不一致时打印 ⚠️ 交叉核对（报告，不作为裁决）；二进制/超大文件只有路径与计数、重命名的旧路径
+  无法从该服务恢复——都作为**明写的限制**而不是补出来的假数据。
+- **互补（官方 spawn 对我们不可用，实测）**：官方 Agent Teams 的 `SpawnTeammateRequest` 只有
+  `{name,description,prompt,context,provider,signal}`，无法表达 persona 影子段 / 工具白名单 / 模型路由 / 深度上限；
+  而每个可加载角色都必须有 persona ⇒ 官方路径表达不了任何角色的策略。`role-guard` 因此**点名拒绝** `dispatch: 'team'`、
+  回落自研 `subagents` 路径，并把官方创建出的 teammate 记为 **ungoverned**（`.dsh/state/teammates/<id>.json`）——
+  刻意**不**声称"已阻止"：工具守卫只覆盖模型面的 `spawn_teammate`，插件直接调服务即可绕过。新增宿主键
+  `composeWithAgentTeams: 'auto' | 'off'`（`off` 逐字段等于旧行为）。
+- **不采纳**：官方 `auto-review` 不得接管授权。代码级核实它只返回 `deny` / `ask` / `cancel`，**从不 `allow`**；
+  我们的强制拦截又是**单调守卫**（"任何守卫都可以拒绝，但没有任何守卫能强制放行"）。挂上它的后果是更严 + 更多问人 +
+  更多 LLM 调用，不是绕过门禁——但它仍**不是**授权依据。
+- **PTC 真机验证 + 量化**：`run_code` 只在 `dsh-tools` 的 `config.mode: 'ptc'` 下可见（默认 `native`）。打开后，
+  PTC 程序里的 `await tools.write({...})` 被 spec-gate 拒绝（审计留下**子调用自己的两行**，拒绝原文与下一步提示都在），
+  文件未被创建，拒绝作为程序错误传回。代价：1 次 `run_code` + 1 个子调用 = 4 行审计——治理预算要预期这个放大系数。
+- **文档**：`ARCHITECTURE §5.16`（官方 vs 自研的采纳边界与守卫机制）、`UPGRADE` 的"采纳 / 不采纳"清单。
+
+### 验证
+
+- `bash scripts/verify.sh`：**830 测试 / 829 通过 / 0 失败 / 1 如实跳过**（含 OPS SELFTEST GREEN）。
+- `scripts/e2e-mission.sh`：**E2E GREEN**，14/14 插件在 `@deepseek-ai/dsh-*` **0.2.0-rc.1** 上完成一条真实 mission。
+
 ## [0.2.0] — 2026-09-29
 
 ### 兼容基线

@@ -13,6 +13,9 @@
 - 技能白名单在调用时强制：子会话 id → 角色的绑定落盘，`ctx.tools.guard` 拒绝加载白名单外的技能
   （见下文「技能白名单如何被强制」）。
 - 把角色清单与职责分离要求注入系统提示。
+- 与官方 **Agent Teams**（`agentTeams` 服务 + `spawn_teammate` 等工具，harness 0.2.0）合成：
+  `team_delegate` 会**按名字拒绝**走官方 teammate 创建路径并说明缺哪条保证，
+  官方路径创建的 teammate 一律被记录为 `ungoverned`（见下文「与官方 Agent Teams 的合成」）。
 
 ## 角色文件
 
@@ -52,7 +55,7 @@ persona: |
 
 | 工具 | 参数 | 说明 |
 |---|---|---|
-| `team_delegate` | `role` `task`(必填) `context` `deliverable` `model` `reasoningEffort` `maxTokens` | 按角色派发；返回子 Agent 会话 id、stop reason、工具/技能白名单、**实际生效的模型路由及来源**与产出 |
+| `team_delegate` | `role` `task`(必填) `context` `deliverable` `model` `reasoningEffort` `maxTokens` `dispatch` | 按角色派发；返回子 Agent 会话 id、stop reason、工具/技能白名单、**实际生效的模型路由及来源**、**派发路径**与产出 |
 | `role_list` | `role` | 列出角色表（含技能白名单）；给 `role` 时输出该角色完整 persona 与白名单强制状态 |
 
 派发时子 Agent 的 prompt 会自动带上：角色卡、任务、上下文、交付要求、**当前 mission 的规格摘要**
@@ -106,6 +109,60 @@ const plan = ctx.get('role-guard').plan({ role: 'developer', cwd: mission.cwd, a
 **模型覆盖是一个成本决策**——调用方（模型自己）能把一个便宜角色改派到贵模型上，宿主必须能一刀禁掉；
 禁用后子 Agent 一律按角色文件 / 宿主默认的路由运行，调用参数不会悄悄生效。
 
+## 与官方 Agent Teams 的合成
+
+harness 0.2.0 带来官方 **Agent Teams**：`@deepseek-ai/dsh-experimental-agent-team`（服务 `agentTeams`：
+名册 / 持久 mailbox / 共享任务 DAG）与 `@deepseek-ai/dsh-experimental-tool-agent-team`
+（模型面工具 `spawn_teammate` / `send_message` / `interrupt_agent` / `list_agents` / `team_task_*`）。
+
+**合成规则：Agent Teams 是协作面，不是权限面。**
+
+`SpawnTeammateRequest` 只有 `{ name, description, prompt, context: 'fresh' | 'fork', provider, signal }`
+——**没有** persona / toolFilter / agentOptions / maxDepth，也没有权限参数。服务把它转成
+`ctx.subagents.startContinuable({ provider, request: { prompt, parent } })`，于是 teammate 按
+`resolveChildAgentOptions(parent, undefined, depth)` 与 `{ persona: undefined, toolFilter: undefined }` 组装：
+**继承 Lead 的 provider/model 和全部工具，跑在部署 persona 下**。而 `startContinuable` 本身是接受
+`persona` / `toolFilter` / `agentOptions` / `maxDepth` 的——缺口就在官方这一层请求类型上。
+
+因此本插件的做法是：
+
+1. **`team_delegate` 的 `dispatch: 'team'` 一律被按名字拒绝**，改用本插件自己的 `ctx.subagents.start()`
+   路径（`dispatch path: subagents（请求 team：拒绝 agentTeams.spawnTeammate——它无法表达：…）`）。
+   拒绝不是笼统的"不支持"，而是逐条点名：`persona 影子段`（官方请求没有 persona 字段，而每个角色都必须有
+   persona——这条是**结构性**的，所以今天**任何**角色都走不了官方路径）、`工具白名单`（没有 toolFilter，
+   只读模式的降权也靠它）、`模型路由`（没有 agentOptions）、`技能白名单`（绑定必须早于 teammate 第一轮，
+   而官方 spawn 只在创建完成后才给出会话 id）。报告里同时写明官方 API 需要怎么改才可用。
+   **本插件从不调用 `spawnTeammate`**：它只探测这个方法在不在（`auto` 模式），不在就说明"官方服务只是模型
+   工具的底座"。
+2. **官方路径创建的 teammate 被记录为 `ungoverned`**：官方名册每次写 Lead 会话日志时（`session/event`
+   且 `event.type === 'team/member'`——官方服务自己不 emit 事件，只在 Lead 日志里写 `team/member` /
+   `team/task` / `team/message/queued` / `team/message/delivered`），本插件把该 teammate 的会话 id、团队 id、
+   名字、phase，以及**它没有被施加哪些角色策略**写进 `<root>/state/teammates/<sessionId>.json`
+   （`governance: 'ungoverned'`，`missing: [...]`，`provenance: 'team/member'`）。同一 teammate 只写一份记录，
+   后续名册写入只更新 phase。
+3. **谁保证什么**：官方给的是协作（名册、点对点 mailbox、任务 DAG）；**宿主自己**给所有 in-process
+   子会话的是审批钉死（`captureDelegatedPolicyOverrides` → `approvalPolicy: 'never'`，一次性与持续两条
+   创建路径都有，teammate 也在内）；本插件给的是 persona 影子段、宿主强制的工具白名单、模型路由、
+   技能白名单、只读降权，以及每个子会话的绑定与派发路径记录。**本插件不保证**（也没法保证）：
+   官方路径创建的 teammate 的工具面、persona、模型路由。
+   **委派深度不属于任何一方**：`SpawnTeammateRequest` 没有 `maxDepth`，官方路径不设每子深度上限；而
+   `team_delegate` 今天也不传 `maxDepth`（深度上限由宿主的 `maxDepth` 配置**在模型面派发工具里**把关，
+   见「已知边界」）。teammate 又继承 Lead 的整个工具面（可能包含派发类工具），所以这是本合成里
+   唯一一处"两条路径都不设限"的地方，写在这里以免被误读成已覆盖。
+4. **没有"防止"，只有"记录"——这是刻意的**：官方 teammate 只能在其创建**之后**被观察到
+   （`session/event` 是 post-commit 事件，服务不 emit 自己的创建事件），而 `ctx.tools.guard` 只覆盖
+   模型面的 `spawn_teammate`：任何插件直接调 `agentTeams.spawnTeammate` 都能绕过 guard。既然如此，
+   声称"已阻止未经治理的 teammate"就是**假保证**；本插件改为把它记成 `ungoverned`（失败关闭的方向是
+   "不承认它受治理"，而不是"假装拦住了它"）。
+5. **协作面永远不会变成授权**：teammate 的消息、任务板条目、汇报都不是审批；本插件没有任何 API 接受
+   teammate 的说法来放行、授权写入或写入证据。记录本身写的是**本插件的结论**（"我没有治理它"）加上一条
+   持久事实（官方名册事件），不是 teammate 的自我声明。
+
+**配置开关 `composeWithAgentTeams`（默认 `'auto'`）**：`'off'` 时完全不读 `agentTeams`、不装名册观察者、
+提示词也不加那一段，行为与引入本能力之前**逐字段一致**（回归测试断言：`off` 与 `auto` 下同一次派发给
+`ctx.subagents.start` 的请求完全相同、工具输出逐字节相同）。装配日志会打印
+`agentTeams=off(config)` / `absent` / `on(availability=programmatic-spawn|no-programmatic-spawn)`。
+
 ## 配置
 
 | 键 | 默认 | 说明 |
@@ -123,6 +180,7 @@ const plan = ctx.get('role-guard').plan({ role: 'developer', cwd: mission.cwd, a
 | `injectSpec` | `true` | 是否把 mission 规格注入子 Agent prompt |
 | `enforceSkillWhitelist` | `true` | 是否在**调用时**强制角色的技能白名单 |
 | `skillTools` | `['skill']` | 会加载技能的工具名（只有这些工具被上面的开关检查） |
+| `composeWithAgentTeams` | `'auto'` | 与官方 Agent Teams 的合成：`'auto'` = 拒绝官方 teammate 创建路径（点名缺哪条保证）并把官方创建的 teammate 记成 `ungoverned`；`'off'` = 完全不读 `agentTeams`，行为与引入该能力前逐字段一致（未知值按 `'auto'`，因为 `'auto'` 才是拒绝 + 记录的那一侧） |
 | `prompt.enabled` / `prompt.order` | `true` / `610` | |
 
 ## 技能白名单如何被强制
@@ -130,8 +188,10 @@ const plan = ctx.get('role-guard').plan({ role: 'developer', cwd: mission.cwd, a
 技能白名单（角色文件的 `skills`）**不是提示级约束**，它在**调用时**由宿主强制：
 
 1. `team_delegate` 启动子 Agent 后，把它返回的会话 id（`SubagentRun.id`）与角色一起写进
-   `<root>/state/roles/<sessionId>.json`（`{ sessionId, roleId, role, mode, skills, tools, route, updatedAt }`；
-   `route` = 这个子代理**实际生效**的模型路由，字段与 `agentOptions` 一致、全部可选，继承宿主默认时整个键省略）。
+   `<root>/state/roles/<sessionId>.json`（`{ sessionId, roleId, role, mode, skills, tools, route, dispatch, updatedAt }`；
+   `route` = 这个子代理**实际生效**的模型路由，字段与 `agentOptions` 一致、全部可选，继承宿主默认时整个键省略；
+   `dispatch` = 产生这个子会话的派发路径，`team_delegate` 写 `'subagents'`；`role-guard` 服务的
+   `bind`（自主派发器自己创建子会话）不写这个键——那条路径本插件没有亲眼看到）。
    文件是唯一事实来源：插件重载、宿主重启、会话恢复后依然有效。
 2. 插件注册一个**单调 guard**（`ctx.tools.guard`，不是 `tools/pre-execute` 监听器——guard 没有
    "allow" 结果，监听器顺序无法把拒绝变回允许），对配置 `skillTools`（默认 `['skill']`，
@@ -170,6 +230,9 @@ const plan = ctx.get('role-guard').plan({ role: 'developer', cwd: mission.cwd, a
   = 绑定文件里的 `route`。按调用覆盖只在 `allowModelOverride` 允许时生效；畸形覆盖值逐字段回落到
   角色路由并在结果里 warning（既不会静默换模型，也不会把整次派发弄失败）。
 - **子代理一定被释放**：派发结束后调用 `run.dispose()`（seam 的契约要求）。
+- **官方 teammate 只记录、不阻止**（见「与官方 Agent Teams 的合成」）：`ctx.tools.guard` 只覆盖模型面的
+  `spawn_teammate`，插件直接调 `agentTeams.spawnTeammate` 可以绕过它，所以"已阻止"会是假保证；
+  本插件的选择是把这类 teammate 记成 `ungoverned` 并说明缺哪些策略，绝不把它们当受治理对象。
 
 ## 已知边界（诚实说明）
 
@@ -194,4 +257,21 @@ const plan = ctx.get('role-guard').plan({ role: 'developer', cwd: mission.cwd, a
   **调用方**会话的 `header.cwd` 定位。如果某个 provider 让子会话跑在另一个工作区，两侧路径不一致，
   就会读不到绑定（= 不限制）。默认的 `spawn` provider 子会话继承父会话 cwd，不受影响；把 `rootDir`
   配成绝对路径（如 `~/.dsh/eng`）可以让绑定与工作区解耦。
+- 官方 teammate 的记录（`<root>/state/teammates/<sessionId>.json`）同样是**报告**，不是策略：
+  它不改变任何门禁。`ungoverned` 的 teammate 因此也**不受技能白名单约束**（它没有绑定，技能门禁按
+  "无绑定 = 不归我管"放行）——这正是记录要说明的缺口；反过来，如果某个 teammate 的父会话有绑定
+  （把 `maxDepth` 放宽后由受治理的子代理派生），技能门禁照旧按那条绑定强制，与该记录无关。
+- teammate 记录只在官方名册**成功写入**时产生（`session/event` 是 post-commit 事件）。若官方服务在
+  teammate 启动前就失败（`phase: 'failed'` 会被记下，创建失败则不会有名册行），或者 Lead 会话头里没有
+  `cwd`（本插件拒绝用 `process.cwd()` 兜底，会在日志里 warning 并**不记录**——宁可漏记也不写错项目），
+  那段过程就没有记录。
+- 名册观察者是**事后**的：`team_delegate` 拒绝官方创建路径是事前决定，但官方工具/插件**已经**创建出来的
+  teammate 只能被观察到并记录（原因见「与官方 Agent Teams 的合成」第 4 条）。
+- 本插件只探测 `agentTeams.spawnTeammate` 是否**存在**，不校验它的签名；官方若把语义改坏（例如接受
+  了 persona 却忽略），探测依然只能报"官方路径不可用/可用性未知"。真正修好这条合成需要在官方请求类型上
+  带上委派请求，或提供"接管一个已按角色创建的子会话"的操作。
+- **委派深度不由本插件设置**：`team_delegate` 不传 `maxDepth`（子 Agent 的深度上限由宿主的
+  `ctx.subagents` 配置在模型面派发工具里生效，本插件的角色文件也没有 depth 字段）。官方 teammate
+  创建路径同样不传，且它继承 Lead 的工具面——所以"teammate 不会再往下派"这句话今天**不成立**，
+  要收紧只能在宿主侧配置，或等官方请求类型支持 `maxDepth`。
 

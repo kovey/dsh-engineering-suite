@@ -48,6 +48,13 @@ import {
 } from 'dsh-eng-core'
 import { TEMPLATE_EXAMPLES, type EffectiveConfig, type ImpactGateConfig } from './config.js'
 import {
+    changeSourceLabel,
+    resolveChangeSet,
+    sourceLabel,
+    type ChangeProviderDeps,
+    type ChangeProvenance,
+} from './changes.js'
+import {
     buildPlan,
     clampRuns,
     currentQuarantines,
@@ -104,6 +111,8 @@ export interface ToolDeps {
     config: ImpactGateConfig
     /** Effective config for one workspace (profile row + `<repo>/.dsh/impact-gate.json`). */
     configFor: (cwd: string) => EffectiveConfig
+    /** Where the change set may come from: the host's `workspaceChanges` service, or git. */
+    changes: ChangeProviderDeps
     stores: MissionStoreRegistry
     /** `ctx.get('subagents')`, used only when `reviewDispatch.enabled`. */
     subagents: () => SubagentsLike | undefined
@@ -155,10 +164,24 @@ export interface ImpactArtifact {
     paths?: readonly string[]
     /** Explicit paths that did not exist on disk at analysis time. */
     missingPaths?: readonly string[]
-    /** Whether the diff could be read (always true in paths mode). */
+    /**
+     * Whether the GIT diff could be read (always true in paths mode).
+     *
+     * With `changeSource.source === 'workspaceChanges'` this describes the
+     * cross-check read only: the change set itself came from the host service,
+     * and `changeSource` is the field that says so.
+     */
     diffRead: boolean
-    /** Why the diff could not be read, verbatim from core. */
+    /** Why the git diff could not be read, verbatim from core. */
     diffProblem?: string
+    /**
+     * Which source produced the change set, and what it could not tell us.
+     *
+     * Recorded because the two sources answer different questions: a reader of
+     * this artifact must be able to tell a turn snapshot from a diff against a
+     * ref without reading the tool output.
+     */
+    changeSource: ChangeProvenance
     risk: ImpactReport['risk']
     reasons: readonly string[]
     counts: { changed: number; impacted: number; tests: number; unreached: number }
@@ -173,6 +196,8 @@ export interface ImpactArtifact {
         maxDistance: number
         maxFiles: number
         maxFileBytes: number
+        /** The configured source (`auto` / `workspaceChanges` / `git`). */
+        changeSource: ImpactGateConfig['changeSource']
         /** `null` = the host has not configured a runner (`impact_tests` refuses). */
         testCommandTemplate: string | null
         fullTestCommand: string | null
@@ -363,6 +388,8 @@ export function buildArtifact(input: {
     report: ImpactReport
     config: ImpactGateConfig
     generatedAt: string
+    /** Where the change set came from; recorded verbatim. */
+    provenance: ChangeProvenance
     paths?: readonly string[]
     missingPaths?: readonly string[]
     diff?: { isRepo: boolean; problem?: string }
@@ -380,6 +407,7 @@ export function buildArtifact(input: {
         ...(input.missingPaths === undefined || input.missingPaths.length === 0 ? {} : { missingPaths: input.missingPaths }),
         diffRead,
         ...(input.diff?.problem === undefined ? {} : { diffProblem: input.diff.problem }),
+        changeSource: input.provenance,
         risk: report.risk,
         reasons: report.reasons,
         counts: {
@@ -399,6 +427,8 @@ export function buildArtifact(input: {
             maxDistance: config.maxDistance,
             maxFiles: config.maxFiles,
             maxFileBytes: config.maxFileBytes,
+            /** The host's pin; the artifact also records what actually answered. */
+            changeSource: config.changeSource,
             testCommandTemplate: config.testCommandTemplate === '' ? null : config.testCommandTemplate,
             fullTestCommand: config.fullTestCommand ?? null,
         },
@@ -451,6 +481,12 @@ export interface ImpactArtifactSummary {
     risk?: string
     counts?: { changed?: number; impacted?: number; tests?: number; unreached?: number }
     base?: string
+    /**
+     * Which source produced that analysis (`workspaceChanges` / `git` /
+     * `显式 paths`), as recorded in the artifact. Absent for artifacts written
+     * before the sources were told apart — read it as "unknown", never as "git".
+     */
+    changeSource?: string
     /** Set when the file exists but cannot be read as JSON. */
     problem?: string
 }
@@ -470,6 +506,7 @@ export function listImpactArtifacts(store: MissionStore, missionId: string): Imp
             const file = path.join(dir, name)
             const raw = readJson<Partial<ImpactArtifact>>(file)
             if (raw === undefined) return { file, relative: `impact/${name}`, problem: `${file} 不是合法 JSON：无法读取这次分析` }
+            const recorded = raw.changeSource as { source?: unknown; fallbackReason?: unknown } | undefined
             return {
                 file,
                 relative: `impact/${name}`,
@@ -477,6 +514,14 @@ export function listImpactArtifacts(store: MissionStore, missionId: string): Imp
                 ...(typeof raw.risk === 'string' ? { risk: raw.risk } : {}),
                 ...(raw.counts === undefined ? {} : { counts: raw.counts }),
                 ...(typeof raw.base === 'string' ? { base: raw.base } : {}),
+                ...(typeof recorded?.source !== 'string'
+                    ? {}
+                    : {
+                          changeSource:
+                              recorded.source === 'git' && typeof recorded.fallbackReason === 'string'
+                                  ? `git（回退：${recorded.fallbackReason}）`
+                                  : recorded.source,
+                      }),
             }
         })
 }
@@ -488,6 +533,8 @@ interface AnalyzeInput {
     config: ImpactGateConfig
     base: string
     paths?: readonly string[]
+    /** The calling agent: its session is what the host's change service is keyed by. */
+    agent?: AgentLike
     signal?: AbortSignal
 }
 
@@ -505,19 +552,25 @@ function missingPathsOf(cwd: string, paths: readonly string[] | undefined): stri
         .sort((left, right) => left.localeCompare(right))
 }
 
-/** Run core's analysis with the configured bounds. */
+/**
+ * Run core's analysis with the configured bounds, on the change set the
+ * configured SOURCE supplies.
+ *
+ * The diff is still pre-read in diff mode: it is the only way to learn
+ * `isRepo`/`problem` (core's report drops the `problem` field that
+ * `changedRanges` carries — a non-git workspace would otherwise be reported as
+ * "no tests cover this change"), and, when the host's `workspaceChanges` service
+ * answers instead, it is the cross-check the report prints. A source that cannot
+ * answer is a reported fallback, never an empty change set.
+ */
 async function analyze(
     deps: ToolDeps,
     input: AnalyzeInput,
-): Promise<{ report: ImpactReport; diff?: { isRepo: boolean; problem?: string }; missingPaths: string[] }> {
+): Promise<{ report: ImpactReport; diff?: { isRepo: boolean; problem?: string }; missingPaths: string[]; provenance: ChangeProvenance }> {
     if (input.signal?.aborted === true) {
         throw new Error('调用方已取消（signal 已 abort）：未做分析。下一步：确认会话仍在运行后重试 impact_analyze。')
     }
-    // The diff is read TWICE in diff mode (here and inside analyzeImpact): the
-    // pre-read is the only way to learn `isRepo`/`problem`, because core's report
-    // drops the `problem` field that `changedRanges` carries — a non-git
-    // workspace would otherwise be reported as "no tests cover this change".
-    const diff =
+    const git =
         input.paths === undefined
             ? await changedRanges({
                   cwd: input.cwd,
@@ -525,9 +578,27 @@ async function analyze(
                   ...(deps.logger === undefined ? {} : { logger: deps.logger }),
               })
             : undefined
+    const diff = git === undefined ? undefined : { isRepo: git.isRepo, ...(git.problem === undefined ? {} : { problem: git.problem }) }
+    const resolved = await resolveChangeSet(deps.changes, {
+        cwd: input.cwd,
+        base: input.base,
+        config: input.config,
+        ...(input.paths === undefined ? {} : { paths: input.paths }),
+        ...(input.agent === undefined ? {} : { agent: input.agent }),
+        ...(input.signal === undefined ? {} : { signal: input.signal }),
+        ...(git === undefined
+            ? {}
+            : { gitRead: { isRepo: git.isRepo, files: git.files, ...(git.problem === undefined ? {} : { problem: git.problem }) } }),
+    })
     const report = await analyzeImpact({
         cwd: input.cwd,
-        ...(input.paths === undefined ? { base: input.base } : { paths: input.paths }),
+        ...(input.paths === undefined
+            ? resolved.adopted === undefined
+                ? { base: input.base }
+                : // The service's facts are not relative to a ref, so the label
+                  // core reports is the source itself (see `ImpactOptions.changed`).
+                  { changed: resolved.adopted, base: resolved.base }
+            : { paths: input.paths }),
         maxDistance: input.config.maxDistance,
         maxFiles: input.config.maxFiles,
         maxFileBytes: input.config.maxFileBytes,
@@ -536,9 +607,8 @@ async function analyze(
     return {
         report,
         missingPaths: missingPathsOf(input.cwd, input.paths),
-        ...(diff === undefined
-            ? {}
-            : { diff: { isRepo: diff.isRepo, ...(diff.problem === undefined ? {} : { problem: diff.problem }) } }),
+        ...(diff === undefined ? {} : { diff }),
+        provenance: resolved.provenance,
     }
 }
 
@@ -548,6 +618,8 @@ async function analyze(
 export interface AnalyzeRenderInput {
     report: ImpactReport
     config: ImpactGateConfig
+    /** Where the change set came from: printed, so an audit can tell the sources apart. */
+    provenance: ChangeProvenance
     /** Explicit paths, when that was the mode. */
     paths?: readonly string[]
     /** Explicit paths that do not exist on disk (a typo looks like a planned file). */
@@ -563,15 +635,74 @@ export interface AnalyzeRenderInput {
     review?: ReviewOutcome
 }
 
+/**
+ * The lines that say where the change set came from.
+ *
+ * Two sources can answer this question and they do NOT mean the same thing, so
+ * the report never prints one without the other: the base says what the facts
+ * are relative to, the source line says who produced them (and, on a fallback,
+ * why the preferred source did not).
+ */
+export function originLines(input: {
+    report: ImpactReport
+    provenance: ChangeProvenance
+    paths?: readonly string[]
+}): string[] {
+    const { provenance, report } = input
+    if (input.paths !== undefined) {
+        return [`变更基线：${report.base}（显式 paths 模式：没有 diff，新增行区间不可用）`, `变更来源：${sourceLabel(provenance)}`]
+    }
+    if (provenance.source === 'git') {
+        return [`变更基线：${report.base}`, `变更来源：${sourceLabel(provenance)}`]
+    }
+    return [
+        `变更来源：${provenance.detail}`,
+        '变更基线：不适用（该来源报的是某一轮的改动，不是相对某个 ref 的差异）',
+        provenance.granularity === 'hunk'
+            ? '行区间：hunk 级（来自该来源自己的比较，未再读工作区）'
+            : '行区间：不可用（该来源只给了文件与行数，没有位置）',
+    ]
+}
+
+/** The adopted source's limits and the git cross-check — `impact_analyze` only. */
+export function provenanceNotes(input: { provenance: ChangeProvenance; changed: number }): string[] {
+    const provenance = input.provenance
+    if (provenance.source !== 'workspaceChanges') return []
+    const lines = ['', '### 这一次改动集的边界（来源本身的限制）', '', ...provenance.limits.map((limit) => `- ${limit}`)]
+    const cross = provenance.crossCheck
+    if (cross !== undefined && (cross.onlyInGit.length > 0 || cross.onlyInService.length > 0)) {
+        // Not a verdict, a divergence: the service answers "what this turn
+        // changed", git answers "what differs from the ref", and a reader who
+        // needs the second question answered must not be left to infer it.
+        lines.push(
+            '',
+            `⚠️ 交叉核对（只报告，不裁决）：\`git diff ${cross.base}\` 报 ${cross.gitFiles} 个改动文件，本次采用的来源报了 ${input.changed} 个：`,
+            ...(cross.onlyInGit.length === 0
+                ? []
+                : [`- 只有 git 报的：${cross.onlyInGit.map((entry) => `\`${entry}\``).join('、')}${cross.onlyInGit.length >= 10 ? '（列表已截断）' : ''}`]),
+            ...(cross.onlyInService.length === 0
+                ? []
+                : [`- 只有服务报的：${cross.onlyInService.map((entry) => `\`${entry}\``).join('、')}${cross.onlyInService.length >= 10 ? '（列表已截断）' : ''}`]),
+            '若这次分析必须覆盖 base 以来的全部改动，用 `changeSource: "git"` 重跑（或显式传 `paths`）——服务的语义是"哪一轮改了什么"。',
+        )
+        return lines
+    }
+    if (cross !== undefined) {
+        lines.push('', `交叉核对：\`git diff ${cross.base}\` 与本次来源的改动集一致（各 ${cross.gitFiles} 个文件）。`)
+    }
+    return lines
+}
+
 /** Render the `impact_analyze` report. Chinese, exact, ends with 下一步. */
 export function renderAnalyze(input: AnalyzeRenderInput): string {
     const { report, config } = input
-    const unreadable = input.paths === undefined && input.diff?.problem !== undefined
+    const provenance = input.provenance
+    const unreadable = input.paths === undefined && provenance.source === 'git' && input.diff?.problem !== undefined
     const lines: string[] = [
         '## 变更影响分析（impact_analyze）',
         '',
         `工作区：${report.cwd}`,
-        `变更基线：${report.base}${input.paths === undefined ? '' : '（显式 paths 模式：没有 diff，新增行区间不可用）'}`,
+        ...originLines(input),
         `扫描：${report.stats.filesScanned} 个文件、${report.stats.graphEdges} 条导入边${report.stats.truncated ? '（已达 maxFiles 上限：本次分析不完整）' : ''}`,
     ]
 
@@ -615,6 +746,8 @@ export function renderAnalyze(input: AnalyzeRenderInput): string {
                 '所以"谁引用了被删掉的文件"需要人工确认。',
         )
     }
+
+    lines.push(...provenanceNotes({ provenance, changed: report.changed.length }))
 
     const missing = input.missingPaths ?? []
     if (missing.length > 0) {
@@ -727,6 +860,8 @@ export function renderAnalyze(input: AnalyzeRenderInput): string {
 export interface TestsRenderInput {
     report: ImpactReport
     config: ImpactGateConfig
+    /** Where the change set came from (the selection is only as good as it). */
+    provenance: ChangeProvenance
     /** The resolved template (argument or config), for the empty-selection note. */
     template: string
     /** The rendered command (`renderTestCommand` output). */
@@ -744,12 +879,12 @@ export interface TestsRenderInput {
 /** Render the `impact_tests` report. Chinese, exact, ends with 下一步. */
 export function renderTests(input: TestsRenderInput): string {
     const { report, config } = input
-    const unreadable = input.paths === undefined && input.diff?.problem !== undefined
+    const unreadable = input.paths === undefined && input.provenance.source === 'git' && input.diff?.problem !== undefined
     const lines: string[] = [
         '## 最小回归命令（impact_tests）',
         '',
         `工作区：${report.cwd}`,
-        `变更基线：${report.base}${input.paths === undefined ? '' : '（显式 paths 模式）'}`,
+        ...originLines(input),
         `模板来源：${input.templateSource === 'argument' ? '调用参数 template（本次覆盖）' : 'profile 的 testCommandTemplate'}`,
         ...(input.missionId === undefined ? [] : [`mission：${input.missionId}`]),
     ]
@@ -837,6 +972,12 @@ export interface StatusRenderInput {
     artifactsSeen: number
     missionId?: string
     /**
+     * Whether the host mounted the `workspaceChanges` service this call, and how
+     * many sessions it has recorded turns for. Read-only facts: `auto` prefers
+     * the service, so whether it exists changes what the next analysis means.
+     */
+    changeService?: { mounted: boolean; sessions: number }
+    /**
      * `true` when no mission was resolved at all, `false` when a mission exists
      * but has no artifacts yet. Both states are reported distinctly.
      */
@@ -868,6 +1009,12 @@ export function renderStatus(input: StatusRenderInput): string {
         '### 生效配置',
         '',
         `- 变更基线（defaultBase）：\`${config.defaultBase}\``,
+        `- 改动集来源（changeSource）：${changeSourceLabel(config.changeSource)}` +
+            (input.changeService === undefined
+                ? ''
+                : input.changeService.mounted
+                  ? `｜workspaceChanges 服务：已挂载（已记录 ${input.changeService.sessions} 个会话的轮次）`
+                  : '｜workspaceChanges 服务：**未挂载**（`auto` 会回退到 git，并在报告里写明回退原因）'),
         `- 反向可达最大距离（maxDistance）：${config.maxDistance}`,
         `- 扫描上限：maxFiles ${config.maxFiles} / maxFileBytes ${config.maxFileBytes}`,
         config.testCommandTemplate === ''
@@ -918,6 +1065,9 @@ export function renderStatus(input: StatusRenderInput): string {
                 ? []
                 : [`- 生成时间：${formatTime(Date.parse(generated))}`]),
             ...(input.newest.base === undefined ? [] : [`- 当时基线：\`${input.newest.base}\``]),
+            ...(input.newest.changeSource === undefined
+                ? []
+                : [`- 当时的改动集来源：${input.newest.changeSource}（产物里的 \`changeSource.source\`）`]),
         )
     }
 
@@ -985,10 +1135,11 @@ export function registerTools(
                 const store = deps.stores.for(cwd)
                 const mission = resolveMission(store, agent, args.missionId)
                 const base = baseOf(args.base, config)
-                const { report, diff, missingPaths } = await analyze(deps, {
+                const { report, diff, missingPaths, provenance } = await analyze(deps, {
                     cwd,
                     config,
                     base,
+                    ...(agent === undefined ? {} : { agent }),
                     ...(parsed.paths === undefined ? {} : { paths: parsed.paths }),
                     ...(signalOf(exec) === undefined ? {} : { signal: signalOf(exec) }),
                 })
@@ -1024,6 +1175,7 @@ export function registerTools(
                 const artifact = buildArtifact({
                     report,
                     config,
+                    provenance,
                     generatedAt: new Date().toISOString(),
                     ...(parsed.paths === undefined ? {} : { paths: parsed.paths }),
                     ...(missingPaths.length === 0 ? {} : { missingPaths }),
@@ -1049,6 +1201,7 @@ export function registerTools(
                 return renderAnalyze({
                     report,
                     config,
+                    provenance,
                     ...(parsed.paths === undefined ? {} : { paths: parsed.paths }),
                     ...(missingPaths.length === 0 ? {} : { missingPaths }),
                     ...(diff === undefined ? {} : { diff }),
@@ -1103,10 +1256,11 @@ export function registerTools(
                 }
 
                 const base = baseOf(args.base, config)
-                const { report, diff, missingPaths } = await analyze(deps, {
+                const { report, diff, missingPaths, provenance } = await analyze(deps, {
                     cwd,
                     config,
                     base,
+                    ...(agent === undefined ? {} : { agent }),
                     ...(parsed.paths === undefined ? {} : { paths: parsed.paths }),
                     ...(signalOf(exec) === undefined ? {} : { signal: signalOf(exec) }),
                 })
@@ -1132,6 +1286,7 @@ export function registerTools(
                 return renderTests({
                     report,
                     config,
+                    provenance,
                     template,
                     command,
                     templateSource: fromArgument ? 'argument' : 'config',
@@ -1159,8 +1314,11 @@ export function registerTools(
                 const { agent, cwd, effective } = preamble(exec)
                 const store = deps.stores.for(cwd)
                 const mission = resolveMission(store, agent, args.missionId)
+                // Read-only facts about the source that `auto` prefers: whether it
+                // is mounted decides what the NEXT analysis will be based on.
+                const changeService = { mounted: deps.changes.mounted(), sessions: deps.changes.ledger.sessions }
                 if (mission === undefined) {
-                    return renderStatus({ cwd, effective, artifactsSeen: 0, noMission: true })
+                    return renderStatus({ cwd, effective, artifactsSeen: 0, noMission: true, changeService })
                 }
                 const artifacts = listImpactArtifacts(store, mission.id)
                 const newest = artifacts[artifacts.length - 1]
@@ -1170,6 +1328,7 @@ export function registerTools(
                     artifactsSeen: artifacts.length,
                     missionId: mission.id,
                     noMission: false,
+                    changeService,
                     ...(newest === undefined ? {} : { newest }),
                 })
             },

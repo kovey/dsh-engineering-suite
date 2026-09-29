@@ -31,11 +31,13 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { MissionStoreRegistry, createLogger, expandHome, resolveLayout, sessionCwd, sessionIdOf } from 'dsh-eng-core'
 import type { AgentLike, Layout } from 'dsh-eng-core'
+import { agentTeamsAvailability } from './agent-teams.js'
 import { RoleBindingStore } from './bindings.js'
 import { resolveConfig } from './config.js'
 import { RoleRegistryCache } from './loader.js'
 import { PROMPT_SECTION, sectionText } from './prompt.js'
 import { createSkillGuard } from './skill-gate.js'
+import { TeammateAuditStore, teammateObservation } from './teammates.js'
 import { registerTools, type SubagentsLike } from './tools.js'
 import { createRolePlanner } from './service.js'
 
@@ -84,6 +86,15 @@ function disposedSessionId(payload: unknown): string | undefined {
     return typeof nested === 'string' && nested !== '' ? nested : undefined
 }
 
+/** Read a service without letting a hostile registry throw during assembly. */
+function safeGet(context: ContextLike, name: string): unknown {
+    try {
+        return context.get(name)
+    } catch {
+        return undefined
+    }
+}
+
 /** Register the plugin. */
 export function apply(ctx: Context, config: unknown = {}): void {
     const resolved = resolveConfig(config)
@@ -108,6 +119,7 @@ export function apply(ctx: Context, config: unknown = {}): void {
             layoutFor,
             bindings,
             subagents: () => context.get('subagents') as SubagentsLike | undefined,
+            agentTeams: () => safeGet(context, 'agentTeams'),
             visibleTool: (toolName, agent) => {
                 try {
                     return context.tools.get(toolName, agent) !== undefined
@@ -115,6 +127,7 @@ export function apply(ctx: Context, config: unknown = {}): void {
                     return false
                 }
             },
+            logger,
         })
 
         const disposers: (() => void)[] = [...tools.disposers]
@@ -172,6 +185,61 @@ export function apply(ctx: Context, config: unknown = {}): void {
             }
         }
 
+        // --- Agent Teams composition (a collaboration surface, never authority) ---
+        // The official capability (`agentTeams`, harness 0.2.0-rc.1) is
+        // coordination state: its tools carry no persona, tool whitelist, model
+        // route or permission parameter, and a teammate created through it
+        // inherits the Lead's entire tool surface. It must therefore neither
+        // receive our authorisation decisions nor hand us any. Concretely:
+        //  - `team_delegate` REFUSES its spawn path by name and stays on this
+        //    plugin's own `ctx.subagents.start()` path (`agent-teams.ts`);
+        //  - every teammate the roster journals is recorded as `ungoverned`, so
+        //    a reader can tell a role-policed child from a peer that carries no
+        //    role policy at all (`teammates.ts`).
+        // Nothing below reads a teammate's message, task or report as evidence,
+        // and nothing in this plugin can be cleared by one.
+        const teams = resolved.composeWithAgentTeams === 'off' ? undefined : safeGet(context, 'agentTeams')
+        const availability = agentTeamsAvailability(teams)
+        let teamsState: string
+        if (resolved.composeWithAgentTeams === 'off') {
+            teamsState = 'off(config)'
+        } else if (availability === 'absent') {
+            teamsState = 'absent'
+        } else {
+            const audit = new TeammateAuditStore(logger)
+            const observe = (session: unknown, event: unknown): void => {
+                try {
+                    const observation = teammateObservation(session, event)
+                    if (observation === undefined) return
+                    // The workspace comes from the Team Lead's session header
+                    // only. A `process.cwd()` fallback would file the record
+                    // under whatever repository the host happens to run in —
+                    // the "wrong project" failure this suite refuses elsewhere.
+                    const cwd = observation.cwd
+                    if (cwd === undefined || cwd === '') {
+                        logger.warn(
+                            `teammate "${observation.name}" (${observation.sessionId}) 未记录：Lead 会话 header 没有 cwd，无法定位工作区。`,
+                        )
+                        return
+                    }
+                    const written = audit.record(resolveLayout(cwd, resolved.layout), observation)
+                    if (written === undefined) return
+                    if (written.created) {
+                        logger.warn(
+                            `teammate "${written.record.name}" (${written.record.sessionId}) 未经 team_delegate 创建：记录为 ungoverned（${written.record.missing.join('；')}）。`,
+                        )
+                    } else {
+                        logger.debug(`teammate ${written.record.sessionId} 名册更新：phase=${written.record.phase}`)
+                    }
+                } catch (error) {
+                    // An observer must never break the session that produced the event.
+                    logger.debug('teammate observation failed:', error)
+                }
+            }
+            disposers.push(context.on('session/event', observe as never))
+            teamsState = `on(availability=${availability})`
+        }
+
         // --- binding cache cleanup (the files stay: a resumed child keeps its role) ---
         const forget = (event: string): void => {
             try {
@@ -222,7 +290,7 @@ export function apply(ctx: Context, config: unknown = {}): void {
         })
 
         logger.info(
-            `applied (tools: ${tools.registered.join(', ') || 'none'}; provider=${resolved.provider}; defaultRole=${resolved.defaultRole}; skillGate=${skillGate}; service=${serviceState})`,
+            `applied (tools: ${tools.registered.join(', ') || 'none'}; provider=${resolved.provider}; defaultRole=${resolved.defaultRole}; skillGate=${skillGate}; service=${serviceState}; agentTeams=${teamsState})`,
         )
     } catch (error) {
         logger.error('apply failed:', error)

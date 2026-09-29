@@ -39,6 +39,19 @@ export interface RoleGuardConfig {
     enforceSkillWhitelist: boolean
     /** Tool names that load a skill; only these are gated. */
     skillTools: readonly string[]
+    /**
+     * How this plugin composes with the official Agent Teams capability
+     * (`@deepseek-ai/dsh-experimental-agent-team`, service `agentTeams`).
+     *
+     * - `'auto'` (default): `team_delegate` answers a team-style dispatch
+     *   request with a named refusal (the official spawn cannot carry a role's
+     *   persona / tool whitelist / model route — see `agent-teams.ts`), and the
+     *   plugin records every teammate the official surface creates as
+     *   `ungoverned`;
+     * - `'off'`: the service is never read, no roster observer is installed, and
+     *   the plugin behaves exactly as it did before this key existed.
+     */
+    composeWithAgentTeams: 'auto' | 'off'
     prompt: {
         enabled: boolean
         order: number
@@ -107,6 +120,11 @@ export function resolveConfig(input: unknown): RoleGuardConfig {
         injectSpec: bool(raw['injectSpec'], true),
         enforceSkillWhitelist: bool(raw['enforceSkillWhitelist'], true),
         skillTools: skillTools.length > 0 ? skillTools : [...DEFAULT_SKILL_TOOLS],
+        // Only the documented `'off'` disables the composition: an unknown value
+        // is more likely a typo than an intentional opt-out, and 'auto' is the
+        // fail-closed choice here (it is the mode that refuses the official
+        // spawn and records ungoverned teammates).
+        composeWithAgentTeams: raw['composeWithAgentTeams'] === 'off' ? 'off' : 'auto',
         prompt: {
             enabled: bool(prompt['enabled'], true),
             order: num(prompt['order'], 610),

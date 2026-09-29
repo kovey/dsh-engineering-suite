@@ -8,9 +8,11 @@ import path from 'node:path'
 import test from 'node:test'
 import { MissionStoreRegistry, renderSpecMarkdown, resolveLayout } from 'dsh-eng-core'
 import { createFakeHost, runText, tempWorkspace, type FakeHost } from 'dsh-eng-core/testing'
+import { unexpressibleGuarantees } from '../dist/agent-teams.js'
 import { RoleBindingStore, roleForSession } from '../dist/bindings.js'
 import { apply, inject, name } from '../dist/index.js'
 import { parseRole } from '../dist/roles.js'
+import { readTeammate, teammateObservation, UNGOVERNED_MISSING } from '../dist/teammates.js'
 import { filterRefusal, planToolFilter } from '../dist/tools.js'
 
 const HOST_TOOLS = ['read', 'write', 'edit', 'bash', 'glob', 'grep', 'todo_write', 'read_image', 'subagent', 'skill']
@@ -792,4 +794,265 @@ test('the service binds the child so the skill whitelist applies (regression)', 
     }
     walk(path.join(cwd, '.dsh'))
     assert.equal(found.length, 1, `expected exactly one binding file, found: ${found.join(', ')}`)
+})
+
+// --- Agent Teams composition (a collaboration surface, never authority) ------
+
+/**
+ * A fake `agentTeams` service, shaped like the one harness 0.2.0-rc.1 mounts
+ * (`TeamService`: `spawnTeammate` + roster/mailbox reads). `spawns()` counts
+ * calls, so a test can prove the official path was NOT used.
+ */
+function fakeAgentTeams(): { service: Record<string, unknown>; spawns: () => number } {
+    let spawns = 0
+    return {
+        service: {
+            spawnTeammate: async () => {
+                spawns += 1
+                return { member: { id: 'teammate-1', name: 'peer', role: 'teammate', status: 'active', diagnostics: [] } }
+            },
+            listMembers: () => [],
+            tryMembership: () => undefined,
+        },
+        spawns: () => spawns,
+    }
+}
+
+/** A host with an official Agent Teams service mounted (`undefined` = not installed). */
+function hostWithTeams(cwd: string, service: unknown, config: Record<string, unknown> = {}): FakeHost {
+    const fake = createFakeHost({ cwd, withSubagents: true, services: service === undefined ? {} : { agentTeams: service } })
+    stubTools(fake)
+    apply(fake.ctx as never, { logFile: path.join(cwd, 'role-guard.log'), ...config })
+    return fake
+}
+
+/** The Team Lead's session object, as `session/event` carries it. */
+function leadSession(cwd: string, id = 'session-1'): Record<string, unknown> {
+    return { id, header: { id, cwd } }
+}
+
+/** One `team/member` session event, as the official journal writes it. */
+function teamMemberEvent(member: Record<string, unknown>, teamId = 'session-1'): Record<string, unknown> {
+    return {
+        type: 'team/member',
+        seq: 1,
+        time: Date.now(),
+        data: { version: 2, teamId, member: { provider: 'spawn', context: 'fresh', ...member } },
+    }
+}
+
+test('a team-style dispatch is refused by name and served by the governed path (regression)', async () => {
+    const cwd = tempWorkspace('role-guard-teams-')
+    const teams = fakeAgentTeams()
+    const fake = hostWithTeams(cwd, teams.service)
+    const run = await fake.runTool('team_delegate', { role: 'reviewer', task: '审查 src/server.ts', dispatch: 'team' })
+    assert.equal(run.isError, false)
+    const text = runText(run)
+    // Which path was used, and exactly why the official one was not.
+    assert.match(text, /dispatch path: subagents/)
+    assert.match(text, /spawnTeammate/)
+    assert.match(text, /persona 影子段/)
+    assert.match(text, /工具白名单/)
+    // The official spawn was never called: no teammate exists that we did not govern.
+    assert.equal(teams.spawns(), 0)
+    // …and the delegation carries every guarantee it carried before.
+    assert.equal(fake.subagentStarts.length, 1)
+    const start = fake.subagentStarts[0] as { provider: string; request: Record<string, unknown> }
+    assert.equal(start.provider, 'spawn')
+    assert.deepEqual(start.request['toolFilter'], { allow: ['read', 'glob', 'grep'] })
+    assert.match(String(start.request['persona']), /审查者/)
+    assert.match(text, /child output/)
+    // The durable per-child record names the path as well.
+    const binding = JSON.parse(fs.readFileSync(path.join(cwd, '.dsh', 'state', 'roles', 'run-1.json'), 'utf8')) as Record<string, unknown>
+    assert.equal(binding['dispatch'], 'subagents')
+})
+
+test('the refusal names exactly the guarantees this role needs (regression)', async () => {
+    /** The named-guarantee bullets of a dispatch report (the report's own lines only). */
+    const refusalLines = (text: string): string =>
+        text
+            .split('\n')
+            .filter((line) => line.startsWith('  - '))
+            .join('\n')
+
+    // `auditor`: persona + tool whitelist + skill whitelist, no model route.
+    const cwd = skillRoleWorkspace()
+    const text = runText(
+        await hostWithTeams(cwd, fakeAgentTeams().service).runTool('team_delegate', { role: 'auditor', task: '审查实现', dispatch: 'team' }),
+    )
+    assert.match(refusalLines(text), /persona 影子段/)
+    assert.match(refusalLines(text), /工具白名单/)
+    assert.match(refusalLines(text), /技能白名单/)
+    assert.doesNotMatch(refusalLines(text), /模型路由/, 'the role declares no route, so nothing about routing may be refused')
+
+    // A role that declares a route is told about that too.
+    const routed = runText(
+        await hostWithTeams(routeRoleWorkspace(), fakeAgentTeams().service).runTool('team_delegate', {
+            role: 'cheap',
+            task: 't',
+            dispatch: 'team',
+        }),
+    )
+    assert.match(refusalLines(routed), /模型路由/)
+})
+
+test('the persona guarantee is structural: a role that declares nothing still needs one (regression)', () => {
+    const role = parseRole(['---', 'id: bare', 'mode: write', 'tools: []', 'deny: []', 'skills: []', '---', '只声明了 persona。'].join('\n'), 'test')
+    assert.ok(!('error' in role))
+    // No tool filter, no route, no skills: the persona alone is unexpressible,
+    // because every loadable role has one and `SpawnTeammateRequest` has no
+    // persona field. That is why the official path is refused for EVERY role.
+    const missing = unexpressibleGuarantees(role, { filter: {}, dropped: [] }, {})
+    assert.equal(missing.length, 1)
+    assert.match(missing[0] ?? '', /persona 影子段/)
+})
+
+test("composeWithAgentTeams: 'off' reproduces the previous dispatch exactly (regression)", async () => {
+    const cwd = routeRoleWorkspace()
+    const teamsOff = fakeAgentTeams()
+    const off = hostWithTeams(cwd, teamsOff.service, { composeWithAgentTeams: 'off' })
+    const auto = hostWithTeams(cwd, fakeAgentTeams().service)
+
+    const plainOff = await off.runTool('team_delegate', { role: 'cheap', task: 't' })
+    const plainAuto = await auto.runTool('team_delegate', { role: 'cheap', task: 't' })
+    // Field for field the same start request (the signal is per-call by construction).
+    const startOff = { ...(off.subagentStarts[0] as { request: Record<string, unknown> }).request }
+    const startAuto = { ...(auto.subagentStarts[0] as { request: Record<string, unknown> }).request }
+    delete startOff['signal']
+    delete startAuto['signal']
+    assert.deepEqual(startOff, startAuto)
+    assert.deepEqual(startOff['toolFilter'], { allow: ['read'] })
+    assert.deepEqual(startOff['agentOptions'], { provider: 'deepseek-official', model: 'deepseek-v4-flash', reasoningEffort: 'low', maxTokens: 2048 })
+    // …and the same output: a delegation that did not ask for a team gains no line.
+    assert.equal(runText(plainOff), runText(plainAuto))
+    assert.doesNotMatch(runText(plainOff), /dispatch path/)
+    // No observer is installed under 'off': the official roster is never read.
+    assert.equal(off.listeners.has('session/event'), false)
+    assert.equal(auto.listeners.has('session/event'), true)
+
+    // A team request under 'off' is answered, not silently ignored.
+    const refused = runText(await off.runTool('team_delegate', { role: 'cheap', task: 't', dispatch: 'team' }))
+    assert.match(refused, /dispatch path: subagents/)
+    assert.match(refused, /composeWithAgentTeams: off/)
+    assert.equal(teamsOff.spawns(), 0)
+
+    // …and the prompt section is the one from before this capability existed:
+    // 'off' adds no paragraph, 'auto' explains the composition.
+    assert.equal(off.sectionText('eng:role-guard').includes('协作面'), false)
+    assert.match(auto.sectionText('eng:role-guard'), /协作面/)
+})
+
+test('a partial, hostile or missing agentTeams service never breaks a delegation (regression)', async () => {
+    const cwd = tempWorkspace('role-guard-teams-partial-')
+    // Mounted, but with no programmatic spawn: only the model-facing tools' backing store.
+    const partial = await hostWithTeams(cwd, { listMembers: () => [], tryMembership: () => undefined }).runTool('team_delegate', {
+        role: 'reviewer',
+        task: 'x',
+        dispatch: 'team',
+    })
+    assert.equal(partial.isError, false)
+    assert.match(runText(partial), /dispatch path: subagents/)
+    assert.match(runText(partial), /programmatic spawn/)
+
+    // A service whose probe throws is treated as "no programmatic spawn".
+    const hostile = { get spawnTeammate(): never { throw new Error('boom') } }
+    const probed = await hostWithTeams(cwd, hostile).runTool('team_delegate', { role: 'reviewer', task: 'x', dispatch: 'team' })
+    assert.equal(probed.isError, false)
+    assert.match(runText(probed), /programmatic spawn/)
+
+    // Nothing mounted at all.
+    const absent = await hostWithTeams(cwd, undefined).runTool('team_delegate', { role: 'reviewer', task: 'x', dispatch: 'team' })
+    assert.equal(absent.isError, false)
+    assert.match(runText(absent), /没有挂载 agentTeams 服务/)
+
+    // An unrecognised dispatch value falls back with a warning instead of failing.
+    const typo = await hostWithTeams(cwd, fakeAgentTeams().service).runTool('team_delegate', { role: 'reviewer', task: 'x', dispatch: 'teams' })
+    assert.equal(typo.isError, false)
+    assert.match(runText(typo), /未知的 dispatch 值/)
+})
+
+test('a teammate created outside team_delegate is recorded as ungoverned (regression)', async () => {
+    const cwd = tempWorkspace('role-guard-teams-audit-')
+    const fake = hostWithTeams(cwd, fakeAgentTeams().service)
+    const file = path.join(cwd, '.dsh', 'state', 'teammates', 'tm-1.json')
+    assert.equal(fs.existsSync(file), false)
+
+    fake.emit('session/event', [leadSession(cwd), teamMemberEvent({ id: 'tm-1', name: 'peer-a', phase: 'provisioning' })])
+    const first = JSON.parse(fs.readFileSync(file, 'utf8')) as Record<string, unknown>
+    assert.equal(first['sessionId'], 'tm-1')
+    assert.equal(first['teamId'], 'session-1')
+    assert.equal(first['name'], 'peer-a')
+    assert.equal(first['phase'], 'provisioning')
+    assert.equal(first['governance'], 'ungoverned')
+    assert.equal(first['provenance'], 'team/member')
+    assert.deepEqual(first['missing'], [...UNGOVERNED_MISSING])
+    assert.match(String(first['reason']), /未经 team_delegate/)
+    assert.equal(fs.existsSync(path.join(cwd, '.dsh', 'state', 'roles', 'tm-1.json')), false, 'a teammate record is not a role binding')
+
+    // A later roster write updates the phase without a second record and without
+    // resetting the first observation.
+    fake.emit('session/event', [leadSession(cwd), teamMemberEvent({ id: 'tm-1', name: 'peer-a', phase: 'active' })])
+    const second = JSON.parse(fs.readFileSync(file, 'utf8')) as Record<string, unknown>
+    assert.equal(second['phase'], 'active')
+    assert.equal(second['observedAt'], first['observedAt'])
+    assert.deepEqual(fs.readdirSync(path.join(cwd, '.dsh', 'state', 'teammates')), ['tm-1.json'])
+
+    // The record reads back through the store, and the plugin log carries the verdict.
+    const stored = readTeammate(resolveLayout(cwd), 'tm-1')
+    assert.equal(stored?.governance, 'ungoverned')
+    assert.equal(stored?.phase, 'active')
+    assert.match(fs.readFileSync(path.join(cwd, 'role-guard.log'), 'utf8'), /ungoverned/)
+})
+
+test('a teammate record is evidence of a gap, not a grant (regression)', async () => {
+    const cwd = skillRoleWorkspace()
+    const fake = hostWithTeams(cwd, fakeAgentTeams().service)
+    fake.emit('session/event', [leadSession(cwd), teamMemberEvent({ id: 'tm-9', name: 'peer', phase: 'active' })])
+    assert.equal(readTeammate(resolveLayout(cwd), 'tm-9')?.governance, 'ungoverned')
+
+    // The skill gate is NOT widened by the record: a teammate whose session has
+    // no binding (its own or its parent's) stays unrestricted, exactly as any
+    // other child this plugin did not create — the record is a report, never a
+    // policy, and it grants nothing.
+    const orphan = childAgent(cwd, 'tm-9', 'session-unbound')
+    assert.equal(fake.guardReason({ name: 'skill', arguments: { name: 'other-skill' }, agent: orphan }), undefined)
+
+    // And it does not weaken the gate for a teammate that DOES inherit a role
+    // binding one hop up: the gate keeps working from the binding alone.
+    await fake.runTool('team_delegate', { role: 'auditor', task: '审查实现' })
+    const under = childAgent(cwd, 'tm-10', 'run-1')
+    assert.match(String(fake.guardReason({ name: 'skill', arguments: { name: 'other-skill' }, agent: under }) ?? ''), /技能白名单拒绝/)
+})
+
+test('the roster observer is total and never files a record outside a known workspace (regression)', async () => {
+    const cwd = tempWorkspace('role-guard-teams-total-')
+    const fake = hostWithTeams(cwd, fakeAgentTeams().service)
+    const session = leadSession(cwd)
+    // Hostile or unrelated session events must not throw inside the listener.
+    for (const payload of [
+        [],
+        [undefined, undefined],
+        [session, undefined],
+        [session, { type: 'team/task' }],
+        [session, { type: 'team/member' }],
+        [session, { type: 'team/member', data: {} }],
+        [session, { type: 'team/member', data: { member: null } }],
+        [session, { type: 'team/member', data: { member: { id: 'x', phase: 'nope' } } }],
+        [session, { type: 'team/member', data: { teamId: 'session-1', member: { id: '', phase: 'active' } } }],
+        'not an event',
+    ]) {
+        fake.emit('session/event', payload)
+    }
+    assert.equal(fs.existsSync(path.join(cwd, '.dsh', 'state', 'teammates')), false)
+    assert.equal(teammateObservation(session, teamMemberEvent({ id: 'tm-x', name: 'peer-x', phase: 'active' }))?.sessionId, 'tm-x')
+
+    // A Lead session with no cwd is NOT guessed from the process directory
+    // (that would file the record under whatever repository the host runs in).
+    fake.emit('session/event', [{ id: 'session-2', header: {} }, teamMemberEvent({ id: 'tm-2', name: 'peer-b', phase: 'active' })])
+    assert.equal(fs.existsSync(path.join(cwd, '.dsh', 'state', 'teammates', 'tm-2.json')), false)
+
+    // Under 'off' no observer exists at all: the official roster is never read.
+    const off = hostWithTeams(cwd, fakeAgentTeams().service, { composeWithAgentTeams: 'off' })
+    off.emit('session/event', [leadSession(cwd), teamMemberEvent({ id: 'tm-3', name: 'peer-c', phase: 'active' })])
+    assert.equal(fs.existsSync(path.join(cwd, '.dsh', 'state', 'teammates', 'tm-3.json')), false)
 })

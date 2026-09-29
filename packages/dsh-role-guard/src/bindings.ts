@@ -43,6 +43,21 @@ export interface RoleBinding {
      * host's own route (this plugin handed nothing over).
      */
     route?: EffectiveRoute
+    /**
+     * Which creation path produced the child, recorded by the caller that
+     * created it.
+     *
+     * `team_delegate` writes `'subagents'` (its own `ctx.subagents.start()`
+     * path). `'agentTeams'` exists because the binding is the suite's durable
+     * per-child evidence and a reviewer's first question is "which path?": the
+     * value is written only when a path really was used — nothing writes
+     * `'agentTeams'` today, because the official teammate spawn cannot carry a
+     * role's persona / tool whitelist / model route (see `agent-teams.ts`).
+     * The autonomous-dispatcher seam (`role-guard` service `bind`) writes no
+     * path at all: that caller creates the child itself, so this plugin cannot
+     * witness which path it used.
+     */
+    dispatch?: 'subagents' | 'agentTeams'
     updatedAt: number
 }
 
@@ -103,6 +118,7 @@ function asBinding(value: unknown, sessionId: string): RoleBinding | undefined {
     if (roleId === undefined) return undefined
     const stored = record['sessionId']
     const route = asRoute(record['route'])
+    const dispatch = record['dispatch']
     return {
         sessionId: typeof stored === 'string' && stored !== '' ? stored : sessionId,
         roleId,
@@ -111,6 +127,7 @@ function asBinding(value: unknown, sessionId: string): RoleBinding | undefined {
         skills: stringList(record['skills']),
         tools: stringList(record['tools']),
         ...(route === undefined ? {} : { route }),
+        ...(dispatch === 'subagents' || dispatch === 'agentTeams' ? { dispatch } : {}),
         updatedAt: typeof record['updatedAt'] === 'number' && Number.isFinite(record['updatedAt']) ? record['updatedAt'] : 0,
     }
 }
@@ -137,12 +154,19 @@ export class RoleBindingStore {
      * @param role - the role the child was created with.
      * @param route - the effective model route the child ran on (optional and
      *   additive: a binding written without it stays readable).
+     * @param dispatch - the creation path, when the caller witnessed one.
      * @returns the recorded binding, or `undefined` when it could not be written
      *   (the caller must warn: an unwritten binding means no skill enforcement
      *   for that child).
      */
-    bind(agent: AgentLike | undefined, sessionId: string, role: Role, route?: EffectiveRoute): RoleBinding | undefined {
-        return this.bindAt(this.layoutFor(agent), sessionId, role, route)
+    bind(
+        agent: AgentLike | undefined,
+        sessionId: string,
+        role: Role,
+        route?: EffectiveRoute,
+        dispatch?: RoleBinding['dispatch'],
+    ): RoleBinding | undefined {
+        return this.bindAt(this.layoutFor(agent), sessionId, role, route, dispatch)
     }
 
     /**
@@ -156,8 +180,15 @@ export class RoleBindingStore {
      * @param sessionId - the child session id.
      * @param role - the role the child was created with.
      * @param route - the effective route the child ran on.
+     * @param dispatch - the creation path, when the caller witnessed one.
      */
-    bindAt(layout: Layout, sessionId: string, role: Role, route?: EffectiveRoute): RoleBinding | undefined {
+    bindAt(
+        layout: Layout,
+        sessionId: string,
+        role: Role,
+        route?: EffectiveRoute,
+        dispatch?: RoleBinding['dispatch'],
+    ): RoleBinding | undefined {
         try {
             const file = bindingFile(layout, sessionId)
             const effective = compactRoute(route)
@@ -169,6 +200,7 @@ export class RoleBindingStore {
                 skills: [...role.skills],
                 tools: [...role.tools],
                 ...(effective === undefined ? {} : { route: effective }),
+                ...(dispatch === undefined ? {} : { dispatch }),
                 updatedAt: Date.now(),
             }
             writeJsonAtomic(file, binding)

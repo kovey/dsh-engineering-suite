@@ -15,6 +15,10 @@
  *  3. **Loosening.** This plugin records no gate verdict, so there is nothing a
  *     project file could ratchet; what a project MAY refine is the command that
  *     runs here and the analysis budget (see {@link PROJECT_OVERRIDABLE_KEYS}).
+ *  4. **`changeSource`.** Which source supplies the change set (the host's
+ *     `workspaceChanges` service or our own `git diff`) is a HOST decision: the
+ *     two answer different questions, so a project able to pin one could change
+ *     what the analysis means for everyone reading its output.
  *
  * @module dsh-impact-gate/config
  */
@@ -27,6 +31,9 @@ import {
     type FlakySettings,
 } from './flaky.js'
 
+/** Where the change set may come from. */
+export type ChangeSource = 'auto' | 'workspaceChanges' | 'git'
+
 /** Resolved plugin configuration. */
 export interface ImpactGateConfig {
     enabled: boolean
@@ -35,6 +42,18 @@ export interface ImpactGateConfig {
     /** Per-workspace log template (host-only). */
     logFileTemplate?: string
     layout: LayoutOptions
+    /**
+     * Which source supplies the change set (host-only, default `auto`).
+     *
+     * `auto` prefers the host's `workspaceChanges` service and falls back to
+     * `git diff` with a reported reason; the two explicit values pin one source,
+     * and a pinned-but-unusable source is a loud refusal instead of a silent
+     * fallback. It is host-only because the two sources answer DIFFERENT
+     * questions (a turn snapshot vs a diff against a ref), so choosing between
+     * them changes what the analysis means — that is a host decision, not a
+     * repository preference.
+     */
+    changeSource: ChangeSource
     /** Reverse-import walk bound: how far a change is followed (default 6). */
     maxDistance: number
     /** Bound on files walked in one analysis (the same walk the standards gate uses). */
@@ -159,12 +178,17 @@ export function resolveConfig(input: unknown, warn: Warn = () => undefined): Imp
     for (const problem of compiled.problems) warn(`config: ${problem}`)
     const flakyOwner = optionalString(flaky['owner'])
     const flakyQuarantineFile = optionalString(flaky['quarantineFile'])
+    const changeSource = raw['changeSource']
+    if (changeSource !== undefined && !CHANGE_SOURCES.includes(changeSource as ChangeSource)) {
+        warn(`config.changeSource 必须是 ${CHANGE_SOURCES.join(' / ')} 之一，已忽略（继续用默认值 auto）`)
+    }
     return {
         enabled: bool(raw['enabled'], true),
         logFile: str(raw['logFile'], '~/.dsh/impact-gate.log'),
         ...(typeof raw['logFileTemplate'] === 'string' && raw['logFileTemplate'] !== ''
             ? { logFileTemplate: raw['logFileTemplate'] }
             : {}),
+        changeSource: CHANGE_SOURCES.includes(changeSource as ChangeSource) ? (changeSource as ChangeSource) : 'auto',
         layout: {
             ...(typeof layout['rootDir'] === 'string' ? { rootDir: layout['rootDir'] } : {}),
             ...(typeof layout['missionsDir'] === 'string' ? { missionsDir: layout['missionsDir'] } : {}),
@@ -202,6 +226,9 @@ export function resolveConfig(input: unknown, warn: Warn = () => undefined): Imp
 
 /** Keys `config.flaky` accepts (anything else is reported, never silently used). */
 export const FLAKY_KEYS: readonly string[] = ['signatures', 'quarantineMaxDays', 'quarantineFile', 'unseenRunsBeforeWarn', 'owner']
+
+/** Accepted values of `config.changeSource`, in the order the refusal message lists them. */
+export const CHANGE_SOURCES: readonly ChangeSource[] = ['auto', 'workspaceChanges', 'git']
 
 /**
  * Keys a target repository may override in `<repo>/.dsh/impact-gate.json`.

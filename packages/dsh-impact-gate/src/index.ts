@@ -34,6 +34,7 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import { MissionStoreRegistry, createLogger, expandHome, type AgentLike, type Logger } from 'dsh-eng-core'
+import { ChangeLedger, type WorkspaceChangesLike } from './changes.js'
 import { resolveConfig, resolveEffectiveConfig } from './config.js'
 import { PROMPT_SECTION, sectionText } from './prompt.js'
 import { registerTools, type ToolDeps } from './tools.js'
@@ -57,6 +58,15 @@ interface ContextLike {
     systemPrompt: PromptRuntimeLike
     get: (name: string) => unknown
     effect: (execute: () => (() => void) | void) => void
+    /** cordis event subscription; absent only in a host that strips it. */
+    on?: (event: string, listener: (...args: never[]) => unknown) => (() => void) | void
+}
+
+/** Whether a `ctx.get('workspaceChanges')` value is the host service (structure, not identity). */
+function isWorkspaceChanges(value: unknown): value is WorkspaceChangesLike {
+    if (typeof value !== 'object' || value === null) return false
+    const candidate = value as { summary?: unknown; diff?: unknown }
+    return typeof candidate.summary === 'function' && typeof candidate.diff === 'function'
 }
 
 /** Register the plugin. */
@@ -77,11 +87,24 @@ export function apply(ctx: Context, config: unknown = {}): void {
     try {
         const context = ctx as unknown as ContextLike
         const stores = new MissionStoreRegistry({ ...resolved.layout, logger: log })
+        // The host's `workspaceChanges` service (optional, never injected: the
+        // plugin must mount with or without it) and the ledger that remembers
+        // which `workspace/changes` event belongs to which session — the service
+        // is keyed by `(sessionId, seq)`, and the seq is not discoverable from
+        // the service itself.
+        const changes = new ChangeLedger()
+        const serviceOf = (): unknown => context.get('workspaceChanges')
         const deps: ToolDeps = {
             config: resolved,
             // Profile config is the ceiling; a workspace may refine it through its
             // own .dsh/impact-gate.json (see resolveEffectiveConfig).
             configFor: (cwd: string) => resolveEffectiveConfig(resolved, stores.for(cwd).layout, log),
+            changes: {
+                service: serviceOf,
+                ledger: changes,
+                mounted: () => isWorkspaceChanges(serviceOf()),
+                logger: log,
+            },
             stores,
             subagents: () => context.get('subagents') as SubagentsLike | undefined,
             // `flaky_plan`'s repeated-run mode uses the host's managed process
@@ -95,6 +118,23 @@ export function apply(ctx: Context, config: unknown = {}): void {
         if (tools.failed.length > 0) log.warn(`tools that failed to register: ${tools.failed.join(', ')}`)
 
         const disposers: (() => void)[] = [...tools.disposers]
+        // The change set of the CURRENT turn is announced by an event this plugin
+        // has to see as it happens; missing one is a reported fallback reason,
+        // never a silent "nothing changed".
+        try {
+            const offEvent = context.on?.('session/event', (session: unknown, event: unknown) => {
+                try {
+                    changes.observe(session, event)
+                } catch (error) {
+                    log.warn('workspace/changes 记录失败（按没有记录处理）:', error)
+                }
+            })
+            if (typeof offEvent === 'function') disposers.push(offEvent)
+            const offDisposed = context.on?.('session/disposed', (session: unknown) => changes.forget(session))
+            if (typeof offDisposed === 'function') disposers.push(offDisposed)
+        } catch (error) {
+            log.warn('无法订阅 session/event（changeSource=auto 会回退到 git）:', error)
+        }
         if (resolved.prompt.enabled) {
             disposers.push(
                 context.systemPrompt.section({
@@ -128,7 +168,7 @@ export function apply(ctx: Context, config: unknown = {}): void {
         })
 
         log.info(
-            `applied (tools: ${tools.registered.join(', ') || 'none'}; base=${resolved.defaultBase}; maxDistance=${resolved.maxDistance}; ` +
+            `applied (tools: ${tools.registered.join(', ') || 'none'}; base=${resolved.defaultBase}; changeSource=${resolved.changeSource}; maxDistance=${resolved.maxDistance}; ` +
                 `template=${resolved.testCommandTemplate === '' ? 'NOT CONFIGURED' : resolved.testCommandTemplate}; reviewDispatch=${resolved.reviewDispatch.enabled}; ` +
                 `flakyOwner=${resolved.flaky.owner ?? 'NOT CONFIGURED'}; quarantineMaxDays=${resolved.flaky.quarantineMaxDays})`,
         )

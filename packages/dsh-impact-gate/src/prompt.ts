@@ -24,6 +24,9 @@ export function sectionText(config: ImpactGateConfig, projectFile?: string): str
         '改动的影响面不用猜，用事实问：',
         '- 动手前用 `impact_tests` 取这次改动的**最小回归命令**：改动集来自 git diff（或显式 paths），测试来自三类证据',
         '  （import 了改动文件 / 与改动文件同目录 / 与改动文件同名）。',
+        config.changeSource === 'auto'
+            ? '- 改动集的来源：宿主挂载 `workspaceChanges` 时优先用它（宿主记录的**某一轮**改动），否则回退 git diff；两份报告都会写明这次是哪个来源、回退原因是什么。'
+            : `- 改动集的来源被宿主固定为 \`${config.changeSource}\`：报告里写明来源；固定来源不可用时**拒绝执行**，不会静默换成另一个。`,
         '- 动手后用 `impact_analyze` 出一份评审者会读的报告：风险等级 + 判定理由、改动文件与新增行区间、按导入距离分组的影响面、',
         '  选中的测试与选中理由、以及这次选择**看不见什么**。有 mission 时它把 JSON 产物与一条 `artifact` 证据写进',
         '  `.dsh/missions/<id>/impact/`；`impact_status` 只读回看配置、阈值与最近一次分析。',

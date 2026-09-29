@@ -7,7 +7,7 @@
 
 | 问题 | 判定依据（全部来自 `dsh-eng-core`，没有模型判断） |
 |---|---|
-| 这次改动碰到了什么？ | `changedRanges`（git diff `-U0`，带每处新增行区间）+ `analyzeImpact` 的**反向导入闭包**（谁会被波及，带距离与"经由谁"） |
+| 这次改动碰到了什么？ | **改动集**：宿主挂载 `workspaceChanges` 时用它（`summary` + `diff`，hunk 级），否则 `changedRanges`（git diff `-U0`，带每处新增行区间）——两种来源在报告与产物里都写明（见「改动集从哪来」）；**影响面**：`analyzeImpact` 的**反向导入闭包**（谁会被波及，带距离与"经由谁"） |
 | 因此必须跑哪些测试？ | 三类证据选出的测试文件：**import 了改动文件**（带距离）、**与改动文件同目录**、**与改动文件同名** |
 | 用什么命令跑？ | 宿主配置的 `testCommandTemplate`（`renderTestCommand` 渲染），**插件不猜 runner** |
 
@@ -19,7 +19,7 @@
 | `impact_tests({ base?, paths?, template?, missionId? })` | 给出**最小回归命令**（`renderTestCommand(模板, 选中集)`）。**没配模板就拒绝执行**并给出下一步，绝不猜 runner。同时列出选中的文件与选中理由；宿主配了 `fullTestCommand` 时给出"少跑几个测试文件"的对照。 |
 | `flaky_plan({ missionId?, report?, runs?, command? })` | 把不稳定数据变成**计划**（确定性）：每个用例恰好落一类——稳定 / 隔离 / 查根因 / 疑似仪器（失败输出匹配 `flaky.signatures`）。数据来源二选一：`report` 指向 `dsh-coverage-gate` 的 `flaky_check` 产出的报告文件（**不 import 那个包**，文件就是接口），或本插件自己重复运行宿主配置的 `fullTestCommand`（`command` 可临时覆盖，`runs` 默认 3、夹在 2–10；同时看到通过与失败就提前结束）。计划写到 `.dsh/missions/<id>/flaky/<stamp>-plan.json` 并追加一条 `artifact` 证据行；**隔离是借款**：必须有 `owner`（`flaky.owner`，没有就**拒绝**给出隔离命令）和到期时间（`flaky.quarantineMaxDays`，默认 14 天），过期的隔离是升级项。计划会渲染"写入隔离台账"的命令，但**本插件绝不执行它**。 |
 | `flaky_status({ missionId? })` | 只读：当前隔离清单（`<rootDir>/flaky-quarantine.json`，只增行 `{at, test, owner, expiresAt, reason, evidencePath}`）、**已过期**的隔离、台账里无法使用的行，以及**被隔离后最近 N 次运行再没出现过**的用例（隔离后被删除 = 覆盖静默消失）。不写任何文件。 |
-| `impact_status({ missionId? })` | 只读：当前生效配置（基线、`maxDistance`/`maxFiles`/`maxFileBytes`、模板是否配置、`reviewDispatch` 状态、配置来源与问题条数）、`RISK_RULES` 阈值表、以及该 mission **最新**一次分析的产物（风险、四项计数、生成时间、当时的基线）。 |
+| `impact_status({ missionId? })` | 只读：当前生效配置（基线、`changeSource` 与 `workspaceChanges` 服务是否挂载、`maxDistance`/`maxFiles`/`maxFileBytes`、模板是否配置、`reviewDispatch` 状态、配置来源与问题条数）、`RISK_RULES` 阈值表、以及该 mission **最新**一次分析的产物（风险、四项计数、生成时间、当时的基线与当时的**改动集来源**）。 |
 
 `paths` 参数声明为 `type: 'json'`：`paths: "src/a.ts"`（单字符串）、数组、以及写错类型都会到达工具本身，得到一句
 可执行的中文答复，而不是被 schema 直接拒掉。显式 paths 模式**没有 diff**，因此新增行区间不可用；其中**当前不存在**
@@ -94,6 +94,7 @@ profile（宿主上限）与 `<repo>/.dsh/impact-gate.json`（项目只能细化
     testCommandTemplate: ''        # 默认空 = 宿主还没配；impact_tests 会拒绝执行
     # fullTestCommand: 'go test ./...'   # 可选：只用于"少跑多少"的对照
     defaultBase: HEAD              # 调用方没给 base 时用它
+    changeSource: auto             # 改动集来源（宿主专用，默认 auto）
     reviewDispatch:                # 可选的意见层，默认关闭
       enabled: false
       provider: spawn
@@ -122,19 +123,59 @@ profile（宿主上限）与 `<repo>/.dsh/impact-gate.json`（项目只能细化
 **只能收紧**（比 profile 更宽松的值会被忽略并记问题）——否则"项目里把隔离期限改成一年"就能悄悄绕开隔离的到期日。`quarantineFile`
 还必须是**工作区内**的路径（`../`、绝对路径、指向外面的符号链接都会保留 profile 的值并报为问题）：台账是仓库的工件，
 项目把它挪出去等于把隔离记录写进别人的目录。**拒绝并记日志**：`enabled`（项目不能把插件关掉）、`logFile`/`logFileTemplate`/`layout`、
-`prompt`、`reviewDispatch`（开它会花子代理与模型调用，属**升级**，只有宿主能决定）。
+`prompt`、`reviewDispatch`（开它会花子代理与模型调用，属**升级**，只有宿主能决定）、`changeSource`
+（见「改动集从哪来」：两个来源回答的是**不同问题**，项目若能把来源钉死，等于替所有读者改掉这份分析的含义）。
 值不做猜测：类型不对的键逐条记问题并**保留 profile 的值**（不是回落到插件默认值——那会悄悄放宽宿主设定的预算）。
 
 `.dsh/**` 在 `dsh-spec-gate` 的信任根里：模板与预算由**人**提交在仓库里，模型写不了。
 
+## 改动集从哪来（`changeSource`）
+
+"改了什么"有两种来源，它们**回答的不是同一个问题**，所以报告和产物里永远写明这一次是哪一个：
+
+| 来源 | 事实是什么 | 报告里的字样 |
+|---|---|---|
+| `workspaceChanges`（宿主服务，`@deepseek-ai/dsh-workspace-changes`） | 宿主在**某一轮**记下的改动：`summary(sessionId, seq)` 给出该轮的改动文件与行数，`diff(sessionId, seq, index, signal)` 给出逐文件比较（unified hunk，或 `binary`/`oversized` 的拒绝）。插件把 hunk 里的 `+` 连续段翻成**新增行区间**——与 git `-U0` 同一口径 | `变更来源：workspaceChanges（会话 <id> 第 N 轮，事件 seq=…）` |
+| `git` | 工作区相对 `<base>` 的差异（core 的 `changedRanges`） | `变更来源：git` / `变更来源：git（回退：<原因>）` |
+| 显式 `paths` | 调用方自己给的清单（没有 diff，没有行区间） | `变更来源：显式 paths` |
+
+`config.changeSource` 只由宿主决定（默认 `auto`）：
+
+- `auto`：有服务且**能用**就用它；不能用就回退 git，**并把原因写进报告**（`git（回退：…）`）；
+- `workspaceChanges`：钉死服务。服务没挂载 / 没有本会话的 `workspace/changes` 记录 / 抛错 / 报 0 个改动…一律
+  **拒绝执行**并给出三条下一步（挂服务 / 改 `auto` / 改 `git`）——静默换成另一个来源会让报告看起来仍然成功，而事实已经换了；
+- `git`：只用 `git diff`，**连服务都不读**（服务抛错也影响不到这次分析）。
+
+这次用的是哪个来源，同时写在**工具输出**和**分析产物**（`changeSource: { source, turn?, fallbackReason?, granularity, limits, crossCheck? }`）里：
+审计不必读工具输出，也能知道某份报告是基于"某一轮的快照"还是"相对 ref 的 diff"。
+
+服务是**可选**依赖：本插件不 `inject` 它，用 `ctx.get('workspaceChanges')` 结构性识别（没有那个包也能编译、也能跑），
+所有调用都是防御式的——**抛错是一个回退原因，不是崩溃**；拿不到就回退 git，绝不会当成"没有改动"。
+`summary` 需要的 `seq` 来自本插件对 `session/event` 的订阅（服务只按 `(sessionId, seq)` 存摘要，`seq` 不在服务里），
+没订阅到（插件比事件晚装载、或那一轮没有记录）同样只是回退原因。
+
+### 这份事实的边界（报告里逐条写出）
+
+- **语义不同**：服务报的是"**某一轮**改了什么"（turn 快照：该轮开始与结束时的差异），不是"相对某个 ref 的差异"。
+  在它之前/之后几轮里的改动**不在**这次改动集里。因此报告会同时打印 `git diff <base>` 的**交叉核对**（只报告，不裁决）：
+  两边不一致时点名差在哪几个文件，并提示"要覆盖 base 以来的全部改动，就用 `changeSource: "git"` 重跑"。
+- **重命名**：服务的摘要不给重命名前的路径，所以旧路径的依赖者没有被跟踪（`git` 来源才有 `previousPath`）。
+- **工作区外**：服务会列出仓库里、工作目录之外的路径（`../…` 或绝对路径），它们进不了导入图——报告把跳过数与路径写出来，不是悄悄丢掉。
+- **二进制 / 超大文件**：服务拒绝比较，这些文件只有路径与（为 0 的）行数，没有行区间，报告点明。
+- **无法对账**：宿主说它记了什么就是什么，本插件**不**去文件系统上复核（复核等于再造一个事实源）。所以它报告
+  **来源、轮次、上限与交叉核对**，不声称独立核实过——"宿主提供的事实只和它的更新语义一样好"。
+
 ## 事实从哪来
 
 ```
-git diff -U0 <base>            → 改动文件 + 每处新增行区间（core: changedRanges）
+改动集                         → workspaceChanges 服务（hunk 级）或 git diff -U0 <base>（core: changedRanges）
 反向依赖图（imports）         → 传递闭包：谁会被波及，距离几跳、经由谁（core: analyzeImpact）
 三类测试证据                  → imports-changed > same-package > name-match（core 的排序即优先级）
 renderTestCommand(模板, 选中)  → 最小回归命令（core）
 ```
+
+`analyzeImpact` 拿到的是**确定的改动集**：来源不同只换"事实"，图、风险阈值与测试选择的算法完全同一套
+（core 的 `ImpactOptions.changed`：调用方给改动集，函数不再自己读 diff）。
 
 没有 mission 也能用（`dsh-spec-gate` 没挂载、或只是想先看一眼），只是不留痕。
 
@@ -145,7 +186,8 @@ renderTestCommand(模板, 选中)  → 最小回归命令（core）
 | `dsh-quality-gate` | 门禁执行的是**宿主配置的固定命令集**；本插件给的是"先跑哪些"和"少跑多少的对照"。要让门禁真的只跑选中集，前提是宿主配置了 `fullTestCommand` 对照；否则门禁照旧跑全量。 |
 | `dsh-spec-gate` | `.dsh/impact-gate.json` 在信任根内（模型改不了模板与预算）；本插件给出的改动集 `changed` 正是"spec 声明的文件边界有没有被越过"所需的事实，边界判定本身由 spec-gate 做。 |
 | `dsh-orchestrator` | `implement` 阶段：动手前 `impact_tests`、动手后 `impact_analyze`；`quality-verify` 阶段的离开门禁仍然由质量门禁裁决，本插件不改任何阶段状态。 |
-| `dsh-evidence-gate` | 每次分析追加一条 `kind: artifact` 的证据行（`artifactPath` 指向产物），交付侧可读；产物本身是 UTF-8 JSON，可 commit、可 diff。 |
+| `dsh-evidence-gate` | 每次分析追加一条 `kind: artifact` 的证据行（`artifactPath` 指向产物），交付侧可读；产物本身是 UTF-8 JSON，可 commit、可 diff。产物里的 `changeSource` 记录这次用的是哪个来源（`source` / `turn` / `fallbackReason` / `limits`），`config.changeSource` 记录宿主的设置。 |
+| `@deepseek-ai/dsh-workspace-changes`（宿主服务，可选） | 只在挂载时使用：`ctx.get('workspaceChanges')` 的 `summary` + `diff` 提供 hunk 级的改动事实（见「改动集从哪来」）。**没有它本插件照常工作**（回退 `git diff`）；`paths` 模式下两者都不读。 |
 | `dsh-audit-trail` | 产物落盘在 mission 目录（`.dsh/missions/<id>/impact/`），`impact_status` 只读回看；工具调用本身在审计里。 |
 | `dsh-role-guard` / reviewer | `reviewDispatch`（默认关闭）派一个**只读**子代理（`allow: [read, glob, grep]`、`deny: [orchestrate]`、`maxDepth: 1`）按 rubric 回答"import 图看不见的引用方在哪里"，结论是**意见**，不改风险等级、不写门禁记录。 |
 | `dsh-standards-gate` | 同一次 `maxFiles`/`maxFileBytes` 走查、同一套 `dsh-eng-core`；规范门禁看结构，本插件看影响面。 |
@@ -163,6 +205,10 @@ renderTestCommand(模板, 选中)  → 最小回归命令（core）
   单独成节并给出 `风险：无法判定`——这是对 core 的补偿，不是 core 的行为。
 - **删除的文件**不参与反向可达性（core 只从未删除文件出发）：谁引用了被删掉的文件需要人工确认，报告会点出来。
 - **显式 paths 模式**没有 diff，"计划新增"与"拼写错误"在 core 眼里一样；报告会列出不存在的路径，但无法替你判断是哪一种。
+- **宿主服务可能是旧的一轮**：`workspaceChanges` 记的是"某一轮"，一轮没记录（没有改动、或插件比事件晚装载）就没有记录。
+  所以报告永远写出轮次与 seq，并在与 `git diff <base>` 不一致时给出交叉核对——**交叉核对是提示，不是裁决**：
+  本次分析采用的就是报告里写明的那个来源，不会因为核对结果而偷偷换来源。
+  真正的保证只有一条：**拿不到事实就拒绝或回退并写明原因，绝不把"读不到"变成"没有改动"**。
 - `impact_status` 读的是**产物**（`impact/<stamp>.json`）；产物是一次运行的记录，改动集变了就必须重跑，
   它不会自动失效或自动关联到最新代码指纹。
 - **本插件不执行隔离**：它只渲染写入台账的命令。台账文件在 `.dsh/**`（信任根）之外吗？不——`flaky-quarantine.json`

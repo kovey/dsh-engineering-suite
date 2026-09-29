@@ -496,9 +496,9 @@ IM 侧的职责（不在本仓库）：卡片按钮不可伪造且一次性、�
 
 | 官方能力 | 性质 | 判定 | 理由 |
 |---|---|---|---|
-| `dsh-experimental-agent-team`（`agentTeams` 服务 + `spawn_teammate`/`send_message`/`team_task_*`） | **协作面**（roster + 持久邮箱 + 共享任务 DAG） | 与 `role-guard` / `orchestrator` **互补** | 它的工具**没有** persona/模型/工具白名单/权限参数：谁和谁说话、任务怎么分是它的事；**谁有权做什么、结果算不算证据**是我们的事 |
+| `dsh-experimental-agent-team`（`agentTeams` 服务 + `spawn_teammate`/`send_message`/`team_task_*`） | **协作面**（roster + 持久邮箱 + 共享任务 DAG） | 互补，但**官方 spawn 对我们不可用**（实测） | `SpawnTeammateRequest` 只有 `{name,description,prompt,context,provider,signal}`，**无法表达** persona 影子段 / 工具白名单 / 模型路由 / 深度上限（缺口在官方请求类型这一层，而 `startContinuable` 本身接受这些参数）；每个可加载角色又都必须有 persona ⇒ 任何角色的策略都表达不了。因此 `role-guard` **点名拒绝**官方路径、回落到自研 `subagents` 路径，并把官方创建出的 teammate 记为 **ungoverned**（不是"已阻止"：工具守卫只覆盖模型面的 `spawn_teammate`，插件直接调服务即可绕过——声称阻止就是假保证） |
 | `dsh-experimental-auto-review`（按工具调用的 LLM 授权判断） | **概率判断**，挂在 `tools/pre-execute` **瀑布**上 | **不接管授权**（但它只收紧） | 代码级核实：它只返回 `deny` / `ask` / `cancel`，**从不返回 `allow`**——因此它能加限制、能把调用升级成"问人"，却不能放行任何东西 |
-| `dsh-workspace-changes`（`workspaceChanges` 服务） | **事实源**（宿主视角的变更） | **采纳** | 变更事实宿主更权威；"选哪些测试、算不算风险"仍是我们的算法 |
+| `dsh-workspace-changes`（`workspaceChanges` 服务） | **事实源**（宿主视角的变更） | **已采纳**（`impact-gate` 的 `changeSource`，默认 `auto`） | 语义是**按轮**：turn 起止快照、靠 `workspace/changes` 事件的 `seq` 定位、无变更的轮不产生事件、记录随会话消失。采纳后处处标注来源（`workspaceChanges（会话 … 第 N 轮）` / `git` / `git（回退：<原因>）`），不可用一律回退 git 并说明原因；与 `git diff <base>` 不一致时打印 ⚠️ 交叉核对（**报告，不作为裁决**） |
 | `dsh-plugin-manager` / `dsh-config-editor` | 安装与编辑 | 各司其职 | 它们负责"装上"；**"装上之后真的工作吗"**由本套件的自检与验证脚本回答 |
 | `dsh-workflow-ptc` / `dsh-ptc-runtime`（`run_code`） | **新的调用来源** | 已核实守卫语义（见下） | 模型写代码调工具，必须证明它不绕过我们的拦截 |
 

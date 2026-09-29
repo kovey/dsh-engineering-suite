@@ -13,6 +13,7 @@
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { head, sessionCwd, tail, type Layout, type MissionStoreRegistry } from 'dsh-eng-core'
 import type { AgentLike } from 'dsh-eng-core'
+import { teamDispatchReport } from './agent-teams.js'
 import type { RoleBindingStore } from './bindings.js'
 import type { RoleGuardConfig } from './config.js'
 import type { RoleRegistryCache } from './loader.js'
@@ -48,6 +49,15 @@ export interface ToolDeps {
     roles: RoleRegistryCache
     /** `ctx.get('subagents')`, read per call. */
     subagents: () => SubagentsLike | undefined
+    /**
+     * `ctx.get('agentTeams')`, read per call.
+     *
+     * Read-only on purpose: this plugin PROBES the official collaboration
+     * service to refuse its spawn path by name (see `agent-teams.ts`) and never
+     * calls it. A teammate's message or task-board entry is coordination state,
+     * not an authorisation, so nothing here may consume it as one.
+     */
+    agentTeams: () => unknown
     /** `ctx.tools.get(name, agent)` — the tool surface visible to one agent. */
     visibleTool: (name: string, agent: AgentLike | undefined) => boolean
     /** Workspace layout for the calling agent. */
@@ -56,6 +66,8 @@ export interface ToolDeps {
     stores: MissionStoreRegistry
     /** Durable session → role bindings, written when a child starts. */
     bindings: RoleBindingStore
+    /** A logger, for refused dispatch paths and unwritable bindings. */
+    logger?: { warn: (message: string, error?: unknown) => void; info?: (message: string) => void }
 }
 
 /** Caller-supplied delegation request. */
@@ -76,6 +88,19 @@ export interface DelegateArgs {
     reasoningEffort?: unknown
     /** Per-call output-token cap override (a positive integer when well-formed). */
     maxTokens?: unknown
+    /**
+     * Which dispatch style this delegation asks for.
+     *
+     * `'subagent'` (default) is this plugin's own `ctx.subagents.start()` path.
+     * `'team'` asks for a durable teammate on the official Agent Teams roster;
+     * it is answered with a named refusal today (see `agent-teams.ts`) and the
+     * delegation is served by the plugin path instead.
+     *
+     * `unknown` on purpose, like the route overrides: the schema declares the
+     * type, and an unrecognised VALUE falls back to `'subagent'` with a reported
+     * warning instead of failing the whole delegation.
+     */
+    dispatch?: unknown
 }
 
 /** The filter actually handed to the provider, plus what was dropped. */
@@ -252,6 +277,21 @@ async function startWithDiagnostics(
     }
 }
 
+/**
+ * Read the official Agent Teams service without ever letting it throw.
+ *
+ * The service is only PROBED (see `agent-teams.ts`): a missing, partial or
+ * hostile object reads as "absent" and the delegation proceeds on our own path.
+ * @param read - `ctx.get('agentTeams')`, deferred per call.
+ */
+function safeAgentTeams(read: () => unknown): unknown {
+    try {
+        return read()
+    } catch {
+        return undefined
+    }
+}
+
 function stopReasonText(stopReason: string): string {
     switch (stopReason) {
         case 'completed':
@@ -324,6 +364,11 @@ export function registerTools(
                     description:
                         'Optional per-call output-token cap (positive). Takes precedence over the role file; the host may forbid overriding.',
                 },
+                dispatch: {
+                    type: 'string',
+                    description:
+                        "Optional dispatch style: 'subagent' (default) creates a one-shot child through this plugin's own path; 'team' asks for a durable teammate on the official Agent Teams roster. A 'team' request is refused when the official spawn cannot carry the role's persona / tool whitelist / model route (it cannot, on harness 0.2.0-rc.1) — the result then names the guarantee and the child is created through this plugin's path instead.",
+                },
             },
             output: { schema: TEXT_OUTPUT, render: (_args, value) => [{ type: 'text', text: value }] },
             async execute(args: DelegateArgs, exec) {
@@ -373,6 +418,32 @@ export function registerTools(
                     deps.config.allowModelOverride,
                 )
                 const agentOptions = route.route
+                // --- dispatch path: the official Agent Teams spawn is refused ----
+                // Computed BEFORE the child starts and answered explicitly, so a
+                // caller that asked for a durable teammate is never left
+                // believing it got one. Every authorisation gate above has
+                // already run, in the same order as before this parameter
+                // existed: the collaboration surface can neither widen nor
+                // narrow a role decision, it can only be reported on.
+                const dispatchProblems: string[] = []
+                let requestedTeam = false
+                if (args.dispatch !== undefined && args.dispatch !== 'subagent') {
+                    if (args.dispatch === 'team') requestedTeam = true
+                    else {
+                        dispatchProblems.push(
+                            `未知的 dispatch 值（${JSON.stringify(args.dispatch)}）：只接受 'subagent' | 'team'，已按 'subagent' 处理。`,
+                        )
+                    }
+                }
+                const dispatchReport = requestedTeam
+                    ? teamDispatchReport({
+                          compose: deps.config.composeWithAgentTeams,
+                          teams: safeAgentTeams(deps.agentTeams),
+                          role,
+                          plan,
+                          route: route.route,
+                      })
+                    : undefined
                 const run = await startWithDiagnostics(subagents, deps.config.provider, {
                     label: `${role.name} · ${head(args.task, 60)}`,
                     prompt: [{ type: 'text', text: prompt }],
@@ -382,12 +453,18 @@ export function registerTools(
                     ...(plan.filter === undefined ? {} : { toolFilter: plan.filter }),
                     persona: role.persona,
                 })
+                if (dispatchReport !== undefined) {
+                    // The durable half of the report (the tool output is the
+                    // other half): a refused team dispatch is an audit fact, not
+                    // a silent substitution.
+                    deps.logger?.warn(`team_delegate 请求 team 派发（角色 ${role.id}，子会话 ${run.id}）：\n${dispatchReport}`)
+                }
                 // A `SubagentRun`'s id IS the child session id, which is the key the
                 // invocation-time gates look the role up by. Recorded before the
                 // first result is awaited; the file is what survives a reload.
                 // The effective route travels with it, so an audit can see which
-                // model the child actually ran on.
-                const binding = deps.bindings.bind(agent, run.id, role, route.route)
+                // model the child actually ran on; so does the dispatch path.
+                const binding = deps.bindings.bind(agent, run.id, role, route.route, 'subagents')
                 let result: Awaited<typeof run.result>
                 try {
                     result = await run.result
@@ -410,6 +487,7 @@ export function registerTools(
                     )
                 }
                 for (const problem of route.problems) warnings.push(problem)
+                for (const problem of dispatchProblems) warnings.push(problem)
                 if (plan.dropped.length > 0) {
                     warnings.push(`角色文件里这些工具在当前部署不存在，已从白名单剔除：${plan.dropped.join(', ')}`)
                 }
@@ -426,6 +504,10 @@ export function registerTools(
                     `tool whitelist: ${plan.filter?.allow?.join(', ') ?? '(继承全部，deny: ' + (plan.filter?.deny?.join(', ') ?? '无') + ')'}`,
                     `skill whitelist: ${role.skills.join(', ') || '(未声明 = 不限制)'}（调用时强制）`,
                     routeLine(route),
+                    // Only a team-style request adds a line here: the default
+                    // path's output stays exactly what it was, so 'off' (and an
+                    // unchanged deployment) reads identically to before.
+                    ...(dispatchReport === undefined ? [] : [dispatchReport]),
                 ]
                 const body = tail(renderChildOutput(result.output), deps.config.maxOutputChars)
                 const diagnostic = result.diagnostic === undefined ? '' : `\ndiagnostic: ${result.diagnostic}`

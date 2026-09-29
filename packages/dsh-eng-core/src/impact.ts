@@ -257,6 +257,18 @@ export interface ImpactOptions {
     base?: string
     /** Explicit paths instead of a diff (e.g. a planned change). */
     paths?: readonly string[]
+    /**
+     * A change set the caller already read from an authoritative source (e.g.
+     * the host's `workspaceChanges` service), instead of this function's own
+     * `git diff`. It REPLACES the internal read when present, so the graph, the
+     * risk rules and the test selection below run on exactly the caller's facts
+     * rather than on a second, possibly different read; `base` then labels that
+     * source in the report (the caller owns the label, this function cannot
+     * verify it). Empty is a legal value and yields `analysis: 'empty'` — a
+     * caller that could not read its source must not pass `[]`, or an
+     * unreadable change set becomes "nothing changed".
+     */
+    changed?: readonly ChangedFile[]
     /** Stop the reverse walk after this distance (default 6). */
     maxDistance?: number
     maxFiles?: number
@@ -283,13 +295,17 @@ export const RISK_RULES = {
  *
  * The graph is FILE-level import reachability, computed from the same walk the
  * standards gate uses (bounded, deterministic, no network).
+ *
+ * The change set comes from the internal `git diff` unless the caller supplies
+ * one (`options.changed` / `options.paths`): this function decides what a change
+ * TOUCHES, not where the change set came from.
  * @param options - workspace, diff base or explicit paths, walk bounds.
  */
 export async function analyzeImpact(options: ImpactOptions): Promise<ImpactReport> {
     const cwd = options.cwd
     const maxDistance = options.maxDistance ?? 6
     const diff =
-        options.paths === undefined
+        options.paths === undefined && options.changed === undefined
             ? await changedRanges({
                   cwd,
                   ...(options.base === undefined ? {} : { base: options.base }),
@@ -304,9 +320,16 @@ export async function analyzeImpact(options: ImpactOptions): Promise<ImpactRepor
                   return path.relative(cwd, absolute).split(path.sep).join('/')
               })
     const changed: ChangedFile[] =
-        explicit.length > 0
-            ? explicit.map((entry) => ({ path: entry, added: [], removed: 0, status: 'modified' as const }))
-            : (diff?.files ?? [])
+        options.changed !== undefined
+            ? [...options.changed]
+            : explicit.length > 0
+              ? explicit.map((entry) => ({ path: entry, added: [], removed: 0, status: 'modified' as const }))
+              : (diff?.files ?? [])
+    // The label reported as `base`. A caller-supplied change set is not relative
+    // to a commit, so its own label (if any) is what the report can print —
+    // inventing a ref here would attribute the facts to a diff that never ran.
+    const baseLabel =
+        diff?.base ?? (options.changed === undefined ? undefined : (options.base ?? 'HEAD'))
 
     const metrics: MetricsResult = measureWorkspace({
         cwd,
@@ -407,7 +430,7 @@ export async function analyzeImpact(options: ImpactOptions): Promise<ImpactRepor
     if (analysis === 'error') {
         return {
             cwd,
-            base: diff?.base ?? 'HEAD',
+            base: baseLabel ?? 'HEAD',
             changed,
             impacted: [],
             tests: [],
@@ -422,7 +445,7 @@ export async function analyzeImpact(options: ImpactOptions): Promise<ImpactRepor
     if (analysis === 'empty') {
         return {
             cwd,
-            base: diff?.base ?? 'HEAD',
+            base: baseLabel ?? 'HEAD',
             changed,
             impacted: [],
             tests: [],
@@ -469,7 +492,7 @@ export async function analyzeImpact(options: ImpactOptions): Promise<ImpactRepor
 
     return {
         cwd,
-        base: diff?.base ?? (options.paths === undefined ? 'HEAD' : '(explicit paths)'),
+        base: baseLabel ?? (options.paths === undefined ? 'HEAD' : '(explicit paths)'),
         changed,
         analysis,
         impacted: [...impacted.values()].sort((left, right) => left.distance - right.distance || left.path.localeCompare(right.path)),

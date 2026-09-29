@@ -179,6 +179,35 @@ test('a rename keeps the old path in the walk (regression)', async () => {
     assert.ok(report.impacted.length + report.tests.length > 0, 'the old name still reaches dependents')
 })
 
+test('a caller-supplied change set replaces the internal diff (regression)', async () => {
+    // The seam a host-provided fact source needs: the graph, risk and test
+    // selection must run on the caller's facts, labelled by the caller.
+    const cwd = repo()
+    const supplied = await analyzeImpact({
+        cwd,
+        base: 'workspaceChanges（第 3 轮）',
+        changed: [{ path: 'src/store/store.ts', added: [[2, 3]], removed: 1, status: 'modified' }],
+    })
+    assert.equal(supplied.analysis, 'ok')
+    assert.equal(supplied.base, 'workspaceChanges（第 3 轮）', 'the caller owns the label: no ref is invented')
+    assert.deepEqual(supplied.changed.map((file) => file.path), ['src/store/store.ts'])
+    assert.ok(supplied.tests.some((test) => test.path === 'src/store/store.test.ts'))
+
+    // A DIRTY worktree that the caller did not report must not leak in: the
+    // caller's change set is the fact, not the git one.
+    fs.writeFileSync(path.join(cwd, 'src', 'store', 'extra.ts'), 'export const extra = 1\n')
+    const still = await analyzeImpact({
+        cwd,
+        changed: [{ path: 'src/store/store.ts', added: [], removed: 0, status: 'modified' }],
+    })
+    assert.deepEqual(still.changed.map((file) => file.path), ['src/store/store.ts'])
+
+    // An empty change set is "empty" (a fact), never an error.
+    const empty = await analyzeImpact({ cwd, changed: [] })
+    assert.equal(empty.analysis, 'empty')
+    assert.equal(empty.risk, 'low')
+})
+
 test('an empty selection never renders a bare placeholder (regression)', () => {
     assert.equal(renderTestCommand('go test {files}', []), 'go test')
     assert.equal(renderTestCommand('vitest run {files}', []), 'vitest run')
