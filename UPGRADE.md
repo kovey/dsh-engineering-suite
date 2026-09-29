@@ -115,6 +115,23 @@ declare module '@deepseek-ai/dsh-llm' {
   被 spec-gate 拒绝、文件未创建、审计留下子调用自己的两行；代价是调用量（1 次 `run_code` + 1 个子调用 = 4 行审计）。
   注意 `run_code` 只在 `dsh-tools` 的 `config.mode: ptc` 下可见（默认 `native`）。
 
+### 1.7 从 v0.2.0 到 v0.2.1（**不需要改任何声明**）
+
+peer 范围不变（`>=0.2.0-rc.1 <0.2.1-0` 同时匹配 0.2.0 与 0.2.1 的宿主），**没有破坏性变更**。新增两个**宿主键**
+（项目文件写了会被拒绝并上报）：
+
+| 键 | 默认 | 作用 |
+|---|---|---|
+| `impact-gate` 的 `changeSource` | `auto` | 变更事实优先用官方 `workspaceChanges`（按轮语义），不可用则回退 git 并说明原因；输出与工件都标注来源 |
+| `role-guard` 的 `composeWithAgentTeams` | `auto` | `off` = 不读官方 Agent Teams 服务、不装观察者，逐字段等于旧行为 |
+
+两处**行为变化**（都在输出里明说，不静默）：
+
+1. `impact_gate`/`impact_tests` 在 `auto` 且服务可用时，变更集合是**该轮快照**，可能比 `git diff <base>` **更少**；
+   不一致时报告会打印 ⚠️ 交叉核对并给出改回 `changeSource: 'git'` 的确切命令。
+2. `team_delegate` 的 `dispatch: 'team'` 会被**点名拒绝**（官方请求类型无法表达 persona/工具白名单/模型路由/深度上限），
+   请求由自研 `subagents` 路径完成；官方服务创建出的 teammate 会被记为 `ungoverned`。
+
 ### 1.6 从 0.1.7-rc.2 到 0.2.0-rc.1（v0.2.0 的基线）
 
 **必改的只有一件事：peer 范围。** 0.2.0 的加载时门禁会拒绝针对 0.1.7 线声明的插件
