@@ -103,6 +103,18 @@ declare module '@deepseek-ai/dsh-llm' {
 
 ---
 
+#### 0.2.0 官方能力：采纳 / 不采纳（结论，理由见 ARCHITECTURE §5.16）
+
+- **采纳**：`workspaceChanges` 作为"变更事实"的来源（挂载且可用时优先，否则回退自研 git 解析，并在输出里标明来源）。
+- **互补**：官方 Agent Teams 是协作面（roster / 邮箱 / 任务 DAG），`role-guard` 是授权面（角色 / 权限 / 模型 / 白名单）；
+  协作状态**不是**证据，不能替代 mission / 回执 / 门禁记录。
+- **不采纳（但它只收紧）**：`auto-review` 不得接管授权。代码级核实：它只返回 `deny` / `ask` / `cancel`，**从不返回 `allow`**；
+  我们的强制性拦截又是**单调守卫**（没有守卫能强制放行）。挂上它的后果是"更严 + 更多问人 + 更多 LLM 调用"，不是绕过门禁。
+- **各司其职**：`plugin-manager` / `config-editor` 负责安装与编辑；**验证与自检仍是本套件**。
+- **已核实的边界（真机）**：PTC（`run_code`）的子调用经过 `prepareExecution`，守卫仍生效——实验里 PTC 程序内的 `write`
+  被 spec-gate 拒绝、文件未创建、审计留下子调用自己的两行；代价是调用量（1 次 `run_code` + 1 个子调用 = 4 行审计）。
+  注意 `run_code` 只在 `dsh-tools` 的 `config.mode: ptc` 下可见（默认 `native`）。
+
 ### 1.6 从 0.1.7-rc.2 到 0.2.0-rc.1（v0.2.0 的基线）
 
 **必改的只有一件事：peer 范围。** 0.2.0 的加载时门禁会拒绝针对 0.1.7 线声明的插件

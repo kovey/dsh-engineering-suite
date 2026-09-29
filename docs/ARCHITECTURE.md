@@ -490,6 +490,50 @@ IM 侧的职责（不在本仓库）：卡片按钮不可伪造且一次性、�
 `scope.full = false`、不清 `pendingWrites`、reason 带前缀。否则"source 撞车 + full=true"就能在没有跑过宿主命令集的情况下
 授权交付——见 `KNOWN-LIMITS` 附一之十四。
 
+### 5.16 官方能力 vs 自研：采纳边界与守卫机制
+
+0.2.0 带来了几个与"工程治理"相邻的官方能力。评估的结论不是"用哪个"，而是**按性质分层**：
+
+| 官方能力 | 性质 | 判定 | 理由 |
+|---|---|---|---|
+| `dsh-experimental-agent-team`（`agentTeams` 服务 + `spawn_teammate`/`send_message`/`team_task_*`） | **协作面**（roster + 持久邮箱 + 共享任务 DAG） | 与 `role-guard` / `orchestrator` **互补** | 它的工具**没有** persona/模型/工具白名单/权限参数：谁和谁说话、任务怎么分是它的事；**谁有权做什么、结果算不算证据**是我们的事 |
+| `dsh-experimental-auto-review`（按工具调用的 LLM 授权判断） | **概率判断**，挂在 `tools/pre-execute` **瀑布**上 | **不接管授权**（但它只收紧） | 代码级核实：它只返回 `deny` / `ask` / `cancel`，**从不返回 `allow`**——因此它能加限制、能把调用升级成"问人"，却不能放行任何东西 |
+| `dsh-workspace-changes`（`workspaceChanges` 服务） | **事实源**（宿主视角的变更） | **采纳** | 变更事实宿主更权威；"选哪些测试、算不算风险"仍是我们的算法 |
+| `dsh-plugin-manager` / `dsh-config-editor` | 安装与编辑 | 各司其职 | 它们负责"装上"；**"装上之后真的工作吗"**由本套件的自检与验证脚本回答 |
+| `dsh-workflow-ptc` / `dsh-ptc-runtime`（`run_code`） | **新的调用来源** | 已核实守卫语义（见下） | 模型写代码调工具，必须证明它不绕过我们的拦截 |
+
+**守卫机制是这一切成立的前提。** harness 提供两种拦截点，语义完全不同：
+
+- `ctx.on('tools/pre-execute')` 是**瀑布**：后注册的监听者可以返回自己的决定，也就是**可以覆盖**前面的；
+- `ctx.tools.guard(fn)` 是**单调守卫**：在瀑布之后运行，官方注释写明"任何守卫都可以拒绝，**但没有任何守卫能强制放行**另一个守卫拒绝的调用"。
+
+因此本套件所有**强制性**拦截都用单调守卫：`dsh-spec-gate`（写操作前置拦截）与 `dsh-role-guard`（工具白名单）注册的是 guard；
+`dsh-audit-trail` 虽然挂在瀑布上，但**原样返回 `next()` 的决定**，只旁听不改变结论。
+
+两个直接推论：
+
+1. **任何插件都无法放行我们拒绝的操作**：我们的强制拦截是单调守卫，官方注释明确"没有任何守卫能强制放行"；
+2. **自动评审也只会收紧**：`dsh-experimental-auto-review` 的返回值只有 `deny` / `ask` / `cancel`（代码级核实，**从不 `allow`**），
+   所以挂上它的后果是"更严 + 更多问人 + 更多 LLM 调用"，而不是"绕过门禁"。它仍然不能成为**授权依据**：一个概率判断
+   可以作为附加限制，不能作为放行的理由。
+
+**PTC（`run_code`）的守卫语义——读码 + 真机双重核实**：子派发走 `scheduler.dispatch(prepared.exec)`，其中 `prepared` 来自
+`prepareScheduledExecution` → `prepareExecution`，后者内部才是 `waterfall('tools/pre-execute')` 与随后的单调守卫。
+
+真机实验（0.2.0-rc.1 + 本套件 14 个插件，隔离 `DSH_HOME`）：PTC 程序里执行 `await tools.write({ path: 'src/ptc-before-approval.mjs', … })`，
+审计台账如实记下**子调用自己的两行**（`write` 的 `pre`/`result`），结果是 spec-gate 的拒绝原文：
+`Error: spec-gate: 该会话没有已登记的规格（mission），写操作被拒绝。… 下一步：调用 spec_create …`，文件**未被创建**，
+拒绝作为程序错误传回 PTC 程序（无法装作写成功）。
+
+两个工程结论：
+
+1. **不存在绕过通道**，且审计覆盖延伸到 PTC 程序内部的每一次子调用；
+2. **代价是调用量**：一次 `run_code` + 一个子调用产生 4 行审计（`run_code` 与子调用各 pre/result）——治理类插件按调用计数的
+   预算、门禁计数与 turn 预算都要预期这个放大系数。
+
+**启用方式（不要误解）**：`run_code` 是 PTC **呈现传输**，只在 `dsh-tools` 的 `config.mode = 'ptc'` 时可见（默认 `native`，
+此时调用它会得到 `unknown tool "run_code"`）。也就是说"默认不打扰"；要评估 PTC 的成本，先显式打开这个模式。
+
 ## 6. 为什么这样切分
 
 - **一个关注点一个插件**：门禁可以单独失效（例如先只上 quality-gate），不影响其它环节。
