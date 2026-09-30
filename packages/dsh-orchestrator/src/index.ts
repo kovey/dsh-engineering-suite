@@ -75,6 +75,11 @@ export function apply(ctx: Context, config: unknown = {}): void {
         if (resolved.autoDispatch.issues.length > 0) {
             logger.warn(`config.autoDispatch 有问题（已按说明处理）：\n- ${resolved.autoDispatch.issues.join('\n- ')}`)
         }
+        // GAP-10 applies to the metrics keys too: `windowDays: "90"` must not look
+        // like it changed the window.
+        if (resolved.metrics.issues.length > 0) {
+            logger.warn(`config.metrics 有问题（已按说明处理）：\n- ${resolved.metrics.issues.join('\n- ')}`)
+        }
         if (resolved.autoDispatch.enabled) {
             logger.info(
                 `autoDispatch：已启用（provider=${resolved.autoDispatch.provider}；阶段 ${resolved.autoDispatch.stages.join(', ') || '(空：不会派发)'}；上限 ${Math.round(resolved.autoDispatch.timeoutMs / 1000)}s）`,

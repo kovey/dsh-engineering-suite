@@ -5,10 +5,11 @@
  * the opt-in automatic transition with its role binding (docs.md §4.3).
  */
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import test from 'node:test'
-import { MissionStoreRegistry, type MissionStore } from 'dsh-eng-core'
+import { MissionStoreRegistry, type GateState, type MissionRecord, type MissionStore } from 'dsh-eng-core'
 import { createFakeHost, runText, tempWorkspace, type FakeHost } from 'dsh-eng-core/testing'
 import { apply, inject, name } from '../dist/index.js'
 import { resolveConfig } from '../dist/config.js'
@@ -707,7 +708,10 @@ test('the tool schema rejects an out-of-contract call before the handler runs', 
     const fake = host()
     const unknownAction = await fake.runTool('orchestrate', { action: 'nonsense' })
     assert.equal(unknownAction.isError, true)
-    assert.match(String(unknownAction.content), /must be one of \["start","status","advance","rerun","resume","stages","retro","unblock"\]/)
+    // The action enum is an exact set on purpose (the schema refuses an
+    // out-of-contract call before the handler runs). Adding `metrics` to the
+    // surface legitimately extends this list — updated here, not silently.
+    assert.match(String(unknownAction.content), /must be one of \["start","status","advance","rerun","resume","stages","retro","unblock","metrics"\]/)
 
     const missingAction = await fake.runTool('orchestrate', {})
     assert.equal(missingAction.isError, true)
@@ -1856,4 +1860,474 @@ test('a deploy stage needs a deployment verdict from THIS round (regression)', a
     const verifyBlocked = await orchestrate(fake, { action: 'advance', verdict: 'PASS' })
     assert.match(verifyBlocked, /早于本阶段进入时间|没有任何部署门禁记录/)
     assert.match(verifyBlocked, /deploy_verify/)
+})
+
+// ---------------------------------------------------------------------------
+// 15. delivery metrics (action: 'metrics') — 交付度量
+// ---------------------------------------------------------------------------
+
+const DAY_MS = 86_400_000
+
+/** A gate frozen in the trail (the tests own every timestamp; no clock). */
+interface SeededGate {
+    source: string
+    state: GateState
+    checkedAt: number
+    reason?: string
+}
+
+/** One mission as the trail would show it, with exact timestamps. */
+interface SeededMission {
+    id: string
+    title?: string
+    createdAt: number
+    status?: MissionRecord['status']
+    approvedAt?: number
+    stage?: string
+    stageEnteredAt?: number
+    stageState?: 'entered' | 'passed' | 'failed'
+    gates?: SeededGate[]
+    /** Receipt issue times, oldest first. */
+    receipts?: number[]
+}
+
+/**
+ * Write one mission the way the gates would have written it.
+ *
+ * `store.create`/`recordGate`/`issueReceipt` stamp their own clock, so anything
+ * the metrics read as a *time* is written directly: the tests must be able to
+ * hand-compute the medians they assert.
+ */
+function seedMission(store: MissionStore, cwd: string, spec: SeededMission): void {
+    store.create({ id: spec.id, title: spec.title ?? spec.id, cwd })
+    const created = store.read(spec.id)
+    assert.ok(created !== undefined, `mission ${spec.id} exists`)
+    store.save({
+        ...created,
+        createdAt: spec.createdAt,
+        status: spec.status ?? 'delivered',
+        ...(spec.stage === undefined ? {} : { stage: spec.stage }),
+        ...(spec.approvedAt === undefined
+            ? {}
+            : {
+                  spec: {
+                      title: spec.id,
+                      background: '',
+                      requirements: [],
+                      acceptanceCriteria: [],
+                      fileBoundaries: [],
+                      negativeConstraints: [],
+                      revision: 1,
+                      createdAt: spec.createdAt,
+                      updatedAt: spec.createdAt,
+                      approvedAt: spec.approvedAt,
+                      approvedBy: 'test',
+                  },
+              }),
+    })
+    for (const [index, gate] of (spec.gates ?? []).entries()) {
+        const id = `GATE-${String(index + 1).padStart(2, '0')}`
+        store.writeArtifact(
+            spec.id,
+            path.join('gates', `${id}.json`),
+            `${JSON.stringify({
+                id,
+                missionId: spec.id,
+                source: gate.source,
+                state: gate.state,
+                checkedAt: gate.checkedAt,
+                reason: gate.reason ?? `${gate.source} ${gate.state}`,
+                results: [],
+            })}\n`,
+        )
+    }
+    for (const [index, issuedAt] of (spec.receipts ?? []).entries()) {
+        const id = `RCP-${String(index + 1).padStart(2, '0')}`
+        store.writeArtifact(
+            spec.id,
+            path.join('receipts', `${id}.json`),
+            `${JSON.stringify({ id, missionId: spec.id, issuedAt, issuedBy: 'dsh-evidence-gate', digest: 'd', gateId: 'GATE-01', evidenceIds: [] })}\n`,
+        )
+    }
+    if (spec.stage !== undefined && spec.stageEnteredAt !== undefined) {
+        store.writeStageResult(spec.id, { stageId: spec.stage, attempt: 1, state: spec.stageState ?? 'entered', enteredAt: spec.stageEnteredAt })
+    }
+}
+
+/** Append rows to one of the trail ledgers the sibling plugins own. */
+function appendLedger(cwd: string, name: 'deployments' | 'releases', rows: readonly unknown[]): void {
+    const file = path.join(cwd, '.dsh', `${name}.jsonl`)
+    fs.mkdirSync(path.dirname(file), { recursive: true })
+    for (const row of rows) fs.appendFileSync(file, `${JSON.stringify(row)}\n`)
+}
+
+/** One deployment row, shaped like `dsh-deploy-gate`'s ledger row. */
+function deployRow(at: number, id: string, environment: string, revision: string, state: string, rollbackOf?: string): Record<string, unknown> {
+    return { at, id, environment, revision, deployer: 'test', state, ...(rollbackOf === undefined ? {} : { rollbackOf }) }
+}
+
+/** The metrics table row whose label starts with `label` (empty when absent). */
+function metricRow(text: string, label: string): string {
+    return text.split('\n').find((line) => line.startsWith(`| ${label}`)) ?? ''
+}
+
+/** Content hash of every file under `.dsh` (the read-only assertion). */
+function snapshotDsh(cwd: string): Record<string, string> {
+    const root = path.join(cwd, '.dsh')
+    const files: Record<string, string> = {}
+    const walk = (dir: string): void => {
+        for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+            const full = path.join(dir, entry.name)
+            if (entry.isDirectory()) walk(full)
+            else files[path.relative(cwd, full)] = createHash('sha256').update(fs.readFileSync(full)).digest('hex')
+        }
+    }
+    if (fs.existsSync(root)) walk(root)
+    return files
+}
+
+test('metrics reports lead time and approval wait as the median/p90 of a hand-computed sample (linear interpolation)', async () => {
+    disposeHosts()
+    const cwd = tempWorkspace('orchestrator-metrics-')
+    const fake = host({ cwd })
+    const store = storeFor(cwd)
+    const now = Date.now()
+    // lead time = 首个回执 - createdAt：2 / 4 / 10 天；审批等待：1 / 3 / 5 天。
+    seedMission(store, cwd, { id: 'm-a', createdAt: now - 20 * DAY_MS, approvedAt: now - 19 * DAY_MS, receipts: [now - 18 * DAY_MS] })
+    seedMission(store, cwd, { id: 'm-b', createdAt: now - 25 * DAY_MS, approvedAt: now - 22 * DAY_MS, receipts: [now - 21 * DAY_MS] })
+    seedMission(store, cwd, { id: 'm-c', createdAt: now - 40 * DAY_MS, approvedAt: now - 35 * DAY_MS, receipts: [now - 30 * DAY_MS] })
+
+    const report = await orchestrate(fake, { action: 'metrics' })
+    // 手算：sorted [2,4,10] → median rank 1 → 4.0；p90 rank 1.8 → 4 + 0.8·(10-4) = 8.8。
+    const lead = metricRow(report, 'lead time')
+    assert.match(lead, /中位数 4\.0 天 \/ p90 8\.8 天/)
+    assert.match(lead, /\| n=3 \|/)
+    assert.match(lead, /linear-interpolation/)
+    // 手算：sorted [1,3,5] → median 3.0；p90 rank 1.8 → 3 + 0.8·(5-3) = 4.6。
+    const approval = metricRow(report, '审批等待')
+    assert.match(approval, /中位数 3\.0 天 \/ p90 4\.6 天/)
+    assert.match(approval, /\| n=3 \|/)
+    assert.match(report, /样本：窗口内 mission 3 个/)
+    assert.match(report, /已交付 3 个；在飞 0 个/)
+})
+
+test('metrics on an empty repository says 没有数据 for every metric instead of implying health', async () => {
+    disposeHosts()
+    const cwd = tempWorkspace('orchestrator-metrics-empty-')
+    const fake = host({ cwd })
+
+    const report = await orchestrate(fake, { action: 'metrics' })
+    for (const label of ['lead time', '审批等待', '门禁失败率', '部署失败率', '回滚行数', '在飞 mission', '最近发布']) {
+        const row = metricRow(report, label)
+        assert.ok(row !== '', `missing metric row: ${label}`)
+        assert.match(row, /没有数据：/, `${label} must say 没有数据 with a reason`)
+    }
+    // No ratio at all: a 0% would read like a measurement, and there is none.
+    assert.equal(report.includes('%'), false, 'an empty trail must not produce a rate')
+    for (const claim of ['健康', '全部通过', '良好', '无失败']) assert.equal(report.includes(claim), false, `must not claim ${claim}`)
+    assert.match(report, /本仓库还没有任何 mission 记录/)
+    assert.match(report.split('\n').at(-1) ?? '', /^下一步：/)
+    assert.equal(fs.existsSync(path.join(cwd, '.dsh', 'missions')), false, 'reading metrics creates nothing')
+})
+
+test('metrics marks a one-sample lead time as 单样本 instead of pretending a distribution', async () => {
+    disposeHosts()
+    const cwd = tempWorkspace('orchestrator-metrics-one-')
+    const fake = host({ cwd })
+    seedMission(storeFor(cwd), cwd, { id: 'only', createdAt: Date.now() - 6 * DAY_MS, receipts: [Date.now()] })
+
+    const report = await orchestrate(fake, { action: 'metrics' })
+    const lead = metricRow(report, 'lead time')
+    assert.match(lead, /中位数 6\.0 天 \/ p90 6\.0 天/)
+    assert.match(lead, /单样本/)
+    assert.match(lead, /n=1（样本不足）/)
+})
+
+test('metrics lists a mission without a receipt in flight with its age and current stage', async () => {
+    disposeHosts()
+    const cwd = tempWorkspace('orchestrator-metrics-flight-')
+    const fake = host({ cwd })
+    const store = storeFor(cwd)
+    const now = Date.now()
+    seedMission(store, cwd, {
+        id: 'm-flight',
+        title: '卡住的交付',
+        status: 'implementing',
+        createdAt: now - 12 * DAY_MS,
+        stage: 'quality-verify',
+        stageEnteredAt: now - 3 * DAY_MS,
+    })
+
+    const report = await orchestrate(fake, { action: 'metrics' })
+    assert.match(metricRow(report, '在飞 mission'), /1 个（最老 12\.0 天）/)
+    const row = report.split('\n').find((line) => line.startsWith('- `m-flight`')) ?? ''
+    assert.match(row, /已 12\.0 天/)
+    assert.match(row, /阶段 quality-verify（entered @/)
+    assert.match(row, /无门禁记录/)
+})
+
+test('metrics groups gate failures by source and counts only gates recorded before the receipt', async () => {
+    disposeHosts()
+    const cwd = tempWorkspace('orchestrator-metrics-gates-')
+    const fake = host({ cwd })
+    const store = storeFor(cwd)
+    const now = Date.now()
+    const base = now - 30 * DAY_MS
+    seedMission(store, cwd, {
+        id: 'm-block',
+        createdAt: base,
+        gates: [{ source: 'dsh-quality-gate', state: 'BLOCK', checkedAt: base + DAY_MS, reason: '命令 go test ./... 退出码 1' }],
+        receipts: [base + 2 * DAY_MS],
+    })
+    seedMission(store, cwd, {
+        id: 'm-late',
+        createdAt: base,
+        gates: [
+            { source: 'dsh-quality-gate', state: 'PASS', checkedAt: base + DAY_MS, reason: '交付前那次是 PASS' },
+            // 回执之后补跑的门禁：不能改写这次交付的历史。
+            { source: 'dsh-quality-gate', state: 'BLOCK', checkedAt: base + 5 * DAY_MS, reason: '回执之后才跑的补测' },
+        ],
+        receipts: [base + 2 * DAY_MS],
+    })
+    seedMission(store, cwd, {
+        id: 'm-warn',
+        createdAt: base,
+        gates: [{ source: 'dsh-standards-gate', state: 'WARN', checkedAt: base + DAY_MS, reason: '非必需命令失败：可以带风险交付' }],
+        receipts: [base + DAY_MS],
+    })
+    seedMission(store, cwd, {
+        id: 'm-clean',
+        createdAt: base,
+        gates: [{ source: 'dsh-quality-gate', state: 'PASS', checkedAt: base + DAY_MS, reason: '一切正常' }],
+        receipts: [base + DAY_MS],
+    })
+
+    const report = await orchestrate(fake, { action: 'metrics' })
+    // BLOCK 与 WARN 都算"交付前最后一次门禁不是 PASS"：2/4。
+    assert.match(metricRow(report, '门禁失败率'), /50\.0%（2\/4）个已交付 mission/)
+    assert.match(report, /（按 source 合计：dsh-quality-gate ×1、dsh-standards-gate ×1；分母：4 个已交付 mission；PASS 2 \/ WARN 1 \/ BLOCK 1）/)
+    assert.match(report, /`dsh-quality-gate` ×1：命令 go test \.\/\.\.\. 退出码 1/)
+    assert.match(report, /`dsh-standards-gate` ×1：非必需命令失败/)
+    assert.equal(report.includes('回执之后才跑的补测'), false, 'a gate recorded after the receipt must not count')
+})
+
+test('metrics counts a failed deployment once in the failure rate and a rollbackOf row as one rollback', async () => {
+    disposeHosts()
+    const cwd = tempWorkspace('orchestrator-metrics-deploy-')
+    const fake = host({ cwd })
+    const now = Date.now()
+    seedMission(storeFor(cwd), cwd, { id: 'm-any', createdAt: now - 5 * DAY_MS, receipts: [now - DAY_MS] })
+    appendLedger(cwd, 'deployments', [
+        deployRow(now - 20 * DAY_MS, 'DPL-1', 'prod', 'r1', 'deployed'),
+        deployRow(now - 19 * DAY_MS, 'DPL-2', 'prod', 'r1', 'verified'),
+        deployRow(now - 10 * DAY_MS, 'DPL-3', 'prod', 'r2', 'deployed'),
+        deployRow(now - 9 * DAY_MS, 'DPL-4', 'prod', 'r2', 'verify-failed'),
+        // 这次回滚是 DPL-3 那次失败的补救：回滚算 1 行，失败不重复计。
+        deployRow(now - 8 * DAY_MS, 'DPL-5', 'prod', 'r1', 'rolled-back', 'DPL-3'),
+        deployRow(now - 7 * DAY_MS, 'DPL-6', 'staging', 'r3', 'deployed'),
+        deployRow(now - 6 * DAY_MS, 'DPL-7', 'staging', 'r3', 'refused'),
+    ])
+
+    const report = await orchestrate(fake, { action: 'metrics' })
+    assert.match(metricRow(report, '部署失败率'), /33\.3%（1\/3）次部署尝试失败/)
+    assert.match(metricRow(report, '回滚行数'), /\| 1 行 \|/)
+    assert.match(metricRow(report, '回滚行数'), /7 行台账/)
+    assert.match(metricRow(report, '部署失败率'), /refused 1 行不计入尝试/)
+})
+
+test('metrics reports a missing deployments ledger as a named gap, never as a 0% failure rate', async () => {
+    disposeHosts()
+    const cwd = tempWorkspace('orchestrator-metrics-noledger-')
+    const fake = host({ cwd })
+    seedMission(storeFor(cwd), cwd, { id: 'm-only', createdAt: Date.now() - 2 * DAY_MS, receipts: [Date.now()] })
+
+    const report = await orchestrate(fake, { action: 'metrics' })
+    assert.match(metricRow(report, '部署失败率'), /没有数据：无部署台账/)
+    assert.match(metricRow(report, '部署失败率'), /deployments\.jsonl/)
+    assert.match(metricRow(report, '回滚行数'), /没有数据：无部署台账/)
+    assert.equal(/部署失败率[^\n]*0\.0%/.test(report), false, 'an absent ledger is a gap, not 0%')
+    assert.equal(fs.existsSync(path.join(cwd, '.dsh', 'deployments.jsonl')), false, 'metrics does not create the ledger')
+})
+
+test('metrics tolerates a truncated last line in every JSONL it reads and names the unusable line', async () => {
+    disposeHosts()
+    const cwd = tempWorkspace('orchestrator-metrics-truncated-')
+    const fake = host({ cwd })
+    const now = Date.now()
+    seedMission(storeFor(cwd), cwd, { id: 'm-trunc', createdAt: now - 5 * DAY_MS, receipts: [now - DAY_MS] })
+    appendLedger(cwd, 'deployments', [
+        deployRow(now - 4 * DAY_MS, 'DPL-1', 'prod', 'r1', 'deployed'),
+        deployRow(now - 4 * DAY_MS + 1000, 'DPL-2', 'prod', 'r1', 'verified'),
+        deployRow(now - 3 * DAY_MS, 'DPL-3', 'prod', 'r2', 'deployed'),
+        deployRow(now - 3 * DAY_MS + 1000, 'DPL-4', 'prod', 'r2', 'failed'),
+    ])
+    appendLedger(cwd, 'releases', [{ at: now - 2 * DAY_MS, version: 'v1.0.0', tag: 'v1.0.0', missionIds: ['m-trunc'], receiptIds: ['RCP-01'] }])
+    // A crash mid-append leaves half a line behind — the expected shape.
+    fs.appendFileSync(path.join(cwd, '.dsh', 'deployments.jsonl'), '{"at":1690000000000,"id":"DPL-5","environm')
+    fs.appendFileSync(path.join(cwd, '.dsh', 'releases.jsonl'), '{"at":1690000000000,"version":"v1.1')
+
+    const report = await orchestrate(fake, { action: 'metrics' })
+    assert.match(metricRow(report, '部署失败率'), /50\.0%（1\/2）次部署尝试失败/)
+    assert.match(report, /v1\.0\.0（tag v1\.0\.0）/)
+    assert.match(metricRow(report, '最近发布'), /1 条/)
+    const gaps = report.split('### 数据缺口')[1] ?? ''
+    assert.match(gaps, /deployments\.jsonl：第 5 行无法解析（JSON 不完整，通常是写入被中断留下的截断末行）：已跳过，不影响前面的 4 行/)
+    assert.match(gaps, /releases\.jsonl：第 2 行无法解析/)
+})
+
+test('metrics reports the missions its window excluded instead of silently measuring a subset', async () => {
+    disposeHosts()
+    const cwd = tempWorkspace('orchestrator-metrics-window-')
+    const fake = host({ cwd })
+    const store = storeFor(cwd)
+    const now = Date.now()
+    seedMission(store, cwd, { id: 'm-old-delivered', createdAt: now - 200 * DAY_MS, receipts: [now - 199 * DAY_MS] })
+    seedMission(store, cwd, { id: 'm-recent', createdAt: now - 3 * DAY_MS, receipts: [now - 2 * DAY_MS] })
+
+    const report = await orchestrate(fake, { action: 'metrics', windowDays: 30 })
+    assert.match(report, /窗口 30 天/)
+    assert.match(report, /样本：窗口内 mission 1 个（仓库共 2 个，被窗口排除 1 个）/)
+    assert.equal(report.includes('m-old-delivered'), false, 'an excluded mission is not measured')
+    assert.match(metricRow(report, 'lead time'), /n=1（样本不足）/)
+})
+
+test('metrics bounds the in-flight list oldest first and reports how many are hidden', async () => {
+    disposeHosts()
+    const cwd = tempWorkspace('orchestrator-metrics-bound-')
+    const fake = host({ cwd })
+    const store = storeFor(cwd)
+    const now = Date.now()
+    seedMission(store, cwd, { id: 'm-30', createdAt: now - 30 * DAY_MS, status: 'implementing', stage: 'implement', stageEnteredAt: now - 20 * DAY_MS })
+    seedMission(store, cwd, { id: 'm-20', createdAt: now - 20 * DAY_MS, status: 'implementing', stage: 'quality-verify', stageEnteredAt: now - 10 * DAY_MS })
+    seedMission(store, cwd, { id: 'm-10', createdAt: now - 10 * DAY_MS, status: 'draft' })
+
+    const report = await orchestrate(fake, { action: 'metrics', maxInFlight: 2 })
+    assert.match(metricRow(report, '在飞 mission'), /3 个（最老 30\.0 天）/)
+    const listed = report.split('\n').filter((line) => line.startsWith('- `m-'))
+    assert.deepEqual(
+        listed.map((line) => line.slice(3, line.indexOf('`', 3))),
+        ['m-30', 'm-20'],
+        'oldest first, bounded by maxInFlight',
+    )
+    assert.match(report, /（另有 1 个未显示：用 metrics\.maxInFlight 或 action 入参放宽上限）/)
+    assert.equal(report.includes('m-10'), false, 'the bound hides the newest one, not the oldest')
+})
+
+test('metrics is read-only: the .dsh snapshot is byte-identical before and after', async () => {
+    disposeHosts()
+    const cwd = tempWorkspace('orchestrator-metrics-readonly-')
+    const fake = host({ cwd })
+    const store = storeFor(cwd)
+    const now = Date.now()
+    seedMission(store, cwd, {
+        id: 'm-live',
+        createdAt: now - 9 * DAY_MS,
+        stage: 'implement',
+        stageEnteredAt: now - 4 * DAY_MS,
+        approvedAt: now - 8 * DAY_MS,
+        status: 'implementing',
+        gates: [{ source: 'dsh-quality-gate', state: 'BLOCK', checkedAt: now - 2 * DAY_MS, reason: 'lint 失败' }],
+    })
+    seedMission(store, cwd, { id: 'm-done', createdAt: now - 40 * DAY_MS, approvedAt: now - 39 * DAY_MS, gates: [{ source: 'dsh-quality-gate', state: 'PASS', checkedAt: now - 38 * DAY_MS }], receipts: [now - 36 * DAY_MS] })
+    appendLedger(cwd, 'deployments', [deployRow(now - DAY_MS, 'DPL-1', 'prod', 'r1', 'deployed')])
+    appendLedger(cwd, 'releases', [{ at: now - DAY_MS, version: 'v2.0.0', missionIds: ['m-done'], receiptIds: ['RCP-01'] }])
+    const before = snapshotDsh(cwd)
+    assert.ok(Object.keys(before).length > 5, 'the fixture has a trail to protect')
+    const liveBefore = store.read('m-live')
+
+    const report = await orchestrate(fake, { action: 'metrics' })
+    assert.match(report, /## 交付度量/)
+    assert.deepEqual(snapshotDsh(cwd), before, 'metrics must not write, append or touch anything under .dsh')
+    assert.deepEqual(store.read('m-live'), liveBefore, 'no mission mutation')
+    // 门禁/回执/阶段计数不变：读两次的报告也必须一致（没有副作用累积）。
+    assert.equal(await orchestrate(fake, { action: 'metrics' }), report)
+})
+
+test('metrics counts a failed row with no deployed row as an attempt so the rate can never exceed 100%', async () => {
+    disposeHosts()
+    const cwd = tempWorkspace('orchestrator-metrics-standalone-')
+    const fake = host({ cwd })
+    const now = Date.now()
+    seedMission(storeFor(cwd), cwd, { id: 'm-dpl', createdAt: now - 5 * DAY_MS, receipts: [now - DAY_MS] })
+    appendLedger(cwd, 'deployments', [
+        // 部署命令直接失败：部署门禁没有写 deployed 行，这行自己就是一次尝试。
+        deployRow(now - 4 * DAY_MS, 'DPL-1', 'staging', 'r1', 'failed'),
+        // 验收行，但那次部署在窗口外：既不算尝试也不算成功，只进缺口。
+        deployRow(now - 3 * DAY_MS, 'DPL-2', 'prod', 'r9', 'verified'),
+    ])
+
+    const report = await orchestrate(fake, { action: 'metrics' })
+    assert.match(metricRow(report, '部署失败率'), /100\.0%（1\/1）次部署尝试失败/)
+    assert.match(report, /1 行 verified 在窗口内没有对应的 deployed 行/)
+    assert.equal(/（\d+\/\d+）/.test(report) && /（2\/1）/.test(report), false, 'failures can never exceed attempts')
+})
+
+test('metrics counts a delivered mission with no gate at all as 无门禁记录, not as a pass', async () => {
+    disposeHosts()
+    const cwd = tempWorkspace('orchestrator-metrics-nogate-')
+    const fake = host({ cwd })
+    const store = storeFor(cwd)
+    const now = Date.now()
+    seedMission(store, cwd, { id: 'm-gated', createdAt: now - 10 * DAY_MS, gates: [{ source: 'dsh-quality-gate', state: 'PASS', checkedAt: now - 9 * DAY_MS }], receipts: [now - 8 * DAY_MS] })
+    // 回执由别的流程签发：交付前一个门禁记录都没有，度量不能把它算成"通过"。
+    seedMission(store, cwd, { id: 'm-ungated', createdAt: now - 10 * DAY_MS, receipts: [now - 8 * DAY_MS] })
+
+    const report = await orchestrate(fake, { action: 'metrics' })
+    assert.match(metricRow(report, '门禁失败率'), /0\.0%（0\/2）个已交付 mission/)
+    assert.match(report, /无门禁记录 1/)
+    assert.match(report, /有 1 个已交付 mission 在交付前没有任何门禁记录：它们既不算通过也不算失败，但仍在门禁失败率的分母里/)
+})
+
+test('metrics config keys are validated: an unusable value keeps the host value and is reported', () => {
+    const defaults = resolveConfig({})
+    assert.equal(defaults.config.metrics.windowDays, 90)
+    assert.equal(defaults.config.metrics.maxInFlight, 20)
+    assert.deepEqual(defaults.config.metrics.issues, [])
+
+    const tuned = resolveConfig({ metrics: { windowDays: 30, maxInFlight: 5 } })
+    assert.equal(tuned.config.metrics.windowDays, 30)
+    assert.equal(tuned.config.metrics.maxInFlight, 5)
+    assert.deepEqual(tuned.config.metrics.issues, [])
+
+    const broken = resolveConfig({ metrics: { windowDays: 0, maxInFlight: 'lots', windowDay: 7 } })
+    assert.equal(broken.config.metrics.windowDays, 90, 'an unusable value keeps the host value')
+    assert.equal(broken.config.metrics.maxInFlight, 20)
+    assert.equal(broken.config.metrics.issues.length, 3)
+    assert.match(broken.config.metrics.issues.join('\n'), /metrics\.windowDays 必须是 1–3650 的整数（收到 0）：已保留宿主值 90/)
+    assert.match(broken.config.metrics.issues.join('\n'), /metrics\.maxInFlight 必须是 1–200 的整数（收到 "lots"）：已保留宿主值 20/)
+    assert.match(broken.config.metrics.issues.join('\n'), /metrics 里有未知键：windowDay/)
+    // A non-object section is reported too, never silently ignored.
+    assert.match(resolveConfig({ metrics: 90 }).config.metrics.issues.join('\n'), /metrics 必须是对象/)
+
+    // …and the host sees it at assembly time, not in a broken report later.
+    disposeHosts()
+    const fake = host({ withPlugins: false, config: { metrics: { windowDays: -1 } } })
+    const log = fs.readFileSync(path.join(fake.cwd, 'orchestrator.log'), 'utf8')
+    assert.match(log, /config\.metrics 有问题/)
+    assert.match(log, /已保留宿主值 90/)
+})
+
+test('the metrics window argument overrides the config and an unusable one is reported in the report', async () => {
+    disposeHosts()
+    const cwd = tempWorkspace('orchestrator-metrics-arg-')
+    const fake = host({ cwd, config: { metrics: { windowDays: 30 } } })
+    const store = storeFor(cwd)
+    const now = Date.now()
+    seedMission(store, cwd, { id: 'm-60d', createdAt: now - 60 * DAY_MS, receipts: [now - 59 * DAY_MS] })
+
+    const configured = await orchestrate(fake, { action: 'metrics' })
+    assert.match(configured, /窗口 30 天/)
+    assert.match(configured, /被窗口排除 1 个/)
+
+    const widened = await orchestrate(fake, { action: 'metrics', windowDays: 90 })
+    assert.match(widened, /窗口 90 天/)
+    assert.match(widened, /样本：窗口内 mission 1 个/)
+    assert.equal(widened.includes('被窗口排除 1 个'), false)
+
+    const unusable = await orchestrate(fake, { action: 'metrics', windowDays: 0 })
+    assert.match(unusable, /- 参数：windowDays=0 不可用（要求 1–3650 的整数），已改用配置值 30 天/)
+    assert.match(unusable, /窗口 30 天/)
+
+    const badMax = await orchestrate(fake, { action: 'metrics', maxInFlight: 1.5 })
+    assert.match(badMax, /maxInFlight=1\.5 不可用（要求 1–200 的整数），已改用配置值 20/)
 })

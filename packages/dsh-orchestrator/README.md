@@ -72,7 +72,8 @@
 dsh 工程体系的**顶层流程编排插件**（docs.md §4）：定义“什么阶段用哪个插件”，探测插件是否挂载，
 用确定性门禁管理流转，门禁失败**回退**而非跳过，反复失败则**熔断**；阶段结果落盘，支持断点恢复
 与阶段重跑。插件 id `orchestrator`，包名 `dsh-orchestrator`，`inject = ['tools', 'systemPrompt']`，
-唯一工具 `orchestrate`（不注册别名）。
+唯一工具 `orchestrate`（不注册别名）；另外提供**只读**的交付度量（`orchestrate({ action: 'metrics' })`，
+见下文「交付度量」）。
 
 ## 1. 阶段定义与默认流水线
 
@@ -140,6 +141,7 @@ dsh 工程体系的**顶层流程编排插件**（docs.md §4）：定义“什�
 | `status` | — | 流水线视图：state / attempt / 进入与完成时间 / 门禁裁决 / 角色 + 插件挂载列；末尾列出未挂载插件 |
 | `rerun` | `stageId?`（默认当前阶段）、`summary?` | 重新进入该阶段（`attempt + 1`），同样受熔断约束 |
 | `resume` | — | 从 `mission.stage` 的断点恢复（保留原 `attempt` 与 `enteredAt`），并说明这是恢复 |
+| `metrics` | `windowDays?`（默认取 `config.metrics.windowDays`，90）、`maxInFlight?`（默认 20） | **只读**：本仓库的交付度量（lead time / 审批等待 / 门禁失败率 / 部署失败率与回滚 / 在飞 / 最近发布），每个数字都带样本量，末行是"下一步"；不写任何文件 |
 
 公共参数：`missionId?`（`store.resolveForAgent(exec.agent, { explicitId, fallbackLatest: true })`：
 显式 id → 本会话/委派父会话绑定 → 工作区最新 mission）与 `verdict?: PASS|WARN|BLOCK`。
@@ -238,6 +240,58 @@ orchestrate({ action: "unblock", summary: "根因已修复，人工放行" })
   这样经验是在**规划阶段**被读到的，而不是靠人记得去 grep。
 返回均为中文结构化文本，**末行固定是下一步动作**。
 
+## 交付度量（`orchestrate({ action: 'metrics' })`）
+
+复盘（上面那节）回答"**这一个** mission 为什么返工"；度量回答"**这段时间**交付到底怎么样"。
+管理问题只能从套件本来就在写的 trail 里读，所以这条路径**只读**：`metrics.ts` 里没有任何写路径，
+测试用 `.dsh` 前后内容哈希快照断言"不写门禁、不改 mission、不落文件"。
+
+### 指标定义（公式写死在代码里，报告里带口径）
+
+| 指标 | 公式 | 样本量 |
+|---|---|---|
+| lead time | `首个回执.issuedAt − mission.createdAt`（首个 = 交付时点），报**中位数**与 **p90** | 窗口内**已回执**的 mission 数 |
+| 审批等待 | `spec.approvedAt − mission.createdAt`，报中位数与 p90（"等人工"是流程方能改的那部分） | 窗口内已批准（`spec.approvedAt` 存在）的 mission 数 |
+| 门禁失败率 | 交付前**最后一次**门禁（`checkedAt ≤ 首个回执`）**不是 PASS** 的 mission / 已交付 mission（WARN 也算"不是 PASS"）；交付前**完全没有**门禁记录的单独数成"无门禁记录"（进数据缺口），绝不冒充通过、也不偷偷缩小分母 | 已交付 mission 数 |
+| 门禁失败原因 | 按 `(source, 原因文本)` 归组计数（另给按 source 的合计），最多显示前 5 组 | 上面那些失败 |
+| 部署失败率 | 失败次数 / 部署尝试次数。`deployed` 行 = 一次尝试；`verified` 结算成功；`failed`/`verify-failed` 计一次失败（归因到还开着的那次部署；没有 `deployed` 行时这行自己也算一次尝试，**所以失败率永远不会 >100%**）；`rolled-back`/`rollback-failed` 计一次回滚，**同一次失败的回滚不重复计失败**；`refused` 没碰环境，既不算尝试也不算失败；没有对应 `deployed` 行的 `verified` 既不算尝试也不算成功（进数据缺口） | 尝试次数（台账里 `state` 是部署门禁写的值、且在窗口内的行） |
+| 回滚行数 | 带 `rollbackOf` 的行数 | 台账行数 |
+| 在飞 | 没有回执的窗口内 mission：年龄 + 当前阶段（`mission.stage` 的工件状态与进入时间）+ 最新门禁裁决，**最老的在前**，最多 `maxInFlight` 条（截断数会写出来） | 窗口内 mission 数 |
+| 最近发布 | `releases.jsonl` 里 `at` 在窗口内的最新 5 条（版本、tag、mission 数、回执数） | 台账条数（含窗口外条数） |
+
+- **分位数方法**：linear interpolation（R-7，numpy `linear` 默认）——排序样本上取 `rank = (n−1)·p`，
+  在相邻两个值之间线性插值。**1 个样本**时报告写"中位数 = p90 = 该值（单样本，不代表分布）"；
+  **0 个样本**时写"没有数据：<原因>"，绝不用 0 冒充测量结果。
+- **窗口**：`windowDays`（`config.metrics.windowDays` 或 action 入参，默认 90 天）。mission 按
+  `createdAt` 进窗（**不是**按回执时间：一个 200 天前创建、今天才交付的 mission 不在窗口内），
+  部署/发布台账按各自的 `at`。被窗口排除的数量会写在报告抬头与列表里，**不静默只测子集**。
+- **缺口有名字**：台账缺失（"无部署台账/无发布台账"）、JSONL 末行被截断、行缺字段、`state` 不认识、
+  `mission.json` 读不到——都进"数据缺口"段，用一句中文说明跳过了什么，而不是变成 0。
+- **收尾一行**是**最有行动价值的发现**，按优先级取一条：空 trail → 全在飞（含"还没批准的规格"）→
+  `审批等待中位数 > lead time 中位数的一半`（→ 先把送审环节前置）→ 门禁失败率 ≥ 50%（→ 指出最常见的
+  source 与原因）→ 部署失败/回滚 → 数据缺口 → 节奏基线。
+- 中文报告的形状：抬头（窗口/样本/台账）+ 指标表（每行带样本量）+ 门禁失败原因归组 + 在飞列表 +
+  最近发布 + 数据缺口 + `下一步：…`。
+
+### 这些数字**不**意味着什么（诚实边界）
+
+- 它们描述的是**本仓库记录下来的 trail**，不是团队绩效：**没有被记录的 mission 完全不可见**
+  （没跑 `orchestrate start`、或回执由别的流程签发，度量都看不到），所以"在飞 3 个"读作
+  "**.dsh 里记着 3 个**在飞"，不是"公司里只有 3 件事在做"。
+- "失败"是**门禁记下的那一次记录**（`deployments.jsonl` 里那一行的 `state`），不是生产判断：
+  部署失败率量的是"部署门禁/回滚流程里出现过多少次失败动作"，不是"线上出过几次事故"。
+- lead time 用的是**首个回执**：重新签发、补签的回执不会拉长 lead time；交付之后才跑的门禁也不会
+  改写"交付前最后一次门禁"（`checkedAt ≤ 首个回执`）。
+- 审批等待只统计**有 `spec.approvedAt`** 的 mission；没批准的不是"等待 0 天"，而是不出现在这个
+  中位数里（在飞的未批准数量会单独说）。
+- 度量**不**计算返工类信号（规格 revision、阶段回退、失败命令）：那是 `action: 'retro'` 的领域
+  （`.dsh/retrospectives.jsonl`），两者是不同的问题，混在一张表里会让读数更难解释。
+- 也**不**读 `audit/<session>.jsonl`、`plan.jsonl`（工具调用与计划不是交付事实），**不**校验回执
+  digest、**不**读 git（重复发布/回滚的真实性由各门禁自己保证）。
+- 部署/发布台账按 `<layout.rootDir>/deployments.jsonl`、`<layout.rootDir>/releases.jsonl` 找，
+  找不到再看默认位置 `<cwd>/.dsh/…`：如果宿主把 `ledgerFile`/`releasesFile` 挪到别处，报告会说
+  "无部署台账/无发布台账"（这是**缺口**，不是"0 次失败"）。
+
 ## 6. 配置
 
 ```yaml
@@ -256,11 +310,19 @@ orchestrate({ action: "unblock", summary: "根因已修复，人工放行" })
           gate: none, maxAttempts: 3, next: test-design-review }
     probes: { dsh-quality-gate: { tool: quality_gate_run } }
     turnStop: { maxAutoAdvancesPerTurn: 2 }  # autoAdvance 阶段的每 turn 自动推进上限
+    metrics: { windowDays: 90, maxInFlight: 20 }  # action: "metrics" 的默认窗口与在飞列表上限
     prompt: { enabled: true, order: 660 }   # systemPrompt section: eng:orchestrator
 ```
 
 `stages` 严格校验（id 唯一、`next`/`onFail` 指向已知阶段、`maxAttempts` ≥1、gate 类型已知、
 `role` 非空字符串、`autoAdvance` 布尔）；**校验失败则记日志并回退默认流水线**，绝不弄坏宿主会话。
+
+`metrics` 的两个键同样校验（`windowDays` 1–3650、`maxInFlight` 1–200 的整数）：**不可用的值保留宿主值
+并在装配日志里报告**（`config.metrics 有问题：…`），未知键也会被点名——一个"看起来生效了"的配置比一个
+报错的配置危险得多。这两个键是**宿主级**的，不做项目级覆盖：`docs/ARCHITECTURE.md` 明确
+`dsh-orchestrator` 不需要项目级配置（流水线本身就是宿主策略），所以这里不新开一套键策略；
+某个仓库要看别的窗口，用 `orchestrate({ action: 'metrics', windowDays: 365 })` 的入参即可
+（入参不可用时同样会在报告里说明"已改用配置值"）。
 
 ## 7. 断点恢复与审计
 

@@ -196,3 +196,48 @@ test('a spec without the budget section contributes no rows (regression)', () =>
     assert.equal(check?.state, 'ok')
     assert.match(check?.detail ?? '', /未声明非功能预算/)
 })
+
+test('a wrapper test command counts, and "commands but no recognisable test" is advice (regression)', () => {
+    const cwd = repo({ ignoreTrail: true })
+    // `make test` is a test command: the first version of this check only knew
+    // toolchain binaries and reported a healthy repository as having none.
+    fs.writeFileSync(path.join(cwd, '.dsh', 'quality-gate.json'), JSON.stringify({
+        commands: [
+            { id: 'test', name: '单元测试', command: 'make test', required: true, phase: 'gate' },
+            { id: 'vet', name: 'lint', command: 'make vet', required: false, phase: 'lint' },
+        ],
+    }))
+    const recognised = checkWorkspace({ cwd, now: 0 }).checks.find((item) => item.id === 'test.command')
+    assert.equal(recognised?.state, 'ok')
+    assert.match(recognised?.detail ?? '', /1 条测试命令/)
+
+    // An unusual runner is not a missing test: partial + advice, never a blocker.
+    fs.writeFileSync(path.join(cwd, '.dsh', 'quality-gate.json'), JSON.stringify({
+        commands: [{ id: 'ci', name: 'CI', command: './ci/run.sh --all', required: true, phase: 'gate' }],
+    }))
+    const report = checkWorkspace({ cwd, now: 0 })
+    const odd = report.checks.find((item) => item.id === 'test.command')
+    assert.equal(odd?.state, 'partial')
+    assert.equal(odd?.severity, 'recommended')
+    assert.match(odd?.detail ?? '', /人工确认/)
+    assert.equal(report.blockers.some((item) => item.id === 'test.command'), false, 'a wrapper script must not block delivery readiness')
+
+    // Only an EMPTY command list is a required gap.
+    fs.writeFileSync(path.join(cwd, '.dsh', 'quality-gate.json'), JSON.stringify({ commands: [] }))
+    const empty = checkWorkspace({ cwd, now: 0 }).checks.find((item) => item.id === 'test.command')
+    assert.equal(empty?.state, 'missing')
+    assert.equal(empty?.severity, 'required')
+})
+
+test('without git the ignore rule is "not applicable", not a blocker (regression)', () => {
+    // A plain directory (no .git): the fingerprint rules cannot apply, so a
+    // REQUIRED ignore gap here is a false alarm that makes a healthy repository
+    // look un-ready.
+    const cwd = tempWorkspace('doctor-nogit-')
+    fs.mkdirSync(path.join(cwd, '.dsh'), { recursive: true })
+    const check = checkWorkspace({ cwd, now: 0 }).checks.find((item) => item.id === 'ledger.gitignore')
+    assert.equal(check?.severity, 'recommended')
+    assert.equal(check?.state, 'partial')
+    assert.match(check?.detail ?? '', /不适用/)
+    assert.equal(checkWorkspace({ cwd, now: 0 }).blockers.some((item) => item.id === 'ledger.gitignore'), false)
+})

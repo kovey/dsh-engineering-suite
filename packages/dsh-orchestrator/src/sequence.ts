@@ -1,5 +1,5 @@
 /**
- * The orchestration sequence: `orchestrate` and the six actions behind it
+ * The orchestration sequence: `orchestrate` and the actions behind it
  * (docs.md §4.2 — 路径一 配置驱动流水线 + 路径二 条件边/回退/熔断).
  *
  * Every decision here reads durable facts from the mission store: which
@@ -25,6 +25,7 @@ import {
 import type { OrchestratorConfig } from './config.js'
 import { dispatchStage, shouldDispatch, type DispatchDeps, type DispatchOutcome } from './dispatch.js'
 import { evaluateGate, type Verdict } from './gates.js'
+import { MAX_MAX_IN_FLIGHT, MAX_METRICS_WINDOW_DAYS, collectMetrics, renderMetrics } from './metrics.js'
 import {
     describeGate,
     describeStageRoute,
@@ -76,9 +77,9 @@ function budgetOf(deps: SequenceDeps, stage: StageConfig): number {
 }
 
 /** Every action the single tool exposes. */
-export type OrchestrateAction = 'start' | 'status' | 'advance' | 'rerun' | 'resume' | 'stages' | 'retro' | 'unblock'
+export type OrchestrateAction = 'start' | 'status' | 'advance' | 'rerun' | 'resume' | 'stages' | 'retro' | 'unblock' | 'metrics'
 
-const ACTIONS: readonly OrchestrateAction[] = ['start', 'status', 'advance', 'rerun', 'resume', 'stages', 'retro', 'unblock']
+const ACTIONS: readonly OrchestrateAction[] = ['start', 'status', 'advance', 'rerun', 'resume', 'stages', 'retro', 'unblock', 'metrics']
 
 /** Arguments of `orchestrate`. */
 export interface OrchestrateArgs {
@@ -87,6 +88,10 @@ export interface OrchestrateArgs {
     stageId?: string
     summary?: string
     verdict?: Verdict
+    /** `action: 'metrics'` 的窗口天数（覆盖 `config.metrics.windowDays`）。 */
+    windowDays?: number
+    /** `action: 'metrics'` 的在飞列表上限（覆盖 `config.metrics.maxInFlight`）。 */
+    maxInFlight?: number
 }
 
 /** Everything the handlers read at call time. */
@@ -122,7 +127,7 @@ interface CallContext {
 
 /** The english model-facing description of `orchestrate`. */
 export const ORCHESTRATE_DESCRIPTION =
-    'Drive the engineering stage pipeline of the current mission (dsh-orchestrator): list stages, start, report status, advance, rerun or resume. Stage gates are deterministic — a stage cannot be entered while a plugin it requires is not mounted, a stage whose exit gate fails rolls back to its onFail stage instead of advancing, and a stage that exceeds maxAttempts blocks the mission (circuit breaker). Always call this tool to move between stages instead of assuming the next step.'
+    'Drive the engineering stage pipeline of the current mission (dsh-orchestrator): list stages, start, report status, advance, rerun or resume, and read the read-only delivery metrics of this repository. Stage gates are deterministic — a stage cannot be entered while a plugin it requires is not mounted, a stage whose exit gate fails rolls back to its onFail stage instead of advancing, and a stage that exceeds maxAttempts blocks the mission (circuit breaker). Always call this tool to move between stages instead of assuming the next step.'
 
 function agentOf(exec: unknown): AgentLike | undefined {
     return (exec as { agent?: AgentLike }).agent
@@ -1110,9 +1115,49 @@ export async function runOrchestrate(deps: SequenceDeps, args: OrchestrateArgs, 
             return retroAction(deps, ctx)
         case 'unblock':
             return unblockAction(deps, ctx, args)
+        case 'metrics':
+            return metricsAction(deps, ctx, args)
         default:
             return '未知的 action。\n\n下一步：调用 orchestrate({ action: "status" })。'
     }
+}
+
+/**
+ * `metrics` — 交付度量（只读）。
+ *
+ * 度量是**仓库级**的问题（"这段时间交付怎么样"），不是某个 mission 的问题：所以
+ * 这里不看 `ctx.mission`，也就没有"没有 mission"这种拒绝——空仓库是要报告的事实
+ * （每条指标说"没有数据"），不是错误。它同时**不写任何文件**：`metrics.ts` 没有写
+ * 路径，测试用 `.dsh` 前后快照断言。
+ */
+function metricsAction(deps: SequenceDeps, ctx: CallContext, args: OrchestrateArgs): string {
+    const window = resolveWindowDays(args.windowDays, deps.config.metrics.windowDays)
+    const maxInFlight = resolveMaxInFlight(args.maxInFlight, deps.config.metrics.maxInFlight)
+    const notes = [...window.notes, ...maxInFlight.notes]
+    const metrics = collectMetrics({ store: ctx.store, now: Date.now(), windowDays: window.days })
+    return renderMetrics(metrics, {
+        cwd: ctx.cwd,
+        maxInFlight: maxInFlight.value,
+        note: notes.length === 0 ? undefined : notes.join('；'),
+    })
+}
+
+/** 入参优先，其次配置值；不可用的入参**改用配置值并在报告里说明**（不静默）。 */
+function resolveWindowDays(value: number | undefined, fallback: number): { days: number; notes: string[] } {
+    if (value === undefined) return { days: fallback, notes: [] }
+    if (typeof value !== 'number' || !Number.isFinite(value) || !Number.isInteger(value) || value < 1 || value > MAX_METRICS_WINDOW_DAYS) {
+        return { days: fallback, notes: [`windowDays=${String(value)} 不可用（要求 1–${MAX_METRICS_WINDOW_DAYS} 的整数），已改用配置值 ${fallback} 天`] }
+    }
+    return { days: value, notes: [] }
+}
+
+/** 同上，用在飞列表上限。 */
+function resolveMaxInFlight(value: number | undefined, fallback: number): { value: number; notes: string[] } {
+    if (value === undefined) return { value: fallback, notes: [] }
+    if (typeof value !== 'number' || !Number.isFinite(value) || !Number.isInteger(value) || value < 1 || value > MAX_MAX_IN_FLIGHT) {
+        return { value: fallback, notes: [`maxInFlight=${String(value)} 不可用（要求 1–${MAX_MAX_IN_FLIGHT} 的整数），已改用配置值 ${fallback}`] }
+    }
+    return { value, notes: [] }
 }
 
 /** `retro` — fold the finished mission into a retrospective (docs.md §8 phase 4). */
@@ -1193,15 +1238,23 @@ export function registerTools(
                     required: true,
                     enum: [...ACTIONS],
                     description:
-                        'start = create/bind the mission and enter the first stage; status = pipeline view; advance = settle the current stage and enter the next one (only the current stage); rerun = re-enter a stage (attempt + 1); resume = re-enter the persisted mission.stage; stages = list the configured pipeline with capability probing; retro = fold the finished mission into a retrospective (返工信号 + 候选经验) and append it to the cross-run ledger; unblock = the human release of a blocked (熔断) mission.',
+                        'start = create/bind the mission and enter the first stage; status = pipeline view; advance = settle the current stage and enter the next one (only the current stage); rerun = re-enter a stage (attempt + 1); resume = re-enter the persisted mission.stage; stages = list the configured pipeline with capability probing; retro = fold the finished mission into a retrospective (返工信号 + 候选经验) and append it to the cross-run ledger; unblock = the human release of a blocked (熔断) mission; metrics = READ-ONLY delivery metrics of this repository over a window (lead time, approval wait, gate failure rate, deployment/rollback rate, in flight, recent releases) — it writes nothing at all.',
                 },
-                missionId: { type: 'string', description: 'Mission to act on (default: the mission bound to this session or its delegating parent; pass an explicit id to drive another one).' },
+                missionId: { type: 'string', description: 'Mission to act on (default: the mission bound to this session or its delegating parent; pass an explicit id to drive another one). Ignored by action "metrics", which reports the whole repository.' },
                 stageId: { type: 'string', description: 'Stage to act on for rerun (default: the current stage).' },
                 summary: { type: 'string', description: 'One-line summary of what the stage did; recorded with the stage result.' },
                 verdict: {
                     type: 'string',
                     enum: ['PASS', 'WARN', 'BLOCK'],
                     description: 'Explicit verdict recorded with the stage result. BLOCK forces the rollback path even when the gate would pass.',
+                },
+                windowDays: {
+                    type: 'number',
+                    description: `For action "metrics": how many days back to measure (>= 1, <= ${MAX_METRICS_WINDOW_DAYS}). Default: config.metrics.windowDays (90). An unusable value falls back to the configured one and is stated in the report.`,
+                },
+                maxInFlight: {
+                    type: 'number',
+                    description: `For action "metrics": how many in-flight missions the report lists (>= 1, <= ${MAX_MAX_IN_FLIGHT}; oldest first). Default: config.metrics.maxInFlight (20).`,
                 },
             },
             output: { schema: TEXT_OUTPUT, render: (_args, value) => [{ type: 'text', text: value }] },

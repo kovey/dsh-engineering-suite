@@ -355,12 +355,16 @@ export function checkWorkspace(options: DoctorOptions): DoctorReport {
     add({
         id: 'ledger.gitignore',
         area: 'deliver',
-        state: !repo ? 'unknown' : leaking.length === 0 ? 'ok' : leaking.length === runtimePaths.length + ledgerFiles.length ? 'missing' : 'partial',
-        severity: 'required',
+        // Not applicable without git: no fingerprints, so no `requireCleanTree`
+        // to fight with the ledgers. Reporting it as a REQUIRED gap made a
+        // non-git repository look un-ready for a rule it cannot have (the first
+        // version counted `unknown` as a blocker).
+        state: !repo ? 'partial' : leaking.length === 0 ? 'ok' : leaking.length === runtimePaths.length + ledgerFiles.length ? 'missing' : 'partial',
+        severity: repo ? 'required' : 'recommended',
         label: `运行时台账被 git 忽略（${trail}/ 下的运行时目录与实际存在的 *.jsonl）`,
         detail:
             !repo
-                ? '无法判断（不是 git 仓库或 git 不可用）'
+                ? '不适用：这个工作区不是 git 仓库（没有工作区指纹，也就没有 requireCleanTree 与台账的冲突）——但同时也失去了"交付观测的指纹"保护'
                 : leaking.length === 0
                   ? '运行时目录与台账文件都已忽略：门禁观测的工作区指纹不会被写入弄脏'
                   : `未忽略：${leaking.map((entry) => entry.target).join('、')}${
@@ -478,17 +482,29 @@ export function checkWorkspace(options: DoctorOptions): DoctorReport {
     })
 
     // ---- test -------------------------------------------------------------
+    // Recognise "this command runs tests" across the toolchains people actually
+    // use — including the make/gradle/script wrappers that a plain "go test"
+    // pattern misses (a repo whose only command is `make test` was reported as
+    // having NO test command, which is a false alarm on a healthy repository).
     const testLike = commands.filter((entry) => {
         const command = typeof entry === 'object' && entry !== null ? String((entry as { command?: unknown }).command ?? '') : ''
-        return /(^|\s)(go\s+test|npm\s+test|pnpm\s+test|yarn\s+test|pytest|vitest|jest|node\s+--test|cargo\s+test|mvn\s+test)/.test(command)
+        return /(^|\s)(go\s+test|gotestsum|npm\s+(run\s+)?test|pnpm\s+(run\s+)?test|yarn\s+(run\s+)?test|bun\s+test|pytest|python\s+-m\s+pytest|vitest|jest|mocha|node\s+--test|deno\s+test|cargo\s+test|mvn\s+(test|verify)|gradle(w)?\s+test|\.\/gradlew\s+test|dotnet\s+test|rake\s+test|make\s+(test|check|verify)|bash\s+\S*test\S*\.sh|sh\s+\S*test\S*\.sh)/i.test(command)
     })
     add({
         id: 'test.command',
         area: 'test',
-        state: testLike.length > 0 ? 'ok' : 'partial',
-        severity: 'required',
+        state: testLike.length > 0 ? 'ok' : commands.length === 0 ? 'missing' : 'partial',
+        // Only "there are no commands at all" is a hard gap. When commands exist
+        // but none matches a known test invocation, the honest answer is "无法从命令
+        // 文本判断" — a wrapper script or an unusual runner is not a missing test.
+        severity: commands.length === 0 ? 'required' : 'recommended',
         label: '质量门禁里有测试类命令',
-        detail: testLike.length > 0 ? `${testLike.length} 条测试命令` : '命令列表里没有测试类命令：交付证据可能只有 lint/构建',
+        detail:
+            testLike.length > 0
+                ? `${testLike.length} 条测试命令`
+                : commands.length === 0
+                  ? '命令列表为空：交付证据不会有任何确定性裁决'
+                  : `有 ${commands.length} 条命令但没有一条能认出是测试（可能是包装脚本或特殊 runner）：请人工确认其中至少一条真的跑测试`,
         ...(testLike.length > 0 ? {} : { fix: 'bash scripts/project-config.sh --workspace <repo> --write --test "<测试命令>"' }),
     })
 

@@ -79,6 +79,15 @@ export const CHANGES_EVENT = 'workspace/changes'
 export interface RecordedTurn {
     seq: number
     turn: number
+    /**
+     * Set once an analysis has used this record. The service appends a record
+     * ONLY for a turn that changed something, so "the newest record is already
+     * consumed" is the only available evidence that the CURRENT turn produced no
+     * record — and re-reporting a consumed turn's change set as if it described
+     * now is exactly the silent staleness the live verification caught (turn 3
+     * repeating turn 1's line verbatim).
+     */
+    consumed?: boolean
 }
 
 /**
@@ -129,6 +138,12 @@ export class ChangeLedger {
     /** The newest recorded turn of one session. */
     latestFor(sessionId: string): RecordedTurn | undefined {
         return this.turns.get(sessionId)
+    }
+
+    /** Mark the newest record as used, so a later analysis can tell it is stale. */
+    markConsumed(sessionId: string, seq: number): void {
+        const current = this.turns.get(sessionId)
+        if (current !== undefined && current.seq === seq) this.turns.set(sessionId, { ...current, consumed: true })
     }
 
     /** Sessions currently remembered (reported by `impact_status`). */
@@ -321,6 +336,18 @@ async function readFromService(deps: ChangeProviderDeps, input: ResolveChangesIn
     const sessionId = sessionIdOf(input.agent)
     if (sessionId === undefined) return { ok: false, reason: '调用方会话没有 id：无法按会话读取宿主记录的改动' }
     const recorded = deps.ledger.latestFor(sessionId)
+    if (recorded !== undefined && recorded.consumed === true) {
+        // Fail safe instead of re-serving an old turn: the service has recorded
+        // nothing since that turn, which is evidence that the current turn changed
+        // nothing OR that its record has not arrived yet — either way this record
+        // does not describe now, while `git diff` does.
+        return {
+            ok: false,
+            reason:
+                `workspaceChanges 的最新记录（第 ${recorded.turn} 轮）已经被上一次分析使用过，此后没有新记录：` +
+                '这一次的改动不在服务已记录的轮次里（服务只在有变更的轮上追加记录）——不用旧记录冒充本轮',
+        }
+    }
     if (recorded === undefined) {
         return {
             ok: false,
@@ -416,6 +443,9 @@ async function readFromService(deps: ChangeProviderDeps, input: ResolveChangesIn
         limits: serviceLimits({ skipped, noHunks, total, listed: files.length }),
     }
     const crossCheck = crossCheckOf(input, changed)
+    // Consume it: a later analysis in this session must not present this same
+    // record as the current change set.
+    deps.ledger.markConsumed(sessionId, recorded.seq)
     return {
         ok: true,
         files: changed,

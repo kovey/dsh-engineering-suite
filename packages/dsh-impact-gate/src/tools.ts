@@ -456,7 +456,14 @@ export function buildArtifact(input: {
  * delivery.
  */
 export function writeImpactArtifact(store: MissionStore, missionId: string, artifact: ImpactArtifact): Recorded {
-    const relative = `impact/${stamp()}.json`
+    // `stamp()` is second-resolution, so two analyses inside one second used to
+    // land on the SAME path: the second silently overwrote the first while both
+    // evidence rows kept pointing at it (the live verification hit exactly that).
+    // Suffix until the name is free; lexicographic order stays chronological.
+    let relative = `impact/${stamp()}.json`
+    for (let attempt = 2; attempt < 100 && fs.existsSync(store.artifactPath(missionId, relative)); attempt += 1) {
+        relative = `impact/${stamp()}-${attempt}.json`
+    }
     const absolute = store.writeArtifact(missionId, relative, `${JSON.stringify(artifact, null, 2)}\n`)
     const evidence = store.appendEvidence(missionId, {
         kind: 'artifact',

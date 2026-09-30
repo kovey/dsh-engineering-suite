@@ -543,3 +543,64 @@ test('the source labels are the exact strings an audit reads', () => {
     assert.match(problems.join('\n'), /config\.changeSource 必须是 auto \/ workspaceChanges \/ git 之一/)
     assert.equal(resolveConfig({}, () => undefined).changeSource, 'auto')
 })
+
+test('a consumed service record never masquerades as the current turn (regression)', async () => {
+    // The live verification caught this: the service appends a record ONLY for a
+    // turn that changed something, so a later analysis in the same session re-served
+    // the earlier turn's change set verbatim. The second call must not present that
+    // record as the current change set — it falls back and says why.
+    const cwd = fixture()
+    touchStore(cwd)
+    const { api } = fakeService()
+    const fake = host(cwd, {}, { workspaceChanges: api })
+    emitChange(fake)
+    const first = runText(await fake.runTool('impact_analyze', {}))
+    assert.match(first, /变更来源：workspaceChanges/, 'the first analysis uses the record')
+    const second = runText(await fake.runTool('impact_analyze', {}))
+    assert.match(second, /已经被上一次分析使用过/, 'the same record is refused as stale, with the reason')
+    assert.match(second, /变更来源：git/, 'and it falls back to git, which does describe now')
+    assert.doesNotMatch(second, /变更来源：workspaceChanges（会话 session-1 第 3 轮，事件 seq=7）/)
+})
+
+test('a fresh record after a consumed one is used again (regression)', async () => {
+    const cwd = fixture()
+    touchStore(cwd)
+    const { api } = fakeService()
+    const fake = host(cwd, {}, { workspaceChanges: api })
+    emitChange(fake)
+    await fake.runTool('impact_analyze', {})
+    emitChange(fake, 9, 4)
+    const third = runText(await fake.runTool('impact_analyze', {}))
+    // The invariant is "a NEW record is usable again" — not the turn number, which
+    // the fake service reports from its own options rather than from the seq.
+    assert.match(third, /变更来源：workspaceChanges/, 'a NEW record is not stale')
+    assert.doesNotMatch(third, /已经被上一次分析使用过/)
+    assert.match(third, /事件 seq=9/, 'and it is the record that just arrived')
+})
+
+test('two analyses in the same second write two artifacts (regression)', async () => {
+    // `stamp()` is second-resolution: the second analysis used to overwrite the
+    // first artifact while both evidence rows pointed at that one path.
+    const cwd = fixture()
+    touchStore(cwd)
+    bindMission(cwd)
+    const { api } = fakeService()
+    const fake = host(cwd, {}, { workspaceChanges: api })
+    emitChange(fake)
+    await fake.runTool('impact_analyze', {})
+    emitChange(fake, 9, 4)
+    await fake.runTool('impact_analyze', {})
+    const dir = path.join(cwd, '.dsh', 'missions', 'm1', 'impact')
+    const artifacts = fs.readdirSync(dir).filter((name) => name.endsWith('.json'))
+    assert.equal(artifacts.length, 2, `two analyses must leave two artifacts, got ${JSON.stringify(artifacts)}`)
+    // …and the two evidence rows must point at the two DIFFERENT artifacts, which
+    // is the property the live verification found broken (both rows named one path
+    // because `stamp()` is second-resolution).
+    const rows = fs
+        .readFileSync(path.join(cwd, '.dsh', 'missions', 'm1', 'evidence.jsonl'), 'utf8')
+        .split('\n')
+        .filter((line) => line.trim() !== '')
+        .map((line) => JSON.parse(line) as { artifactPath?: string })
+        .filter((row) => row.artifactPath !== undefined)
+    assert.equal(new Set(rows.map((row) => row.artifactPath)).size, 2, `evidence rows must name distinct artifacts: ${JSON.stringify(rows.map((r) => r.artifactPath))}`)
+})
