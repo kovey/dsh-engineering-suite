@@ -1,6 +1,6 @@
 # 验证记录（2026-09-17）
 
-> **兼容基线（本文件全部结论的宿主版本）**：`@deepseek-ai/dsh-*` **0.2.0-rc.1**（`cordis ~4.0.4`）。
+> **兼容基线（本文件全部结论的宿主版本）**：`@deepseek-ai/dsh-*` **0.2.0-rc.2**（`cordis ~4.0.4`）。
 > 14 个插件的 `peerDependencies` 用**同一 0.2.0 线**的范围 `>=0.2.0-rc.1 <0.2.1-0`。
 >
 > **0.1.7-rc.2 起，宿主在加载时强制校验 peer 版本**（`dsh-app-boot` 的 `evaluatePluginCompatibility`，
@@ -21,6 +21,20 @@
 > `approvalPolicy: 'never'`** 并继承 preset/sandbox（`captureDelegatedPolicyOverrides`），
 > 与我们"派出去的子代理不能自己批准什么"的立场一致，无需插件侧改动。
 >
+> **0.2.0-rc.2 适配记录**（本轮，**零代码改动**）：类型编译 0 错误；`verify.sh` 830/829/0/1 + OPS SELFTEST GREEN；
+> `e2e-mission.sh` 在**真机安装的 rc2** 上 GREEN，14/14 插件挂载并跑完一条 mission。
+> peer 范围**无需改动**——同一 0.2.0 线的 `>=0.2.0-rc.1 <0.2.1-0` 本来就匹配 rc.2（用宿主自带的 semver 判定：
+> rc.1 ✓、rc.2 ✓、0.2.0 ✓、0.2.1-rc.1 ✗），这正是放弃精确锁版的收益。
+> 契约复核（rc2 上与 rc1 逐条对照）：`ApprovalOutcome` 仍是四个字符串；"每个生产者声明自己的 kind、无 `plugin` 兜底"仍在；
+> 单调守卫语义（"no guard can force-allow"）仍在；`run_code` 仍由 `dsh-tools` 的 `config.mode` 门控（默认 `native`）；
+> PTC 仍走 `prepareScheduledExecution` → `prepareExecution`（我们的守卫仍在链上）。
+>
+> **可选能力缺席时的降级（真机实测）**：真机 profile 是 **250 包的基础安装**，不含
+> `dsh-workspace-changes` / `dsh-experimental-agent-team` / `dsh-experimental-auto-review` / `dsh-ptc-runtime(-node)` / `dsh-workflow-ptc`
+> （隔离的完整安装是 289 包）。两个新集成因此按设计退化：
+> `impact_analyze` 报 `变更来源：git（回退：宿主没有挂载 workspaceChanges 服务（ctx.get("workspaceChanges") 为空））`；
+> `role-guard` 记 `agentTeams=absent`。**都不报错、不静默改变语义**——这也是"适配"的另一半：不是假设官方能力一定在。
+
 > **0.1.7-rc.1 / rc.2 适配记录**（真实改动，全部实测过）：
 > 1. **消息来源词汇表**：`MessageSourceMap` 里**没有**共享的 `plugin` 兜底 kind 了（官方文档原话：each producer declares its own kind），
 >    每个生产者要用 `declare module '@deepseek-ai/dsh-llm'` 声明自己的 kind。我们新增

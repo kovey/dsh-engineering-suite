@@ -115,6 +115,17 @@ declare module '@deepseek-ai/dsh-llm' {
   被 spec-gate 拒绝、文件未创建、审计留下子调用自己的两行；代价是调用量（1 次 `run_code` + 1 个子调用 = 4 行审计）。
   注意 `run_code` 只在 `dsh-tools` 的 `config.mode: ptc` 下可见（默认 `native`）。
 
+### 1.8 harness 0.2.0-rc.2：**同样不需要改任何声明**
+
+同一 0.2.0 线的范围 `>=0.2.0-rc.1 <0.2.1-0` 本来就匹配 rc.2（也匹配 0.2.0 正式版），所以升级 harness 到 rc.2 之后
+**不需要重发插件、不需要改 peer**。本套件已在 rc.2 上完成全量验证（编译 0 错误、830 测试、E2E 14/14）。
+
+一个容易被忽略的前提：**官方能力是可选包**。基础安装（例如 250 个包的 profile）通常**不含**
+`dsh-workspace-changes` / `dsh-experimental-agent-team` / `dsh-experimental-auto-review` / `dsh-ptc-runtime(-node)` / `dsh-workflow-ptc`。
+本套件对此的设计是**显式降级**：`changeSource: auto` 会回退 git 并写出原因，`role-guard` 会把 `agentTeams` 标为 absent，
+PTC 的 `run_code` 直接不存在（模式门控）。要用这些官方能力，需要把对应包**显式装进 profile**
+（`dsh-base` 的 patch 里已经声明了 PTC 两行，缺包时不会自动补）。
+
 ### 1.7 从 v0.2.0 到 v0.2.1（**不需要改任何声明**）
 
 peer 范围不变（`>=0.2.0-rc.1 <0.2.1-0` 同时匹配 0.2.0 与 0.2.1 的宿主），**没有破坏性变更**。新增两个**宿主键**
