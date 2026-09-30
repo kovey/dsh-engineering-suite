@@ -1,6 +1,6 @@
 {
   "name": "dsh-suite-doctor",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Runtime half of the engineering suite's self-check for DeepSeek Harness: which plugins are actually mounted, where the session's mission stands, which interaction channels can reach a human and which phases this build does not implement — merged into dsh-eng-core's offline doctor report behind one read-only tool (suite_status).",
   "type": "module",
   "main": "./dist/index.js",

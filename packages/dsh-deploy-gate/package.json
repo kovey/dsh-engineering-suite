@@ -1,6 +1,6 @@
 {
   "name": "dsh-deploy-gate",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Deployment gate for DeepSeek Harness: turn 'deploy' from a human typing commands into a gated process with evidence — a release plan computed from what the suite already knows, a go/no-go verdict, human approval for production, host-configured commands executed as argv (never a shell), post-deploy verification, and a declared rollback path — all recorded in a repo-local ledger.",
   "type": "module",
   "main": "./dist/index.js",

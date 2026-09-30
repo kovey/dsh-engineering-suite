@@ -3,6 +3,31 @@
 本文件的格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；
 版本号遵循语义化版本。**harness 版本与套件版本是两个数字**：本版本声明并验证于 `@deepseek-ai/dsh-*` **0.2.0-rc.1**（cordis `~4.0.4`）。
 
+## [0.2.2] — 2026-09-30
+
+**已在 harness `0.2.0-rc.2` 上完成全量验证：零代码改动。** 这一版是"验证 + 文档"的发布，理由值得写清楚：
+同一 0.2.0 线的 peer 范围 `>=0.2.0-rc.1 <0.2.1-0` **本来就匹配 rc.2**（同时匹配 0.2.0 正式版），
+所以宿主升 rc 不需要重发插件——这是放弃精确锁版换来的，也应当被记录成一次"无需改动"的证据。
+
+### 验证
+
+- 15 个包在 rc.2 上类型编译 **0 错误**；`bash scripts/verify.sh` **830 测试 / 829 通过 / 0 失败 / 1 如实跳过**
+  （含 OPS SELFTEST GREEN）；`scripts/e2e-mission.sh` 在**真机安装的 rc.2** 上 **E2E GREEN**，14/14 插件挂载并跑完一条 mission。
+- 依赖的契约逐条复核（非假设）：`ApprovalOutcome` 仍四个字符串；"每个生产者声明自己的 kind、无 `plugin` 兜底"仍在；
+  单调守卫语义（"no guard can force-allow"）仍在；`run_code` 仍由 `dsh-tools` 的 `config.mode` 门控（默认 `native`）；
+  PTC 仍走 `prepareScheduledExecution → prepareExecution`（我们的守卫仍在链上）。
+
+### 文档 · 官方能力缺席时的行为
+
+- **实测降级**：真机 profile 是 **250 包的基础安装**，不含 `dsh-workspace-changes` / `dsh-experimental-agent-team` /
+  `dsh-experimental-auto-review` / `dsh-ptc-runtime(-node)` / `dsh-workflow-ptc`（完整安装为 289 包）。
+  两个新集成按设计显式退化并说明原因：`impact_analyze` 报
+  `变更来源：git（回退：宿主没有挂载 workspaceChanges 服务…）`，`role-guard` 记 `agentTeams=absent`；
+  不报错、不静默改变语义。
+- `docs/VERIFICATION.md` 基线 → rc.2，并新增本次适配记录（含上面的实测数据与 250/289 对比）；
+- `UPGRADE §1.8` 说明"升到 rc.2 不需要改任何声明"，以及**官方能力是可选包**——要用需显式装进 profile
+  （`dsh-base` 的 patch 声明了 PTC 两行，但缺包不会自动补）。
+
 ## [0.2.1] — 2026-09-29
 
 ### 兼容与组合（官方 0.2.0 能力的采纳边界）
