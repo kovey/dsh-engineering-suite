@@ -247,7 +247,7 @@ fi
 # --- .gitignore：只忽略运行时台账 -------------------------------------------
 if [ "$GITIGNORE" = "1" ] && [ -d "$WS/.git" ]; then
   ADDED=()
-  for target in ".dsh/missions/" ".dsh/audit/" ".dsh/state/" ".dsh/specs/"; do
+  for target in ".dsh/missions/" ".dsh/audit/" ".dsh/state/" ".dsh/specs/" ".dsh/kb/"; do
     if ! git -C "$WS" check-ignore -q "$target" 2>/dev/null; then ADDED+=("$target"); fi
   done
   # 已存在但未忽略的根级台账（只处理真实存在的文件，避免给每个仓库塞四行）

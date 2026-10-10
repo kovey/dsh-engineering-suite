@@ -1,0 +1,30 @@
+# dsh-knowledge-base bundle patch.
+#
+# `insert` is pure-append and the loader rejects duplicate entry ids, so the row
+# uses the plugin's short id (`knowledge-base`) — a profile overrides parameters
+# with a top-level `- id: knowledge-base` + `config:` block.
+#
+# The index is an ARTIFACT of the repository it describes (`.dsh/kb/`), so what
+# lives here is only the ceiling: where the index goes, how big a file may be,
+# how long a chunk may get, which sources exist and how retrieval is bounded.
+# A project narrows those in `<repo>/.dsh/knowledge-base.json`; it can never
+# widen them (a knowledge base that indexes more than the host allowed would
+# answer questions about files the host never agreed to index).
+#
+# No API key, no model, no network: retrieval is lexical (BM25 + field boosts +
+# exact-id bonus) over the chunks this plugin wrote itself.
+- insert:
+    - id: knowledge-base
+      name: 'dsh-knowledge-base'
+      config:
+        enabled: true
+        logFile: '~/.dsh/knowledge-base.log'
+        indexDir: .dsh/kb
+        maxFileBytes: 262144
+        maxChunkLines: 60
+        tokenizer:
+          cjkBigrams: true
+          minTokenLength: 2
+        search:
+          limit: 10
+          maxLimit: 50

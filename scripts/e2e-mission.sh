@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # e2e-mission.sh — run the REAL dsh harness against a SCRIPTED local model and
-# assert that the fourteen-plugin engineering suite actually produced its
+# assert that the ${#SUITE[@]}-plugin engineering suite actually produced its
 # artifacts.
 #
 # Why: the suite had never been verified with a live agent loop (no
@@ -83,6 +83,7 @@ SUITE=(
   dsh-interaction-gate
   dsh-suite-doctor
   dsh-deploy-gate
+  dsh-knowledge-base
 )
 
 while [ $# -gt 0 ]; do
@@ -779,7 +780,7 @@ fi
 # ---------------------------------------------------------------------------
 section "summary"
 if [ "$FAILURES" = "0" ]; then
-  printf '  \033[32mE2E GREEN\033[0m — the fourteen plugins ran a real mission in a live dsh session.\n'
+  printf '  \033[32mE2E GREEN\033[0m — all %s plugins ran a real mission in a live dsh session.\n' "${#SUITE[@]}"
   printf '  artifacts: %s\n' "$DOT"
   printf '  logs:      %s\n' "$LOGS"
   exit 0

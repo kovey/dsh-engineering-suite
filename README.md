@@ -58,6 +58,7 @@ spec-gate  test-design-  spec-gate  role-  quality-   evidence-gate
 | `dsh-interaction-gate` | `interaction-gate` | 交互层：统一 ask / notify / progress，多通道注册、一次性 token、决定台账、fail-closed 超时 | `interaction_ask`、`interaction_notify`、`interaction_progress`、`interaction_status` |
 | `dsh-suite-doctor` | `suite-doctor` | 统一入口与自检：阶段、门禁配置、缺失项、待审批、台账规模（离线判定 + 运行时事实） | `suite_status` |
 | `dsh-deploy-gate` | `deploy-gate` | 部署层：环境清单、go/no-go、人工批准、灰度/回滚、上线后验证、部署台账 | `deploy_plan`、`deploy_run`、`deploy_verify`、`deploy_rollback`、`deploy_status` |
+| `dsh-knowledge-base` | `knowledge-base` | 项目知识库：把规格/决策/交付台账/文档/代码索引成可比对的本地检索，回答项目问题必须**带引用** | `kb_index`、`kb_search`、`kb_status` |
 | `dsh-standards-gate` | `standards-gate` | 代码规范门禁：仓库自有阈值、基线棘轮、只读结构评审 | `standards_check`、`standards_bootstrap`、`standards_review`、`standards_status` |
 | `dsh-impact-gate` | `impact-gate` | 变更影响分析：反向依赖闭包、最小回归测试集、风险分级、**flaky 隔离计划（带 owner 与到期）** | `impact_analyze`、`impact_tests`、`impact_status`、`flaky_plan`、`flaky_status` |
 | `dsh-coverage-gate` | `coverage-gate` | 测试有效性：覆盖率（含增量）、flaky 检测、**变异测试**（存活变异体逐条列出） | `coverage_check`、`flaky_check`、`coverage_status`、`mutation_check` |

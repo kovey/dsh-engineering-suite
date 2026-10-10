@@ -241,3 +241,17 @@ test('without git the ignore rule is "not applicable", not a blocker (regression
     assert.match(check?.detail ?? '', /不适用/)
     assert.equal(checkWorkspace({ cwd, now: 0 }).blockers.some((item) => item.id === 'ledger.gitignore'), false)
 })
+
+test('the knowledge base index counts as a runtime directory (regression)', () => {
+    // `.dsh/kb/` is written whenever the index is (re)built, so leaving it
+    // unignored dirties the tree on every index run and breaks requireCleanTree —
+    // the same trap as the mission trail, one directory later.
+    const cwd = repo()
+    fs.writeFileSync(path.join(cwd, '.gitignore'), '.dsh/missions/\n.dsh/audit/\n.dsh/state/\n.dsh/specs/\n.dsh/media/\n')
+    fs.mkdirSync(path.join(cwd, '.dsh', 'kb'), { recursive: true })
+    fs.writeFileSync(path.join(cwd, '.dsh', 'kb', 'manifest.json'), '{}\n')
+    const check = checkWorkspace({ cwd, now: 0 }).checks.find((item) => item.id === 'ledger.gitignore')
+    assert.equal(check?.state, 'partial', 'the unignored kb/ must be reported')
+    assert.match(check?.detail ?? '', /\.dsh\/kb/)
+    assert.match(check?.fix ?? '', /\.dsh\/kb\//)
+})

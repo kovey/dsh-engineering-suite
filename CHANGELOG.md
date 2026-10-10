@@ -3,6 +3,40 @@
 本文件的格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；
 版本号遵循语义化版本。**harness 版本与套件版本是两个数字**：本版本声明并验证于 `@deepseek-ai/dsh-*` **0.2.0-rc.1**（cordis `~4.0.4`）。
 
+## [未发布]
+
+### 新增 · 项目知识库（`dsh-knowledge-base`，第 15 个插件）
+
+把项目的**需求、决策、交付台账、文档与代码**整理成本地知识库，让 dsh 里的大模型能回答项目相关问题。
+设计的核心是把问题拆成两半：**检索必须确定性、可引用**；**回答由模型做，但每个论断都要带引用**。
+
+- **六类来源**：`spec`（`.dsh/specs/*.md`：需求/验收标准/测试设计原文）、`adr`（决策与备选）、
+  `trail`（每个 mission **一条摘要** + 每条发布：读 store，不手解 `mission.json`）、`plan`（`.dsh/plan.jsonl`、`releases.jsonl`）、
+  `docs`（仓库自己的 markdown）、`code`（源码：文件 + **符号表** + 分块正文）。
+- **工具**：`kb_index({force?,only?})`（逐来源文档/块数 + **每个跳过文件的原因** + 指纹；未改动时明说"索引已是最新，未变"且不重写任何文件）、
+  `kb_search({query,limit?,kinds?,pathPrefix?,missionId?})`（命中带 `路径:起-止`、片段、分数与**命中原因**）、
+  `kb_status()`（覆盖/跳过/新鲜度 + "它是什么不是什么"）。
+- **确定性**：分块 id 内容寻址（`docId:from-to`，**无时间戳**）；三个产物原子写且 **manifest 最后写**（提交点），
+  `postings.json` 携带它由之构建的 chunks 摘要（不一致即拒绝作答）。未改动仓库两次重建 → `chunks.jsonl`/`postings.json`
+  **逐字节相同**，只有 `builtAt` 变（有测试断言）。
+- **检索**：ASCII 小写化 + 最小长度；CJK **重叠二元组**；**BM25**（k1=1.2、b=0.75、IDF 标准式）+
+  字段加权折进词频（标题 3 / 符号 2 / 正文 1）+ **精确 ID 加成**（点名 `AC-003`/`R-7`/`ADR-0002`/`GATE-…` 能命中，
+  且优先返回**定义处**而不是台账里的清单行）。
+- **fail-closed**：无索引 → 拒绝并点名 `kb_index`；索引相对当前 git 指纹**陈旧** → 报告开头告警（"可能漏掉最近的改动"）而不是默默回答；
+  跳过的文件（二进制/超大/不可读/语言不支持）逐个列名；**不做**嵌入/向量库/网络/模型调用，也不索引审计行与 git 历史。
+- **索引是运行时产物**（`.dsh/kb/`）：医生与脚手架都已把它纳入"必须被 git 忽略"的清单——否则每次重建索引都会弄脏工作区，
+  交付时的 `requireCleanTree` 会报指纹不一致。
+
+### 修复
+
+- `scripts/e2e-mission.sh` 的成功文案从 `SUITE` 计数派生（此前硬编码"the fourteen plugins"，加了第 15 个插件后就与实际不符——
+  挂载断言一直是动态的，只有这句文案漂移了）。
+
+### 验证
+
+- `bash scripts/verify.sh`：**881 测试 / 880 通过 / 0 失败 / 1 如实跳过**（含 OPS SELFTEST GREEN）。
+- `scripts/e2e-mission.sh`：**E2E GREEN**，**15/15** 插件挂载并跑完一条 mission。
+
 ## [0.2.3] — 2026-09-30
 
 ### 新增 · 交付度量（`orchestrate({ action: 'metrics' })`）

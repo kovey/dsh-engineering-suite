@@ -27,6 +27,7 @@ import { apply as applyTestDesign } from '../packages/dsh-test-design-gate/dist/
 import { apply as applyInteraction } from '../packages/dsh-interaction-gate/dist/index.js'
 import { apply as applySuiteDoctor } from '../packages/dsh-suite-doctor/dist/index.js'
 import { apply as applyDeploy } from '../packages/dsh-deploy-gate/dist/index.js'
+import { apply as applyKnowledgeBase } from '../packages/dsh-knowledge-base/dist/index.js'
 
 const TEST_DESIGN = [
     '### 正向场景',
@@ -90,6 +91,10 @@ function suite(): Suite {
     applyInteraction(fake.ctx as never, { logFile: log('interaction-gate') })
     applySuiteDoctor(fake.ctx as never, { logFile: log('suite-doctor') })
     applyDeploy(fake.ctx as never, { logFile: log('deploy-gate') })
+    // The knowledge base: deterministic lexical retrieval over the project's own
+    // specs, decisions, trail, docs and code — mounted here because a drift in its
+    // index/report contract is exactly what this test exists to catch.
+    applyKnowledgeBase(fake.ctx as never, { logFile: log('knowledge-base') })
     return { fake, steers, stores: new MissionStoreRegistry().for(cwd) }
 }
 

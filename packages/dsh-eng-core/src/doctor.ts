@@ -331,7 +331,10 @@ export function checkWorkspace(options: DoctorOptions): DoctorReport {
     const runtimePaths = ['missions', 'audit', 'state', 'specs']
         .map((name) => `${trail}/${name}`)
         .concat(
-            ['media', 'interaction', 'deploy']
+            // `kb/` is the knowledge base's index (chunks + postings + manifest):
+            // built artifacts, so they dirty the tree exactly like the other
+            // runtime directories do.
+            ['media', 'interaction', 'deploy', 'kb']
                 .filter((name) => fs.existsSync(path.join(layout.rootDir, name)))
                 .map((name) => `${trail}/${name}`),
         )
