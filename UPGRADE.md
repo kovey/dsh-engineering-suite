@@ -115,6 +115,25 @@ declare module '@deepseek-ai/dsh-llm' {
   被 spec-gate 拒绝、文件未创建、审计留下子调用自己的两行；代价是调用量（1 次 `run_code` + 1 个子调用 = 4 行审计）。
   注意 `run_code` 只在 `dsh-tools` 的 `config.mode: ptc` 下可见（默认 `native`）。
 
+### 1.7c 从 v0.2.3 到 v0.3.0（新增一个插件，**不需要改声明**）
+
+peer 范围不变（`>=0.2.0-rc.1 <0.2.1-0`），无破坏性变更。要做的三件事：
+
+**① 挂第 15 个 bundle**：`"dsh-knowledge-base"` —— 把项目的需求/决策/交付台账/文档/代码索引成本地知识库，
+让模型回答项目问题时**必须带引用**（`路径:起-止`）。
+
+**② 让索引目录被忽略**：`.dsh/kb/` 是运行时产物。**不忽略的后果很具体**：每次重建索引都会弄脏工作区，
+交付时的 `requireCleanTree` 会报"与门禁观测的指纹不一致"，而且索引刚建完就会报自己"陈旧"。
+`bash scripts/project-config.sh --write` 现在会自动补这一行（幂等），`doctor.sh` 也会指出缺哪一条。
+
+**③ 可选**：想要"人直接敲命令、不过模型"的入口，就装官方 `@deepseek-ai/dsh-commands`——本插件会通过
+`ctx.get('commands')` 自动注册 `/kb index|search|status|help`（**不产生模型消息、不花 token**；没装该插件时本插件照常工作，
+只是没有这个入口）。终端/CI 侧不需要任何额外依赖：`bash scripts/kb.sh index|search|status [<repo>]`。
+
+**行为说明**：`kb_index` 的变更种类现在是 `created / coverage / content / postings / forced / fingerprint / unchanged`——
+"内容没变但指纹变了"（例如改了没被索引的 `.gitignore`）会**只刷新 manifest** 并如实报告，从而清掉它此前留下的"陈旧"告警；
+"请求的来源范围与 manifest 记录不同"是独立的 `coverage`，不会再被报成"未变"。
+
 ### 1.7b 从 v0.2.2 到 v0.2.3（**不需要改任何声明**）
 
 peer 范围不变，无破坏性变更。新增与变化如下：

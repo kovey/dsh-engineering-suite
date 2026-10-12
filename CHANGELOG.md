@@ -3,7 +3,7 @@
 本文件的格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；
 版本号遵循语义化版本。**harness 版本与套件版本是两个数字**：本版本声明并验证于 `@deepseek-ai/dsh-*` **0.2.0-rc.1**（cordis `~4.0.4`）。
 
-## [未发布]
+## [0.3.0] — 2026-10-12
 
 ### 新增 · 项目知识库（`dsh-knowledge-base`，第 15 个插件）
 
@@ -26,6 +26,51 @@
   跳过的文件（二进制/超大/不可读/语言不支持）逐个列名；**不做**嵌入/向量库/网络/模型调用，也不索引审计行与 git 历史。
 - **索引是运行时产物**（`.dsh/kb/`）：医生与脚手架都已把它纳入"必须被 git 忽略"的清单——否则每次重建索引都会弄脏工作区，
   交付时的 `requireCleanTree` 会报指纹不一致。
+
+### 修复 · 索引把自己判成过期（`dsh-knowledge-base`，真机抓出）
+
+建索引会写出 `.dsh/kb/`；在一个 `.gitignore` 早于该目录的仓库里这就是未跟踪改动，于是**指纹在"建"与"比"之间变了**，
+`kb_search` 会对它刚建好的索引告警（真机报告是自相矛盾的"工作区改动数从 0 变成 0"）。根因是 `gitFingerprint` 的
+`excludePaths` **只过滤 `changedFiles`**（`dirty` 与无 pathspec 的 `git diff HEAD` 摘要不受影响），而它在 7 个包里有 21 处调用，
+改它不 additive；因此排除放在本包自己的 `indexFingerprint(cwd, indexDir)` 里，交给 git 的 pathspec
+（`:(top,exclude,literal)<dir>`，且必须 `-uall`——否则未跟踪目录被折叠成一行 `?? .dsh/`，产物又从父目录溜回来）。
+四条回归测试，每条在旧行为上失败；除新鲜度那两行外工具输出逐字节不变。
+
+### 修复 · 覆盖范围也是索引身份（`dsh-knowledge-base`）
+
+同一类问题的第二个实例：构建只比较"内容字节 + 指纹"，于是**请求的范围**与 manifest 记录不一致时（例如先全量、再
+`only:['docs']`、再全量），排除的来源恰好没有文档的话就报 `unchanged` 且不写盘——"对局部索引发起的全量请求"静默保持局部，
+而 `kb_status` 一边说 `spec：**不在本次索引里**` 一边说 `文档/块：13 篇 / 13 块`。`ChangeKind` 新增 **`coverage`**，
+优先级显式定义并断言：`created > coverage > content > postings > forced > fingerprint > unchanged`；
+`artifactsWritten` 区分"范围变了且文档真的动了"与"范围变了但没有文档动"（只改写 manifest）。
+`kb_status` 现在**从产物读覆盖范围**：某来源在磁盘上有 chunks 而 manifest 无记录时，明确写"manifest 与产物不一致，以产物为准"并给出重跑 `kb_index`。
+七条测试（六条在修复前失败）。
+
+### 新增 · 人/CI 入口与 `/kb` 命令
+
+- **`bash scripts/kb.sh index|search|status [<repo>]`**：与插件共用同一份实现（建索引/加载/打分都从包内模块导入，
+  不复制逻辑），真机在两个真实仓库上跑过（本仓库 468 文档 / 2 794 块；`golang/im` 含 spec/trail 来源）；
+- **`/kb index|search|status|help`**：官方 `dsh-commands` 的**人类命令**（直接对 agent 执行、**不产生模型消息、不花 token**）。
+  只通过 `ctx.get('commands')` 注册（**不加进 `inject`**，宿主没装该插件时本插件照常加载）；渲染抽到共享的 `report.ts`，
+  且命令调用与工具**完全相同**的操作——有测试断言"命令输出与工具输出逐字节相同"。
+
+### 运维
+
+- 运行时忽略规则补齐到**你的其他真实仓库**：扫描所有带 `.dsh/` 台账的工作区，发现 `deepseek/dsh-memory` 缺
+  `.dsh/missions`、`.dsh/state`、`.dsh/specs` **与新的 `.dsh/kb`**——同一个坑晚了一个目录（未忽略的台账会让每次门禁都弄脏工作区，
+  交付时 `requireCleanTree` 报两个不同指纹）。已补齐并逐个 `git check-ignore` 确认；配置类文件仍被跟踪（信任根）。
+
+### 验证
+
+- `bash scripts/verify.sh`：**903 测试 / 902 通过 / 0 失败 / 1 如实跳过**（含 OPS SELFTEST GREEN）。
+- `scripts/e2e-mission.sh`：**E2E GREEN，15/15 插件**挂载并跑完一条真实 mission。
+- 真机验收：`golang/im` 上"改一个被跟踪但未被索引的文件 → 检索报陈旧 → 非 force 重跑 index → 警告消失"这条用户路径逐步验过。
+
+### 已知边界（明确留下，未修）
+
+- 记录的覆盖范围只比较**来源 id**：项目配置删掉一个**本来没匹配到文件**的 glob 仍报 `unchanged`；
+- 由 `only` 排除的来源，提示文案仍是既有的 `已在配置里停用（enabled=false）`；
+- `/kb` 目前只有单元测试层证据（命令文本与工具文本逐字节一致、注册与降级行为），**尚未在 nvim-tui 里真敲过**。
 
 ### 修复
 

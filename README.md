@@ -1,6 +1,6 @@
 # dsh-engineering-suite
 
-**v0.2.3** · 兼容基线 `@deepseek-ai/dsh-*` **`>=0.2.0-rc.1 <0.2.1-0`**（cordis `~4.0.4`；已在 **0.2.0-rc.2** 上验证）
+**v0.3.0** · 兼容基线 `@deepseek-ai/dsh-*` **`>=0.2.0-rc.1 <0.2.1-0`**（cordis `~4.0.4`；已在 **0.2.0-rc.2** 上验证）
 · [变更记录](./CHANGELOG.md) · [升级指南](./UPGRADE.md) · [验证证据](./docs/VERIFICATION.md)
 
 > 把 [docs.md](./docs.md) 描述的「Agent 时代软件工程落地方案」实现为一组可独立挂载的
@@ -38,6 +38,9 @@ spec-gate  test-design-  spec-gate  role-  quality-   evidence-gate
 
 非功能预算（p95、包体积、迁移耗时）写在**规格**里：随规格一起审批、能追溯到需求 ID、由 `budget_check` 测量；
 宿主配置与规格声明同 id 时**宿主生效但差异会被报告**，`requireSpecBudgets` 打开后"声明了却没验证"的预算会拦住交付。
+
+**横切**：`dsh-knowledge-base` 把上面六个阶段的产物（规格/决策/台账/文档/代码）索引成可比对的本地检索，
+让"回答项目问题"有据可查——检索是确定性的、回答必须带引用。终端入口 `bash scripts/kb.sh`，会话内命令 `/kb`（装了 `dsh-commands` 时）。
 
 **先问"我们在哪、缺什么"**：`bash scripts/doctor.sh`（人/CI，必需项缺失时退出码 1）或会话里的
 `suite_status`（同一份判定，另加运行时事实：哪些插件挂载、当前阶段、待审批、通道能力）。
