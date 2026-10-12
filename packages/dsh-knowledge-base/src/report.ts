@@ -206,9 +206,20 @@ export function renderIndexReport(input: IndexReportInput): string {
     const headline =
         result.changeKind === 'unchanged'
             ? '索引已是最新，未变（块列表与倒排索引的字节和现有产物一致；没有重写任何文件）'
-            : `索引已重建：${describeChange(result.changeKind)}`
+            : result.changeKind === 'fingerprint'
+              ? '内容未变，仅刷新了指纹（chunks.jsonl 与 postings.json 字节未动、未重写；manifest.json 已记下新的指纹与 builtAt）'
+              : `索引已重建：${describeChange(result.changeKind)}`
     const lines: string[] = []
     lines.push(`知识库索引：${headline}`)
+    if (result.changeKind === 'fingerprint') {
+        // The whole point of the refresh: the warning a reader could not get rid
+        // of by following its own advice is gone now, and saying so is what makes
+        // the write worth its bytes.
+        lines.push(
+            '指纹刷新：新指纹与当前工作区一致，`kb_search` / `kb_status` 不会再报“索引陈旧”（索引的内容本来就没变，' +
+                '所以块列表与倒排索引保持原字节——变了的是工作区，不是被索引的内容）。',
+        )
+    }
     lines.push(`索引目录：${displayPath(cwd, result.dir)}（manifest.json / chunks.jsonl / postings.json）`)
     lines.push(`指纹：${fingerprintLine(result.fingerprint)}`)
     lines.push('来源覆盖：')
@@ -374,11 +385,12 @@ export function renderStatusReport(input: StatusReportInput): string {
     )
     lines.push(
         '新鲜度说明：上面的判定基于 git 指纹（HEAD/分支/diff 指纹/改动数），**未跟踪文件的内容改动不会改变指纹**，所以"一致"不等于"一定最新"；' +
-            `比较时索引目录（${ignored}）被排除——重建产物不会把索引自己判成过期。要确定就跑 \`kb_index\`（它按内容比对，未变会明说"未变"且不重写文件）。`,
+            `比较时索引目录（${ignored}）被排除——重建产物不会把索引自己判成过期。要确定就跑 \`kb_index\`：它按内容比对，内容未变、指纹也一致才明说"未变"且不重写任何文件；` +
+            '内容未变但指纹变了（例如编辑了 `.gitignore` 这类没被索引的跟踪文件）则只刷新 manifest.json 的指纹与 builtAt，块列表与倒排索引的字节保持不动，上面的"陈旧"随之消失。',
     )
     lines.push(
         freshness.stale
-            ? '下一步：先 `kb_index` 重建索引（当前工作区已经和索引不一致），再用 `kb_search` 引用。'
+            ? '下一步：先 `kb_index` 重建索引——内容真变了它按新内容重建，只是指纹变了它只刷新指纹，两种情况都会让上面的警告消失；然后 `kb_search` 引用。'
             : '下一步：`kb_search` 检索；改了规格/决策/文档/代码后重新 `kb_index`；引用时照抄 `path:from-to`。',
     )
     return lines.join('\n')

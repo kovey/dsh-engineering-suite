@@ -50,7 +50,20 @@ const dir = indexDirOf(cwd, config)
 
 if (action === 'index') {
     const result = buildIndex({ cwd, layout, config, now: Date.now(), force: argv.includes('--force'), only: flags('--source') })
-    const lines = [`# 知识库索引${result.changed ? '（已更新）' : '（未变化，未写盘）'}`, '', `工作区：${cwd}`, `索引：${path.relative(cwd, result.dir)}`, `指纹：${result.fingerprint.head ?? '(非 git)'}${result.fingerprint.dirty ? ' (dirty)' : ''}`]
+    // Say what actually happened, derived from the change kind rather than from a
+    // boolean: a fingerprint-only refresh is neither "已更新" nor "未变化" (the old
+    // wording made the CLI disagree with its own staleness warning). An unknown
+    // future kind still prints truthfully instead of guessing.
+    const CHANGE_LABEL = {
+        unchanged: '（未变化，未写盘）',
+        created: '（首次建立）',
+        content: '（内容有更新，已写盘）',
+        postings: '（倒排表有更新，已写盘）',
+        fingerprint: '（内容未变，仅刷新指纹）',
+        forced: '（--force 强制重建）',
+    }
+    const label = CHANGE_LABEL[result.changeKind] ?? `（${result.changeKind}：已处理）`
+    const lines = [`# 知识库索引${label}`, '', `工作区：${cwd}`, `索引：${path.relative(cwd, result.dir)}`, `指纹：${result.fingerprint.head ?? '(非 git)'}${result.fingerprint.dirty ? ' (dirty)' : ''}`]
     for (const report of result.reports) {
         lines.push(`- ${report.kind}（${report.id}）：文档 ${report.documents}、分块 ${report.chunks}${report.skipped.length === 0 ? '' : `、跳过 ${report.skipped.length}`}`)
         for (const skip of report.skipped.slice(0, 5)) lines.push(`    · 跳过 ${skip.path}：${skip.reason}`)

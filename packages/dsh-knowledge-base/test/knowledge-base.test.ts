@@ -1127,6 +1127,149 @@ test('/kb refuses the same way the tools do when the project disabled the plugin
     assert.equal((await run('status')).kind, 'success')
 })
 
+// ---------------------------------------------------------------------------
+// Item 3 — the change detection and the freshness judgement must agree
+//
+// The live failure these tests pin down: `kb_index` decided "changed" from the
+// indexed CONTENT only, while `kb_search` / `kb_status` decide "陈旧" from the
+// git fingerprint. Editing a tracked file no source covers (`.gitignore`) moved
+// the fingerprint and left every indexed byte identical, so a plain `kb_index`
+// answered "索引已是最新，未变" and wrote nothing — and the warning's own advice
+// could never clear the warning. Only `--force` helped.
+// ---------------------------------------------------------------------------
+
+/** One manifest as it was written to disk (parsed, not trusted). */
+function manifestOf(file: string): Record<string, unknown> {
+    return JSON.parse(fs.readFileSync(file, 'utf8')) as Record<string, unknown>
+}
+
+test('(regression) a moved fingerprint with unchanged content refreshes the manifest only', () => {
+    const { cwd } = fixture('kb-fingerprint-')
+    const layout = new MissionStoreRegistry().for(cwd).layout
+    const config = configOf()
+    const first = buildIndex({ cwd, layout, config, now: RECORDED_AT })
+    assert.equal(first.changeKind, 'created')
+    const chunksFirst = fs.readFileSync(first.files.chunks)
+    const postingsFirst = fs.readFileSync(first.files.postings)
+
+    // `.gitignore` is tracked and no source covers it: editing it moves the
+    // workspace's diff digest while every indexed byte stays the same.
+    fs.appendFileSync(path.join(cwd, '.gitignore'), 'notes/\n')
+    const second = buildIndex({ cwd, layout, config, now: RECORDED_AT + 60_000 })
+    assert.equal(second.changed, true, 'the moved fingerprint must be recorded')
+    assert.equal(second.changeKind, 'fingerprint')
+    assert.notEqual(second.fingerprint.diffDigest, first.fingerprint.diffDigest, 'the fixture must really move the fingerprint')
+
+    // The byte-identity guarantee survives: the two content artifacts are not
+    // even rewritten, let alone changed.
+    assert.ok(chunksFirst.equals(fs.readFileSync(second.files.chunks)), 'chunks.jsonl must keep its bytes')
+    assert.ok(postingsFirst.equals(fs.readFileSync(second.files.postings)), 'postings.json must keep its bytes')
+
+    const manifest = manifestOf(second.files.manifest)
+    assert.equal(manifest['builtAt'], new Date(RECORDED_AT + 60_000).toISOString(), 'the manifest must be stamped with the injected clock')
+    assert.deepEqual(manifest['fingerprint'], second.fingerprint, 'the manifest must record the current fingerprint')
+
+    // The whole point: the comparison every reader makes is FRESH afterwards,
+    // and it no longer reports the diff that kb_index just declined to record.
+    assert.equal(stalenessOf(second.fingerprint, indexFingerprint(cwd, first.dir)).stale, false)
+    const loaded = loadIndex(second.dir)
+    assert.equal(loaded.manifest?.fingerprint.diffDigest, second.fingerprint.diffDigest)
+    assert.equal(loaded.problems.length, 0, 'a refreshed manifest must still pair with the untouched chunks/postings')
+})
+
+test('(regression) kb_index clears the staleness warning it used to leave behind, and names the refresh', async () => {
+    const { cwd } = fixture('kb-fingerprint-report-')
+    const fake = host(cwd)
+    assert.match(await text(fake, 'kb_index'), /首次构建/)
+    assert.match(await text(fake, 'kb_search', { query: 'health' }), /新鲜度：与当前工作区指纹一致/)
+
+    // The reproduced sequence, on the surface a user actually sees.
+    fs.appendFileSync(path.join(cwd, '.gitignore'), 'notes/\n')
+    assert.match(await text(fake, 'kb_search', { query: 'health' }), /⚠️ 索引可能过期/)
+    assert.match(await text(fake, 'kb_status'), /⚠️ 索引可能过期/)
+
+    const before = snapshot(path.join(cwd, '.dsh', 'kb'))
+    const refreshed = await text(fake, 'kb_index')
+    assert.match(
+        refreshed,
+        /^知识库索引：内容未变，仅刷新了指纹（chunks\.jsonl 与 postings\.json 字节未动、未重写；manifest\.json 已记下新的指纹与 builtAt）$/m,
+    )
+    assert.match(refreshed, /不会再报“索引陈旧”/)
+    assert.doesNotMatch(refreshed, /索引已是最新，未变/, 'a refresh is not "unchanged"')
+    assert.doesNotMatch(refreshed, /索引已重建/, 'a manifest-only refresh is not a rebuild')
+    const after = snapshot(path.join(cwd, '.dsh', 'kb'))
+    assert.equal(after[CHUNKS_FILE], before[CHUNKS_FILE], 'chunks.jsonl must not be touched')
+    assert.equal(after[POSTINGS_FILE], before[POSTINGS_FILE], 'postings.json must not be touched')
+    assert.notEqual(after[MANIFEST_FILE], before[MANIFEST_FILE], 'manifest.json must be rewritten')
+
+    // Every surface that judged the index stale now agrees with the build.
+    assert.match(await text(fake, 'kb_search', { query: 'health' }), /新鲜度：与当前工作区指纹一致/)
+    const status = await text(fake, 'kb_status')
+    assert.doesNotMatch(status, /索引可能过期/)
+    assert.match(status, /内容未变但指纹变了/)
+    assert.match(status, /只刷新 manifest\.json 的指纹与 builtAt/)
+})
+
+test('an unchanged repository is reported as unchanged and writes nothing at all', () => {
+    const { cwd } = fixture('kb-plain-unchanged-')
+    const layout = new MissionStoreRegistry().for(cwd).layout
+    const config = configOf()
+    const first = buildIndex({ cwd, layout, config, now: RECORDED_AT })
+    assert.equal(first.changeKind, 'created')
+    const builtAtFirst = manifestOf(first.files.manifest)['builtAt']
+    const chunksFirst = fs.readFileSync(first.files.chunks)
+    const postingsFirst = fs.readFileSync(first.files.postings)
+    const before = snapshot(path.join(cwd, '.dsh', 'kb'))
+
+    const second = buildIndex({ cwd, layout, config, now: RECORDED_AT + 60_000 })
+    assert.equal(second.changed, false)
+    assert.equal(second.changeKind, 'unchanged')
+    assert.deepEqual(snapshot(path.join(cwd, '.dsh', 'kb')), before, 'an unchanged build must not write a byte')
+    // `builtAt` is the canary: a rewritten manifest always stamps the clock it
+    // was given, so an equal stamp proves the manifest was left alone.
+    assert.equal(manifestOf(second.files.manifest)['builtAt'], builtAtFirst)
+    // the determinism guard, on plain (not forced) builds
+    assert.ok(chunksFirst.equals(fs.readFileSync(second.files.chunks)), 'two plain builds must leave chunks.jsonl byte-identical')
+    assert.ok(postingsFirst.equals(fs.readFileSync(second.files.postings)), 'two plain builds must leave postings.json byte-identical')
+})
+
+test('force keeps its own meaning and never becomes a fingerprint refresh', () => {
+    const { cwd } = fixture('kb-force-kind-')
+    const layout = new MissionStoreRegistry().for(cwd).layout
+    const config = configOf()
+    buildIndex({ cwd, layout, config, now: RECORDED_AT })
+    assert.equal(buildIndex({ cwd, layout, config, now: RECORDED_AT + 60_000 }).changeKind, 'unchanged')
+
+    const forced = buildIndex({ cwd, layout, config, now: RECORDED_AT + 120_000, force: true })
+    assert.equal(forced.changeKind, 'forced', '--force with no change is a requested rewrite, not a refresh')
+    assert.equal(forced.changed, true)
+
+    // and the mirror image: a moved fingerprint is 'fingerprint', not 'forced'
+    fs.appendFileSync(path.join(cwd, '.gitignore'), 'notes/\n')
+    assert.equal(buildIndex({ cwd, layout, config, now: RECORDED_AT + 180_000 }).changeKind, 'fingerprint')
+    assert.equal(
+        buildIndex({ cwd, layout, config, now: RECORDED_AT + 240_000, force: true }).changeKind,
+        'forced',
+        'an explicit force stays a force even when the fingerprint moved',
+    )
+})
+
+test('a real content change is still reported as content (not as a fingerprint refresh)', () => {
+    const { cwd } = fixture('kb-content-kind-')
+    const layout = new MissionStoreRegistry().for(cwd).layout
+    const config = configOf()
+    const first = buildIndex({ cwd, layout, config, now: RECORDED_AT })
+    const chunksFirst = fs.readFileSync(first.files.chunks)
+    fs.appendFileSync(path.join(cwd, 'docs', 'guide.md'), '\n发布前必须跑 scripts/verify.sh。\n')
+    const second = buildIndex({ cwd, layout, config, now: RECORDED_AT + 60_000 })
+    assert.equal(second.changeKind, 'content')
+    assert.equal(second.changed, true)
+    // One tracked edit moves the content AND the fingerprint: the content wins,
+    // because that is the fact the reader has to act on.
+    assert.notEqual(second.fingerprint.diffDigest, first.fingerprint.diffDigest)
+    assert.ok(!chunksFirst.equals(fs.readFileSync(second.files.chunks)), 'the chunk list must be rewritten')
+})
+
 test('every host is disposed without a throw', () => {
     for (const fake of hosts) fake.dispose()
     assert.ok(hosts.length > 0)

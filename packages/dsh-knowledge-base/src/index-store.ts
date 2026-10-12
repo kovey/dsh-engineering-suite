@@ -7,7 +7,9 @@
  *    document's is `<kind>:<path>` — no timestamp, no counter, no clock. Two
  *    builds of an unchanged repository therefore produce byte-identical
  *    `chunks.jsonl`, and only `manifest.json`'s `builtAt` moves. That is what
- *    lets a reviewer diff a rebuild instead of re-reading it.
+ *    lets a reviewer diff a rebuild instead of re-reading it. A workspace whose
+ *    fingerprint moved while its indexed content did not gets the manifest
+ *    rewritten and those two files left alone.
  *  - **Nothing partial is ever visible.** Every file is written to a temporary
  *    sibling and renamed into place; `manifest.json` is written LAST, so a
  *    crash mid-build leaves the previous index (or no index) rather than a
@@ -19,9 +21,13 @@
  *    rows were dropped — a rebuild replaces the files together, so the next
  *    build cleans it up.
  *
- * The rebuild never merges with the previous index: it replaces all three files
- * together. A merge would keep a chunk of a file that no longer exists, which
- * is exactly the stale-fact failure a knowledge base must not have.
+ * The rebuild never merges with the previous index: whenever the content changed
+ * it replaces all three files together. A merge would keep a chunk of a file
+ * that no longer exists, which is exactly the stale-fact failure a knowledge base
+ * must not have. The ONE exception is a fingerprint-only refresh: the indexed
+ * content is byte-identical, so the chunk list and the postings are left on disk
+ * untouched and only the manifest records the new fingerprint (see
+ * `changeKind: 'fingerprint'` in {@link buildIndex}).
  *
  * @module dsh-knowledge-base/index-store
  */
@@ -148,8 +154,16 @@ export interface BuildInput {
     logger?: Logger
 }
 
-/** Why a build counted as "changed" (for the report). */
-export type ChangeKind = 'unchanged' | 'created' | 'content' | 'postings' | 'forced'
+/**
+ * Why a build counted as "changed" (for the report).
+ *
+ * `'forced'` and `'fingerprint'` are NOT the same fact and must not be merged:
+ * `'forced'` means "the caller asked for a rewrite" (`force: true`), while
+ * `'fingerprint'` means "the indexed content did not change, but the workspace's
+ * recorded fingerprint had moved, so the manifest was refreshed on the build's
+ * own initiative" — see `buildIndex`.
+ */
+export type ChangeKind = 'unchanged' | 'created' | 'content' | 'postings' | 'forced' | 'fingerprint'
 
 /** Result of one build. */
 export interface BuildResult {
@@ -338,6 +352,66 @@ function isManifest(value: unknown): value is KbManifest {
     if (typeof value !== 'object' || value === null) return false
     const record = value as Record<string, unknown>
     return typeof record['version'] === 'number' && typeof record['builtAt'] === 'string' && Array.isArray(record['sources'])
+}
+
+/**
+ * Whether a parsed value carries the facts a stored fingerprint is compared by.
+ *
+ * A manifest's `fingerprint` comes back through `JSON.parse`, so it must be
+ * re-established as a `GitFingerprint` before anything compares it: an
+ * unreadable or foreign shape must not be coerced into "looks the same".
+ */
+function isFingerprint(value: unknown): value is GitFingerprint {
+    if (typeof value !== 'object' || value === null) return false
+    const record = value as Record<string, unknown>
+    return (
+        typeof record['isRepo'] === 'boolean' &&
+        typeof record['dirty'] === 'boolean' &&
+        typeof record['changedFiles'] === 'number' &&
+        typeof record['diffDigest'] === 'string' &&
+        (record['head'] === undefined || typeof record['head'] === 'string') &&
+        (record['branch'] === undefined || typeof record['branch'] === 'string')
+    )
+}
+
+/**
+ * The fingerprint a previous manifest recorded, or `undefined` when it cannot
+ * be read (no manifest text, unparsable JSON, a shape this build does not
+ * recognise). `undefined` is never treated as "equal to the current one".
+ */
+function recordedFingerprint(manifestText: string | undefined): GitFingerprint | undefined {
+    if (manifestText === undefined) return undefined
+    try {
+        const parsed: unknown = JSON.parse(manifestText)
+        if (typeof parsed !== 'object' || parsed === null) return undefined
+        const fingerprint = (parsed as Record<string, unknown>)['fingerprint']
+        return isFingerprint(fingerprint) ? fingerprint : undefined
+    } catch {
+        return undefined
+    }
+}
+
+/**
+ * Whether a recorded fingerprint still describes the current workspace, judged
+ * by exactly the fields `stalenessOf` compares (isRepo, HEAD, branch, dirty,
+ * changedFiles, the diff digest).
+ *
+ * Comparing the same field set is the point: the build refreshes the recorded
+ * fingerprint precisely when the freshness comparison would otherwise call the
+ * index 陈旧, so the two can no longer disagree. A `JSON.stringify` comparison
+ * would be wrong here — the recorded value has been through `JSON.parse`, and
+ * the same facts in a different key order are not a change.
+ */
+function sameFingerprint(recorded: GitFingerprint | undefined, current: GitFingerprint): boolean {
+    if (recorded === undefined) return false
+    return (
+        recorded.isRepo === current.isRepo &&
+        recorded.head === current.head &&
+        recorded.branch === current.branch &&
+        recorded.dirty === current.dirty &&
+        recorded.changedFiles === current.changedFiles &&
+        recorded.diffDigest === current.diffDigest
+    )
 }
 
 /** Whether a parsed value looks like a chunk row. */
@@ -561,20 +635,38 @@ export function buildIndex(input: BuildInput): BuildResult {
     const contentChanged = previousChunks !== chunksText
     const postingsChanged = previousPostings !== postingsText
     const created = previousManifest === undefined
+    // The change detection must agree with the freshness judgement every reader
+    // makes (`stalenessOf` below, used by `kb_search` / `kb_status`). A tracked
+    // file that no source covers (`.gitignore`), an added file outside the
+    // sources, a commit or a branch switch move the workspace fingerprint while
+    // leaving the indexed CONTENT byte-identical; comparing content alone then
+    // answered "索引已是最新，未变" and wrote nothing, while `kb_search` still
+    // reported 陈旧 — and the warning's own advice (`kb_index`) never cleared
+    // it. So a moved fingerprint is a change of its own kind, and only the
+    // manifest is rewritten for it.
+    const fingerprintMoved = !created && !sameFingerprint(recordedFingerprint(previousManifest), fingerprint)
     let changeKind: ChangeKind = 'unchanged'
     if (input.force === true && !created && !contentChanged && !postingsChanged) changeKind = 'forced'
     else if (created) changeKind = 'created'
     else if (contentChanged) changeKind = 'content'
     else if (postingsChanged) changeKind = 'postings'
-    else if (input.force === true) changeKind = 'forced'
+    else if (fingerprintMoved) changeKind = 'fingerprint'
     const changed = changeKind !== 'unchanged'
     if (changed) {
         ensureDir(dir)
         // Order matters: the chunk list first, then the index that describes it,
         // then the manifest that commits to both. A crash in between leaves the
         // old manifest pointing at an index the digest check will flag.
-        writeTextAtomic(files.chunks, chunksText)
-        writeTextAtomic(files.postings, postingsText)
+        //
+        // A fingerprint-only refresh skips the first two on purpose: this branch
+        // is taken exactly when the computed chunk list and postings are
+        // byte-identical to the ones on disk, and leaving them untouched is what
+        // keeps "two builds of an unchanged repository produce identical bytes"
+        // true down to the file mtime.
+        if (changeKind !== 'fingerprint') {
+            writeTextAtomic(files.chunks, chunksText)
+            writeTextAtomic(files.postings, postingsText)
+        }
         writeTextAtomic(files.manifest, manifestText)
     }
     return { dir, manifest, chunks, postings, reports, changed, changeKind, fingerprint, problems, files }
@@ -591,6 +683,8 @@ export function describeChange(kind: ChangeKind): string {
             return '分词/索引配置有变化（倒排索引已重写，块列表字节未变）'
         case 'forced':
             return 'force=true：按请求重写'
+        case 'fingerprint':
+            return '内容未变，仅刷新了指纹（块列表与倒排索引的字节未动、未重写；manifest.json 的指纹与 builtAt 已更新）'
         default:
             return '未变'
     }
@@ -620,8 +714,11 @@ export interface Staleness {
  *
  * Note the limit this shares with `git status`: an untracked file's *content*
  * change does not move the diff digest. `kb_index` therefore never trusts the
- * fingerprint — it compares the built bytes — and reports "未变" only when they
- * really are identical.
+ * fingerprint for the CONTENT question — it compares the built bytes and reports
+ * "未变" only when they really are identical — and for the FRESHNESS question it
+ * does the opposite: a recorded fingerprint that no longer matches the workspace
+ * is refreshed by the rebuild itself (`changeKind: 'fingerprint'`), so this
+ * comparison and the build cannot end up disagreeing.
  * @param indexed - the fingerprint stored in the manifest.
  * @param current - the fingerprint captured now.
  */
