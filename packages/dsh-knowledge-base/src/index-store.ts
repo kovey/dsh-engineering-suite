@@ -30,7 +30,6 @@ import fs from 'node:fs'
 import path from 'node:path'
 import {
     ensureDir,
-    gitFingerprint,
     nowIso,
     readText,
     resolvePath,
@@ -41,8 +40,15 @@ import {
     type Logger,
 } from 'dsh-eng-core'
 import type { KbKind, KnowledgeBaseConfig } from './config.js'
+import { indexFingerprint, indexSpecPath } from './fingerprint.js'
 import { collectDocuments, type KbDocument, type KbSkipped, type KbSymbol, type SourceReport } from './sources.js'
 import { BM25_B, BM25_K1, tokenCounts, tokenize, type TokenizerOptions } from './search.js'
+
+// Re-exported so every surface compares with the SAME function: the CLI entry
+// point and any doctor read the manifest through this module, and a fingerprint
+// computed differently from the one stored in the manifest is exactly how a
+// false "过期" appears (see fingerprint.ts).
+export { indexFingerprint, indexSpecPath }
 
 /** Index format version; a mismatch is reported, never silently tolerated. */
 export const KB_INDEX_VERSION = 1
@@ -482,9 +488,10 @@ export function buildIndex(input: BuildInput): BuildResult {
     }))
     const partial = only.length > 0
 
-    // The index directory is excluded from the fingerprint: a build must not
-    // make the workspace dirty and then report its own artifact as "a change".
-    const fingerprint = gitFingerprint(input.cwd, { excludePaths: [dir] })
+    // The index directory is excluded from the fingerprint (status, diff digest
+    // and the dirty flag): a build must not make the workspace dirty and then
+    // report its own artifact as "a change".
+    const fingerprint = indexFingerprint(input.cwd, dir)
     const collected = collectDocuments({
         cwd: input.cwd,
         layout: input.layout,

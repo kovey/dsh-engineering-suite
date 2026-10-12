@@ -10,10 +10,12 @@ import { resolveConfig, resolveEffectiveConfig } from '../dist/config.js'
 import {
     CHUNKS_FILE,
     MANIFEST_FILE,
+    POSTINGS_FILE,
     buildIndex,
     buildPostings,
     chunkDocument,
     indexDirOf,
+    indexFingerprint,
     loadIndex,
     stalenessOf,
     type KbChunk,
@@ -200,11 +202,18 @@ function fixture(prefix = 'kb-'): Fixture {
     return { cwd, missionId: mission.id, receiptId: receipt.id, specFile: path.join(cwd, '.dsh', 'specs', `${mission.id}.md`) }
 }
 
-/** Mount the plugin in a throwaway workspace. */
-function host(cwd: string, config: Record<string, unknown> = {}): FakeHost {
-    const fake = createFakeHost({ cwd })
+/**
+ * Mount the plugin in a throwaway workspace.
+ *
+ * The log file lives OUTSIDE the workspace, as a real profile's does: a log file
+ * inside the repository is itself an untracked change, and that change hides the
+ * index artifact's own contribution to the git fingerprint (the very thing the
+ * freshness tests are about).
+ */
+function host(cwd: string, config: Record<string, unknown> = {}, services: Record<string, unknown> = {}): FakeHost {
+    const fake = createFakeHost({ cwd, services })
     hosts.push(fake)
-    apply(fake.ctx as never, { logFile: path.join(cwd, 'knowledge-base.log'), maxFileBytes: 4096, ...config })
+    apply(fake.ctx as never, { logFile: path.join(tempWorkspace('kb-log-'), 'knowledge-base.log'), maxFileBytes: 4096, ...config })
     return fake
 }
 
@@ -236,6 +245,68 @@ function snapshot(dir: string): Record<string, string> {
     }
     walk(dir)
     return out
+}
+
+/**
+ * A minimal committed repository with no `.dsh/` at all.
+ *
+ * `ignoreKb` decides whether the repository tells git to ignore `.dsh/kb/`; the
+ * tests around the artifact-invalidates-itself bug need BOTH answers, because the
+ * bug only shows up where the artifact is untracked and un-ignored (which is what
+ * a live repository did).
+ */
+function plainRepo(prefix: string, options: { ignoreKb?: boolean } = {}): string {
+    const cwd = tempWorkspace(prefix)
+    if (options.ignoreKb === true) fs.writeFileSync(path.join(cwd, '.gitignore'), '.dsh/kb/\n')
+    fs.writeFileSync(path.join(cwd, 'README.md'), '# 示例项目\n\n登录失败的处理写在 docs/guide.md。\n')
+    fs.mkdirSync(path.join(cwd, 'docs'), { recursive: true })
+    fs.writeFileSync(path.join(cwd, 'docs', 'guide.md'), '# 部署指南\n\n发布流程：先跑 node --test。\n')
+    git(cwd, ['init', '-q'])
+    git(cwd, ['add', '-A'])
+    git(cwd, ['commit', '-qm', 'fixture'])
+    return cwd
+}
+
+/** One command definition as the stand-in registry stores it. */
+interface FakeCommand {
+    name: string
+    description: string
+    input?: { hint: string }
+    handler: (invocation: { agent?: unknown; rawInput?: unknown }) => { kind: string; text?: string } | Promise<{ kind: string; text?: string }>
+}
+
+/**
+ * A stand-in for `@deepseek-ai/dsh-commands`: it records definitions and invokes
+ * handlers, and — like the real registry — returns the exact disposer.
+ */
+function fakeCommandRegistry(): { definitions: Map<string, FakeCommand>; disposed: string[]; register: (definition: FakeCommand) => () => void } {
+    const definitions = new Map<string, FakeCommand>()
+    const disposed: string[] = []
+    return {
+        definitions,
+        disposed,
+        register(definition) {
+            if (definitions.has(definition.name)) throw new Error(`duplicate command ${definition.name}`)
+            definitions.set(definition.name, definition)
+            return () => {
+                definitions.delete(definition.name)
+                disposed.push(definition.name)
+            }
+        },
+    }
+}
+
+/** Mount the plugin with the command registry present, and run `/kb …` lines. */
+function commandHost(cwd: string, config: Record<string, unknown> = {}) {
+    const registry = fakeCommandRegistry()
+    const fake = host(cwd, config, { commands: registry })
+    const run = async (rawInput: unknown): Promise<{ kind: string; text: string }> => {
+        const definition = registry.definitions.get('kb')
+        assert.ok(definition !== undefined, '/kb must be registered when the registry is mounted')
+        const result = await definition.handler({ agent: fake.agent, rawInput })
+        return { kind: result.kind, text: result.text ?? '' }
+    }
+    return { fake, registry, run }
 }
 
 /** One hand-made chunk (for the pure retrieval tests). */
@@ -774,6 +845,286 @@ test('chunking respects maxChunkLines and keeps line numbers exact', () => {
 test('heading extraction drives the title of markdown documents', () => {
     assert.equal(headingOf('# 标题\n\n正文'), '标题')
     assert.equal(headingOf('没有标题\n\n正文'), undefined)
+})
+
+// ---------------------------------------------------------------------------
+// Item 1 — the index must not make itself look stale
+// ---------------------------------------------------------------------------
+
+test('(regression) an un-ignored index artifact does not make its own index stale', async () => {
+    // The live failure: `.dsh/kb/` was untracked and NOT in `.gitignore`, so the
+    // build's own files appeared in the workspace fingerprint between the build
+    // and the comparison — `kb_index` succeeded and `kb_search` answered "过期，
+    // 工作区改动数从 0 变成 0".
+    const cwd = plainRepo('kb-unignored-')
+    const fake = host(cwd)
+    assert.equal((await call(fake, 'kb_index')).isError, false)
+    const dir = indexDirOf(cwd, resolveConfig({}))
+    const manifest = loadIndex(dir).manifest
+    assert.ok(manifest !== undefined, 'the build must have written a manifest')
+
+    const current = indexFingerprint(cwd, dir)
+    assert.equal(stalenessOf(manifest.fingerprint, current).stale, false, `fingerprint: ${JSON.stringify(current)}`)
+    assert.equal(current.dirty, false, 'the artifact must not make the workspace dirty')
+    assert.equal(current.changedFiles, 0, 'the artifact must not be counted as a change')
+
+    const search = await text(fake, 'kb_search', { query: '登录' })
+    assert.match(search, /新鲜度：与当前工作区指纹一致/)
+    assert.doesNotMatch(search, /索引可能过期/)
+    const status = await text(fake, 'kb_status')
+    assert.doesNotMatch(status, /索引可能过期/)
+    assert.match(status, /新鲜度：与当前工作区指纹一致/)
+    assert.match(status, /比较时索引目录（\.dsh\/kb）被排除/)
+    // exit path: the search report's 下一步 no longer tells the reader to rebuild
+    assert.match(search, /索引里没有的内容要说/)
+})
+
+test('(regression) a real change after indexing is still stale, and the reason names it', async () => {
+    const cwd = plainRepo('kb-still-stale-')
+    const fake = host(cwd)
+    assert.equal((await call(fake, 'kb_index')).isError, false)
+    const dir = indexDirOf(cwd, resolveConfig({}))
+    const indexed = loadIndex(dir).manifest?.fingerprint
+    assert.ok(indexed !== undefined)
+
+    // ① a tracked source edit moves the diff digest
+    fs.appendFileSync(path.join(cwd, 'docs', 'guide.md'), '\n发布前必须跑 scripts/verify.sh。\n')
+    const edited = await text(fake, 'kb_search', { query: '发布' })
+    assert.match(edited, /⚠️ 索引可能过期：工作区相对 HEAD 的改动变了/)
+    assert.match(edited, /diff [0-9a-f]{8} → [0-9a-f]{8}/)
+    assert.equal(stalenessOf(indexed, indexFingerprint(cwd, dir)).stale, true)
+
+    // rebuilding clears it — the artifact still does not re-stale the fresh index
+    assert.equal((await call(fake, 'kb_index')).isError, false)
+    assert.doesNotMatch(await text(fake, 'kb_search', { query: '发布' }), /索引可能过期/)
+    assert.equal(stalenessOf(loadIndex(dir).manifest?.fingerprint as never, indexFingerprint(cwd, dir)).stale, false)
+
+    // ② a new untracked file NEXT TO the artifact (inside `.dsh/`, outside `.dsh/kb/`)
+    //    is a real change: the exclusion names the index directory, not its parent
+    fs.writeFileSync(path.join(cwd, '.dsh', 'plan.jsonl'), `${JSON.stringify({ at: RECORDED_AT, kind: 'note' })}\n`)
+    const moved = await text(fake, 'kb_status')
+    assert.match(moved, /⚠️ 索引可能过期/)
+    // the tracked edit above is still counted (1), and the new file is the second
+    assert.match(moved, /改动数从 1 变成 2/)
+})
+
+test('(regression) a committed index artifact does not make its own index stale', () => {
+    // The README allows committing `.dsh/kb/` ("可读、可 diff、可进版本库"). A
+    // rebuild then rewrites a TRACKED manifest.json (builtAt), which lands in
+    // `git diff HEAD` unless the diff digest excludes the artifact too.
+    const cwd = plainRepo('kb-committed-')
+    const layout = new MissionStoreRegistry().for(cwd).layout
+    const config = configOf()
+    const first = buildIndex({ cwd, layout, config, now: RECORDED_AT })
+    git(cwd, ['add', '-A'])
+    git(cwd, ['commit', '-qm', 'index'])
+    const second = buildIndex({ cwd, layout, config, now: RECORDED_AT + 60_000, force: true })
+    assert.equal(second.changed, true, 'force must rewrite the manifest')
+    assert.equal(first.manifest.fingerprint.diffDigest, second.fingerprint.diffDigest, 'the artifact must not move the diff digest')
+    assert.equal(stalenessOf(second.fingerprint, indexFingerprint(cwd, second.dir)).stale, false)
+
+    // and it is an exclusion, not a blindfold
+    fs.appendFileSync(path.join(cwd, 'README.md'), '\n补充说明。\n')
+    assert.equal(stalenessOf(second.fingerprint, indexFingerprint(cwd, second.dir)).stale, true)
+})
+
+test('(regression) a gitignored index directory behaves exactly as before', async () => {
+    const cwd = plainRepo('kb-gitignored-', { ignoreKb: true })
+    const fake = host(cwd)
+    assert.match(await text(fake, 'kb_index'), /首次构建/)
+    const dir = indexDirOf(cwd, resolveConfig({}))
+    const manifest = loadIndex(dir).manifest
+    assert.ok(manifest !== undefined)
+    const current = indexFingerprint(cwd, dir)
+    assert.equal(current.dirty, false)
+    assert.equal(current.changedFiles, 0)
+    assert.equal(stalenessOf(manifest.fingerprint, current).stale, false)
+    assert.match(await text(fake, 'kb_search', { query: '登录' }), /新鲜度：与当前工作区指纹一致/)
+    // the second build is still the byte-comparing, non-rewriting one
+    assert.match(await text(fake, 'kb_index'), /索引已是最新，未变/)
+    // and a real edit is still reported (the gitignored case never relied on the fix)
+    fs.appendFileSync(path.join(cwd, 'docs', 'guide.md'), '\n新的一行。\n')
+    assert.match(await text(fake, 'kb_status'), /⚠️ 索引可能过期/)
+})
+
+test('the index fingerprint excludes exactly the index directory, not its parent', () => {
+    const cwd = plainRepo('kb-exclusion-')
+    const dir = indexDirOf(cwd, resolveConfig({}))
+    const clean = indexFingerprint(cwd, dir)
+    assert.equal(clean.dirty, false)
+    assert.equal(clean.changedFiles, 0)
+    assert.equal(clean.diffDigest, sha256(''), 'a clean worktree has the empty diff digest')
+
+    // the artifact's three files are untracked (and not ignored) — still not a change
+    fs.mkdirSync(dir, { recursive: true })
+    for (const file of [MANIFEST_FILE, CHUNKS_FILE, POSTINGS_FILE]) fs.writeFileSync(path.join(dir, file), '{}\n')
+    assert.equal(indexFingerprint(cwd, dir).changedFiles, 0)
+    assert.equal(indexFingerprint(cwd, dir).dirty, false)
+
+    // one file next to it IS one change
+    fs.writeFileSync(path.join(cwd, '.dsh', 'plan.jsonl'), '{}\n')
+    assert.equal(indexFingerprint(cwd, dir).changedFiles, 1)
+    assert.equal(indexFingerprint(cwd, dir).dirty, true)
+
+    // untracked files elsewhere are counted individually, not collapsed into `?? notes/`
+    fs.mkdirSync(path.join(cwd, 'notes'), { recursive: true })
+    fs.writeFileSync(path.join(cwd, 'notes', 'a.md'), 'a\n')
+    fs.writeFileSync(path.join(cwd, 'notes', 'b.md'), 'b\n')
+    assert.equal(indexFingerprint(cwd, dir).changedFiles, 3)
+})
+
+// ---------------------------------------------------------------------------
+// Item 2 — the `/kb` human command
+// ---------------------------------------------------------------------------
+
+test('(regression) /kb registers only with the command registry, and a broken one never breaks apply', async () => {
+    const { cwd } = fixture('kb-command-optional-')
+
+    // ① no registry: the three tools and the prompt section are unaffected
+    const bare = host(cwd)
+    assert.equal(bare.tools.size, 3)
+    assert.equal((bare.ctx as { get: (name: string) => unknown }).get('commands'), undefined)
+    bare.dispose()
+
+    // ② a partial registry (no `register`) is treated as absent
+    const partial = host(cwd, {}, { commands: {} })
+    assert.equal(partial.tools.size, 3)
+    assert.ok(partial.sections.some((section) => section.name === 'eng:knowledge-base'))
+    partial.dispose()
+
+    // ③ a registry whose register() throws: contained, logged, tools intact
+    const broken = host(
+        cwd,
+        {},
+        {
+            commands: {
+                register() {
+                    throw new Error('registry down')
+                },
+            },
+        },
+    )
+    assert.equal(broken.tools.size, 3)
+    broken.dispose()
+
+    // ④ the mounted registry gets exactly one definition, with a hint and a handler
+    const mounted = commandHost(cwd)
+    assert.deepEqual([...mounted.registry.definitions.keys()], ['kb'])
+    const definition = mounted.registry.definitions.get('kb')
+    assert.match(definition?.description ?? '', /知识库/)
+    assert.match(definition?.input?.hint ?? '', /index/)
+    assert.equal(typeof definition?.handler, 'function')
+    // …and the plugin's teardown unregisters it through the registry's own disposer
+    mounted.fake.dispose()
+    assert.deepEqual(mounted.registry.disposed, ['kb'])
+})
+
+test('/kb calls the same operations as the tools, byte for byte', async () => {
+    const { cwd } = fixture('kb-command-same-')
+    const { fake, run } = commandHost(cwd)
+    assert.equal((await call(fake, 'kb_index')).isError, false)
+
+    const statusCommand = await run('status')
+    assert.equal(statusCommand.kind, 'success')
+    assert.equal(statusCommand.text, await text(fake, 'kb_status'))
+
+    const searchCommand = await run('search health --limit 2 --kind docs --prefix docs/')
+    assert.equal(searchCommand.text, await text(fake, 'kb_search', { query: 'health', limit: 2, kinds: ['docs'], pathPrefix: 'docs/' }))
+
+    // `--force` on both sides so the two reports describe the same build
+    const indexCommand = await run('index --force')
+    assert.equal(indexCommand.text, await text(fake, 'kb_index', { force: true }))
+
+    // repeated `--source` is the tool's `only`
+    const partial = await run('index --source docs')
+    assert.equal(partial.kind, 'success')
+    assert.match(partial.text, /局部索引/)
+    assert.match(partial.text, /spec（spec）：\*\*不在本次索引里\*\*/)
+})
+
+test('/kb answers help for a bare line, and every unrecognised line is an error carrying the usage', async () => {
+    const cwd = plainRepo('kb-command-grammar-')
+    const { run } = commandHost(cwd)
+
+    assert.equal((await run('')).kind, 'success')
+    assert.match((await run('')).text, /\/kb index \[--force\]/)
+    assert.match((await run('help')).text, /\/kb status/)
+    assert.match((await run('help 我该怎么用')).text, /用法：/)
+
+    const refused: [string, RegExp][] = [
+        ['indx', /未知子命令/],
+        ['index --limit 5', /index 无法识别的参数/],
+        ['index --source nope', /未配置的来源/],
+        ['index --source', /--source 后面要跟一个来源 id/],
+        ['search', /search 需要一个关键词/],
+        ['search 登录 --kind nope', /未知类型/],
+        ['search 登录 --limit 0', /--limit 必须是不小于 1 的整数/],
+        ['search 登录 --limit', /--limit 后面要跟一个值/],
+        ['search 登录 --limit=5', /本命令用空格分隔参数：--limit 5/],
+        ['status extra', /status 不接受参数/],
+    ]
+    for (const [line, pattern] of refused) {
+        const result = await run(line)
+        assert.equal(result.kind, 'error', `/${line} must be an error result`)
+        assert.match(result.text, pattern, `/${line}`)
+        assert.match(result.text, /用法：/, `/${line} must carry the usage`)
+    }
+    // a partial host can hand over anything: a non-string rawInput is not a crash
+    assert.equal((await run(undefined)).kind, 'success')
+    assert.equal((await run(42)).kind, 'success')
+
+    // the usage names the configuration in force (source ids live in the config)
+    const configured = commandHost(plainRepo('kb-command-usage-'), { search: { limit: 6, maxLimit: 20 } })
+    const usage = (await configured.run('help')).text
+    for (const id of ['spec', 'adr', 'trail', 'plan', 'docs', 'code']) assert.match(usage, new RegExp(id))
+    assert.match(usage, /limit：默认 6、上限 20/)
+    assert.match(usage, /\.dsh\/kb/)
+})
+
+test('/kb is read-only for search and status, and only `index` writes', async () => {
+    const { cwd } = fixture('kb-command-readonly-')
+    const { fake, run } = commandHost(cwd)
+    assert.equal((await call(fake, 'kb_index')).isError, false)
+    const before = snapshot(path.join(cwd, '.dsh'))
+    assert.equal((await run('status')).kind, 'success')
+    assert.equal((await run('search health')).kind, 'success')
+    assert.equal((await run('help')).kind, 'success')
+    assert.equal((await run('nonsense')).kind, 'error')
+    assert.deepEqual(snapshot(path.join(cwd, '.dsh')), before, 'a read-only sub-command must not touch .dsh')
+
+    // a refusal is an error result (not a crash), and it writes nothing either
+    const missing = commandHost(plainRepo('kb-command-missing-'))
+    const refused = await missing.run('search 登录')
+    assert.equal(refused.kind, 'error')
+    assert.match(refused.text, /索引不存在或不可用/)
+    assert.match(refused.text, /kb_index/)
+    assert.deepEqual(snapshot(path.join(missing.fake.cwd, '.dsh')), {})
+
+    // `index` is the one writer: it creates the artifact…
+    const writer = commandHost(plainRepo('kb-command-writes-'))
+    const empty = snapshot(path.join(writer.fake.cwd, '.dsh'))
+    assert.deepEqual(empty, {})
+    assert.equal((await writer.run('index')).kind, 'success')
+    const written = snapshot(path.join(writer.fake.cwd, '.dsh'))
+    assert.ok(Object.keys(written).length >= 3, 'index must write the three artifact files')
+    // …and a second run is honest about writing nothing
+    assert.match((await writer.run('index')).text, /索引已是最新，未变/)
+    assert.deepEqual(snapshot(path.join(writer.fake.cwd, '.dsh')), written)
+})
+
+test('/kb refuses the same way the tools do when the project disabled the plugin', async () => {
+    const cwd = plainRepo('kb-command-disabled-')
+    fs.mkdirSync(path.join(cwd, '.dsh'), { recursive: true })
+    fs.writeFileSync(path.join(cwd, '.dsh', 'knowledge-base.json'), `${JSON.stringify({ enabled: false })}\n`)
+    const { run } = commandHost(cwd)
+    const refused = await run('index')
+    assert.equal(refused.kind, 'error')
+    assert.match(refused.text, /enabled=false/)
+    assert.equal((await run('search 登录')).kind, 'error')
+    assert.match((await run('search 登录')).text, /enabled=false/)
+    // `kb_status` never refused a disabled workspace either (it still reports what
+    // the artifact is and what is missing), so `/kb status` must behave the same
+    assert.equal((await run('status')).kind, 'success')
 })
 
 test('every host is disposed without a throw', () => {

@@ -7,7 +7,10 @@
  * documentation and the code itself. This plugin turns them into an artifact
  * the model can actually retrieve from — `.dsh/kb/` — and gives it three tools:
  * `kb_index` builds it, `kb_search` answers with `path:line` citations,
- * `kb_status` says what it covers and what it knows it missed.
+ * `kb_status` says what it covers and what it knows it missed. A person at the
+ * keyboard gets the same three operations through the `/kb` command whenever the
+ * host mounted the command registry (optional, reached via `ctx.get`, never
+ * injected).
  *
  * What it is NOT, deliberately:
  *
@@ -26,6 +29,7 @@
  *  - ctx.tools.register(defineTool(...))   @deepseek-ai/dsh-tools
  *  - ctx.systemPrompt.section({...})       @deepseek-ai/dsh-system-prompt
  *  - ctx.effect(() => cleanup)             cordis v4 fiber teardown
+ *  - ctx.get('commands').register({...})   @deepseek-ai/dsh-commands (optional)
  *
  * @module dsh-knowledge-base
  */
@@ -34,6 +38,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import { MissionStoreRegistry, createLogger, expandHome, type AgentLike } from 'dsh-eng-core'
 import { resolveConfig, resolveEffectiveConfig, type EffectiveConfig, type KnowledgeBaseConfig } from './config.js'
 import { PROMPT_SECTION, sectionText } from './prompt.js'
+import { KB_COMMAND_NAME, registerKbCommand } from './command.js'
 import { registerTools, type ToolDeps } from './tools.js'
 
 export const name = 'dsh-knowledge-base'
@@ -52,6 +57,7 @@ interface PromptRuntimeLike {
 interface ContextLike {
     tools: ToolRuntimeLike
     systemPrompt: PromptRuntimeLike
+    get: (name: string) => unknown
     effect: (execute: () => (() => void) | void) => void
 }
 
@@ -97,6 +103,12 @@ export function apply(ctx: Context, config: unknown = {}): void {
         if (tools.failed.length > 0) log.warn(`tools that failed to register: ${tools.failed.join(', ')}`)
 
         const disposers: (() => void)[] = [...tools.disposers]
+        // `/kb` is registered only when the host mounted the command registry:
+        // the accessor is `ctx.get`, not `inject`, so a minimal host without
+        // `@deepseek-ai/dsh-commands` still loads this plugin (see command.ts).
+        const command = registerKbCommand(context, deps)
+        if (command.dispose !== undefined) disposers.push(command.dispose)
+        if (command.problem !== undefined) log.warn(command.problem)
         if (resolved.prompt.enabled) {
             disposers.push(
                 context.systemPrompt.section({
@@ -133,7 +145,7 @@ export function apply(ctx: Context, config: unknown = {}): void {
         })
 
         log.info(
-            `applied (tools: ${tools.registered.join(', ') || 'none'}; indexDir=${resolved.indexDir}; sources=${resolved.sources
+            `applied (tools: ${tools.registered.join(', ') || 'none'}; command: ${command.registered ? `/${KB_COMMAND_NAME}` : 'none'}; indexDir=${resolved.indexDir}; sources=${resolved.sources
                 .filter((source) => source.enabled)
                 .map((source) => source.id)
                 .join(',')}; limit=${resolved.search.limit}/${resolved.search.maxLimit}; cjkBigrams=${resolved.tokenizer.cjkBigrams})`,
@@ -142,5 +154,10 @@ export function apply(ctx: Context, config: unknown = {}): void {
         log.error('apply failed:', error)
     }
 }
+
+// The fingerprint the artifact records, exported so a sibling surface (the CLI
+// entry point, a doctor) can compare with the same function the index was built
+// with instead of raw `gitFingerprint`.
+export { indexFingerprint, indexSpecPath } from './index-store.js'
 
 export type { KnowledgeBaseConfig, EffectiveConfig }

@@ -25,6 +25,26 @@
 
 报告全部是中文，以「下一步：…」结尾；每个拒绝都给出可执行的修法。
 
+## `/kb`：人可以直接敲的命令（可选，需要宿主装配 `@deepseek-ai/dsh-commands`）
+
+模型有 `kb_index` / `kb_search` / `kb_status`，人则有 `/kb`：**不经过模型**（不花 token、不产生一次对话回合），
+处理器在收到命令的那个 agent 上直接执行，并且与工具**共用同一份实现与同一份报告**——同一段引用格式、同一句拒绝、
+同一个跳过原因，不会一个说法给模型、另一个说法给人。
+
+```
+/kb index [--force] [--source <id>]…                 构建/重建索引（唯一会写盘的子命令）
+/kb search <关键词…> [--limit N] [--kind <kind>] [--prefix <path>]   检索（只读）
+/kb status                                           状态与新鲜度（只读）
+/kb help                                             用法（空的 `/kb` 同样打印用法）
+```
+
+- **可选集成**：注册表通过 `ctx.get('commands')` 访问，**不写进 `inject`**：宿主没装 `dsh-commands` 时插件照常加载，
+  只是不注册 `/kb`（日志说明原因）；`register()` 抛异常也只记一条警告，三个工具与提示词段不受影响。
+- **语法失败就是错误**：不认得的子命令/参数、缺值、越界的 `--limit`、未知的 `--kind`/`--source` 都返回
+  **错误结果 + 完整用法**，不会静默地"跑过了但什么都没说"。
+- **只读边界**：`search` / `status` / `help` 不写任何文件（测试用 `.dsh` 逐字节快照证明）；只有 `index` 会写索引目录。
+- 工具里的拒绝（缺索引、被宿主禁用、query 分词为空…）在这里变成**错误结果**，文字与工具端一模一样。
+
 ## 配置（两层：profile 是上限，项目只能收紧）
 
 ```yaml
@@ -98,6 +118,12 @@
   来源自身读不到产物等情况，`kb_search` / `kb_status` 都会转述。
 - **新鲜度（相对当前工作区）**：`kb_search` / `kb_status` 用 git 指纹判定 —— HEAD、分支、`git diff HEAD` 摘要、
   改动数任一不同即**过期**，并在报告最前面说明原因；不是 git 仓库时报告"**无法判定**"而不是假装新鲜。
+- **索引目录不进指纹**：构建与比较都用 `indexFingerprint(cwd, indexDir)`（`index-store.ts` 导出，包根也导出），
+  它用 git pathspec `:(top,exclude,literal)<indexDir>` 把索引目录从 status 与 diff 摘要里排除，`dirty` 与改动数同步跟进。
+  否则刚建好的索引会被自己的产物判成过期（真实现场：`.dsh/kb/` 没写进 `.gitignore`，`kb_index` 之后 `kb_search` 报
+  "工作区改动数从 0 变成 0"）；把产物**提交**进版本库的仓库（README 允许）也不会因为 `builtAt` 变动而自我失效。
+  需要比对新旧的其他面（例如 CLI 入口 `scripts/kb.mjs`）也应调用同一个函数，而不是裸 `gitFingerprint`。
+  这个排除只点名索引目录本身：`.dsh/` 下**别的**文件（如 `.dsh/plan.jsonl`）照旧算改动。
 - **`kb_index` 不靠指纹**：它按**内容**比对重建结果，未变才说"未变"且不重写文件。
   指纹的已知盲区（未跟踪文件的**内容**改动不改变 `git diff HEAD`）因此不会变成"假装最新"。
 
@@ -111,6 +137,7 @@
 | `dsh-impact-gate` | 影响面给的是"改了哪些文件"，本插件能回答"这些文件在规格/决策/台账里被谁引用" |
 | `dsh-standards-gate` | 代码符号来自同一套提取器（`dsh-eng-core` 的 `scanWorkspace`），所以"符号"在两个插件里是同一个定义 |
 | `dsh-audit-trail` | 检索是**只读**的（测试用 `.dsh` 逐字节快照证明），不会污染审计轨迹 |
+| `@deepseek-ai/dsh-commands` | **可选**：装配了就多一条人类命令 `/kb …`（与三个工具共用同一份报告，不经模型、不花 token）；没装配不影响任何工具 |
 
 ## 诚实的边界
 

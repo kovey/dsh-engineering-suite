@@ -18,9 +18,9 @@
 
 import path from 'node:path'
 import process from 'node:process'
-import { gitFingerprint, resolveLayout } from '../packages/dsh-eng-core/dist/index.js'
+import { resolveLayout } from '../packages/dsh-eng-core/dist/index.js'
 import { DEFAULT_SOURCES, resolveConfig } from '../packages/dsh-knowledge-base/dist/config.js'
-import { buildIndex, indexDirOf, loadIndex, stalenessOf } from '../packages/dsh-knowledge-base/dist/index-store.js'
+import { buildIndex, indexDirOf, indexFingerprint, loadIndex, stalenessOf } from '../packages/dsh-knowledge-base/dist/index-store.js'
 import { searchIndex } from '../packages/dsh-knowledge-base/dist/search.js'
 
 const USAGE = `usage:
@@ -69,7 +69,7 @@ if (loaded.manifest === undefined) {
 }
 
 if (action === 'status') {
-    const staleness = stalenessOf(loaded.manifest.fingerprint, gitFingerprint(cwd))
+    const staleness = stalenessOf(loaded.manifest.fingerprint, indexFingerprint(cwd, dir))
     const lines = ['# 知识库现状', '', `工作区：${cwd}`, `构建时间：${new Date(loaded.manifest.builtAt).toISOString()}`, `索引指纹：${loaded.manifest.fingerprint?.head ?? '(非 git)'}`, `分块：${loaded.manifest.totals?.chunks ?? '?'}；文档：${loaded.manifest.totals?.documents ?? '?'}`]
     if (staleness.stale || staleness.unknown === true) lines.push(`⚠️ 新鲜度：${staleness.reason ?? '(未知)'}`)
     for (const line of loaded.problems.slice(0, 5)) lines.push(`⚠️ ${line.message}`)
@@ -103,7 +103,7 @@ const outcome = searchIndex({
 })
 const lines = [`# 知识库检索：${query}`, '', `工作区：${cwd}`, `命中 ${outcome.hits.length} 条（索引构建于 ${new Date(loaded.manifest.builtAt).toISOString()}）`]
 {
-    const staleness = stalenessOf(loaded.manifest.fingerprint, gitFingerprint(cwd))
+    const staleness = stalenessOf(loaded.manifest.fingerprint, indexFingerprint(cwd, dir))
     if (staleness.stale) lines.splice(2, 0, `⚠️ 索引陈旧：可能漏掉最近的改动（${staleness.reason ?? '早于当前指纹'}），先重跑 index`)
 }
 if (outcome.hits.length === 0) lines.push('', '索引里没有匹配——如实说"索引里没有"，不要据此猜答案。')
