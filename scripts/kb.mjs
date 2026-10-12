@@ -60,9 +60,19 @@ if (action === 'index') {
         content: '（内容有更新，已写盘）',
         postings: '（倒排表有更新，已写盘）',
         fingerprint: '（内容未变，仅刷新指纹）',
+        // Two distinct facts, and the plugin tells them apart via `artifactsWritten`:
+        // a coverage change may rewrite the artifacts (documents really moved) or only
+        // the manifest (the requested scope changed but no document did). Saying
+        // "已重建" for the second case would overstate what happened.
+        coverage: '（覆盖范围变化，已按请求重建）',
         forced: '（--force 强制重建）',
     }
-    const label = CHANGE_LABEL[result.changeKind] ?? `（${result.changeKind}：已处理）`
+    const label =
+        result.changeKind === 'coverage'
+            ? result.artifactsWritten
+                ? '（覆盖范围变化：manifest 已改写，块列表与倒排索引一并重写）'
+                : '（覆盖范围变化：仅 manifest 已改写，块列表与倒排索引字节未动）'
+            : (CHANGE_LABEL[result.changeKind] ?? `（${result.changeKind}：已处理）`)
     const lines = [`# 知识库索引${label}`, '', `工作区：${cwd}`, `索引：${path.relative(cwd, result.dir)}`, `指纹：${result.fingerprint.head ?? '(非 git)'}${result.fingerprint.dirty ? ' (dirty)' : ''}`]
     for (const report of result.reports) {
         lines.push(`- ${report.kind}（${report.id}）：文档 ${report.documents}、分块 ${report.chunks}${report.skipped.length === 0 ? '' : `、跳过 ${report.skipped.length}`}`)

@@ -25,8 +25,17 @@
 
 import path from 'node:path'
 import { expandHome, type GitFingerprint } from 'dsh-eng-core'
-import type { EffectiveConfig, KnowledgeBaseConfig } from './config.js'
-import { EXACT_ID_HINT, describeChange, stalenessOf, type BuildResult, type KbManifest, type LoadedIndex } from './index-store.js'
+import type { EffectiveConfig, KbKind, KnowledgeBaseConfig } from './config.js'
+import {
+    CHUNKS_FILE,
+    EXACT_ID_HINT,
+    describeChange,
+    stalenessOf,
+    type BuildResult,
+    type KbChunk,
+    type KbManifest,
+    type LoadedIndex,
+} from './index-store.js'
 import {
     BM25_B,
     BM25_K1,
@@ -98,8 +107,18 @@ export function freshnessLines(indexed: GitFingerprint, current: GitFingerprint,
     return { lines: [`⚠️ 索引可能过期：${staleness.reason ?? ''}——最近改动可能没进索引，引用前先 kb_index 重建。`], stale: true }
 }
 
-/** Per-source coverage table used by both `kb_index` and `kb_status`. */
-export function sourceLines(manifest: KbManifest, config: KnowledgeBaseConfig): string[] {
+/**
+ * Per-source coverage table used by both `kb_index` and `kb_status`.
+ *
+ * `indexed` is what the artifact ACTUALLY holds (the chunk kinds parsed from
+ * `chunks.jsonl`); when it is given and a configured source has no row in the
+ * manifest but does have chunks on disk, that disagreement is stated instead of
+ * the convenient "not in this index"— a manifest is a claim, and the file next to
+ * it is the fact. (An index built by an older version can really be in that
+ * state: a partial → full transition used to leave the manifest claiming partial
+ * coverage over a full chunk list.)
+ */
+export function sourceLines(manifest: KbManifest, config: KnowledgeBaseConfig, indexed?: ReadonlyMap<KbKind, number>): string[] {
     const lines: string[] = []
     const byId = new Map(manifest.sources.map((source) => [source.id, source]))
     for (const source of config.sources) {
@@ -110,6 +129,14 @@ export function sourceLines(manifest: KbManifest, config: KnowledgeBaseConfig): 
             continue
         }
         if (row === undefined) {
+            const onDisk = indexed?.get(source.kind) ?? 0
+            if (onDisk > 0) {
+                lines.push(
+                    `- ${source.id}（${source.kind}）：manifest 里**没有**这一行，但磁盘上的 ${CHUNKS_FILE} 有 ${onDisk} 块属于这个来源——` +
+                        `**manifest 与产物不一致，以产物为准**；跑一次 kb_index 会把它记回来｜${pattern}`,
+                )
+                continue
+            }
             lines.push(`- ${source.id}（${source.kind}）：**不在本次索引里**（局部索引或未构建）｜${pattern}`)
             continue
         }
@@ -117,6 +144,25 @@ export function sourceLines(manifest: KbManifest, config: KnowledgeBaseConfig): 
         lines.push(`- ${source.id}（${source.kind}）：${row.documents} 篇文档 / ${row.chunks} 块；${skipped}｜${pattern}`)
     }
     return lines
+}
+
+/** How many chunks of each kind the artifact on disk really holds. */
+export function indexedKindCounts(chunks: readonly KbChunk[]): Map<KbKind, number> {
+    const counts = new Map<KbKind, number>()
+    for (const chunk of chunks) counts.set(chunk.kind, (counts.get(chunk.kind) ?? 0) + 1)
+    return counts
+}
+
+/**
+ * Sources whose documents are IN the artifact while the manifest does not claim
+ * them (the manifest-versus-disk disagreement `sourceLines` reports). Used by
+ * `kb_status` to say the index is really wider than its own record.
+ */
+export function unrecordedCoverage(manifest: KbManifest, config: KnowledgeBaseConfig, indexed: ReadonlyMap<KbKind, number>): string[] {
+    const recorded = new Set(manifest.sources.map((source) => source.id))
+    return config.sources
+        .filter((source) => source.enabled && !recorded.has(source.id) && (indexed.get(source.kind) ?? 0) > 0)
+        .map((source) => `${source.id}（${indexed.get(source.kind) ?? 0} 块）`)
 }
 
 /** Skipped entries with reasons, bounded. */
@@ -208,7 +254,11 @@ export function renderIndexReport(input: IndexReportInput): string {
             ? '索引已是最新，未变（块列表与倒排索引的字节和现有产物一致；没有重写任何文件）'
             : result.changeKind === 'fingerprint'
               ? '内容未变，仅刷新了指纹（chunks.jsonl 与 postings.json 字节未动、未重写；manifest.json 已记下新的指纹与 builtAt）'
-              : `索引已重建：${describeChange(result.changeKind)}`
+              : result.changeKind === 'coverage'
+                ? result.artifactsWritten
+                    ? '来源覆盖变了：本次请求的来源集合与 manifest 记录的不同——manifest 已按请求改写，块列表与倒排索引也一并重写（请求的范围不同，索引里的文档确实变了）'
+                    : '来源覆盖变了：本次请求的来源集合与 manifest 记录的不同——manifest 已按请求改写（chunks.jsonl 与 postings.json 的字节未动、未重写：这次请求没有多收或少收任何文档）'
+                : `索引已重建：${describeChange(result.changeKind)}`
     const lines: string[] = []
     lines.push(`知识库索引：${headline}`)
     if (result.changeKind === 'fingerprint') {
@@ -220,10 +270,27 @@ export function renderIndexReport(input: IndexReportInput): string {
                 '所以块列表与倒排索引保持原字节——变了的是工作区，不是被索引的内容）。',
         )
     }
+    if (result.changeKind === 'coverage' && result.coverageChange !== undefined) {
+        // Name the transition itself: "the manifest said X, you asked for Y" is
+        // the fact a reader needs to judge what this index does and does not
+        // cover now.
+        const { recorded, requested } = result.coverageChange
+        const show = (ids: readonly string[]): string => (ids.length === 0 ? '（无）' : ids.join('、'))
+        const added = recorded === undefined ? [] : requested.filter((id) => !recorded.includes(id))
+        const removed = recorded === undefined ? [] : recorded.filter((id) => !requested.includes(id))
+        const delta: string[] = []
+        if (added.length > 0) delta.push(`新增 ${added.join('、')}`)
+        if (removed.length > 0) delta.push(`移出 ${removed.join('、')}`)
+        lines.push(
+            `来源覆盖变化：manifest 记录 ${recorded === undefined ? '（读不出来，按需要重写处理）' : show(recorded)} → 本次请求 ${show(requested)}` +
+                `${delta.length === 0 ? '' : `（${delta.join('；')}）`}。manifest.json 现在记的就是本次请求的覆盖，` +
+                '`kb_status` / `kb_search` 转述的也是它。',
+        )
+    }
     lines.push(`索引目录：${displayPath(cwd, result.dir)}（manifest.json / chunks.jsonl / postings.json）`)
     lines.push(`指纹：${fingerprintLine(result.fingerprint)}`)
     lines.push('来源覆盖：')
-    lines.push(...sourceLines(result.manifest, config))
+    lines.push(...sourceLines(result.manifest, config, indexedKindCounts(result.chunks)))
     lines.push(`合计：${result.manifest.totals.documents} 篇文档 / ${result.manifest.totals.chunks} 块；跳过 ${result.manifest.totals.skipped} 项（下面是原因）`)
     const notes = result.reports.flatMap((report) => report.notes.map((note) => `- [${report.id}] ${note}`))
     if (notes.length > 0) {
@@ -348,6 +415,11 @@ export function renderStatusReport(input: StatusReportInput): string {
         return lines.join('\n')
     }
     const manifest = loaded.manifest
+    // What is REALLY indexed (parsed out of chunks.jsonl) versus what the manifest
+    // claims: the two can disagree in an index built by an older version, and the
+    // difference must be visible instead of being resolved in favour of the claim.
+    const indexedKinds = indexedKindCounts(loaded.chunks)
+    const unrecorded = unrecordedCoverage(manifest, config, indexedKinds)
     lines.push(`索引目录：${ignored}（${humanBytes(loaded.totalBytes)}；manifest.json / chunks.jsonl / postings.json）`)
     lines.push(`构建时间：${manifest.builtAt}；格式版本：${manifest.version}`)
     lines.push(`指纹（构建时）：${fingerprintLine(manifest.fingerprint)}`)
@@ -359,7 +431,13 @@ export function renderStatusReport(input: StatusReportInput): string {
         }`,
     )
     lines.push('按来源：')
-    lines.push(...sourceLines(manifest, config))
+    lines.push(...sourceLines(manifest, config, indexedKinds))
+    if (unrecorded.length > 0) {
+        lines.push(
+            `⚠️ manifest 的来源覆盖与磁盘不一致：${unrecorded.join('、')} 的文档**已经在索引里**，但 manifest 没有记这一行——` +
+                '上面这些来源按产物为准（本次检索确实能命中它们）；`kb_index` 会把 manifest 改写成与产物一致。',
+        )
+    }
     lines.push('跳过明细：')
     lines.push(...skippedLines(manifest))
     lines.push(`索引自身声明的局限：${manifest.staleness === undefined ? '无（构建时未发现被截断或不完整的覆盖）' : manifest.staleness.reason}`)
@@ -386,12 +464,16 @@ export function renderStatusReport(input: StatusReportInput): string {
     lines.push(
         '新鲜度说明：上面的判定基于 git 指纹（HEAD/分支/diff 指纹/改动数），**未跟踪文件的内容改动不会改变指纹**，所以"一致"不等于"一定最新"；' +
             `比较时索引目录（${ignored}）被排除——重建产物不会把索引自己判成过期。要确定就跑 \`kb_index\`：它按内容比对，内容未变、指纹也一致才明说"未变"且不重写任何文件；` +
-            '内容未变但指纹变了（例如编辑了 `.gitignore` 这类没被索引的跟踪文件）则只刷新 manifest.json 的指纹与 builtAt，块列表与倒排索引的字节保持不动，上面的"陈旧"随之消失。',
+            '内容未变但指纹变了（例如编辑了 `.gitignore` 这类没被索引的跟踪文件）则只刷新 manifest.json 的指纹与 builtAt，块列表与倒排索引的字节保持不动，上面的"陈旧"随之消失；' +
+            '请求的来源覆盖和 manifest 记的不一样（`only` 局部构建、或改了来源的 `enabled`）时，manifest 会被改写成本次请求的覆盖（报告写"来源覆盖变了"），' +
+            '块列表与倒排索引只在文档集合真的变了时才跟着重写——所以"来源覆盖变了"既不是"未变"，也不是"仅刷新了指纹"。',
     )
     lines.push(
         freshness.stale
             ? '下一步：先 `kb_index` 重建索引——内容真变了它按新内容重建，只是指纹变了它只刷新指纹，两种情况都会让上面的警告消失；然后 `kb_search` 引用。'
-            : '下一步：`kb_search` 检索；改了规格/决策/文档/代码后重新 `kb_index`；引用时照抄 `path:from-to`。',
+            : unrecorded.length > 0
+              ? '下一步：跑一次 `kb_index`——它会按当前请求的来源覆盖改写 manifest，上面的"manifest 与产物不一致"随之消失（产物本身没问题）；然后 `kb_search` 引用。'
+              : '下一步：`kb_search` 检索；改了规格/决策/文档/代码后重新 `kb_index`；引用时照抄 `path:from-to`。',
     )
     return lines.join('\n')
 }

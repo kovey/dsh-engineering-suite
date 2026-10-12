@@ -8,7 +8,8 @@
  *    builds of an unchanged repository therefore produce byte-identical
  *    `chunks.jsonl`, and only `manifest.json`'s `builtAt` moves. That is what
  *    lets a reviewer diff a rebuild instead of re-reading it. A workspace whose
- *    fingerprint moved while its indexed content did not gets the manifest
+ *    fingerprint moved while its indexed content did not — or a build asked for
+ *    a different set of sources than the manifest records — gets the manifest
  *    rewritten and those two files left alone.
  *  - **Nothing partial is ever visible.** Every file is written to a temporary
  *    sibling and renamed into place; `manifest.json` is written LAST, so a
@@ -24,10 +25,16 @@
  * The rebuild never merges with the previous index: whenever the content changed
  * it replaces all three files together. A merge would keep a chunk of a file
  * that no longer exists, which is exactly the stale-fact failure a knowledge base
- * must not have. The ONE exception is a fingerprint-only refresh: the indexed
- * content is byte-identical, so the chunk list and the postings are left on disk
- * untouched and only the manifest records the new fingerprint (see
- * `changeKind: 'fingerprint'` in {@link buildIndex}).
+ * must not have. TWO exceptions write `manifest.json` alone, and both are taken
+ * only when the computed chunk list and postings are byte-identical to the ones
+ * on disk — so neither of them weakens the rule above:
+ *
+ *  - a fingerprint-only refresh, which records the workspace's new fingerprint
+ *    (`changeKind: 'fingerprint'`);
+ *  - a coverage-only change: the sources this build was ASKED for are not the
+ *    ones the manifest records (`changeKind: 'coverage'`), which happens when a
+ *    partial (`only`) build is followed by a full one, or the other way round —
+ *    see {@link buildIndex}.
  *
  * @module dsh-knowledge-base/index-store
  */
@@ -157,13 +164,36 @@ export interface BuildInput {
 /**
  * Why a build counted as "changed" (for the report).
  *
- * `'forced'` and `'fingerprint'` are NOT the same fact and must not be merged:
- * `'forced'` means "the caller asked for a rewrite" (`force: true`), while
- * `'fingerprint'` means "the indexed content did not change, but the workspace's
- * recorded fingerprint had moved, so the manifest was refreshed on the build's
- * own initiative" — see `buildIndex`.
+ * Each kind names ONE fact, and the facts are never merged. When several hold at
+ * once the STRONGEST one is reported, and this is the order (documented in the
+ * README's change-kind table, asserted by the tests, applied in {@link buildIndex}):
+ *
+ * 1. `'created'` — there is no manifest to compare with at all.
+ * 2. `'coverage'` — the sources this build was ASKED for differ from the ones the
+ *    manifest records. It outranks `'content'` because it explains the byte move
+ *    (a narrower/wider source set collects a different document set) and because
+ *    it is the fact the manifest had wrong; the coverage report states whether
+ *    the chunk list was rewritten as well.
+ * 3. `'content'` — the chunk list bytes differ: the indexed content moved.
+ * 4. `'postings'` — the chunk list is byte-identical, the inverted index is not
+ *    (the tokenizer/scoring configuration changed).
+ * 5. `'forced'` — the caller asked for a rewrite (`force: true`) while nothing
+ *    substantive was different; it outranks `'fingerprint'` because an explicit
+ *    force is never a refresh on the build's own initiative.
+ * 6. `'fingerprint'` — the indexed content did not change, but the workspace's
+ *    recorded fingerprint had moved, so the manifest was refreshed on the build's
+ *    own initiative.
+ * 7. `'unchanged'` — nothing differs; nothing is written, not one byte.
  */
-export type ChangeKind = 'unchanged' | 'created' | 'content' | 'postings' | 'forced' | 'fingerprint'
+export type ChangeKind = 'unchanged' | 'created' | 'coverage' | 'content' | 'postings' | 'forced' | 'fingerprint'
+
+/** What a build asked for versus what the previous manifest recorded. */
+export interface CoverageChange {
+    /** The source ids the previous manifest recorded (`undefined`: it could not be read). */
+    recorded?: string[]
+    /** The source ids THIS build was asked for (config `enabled` after `only`). */
+    requested: string[]
+}
 
 /** Result of one build. */
 export interface BuildResult {
@@ -175,6 +205,14 @@ export interface BuildResult {
     /** Whether anything was written. */
     changed: boolean
     changeKind: ChangeKind
+    /**
+     * Whether `chunks.jsonl` and `postings.json` were (re)written. `false` means
+     * only `manifest.json` moved — the case for `'fingerprint'` and for a
+     * `'coverage'` change whose computed bytes already match the ones on disk.
+     */
+    artifactsWritten: boolean
+    /** Set when `changeKind` is `'coverage'`: the recorded and requested source ids. */
+    coverageChange?: CoverageChange
     fingerprint: GitFingerprint
     /** Structural problems (a duplicate document id, a version bump…). */
     problems: string[]
@@ -414,6 +452,41 @@ function sameFingerprint(recorded: GitFingerprint | undefined, current: GitFinge
     )
 }
 
+/**
+ * The source ids a previous manifest recorded as covered, in the order it wrote
+ * them, or `undefined` when they cannot be read (no manifest text, unparsable
+ * JSON, a shape this build does not recognise). `undefined` is never treated as
+ * "equal to what was requested": coverage that cannot be read must be rewritten,
+ * not assumed.
+ */
+function recordedCoverage(manifestText: string | undefined): string[] | undefined {
+    if (manifestText === undefined) return undefined
+    try {
+        const parsed: unknown = JSON.parse(manifestText)
+        if (typeof parsed !== 'object' || parsed === null) return undefined
+        const sources = (parsed as Record<string, unknown>)['sources']
+        if (!Array.isArray(sources)) return undefined
+        const ids: string[] = []
+        for (const source of sources) {
+            if (typeof source !== 'object' || source === null) return undefined
+            const id = (source as Record<string, unknown>)['id']
+            if (typeof id !== 'string') return undefined
+            ids.push(id)
+        }
+        return ids
+    } catch {
+        return undefined
+    }
+}
+
+/** Whether the coverage a manifest recorded is the coverage a build was asked for (as a set). */
+function sameCoverage(recorded: string[] | undefined, requested: readonly string[]): boolean {
+    if (recorded === undefined) return false
+    const seen = [...recorded].sort(compareText)
+    const wanted = [...requested].sort(compareText)
+    return seen.length === wanted.length && seen.every((id, index) => id === wanted[index])
+}
+
 /** Whether a parsed value looks like a chunk row. */
 function isChunk(value: unknown): value is KbChunk {
     if (typeof value !== 'object' || value === null) return false
@@ -561,6 +634,10 @@ export function buildIndex(input: BuildInput): BuildResult {
         enabled: source.enabled && (only.length === 0 || only.includes(source.id)),
     }))
     const partial = only.length > 0
+    // The coverage THIS build was asked for. A source the host disabled is not
+    // requested coverage (it is in no manifest either), and `only` narrows the
+    // request exactly as `collectDocuments` will.
+    const requestedCoverage = sources.filter((source) => source.enabled).map((source) => source.id)
 
     // The index directory is excluded from the fingerprint (status, diff digest
     // and the dirty flag): a build must not make the workspace dirty and then
@@ -645,31 +722,64 @@ export function buildIndex(input: BuildInput): BuildResult {
     // it. So a moved fingerprint is a change of its own kind, and only the
     // manifest is rewritten for it.
     const fingerprintMoved = !created && !sameFingerprint(recordedFingerprint(previousManifest), fingerprint)
+    // The third judgement of the same family: what the caller ASKED this build to
+    // cover versus what the manifest records. Bytes alone cannot see it — a
+    // partial build whose excluded sources happen to contribute no document
+    // produces exactly the artifact a full build produces — so a manifest that
+    // claimed partial coverage stayed partial forever (and a request for partial
+    // coverage was never recorded at all), while `kb_status` kept describing the
+    // index as narrower than what it actually held. Precedence (see
+    // {@link ChangeKind}): created > coverage > content > postings > forced >
+    // fingerprint > unchanged.
+    const recorded = !created ? recordedCoverage(previousManifest) : undefined
+    const coverageChanged = !created && !sameCoverage(recorded, requestedCoverage)
+    const bytesMoved = contentChanged || postingsChanged
     let changeKind: ChangeKind = 'unchanged'
-    if (input.force === true && !created && !contentChanged && !postingsChanged) changeKind = 'forced'
-    else if (created) changeKind = 'created'
+    if (created) changeKind = 'created'
+    else if (coverageChanged) changeKind = 'coverage'
     else if (contentChanged) changeKind = 'content'
     else if (postingsChanged) changeKind = 'postings'
+    else if (input.force === true) changeKind = 'forced'
     else if (fingerprintMoved) changeKind = 'fingerprint'
     const changed = changeKind !== 'unchanged'
+    // Which files this build rewrites. The manifest always is (that is what makes
+    // the recorded coverage and fingerprint true again); the two content artifacts
+    // only when their computed bytes differ from the ones on disk, or when the
+    // caller asked for a rewrite.
+    //
+    // A fingerprint-only or coverage-only change skips them on purpose: this
+    // branch is taken exactly when the computed chunk list and postings are
+    // byte-identical to the ones on disk, and leaving them untouched is what
+    // keeps "two builds of an unchanged repository produce identical bytes" true
+    // down to the file mtime.
+    const writeArtifacts = changed && (created || bytesMoved || changeKind === 'forced')
     if (changed) {
         ensureDir(dir)
         // Order matters: the chunk list first, then the index that describes it,
         // then the manifest that commits to both. A crash in between leaves the
         // old manifest pointing at an index the digest check will flag.
-        //
-        // A fingerprint-only refresh skips the first two on purpose: this branch
-        // is taken exactly when the computed chunk list and postings are
-        // byte-identical to the ones on disk, and leaving them untouched is what
-        // keeps "two builds of an unchanged repository produce identical bytes"
-        // true down to the file mtime.
-        if (changeKind !== 'fingerprint') {
+        if (writeArtifacts) {
             writeTextAtomic(files.chunks, chunksText)
             writeTextAtomic(files.postings, postingsText)
         }
         writeTextAtomic(files.manifest, manifestText)
     }
-    return { dir, manifest, chunks, postings, reports, changed, changeKind, fingerprint, problems, files }
+    return {
+        dir,
+        manifest,
+        chunks,
+        postings,
+        reports,
+        changed,
+        changeKind,
+        artifactsWritten: writeArtifacts,
+        ...(changeKind === 'coverage'
+            ? { coverageChange: { ...(recorded === undefined ? {} : { recorded }), requested: requestedCoverage } }
+            : {}),
+        fingerprint,
+        problems,
+        files,
+    }
 }
 
 /** Human label of a change kind (used by the report). */
@@ -677,6 +787,8 @@ export function describeChange(kind: ChangeKind): string {
     switch (kind) {
         case 'created':
             return '首次构建'
+        case 'coverage':
+            return '来源覆盖与 manifest 记录的不一致（本次请求的来源集合不同，manifest 已按请求改写）'
         case 'content':
             return '内容有变化（块列表已重写）'
         case 'postings':

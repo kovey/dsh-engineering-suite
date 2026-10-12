@@ -1270,6 +1270,212 @@ test('a real content change is still reported as content (not as a fingerprint r
     assert.ok(!chunksFirst.equals(fs.readFileSync(second.files.chunks)), 'the chunk list must be rewritten')
 })
 
+// ---------------------------------------------------------------------------
+// Item 4 — the third judgement: the COVERAGE a build was ASKED for
+//
+// `kb_index` compared the built bytes and the git fingerprint, but never the set
+// of sources the caller asked for. A partial build whose excluded sources happen
+// to contribute no document computes exactly the artifact a full build computes,
+// so the request was reported as "索引已是最新，未变" and nothing was written: a
+// manifest that claimed partial coverage stayed partial forever (and a request
+// for partial coverage over a full index was never recorded at all), while
+// `kb_status` kept describing the index as narrower than the chunks on disk.
+// ---------------------------------------------------------------------------
+
+/** The source ids a manifest on disk records, in file order. */
+function sourceIdsOf(file: string): string[] {
+    const sources = manifestOf(file)['sources']
+    assert.ok(Array.isArray(sources), `${MANIFEST_FILE} must record its sources`)
+    return sources.map((source) => (source as { id: string }).id)
+}
+
+/** The `staleness.reason` a manifest on disk records, or `''`. */
+function stalenessReasonOf(file: string): string {
+    const staleness = manifestOf(file)['staleness']
+    return typeof staleness === 'object' && staleness !== null ? String((staleness as { reason?: unknown }).reason ?? '') : ''
+}
+
+test('(regression) full → partial → full names the coverage change, and every surface agrees', async () => {
+    const { cwd } = fixture('kb-coverage-report-')
+    const fake = host(cwd)
+    const manifestFile = path.join(cwd, '.dsh', 'kb', MANIFEST_FILE)
+    assert.match(await text(fake, 'kb_index'), /首次构建/)
+
+    // The partial build shrinks the artifact AND changes what was asked for: the
+    // coverage is the fact the manifest got wrong, so it is the kind reported.
+    const partial = await text(fake, 'kb_index', { only: ['docs'] })
+    assert.match(partial, /^知识库索引：来源覆盖变了：/m)
+    assert.match(partial, /来源覆盖变化：manifest 记录 spec、adr、trail、plan、docs、code → 本次请求 docs（移出 spec、adr、trail、plan、code）/)
+    assert.deepEqual(sourceIdsOf(manifestFile), ['docs'])
+    assert.match(stalenessReasonOf(manifestFile), /局部索引/)
+
+    // The reproduced sequence's third build: the content is the full set again and
+    // so is the request. Whatever it says, it must never be "nothing changed".
+    const rebuilt = await text(fake, 'kb_index')
+    assert.doesNotMatch(rebuilt, /索引已是最新，未变/)
+    assert.doesNotMatch(rebuilt, /仅刷新了指纹/)
+    assert.match(rebuilt, /^知识库索引：来源覆盖变了：.*块列表与倒排索引也一并重写/m)
+    assert.match(rebuilt, /来源覆盖变化：manifest 记录 docs → 本次请求 spec、adr、trail、plan、docs、code（新增 spec、adr、trail、plan、code）/)
+    assert.deepEqual(sourceIdsOf(manifestFile), ['spec', 'adr', 'trail', 'plan', 'docs', 'code'])
+    assert.equal(manifestOf(manifestFile)['staleness'], undefined, 'the partial limitation must be gone')
+
+    // kb_status derives its coverage from the manifest the build just wrote, so
+    // the index is no longer described as narrower than it is.
+    const status = await text(fake, 'kb_status')
+    assert.doesNotMatch(status, /不在本次索引里/)
+    assert.doesNotMatch(status, /局部索引/)
+    assert.doesNotMatch(status, /manifest 与产物不一致/)
+    for (const id of ['spec', 'adr', 'trail', 'plan', 'docs', 'code']) assert.match(status, new RegExp(`- ${id}（${id}）：\\d+ 篇文档`))
+})
+
+test('(regression) a coverage change with byte-identical content still writes the manifest (both directions)', () => {
+    // A repository where the five non-docs sources contribute no document at all:
+    // the full build and the docs-only build compute the same bytes, which is
+    // exactly the case the byte comparison cannot see.
+    const cwd = plainRepo('kb-coverage-empty-', { ignoreKb: true })
+    const layout = new MissionStoreRegistry().for(cwd).layout
+    const config = configOf()
+    const partial = buildIndex({ cwd, layout, config, now: RECORDED_AT, only: ['docs'] })
+    assert.equal(partial.changeKind, 'created')
+    assert.deepEqual(sourceIdsOf(partial.files.manifest), ['docs'])
+    const chunksAfterPartial = fs.readFileSync(partial.files.chunks)
+    const postingsAfterPartial = fs.readFileSync(partial.files.postings)
+
+    // partial → full: pre-fix this said "索引已是最新，未变" and the manifest kept
+    // claiming partial coverage forever.
+    const full = buildIndex({ cwd, layout, config, now: RECORDED_AT + 60_000 })
+    assert.equal(full.changeKind, 'coverage', 'a full request over a partial manifest is never "unchanged"')
+    assert.equal(full.changed, true)
+    assert.equal(full.artifactsWritten, false, 'the document set did not move, so the content artifacts are left alone')
+    assert.deepEqual(sourceIdsOf(full.files.manifest), ['spec', 'adr', 'trail', 'plan', 'docs', 'code'])
+    assert.equal(manifestOf(full.files.manifest)['staleness'], undefined)
+    assert.ok(chunksAfterPartial.equals(fs.readFileSync(full.files.chunks)), 'chunks.jsonl must keep its bytes')
+    assert.ok(postingsAfterPartial.equals(fs.readFileSync(full.files.postings)), 'postings.json must keep its bytes')
+    assert.equal(stalenessOf(full.fingerprint, indexFingerprint(cwd, full.dir)).stale, false)
+
+    // full → partial: the same judgement the other way round — the narrower
+    // coverage the caller asked for must be recorded, not dropped as "no change".
+    const narrower = buildIndex({ cwd, layout, config, now: RECORDED_AT + 120_000, only: ['docs'] })
+    assert.equal(narrower.changeKind, 'coverage')
+    assert.equal(narrower.artifactsWritten, false)
+    assert.deepEqual(sourceIdsOf(narrower.files.manifest), ['docs'])
+    assert.match(stalenessReasonOf(narrower.files.manifest), /局部索引/)
+    assert.ok(chunksAfterPartial.equals(fs.readFileSync(narrower.files.chunks)), 'chunks.jsonl must keep its bytes')
+})
+
+test('(regression) partial → full indexes the previously excluded sources (and says why it changed)', async () => {
+    const { cwd } = fixture('kb-coverage-restore-')
+    const fake = host(cwd)
+    assert.match(await text(fake, 'kb_index', { only: ['docs'] }), /首次构建/)
+    // `PORT` only exists in the excluded `code` source (src/health.ts).
+    const before = await text(fake, 'kb_search', { query: 'PORT' })
+    assert.doesNotMatch(before, /src\/health\.ts/, 'the excluded source really is not in the partial index yet')
+    assert.match(before, /索引里没有匹配/)
+
+    const full = await text(fake, 'kb_index')
+    assert.match(full, /^知识库索引：来源覆盖变了：/m)
+    assert.doesNotMatch(full, /索引已是最新，未变/)
+    const after = await text(fake, 'kb_search', { query: 'PORT' })
+    assert.match(after, /src\/health\.ts/, 'the full build must put the excluded sources back into the index')
+    assert.doesNotMatch(after, /索引里没有匹配/)
+})
+
+test('(regression) the documented precedence: coverage outranks content, content outranks a fingerprint-only move', () => {
+    const { cwd } = fixture('kb-precedence-')
+    const layout = new MissionStoreRegistry().for(cwd).layout
+    const config = configOf()
+    assert.equal(buildIndex({ cwd, layout, config, now: RECORDED_AT }).changeKind, 'created')
+
+    // Coverage AND content move together: the coverage is named (it is the fact
+    // the manifest had wrong) and the report says the bytes moved too.
+    const partial = buildIndex({ cwd, layout, config, now: RECORDED_AT + 60_000, only: ['docs'] })
+    assert.equal(partial.changeKind, 'coverage')
+    assert.equal(partial.artifactsWritten, true, 'the document set moved, so the content artifacts were rewritten')
+
+    // Same coverage, content moved inside it: now content is the fact to name.
+    fs.appendFileSync(path.join(cwd, 'docs', 'guide.md'), '\n优先级测试：PORT 由 scripts/verify.sh 检查。\n')
+    const content = buildIndex({ cwd, layout, config, now: RECORDED_AT + 120_000, only: ['docs'] })
+    assert.equal(content.changeKind, 'content', 'an unchanged coverage must let the content change be named')
+    assert.ok(fs.readFileSync(content.files.chunks, 'utf8').includes('优先级测试'))
+
+    // Coverage, content and the fingerprint all move at once: coverage wins, and
+    // the rewritten bytes prove neither of the other two facts was skipped.
+    const widened = buildIndex({ cwd, layout, config, now: RECORDED_AT + 180_000 })
+    assert.equal(widened.changeKind, 'coverage')
+    assert.equal(widened.artifactsWritten, true)
+    const chunksText = fs.readFileSync(widened.files.chunks, 'utf8')
+    assert.ok(chunksText.includes('优先级测试'), 'the moved content is in the rewritten artifact')
+    assert.ok(chunksText.includes('src/health.ts'), 'and so are the previously excluded sources')
+    assert.equal(stalenessOf(widened.fingerprint, indexFingerprint(cwd, widened.dir)).stale, false)
+})
+
+test('(regression) kb_status reads coverage from the artifact, not only from the manifest', async () => {
+    const { cwd } = fixture('kb-status-coverage-')
+    const fake = host(cwd)
+    assert.equal((await call(fake, 'kb_index')).isError, false)
+    const manifestFile = path.join(cwd, '.dsh', 'kb', MANIFEST_FILE)
+
+    // The state an index built by the buggy version is left in: the manifest
+    // claims docs-only coverage while chunks.jsonl holds the full document set.
+    const manifest = manifestOf(manifestFile)
+    const docsRow = (manifest['sources'] as { id: string }[]).filter((source) => source.id === 'docs')
+    fs.writeFileSync(
+        manifestFile,
+        `${JSON.stringify({ ...manifest, sources: docsRow, staleness: { reason: '局部索引：kb_index 的 only 参数只构建了 docs，其它来源的文档不在索引里' } }, undefined, 2)}\n`,
+    )
+
+    const status = await text(fake, 'kb_status')
+    assert.doesNotMatch(status, /不在本次索引里/, 'a source whose chunks are on disk is not "not in this index"')
+    assert.match(status, /manifest 与产物不一致/)
+    assert.match(status, /manifest 的来源覆盖与磁盘不一致：spec（\d+ 块）/)
+    assert.match(status, /code（\d+ 块）/)
+    assert.match(status, /下一步：跑一次 `kb_index`/)
+
+    // One plain kb_index repairs the record: the manifest is rewritten to what
+    // was requested — a coverage change, never "nothing changed".
+    const repaired = await text(fake, 'kb_index')
+    assert.match(repaired, /^知识库索引：来源覆盖变了：/m)
+    const after = await text(fake, 'kb_status')
+    assert.doesNotMatch(after, /manifest 与产物不一致/)
+    assert.doesNotMatch(after, /不在本次索引里/)
+    assert.doesNotMatch(after, /局部索引/)
+})
+
+test('(regression) an unknown only id is still refused before any byte is written', () => {
+    const { cwd } = fixture('kb-only-refused-')
+    const layout = new MissionStoreRegistry().for(cwd).layout
+    const config = configOf()
+    assert.throws(() => buildIndex({ cwd, layout, config, now: RECORDED_AT, only: ['docs', 'nope'] }), /未配置的来源：nope/)
+    assert.equal(fs.existsSync(path.join(cwd, '.dsh', 'kb')), false, 'the refusal must come before anything is written')
+
+    assert.equal(buildIndex({ cwd, layout, config, now: RECORDED_AT }).changeKind, 'created')
+    const before = snapshot(path.join(cwd, '.dsh', 'kb'))
+    assert.throws(() => buildIndex({ cwd, layout, config, now: RECORDED_AT + 60_000, only: ['nope'] }), /未配置的来源/)
+    assert.deepEqual(snapshot(path.join(cwd, '.dsh', 'kb')), before, 'a refused build must leave the existing index alone')
+    // …and the refusal is not a change kind: the next plain build is still unchanged
+    assert.equal(buildIndex({ cwd, layout, config, now: RECORDED_AT + 120_000 }).changeKind, 'unchanged')
+})
+
+test('(regression) an unchanged repeat of the SAME coverage is unchanged and writes no bytes at all', () => {
+    const cwd = plainRepo('kb-coverage-repeat-', { ignoreKb: true })
+    const layout = new MissionStoreRegistry().for(cwd).layout
+    const config = configOf()
+    assert.equal(buildIndex({ cwd, layout, config, now: RECORDED_AT, only: ['docs'] }).changeKind, 'created')
+    const partial = snapshot(path.join(cwd, '.dsh', 'kb'))
+
+    const again = buildIndex({ cwd, layout, config, now: RECORDED_AT + 60_000, only: ['docs'] })
+    assert.equal(again.changeKind, 'unchanged', 'the same request over the same content is not a coverage change')
+    assert.deepEqual(snapshot(path.join(cwd, '.dsh', 'kb')), partial, 'not one byte may be written')
+    assert.equal(manifestOf(again.files.manifest)['builtAt'], new Date(RECORDED_AT).toISOString(), 'the manifest must not be restamped')
+
+    // the same for the full coverage, after the one coverage transition
+    assert.equal(buildIndex({ cwd, layout, config, now: RECORDED_AT + 120_000 }).changeKind, 'coverage')
+    const full = snapshot(path.join(cwd, '.dsh', 'kb'))
+    const fullAgain = buildIndex({ cwd, layout, config, now: RECORDED_AT + 180_000 })
+    assert.equal(fullAgain.changeKind, 'unchanged')
+    assert.deepEqual(snapshot(path.join(cwd, '.dsh', 'kb')), full, 'not one byte may be written')
+})
+
 test('every host is disposed without a throw', () => {
     for (const fake of hosts) fake.dispose()
     assert.ok(hosts.length > 0)
