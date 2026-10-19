@@ -21,6 +21,17 @@
 > `approvalPolicy: 'never'`** 并继承 preset/sandbox（`captureDelegatedPolicyOverrides`），
 > 与我们"派出去的子代理不能自己批准什么"的立场一致，无需插件侧改动。
 >
+> **0.2.1-rc.1 / rc.2 适配记录**（基线现在 = **0.2.1-rc.2**，真机 profile 同版本）：
+> `rc.1 → rc.2` 的改动是**常规 rc 递增**——新增 2 个 UI/web 包（`dsh-client-ui-deepseek-model-label-1017`、`dsh-web-deepseek-api`），
+> 295 个包版本号前移，**我们依赖的契约一处未变**（复核：`ApprovalOutcome` 仍四词、单调守卫语义、`run_code` 模式门控、
+> PTC 仍走 `prepareExecution`、`workspaceChanges` 服务、`SpawnTeammateRequest` 字段、`commands` 注册表）。
+> 结果：**0 类型错误**、903 测试（902 通过 / 1 如实跳过）、`E2E GREEN` 且 **15/15 插件挂载**（这说明宿主版本门禁接受新范围）。
+>
+> **同时修正一处真实的文档/实现漂移**：文档从 v0.2.0 起一直写 `>=0.2.0-rc.1 <0.2.1-0`，而各包 manifest 实际声明的是
+> `>=0.2.0-rc.1 <0.2.2`。后者比文档**更松**，且在 `includePrerelease: true` 下会把**未验证的 `0.2.2-rc.1`** 也放进来
+> （用宿主自带 semver 实测）。现已统一为 `>=0.2.0-rc.1 <0.2.2-0`：接受 `0.2.0-rc.2` / `0.2.1-rc.1` / `0.2.1-rc.2` / `0.2.1`，
+> 拒绝 `0.2.2-0` 与 `0.2.2-rc.1`。历史条目不改写，在此标注。
+
 > **0.2.0-rc.2 适配记录**（本轮，**零代码改动**）：类型编译 0 错误；`verify.sh` 830/829/0/1 + OPS SELFTEST GREEN；
 > `e2e-mission.sh` 在**真机安装的 rc2** 上 GREEN，14/14 插件挂载并跑完一条 mission。
 > peer 范围**无需改动**——同一 0.2.0 线的 `>=0.2.0-rc.1 <0.2.1-0` 本来就匹配 rc.2（用宿主自带的 semver 判定：
