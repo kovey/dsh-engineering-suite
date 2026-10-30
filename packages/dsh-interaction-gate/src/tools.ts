@@ -44,6 +44,7 @@ import {
     type MissionStoreRegistry,
 } from 'dsh-eng-core'
 import {
+    describeIm,
     newQuestionToken,
     type AwaitResult,
     type ChannelInfo,
@@ -1206,6 +1207,8 @@ export function registerTools(
                         (read.skipped === 0 ? '' : '——跳过的通常是崩溃时截断的尾行，不算台账损坏'),
                 )
                 for (const problem of read.problems) lines.push(`  ⚠️ ${problem}`)
+
+                lines.push(`- IM 通道：${describeIm(deps.registry.im())}`)
 
                 lines.push('', `通道（注册顺序，共 ${list.length} 个）：`)
                 if (list.length === 0) lines.push('  （无：`interaction_ask` 会拒绝，`interaction_notify` 会报告推送失败）')

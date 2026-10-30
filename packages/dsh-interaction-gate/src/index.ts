@@ -33,7 +33,8 @@
 import path from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import { MissionStoreRegistry, createLogger, expandHome, type AgentLike } from 'dsh-eng-core'
-import { createInteractionRegistry } from './channels.js'
+import { createInteractionRegistry, imLogLine, type ImChannelReport } from './channels.js'
+import { CHAT_CHANNEL_NAME, createChatChannel, imRequiredHint, probeChatInteraction, type ChatProbe } from './chat-channel.js'
 import { resolveConfig, resolveEffectiveConfig, type EffectiveConfig, type InteractionGateConfig } from './config.js'
 import { PROMPT_SECTION, sectionText } from './prompt.js'
 import { registerTools, type ToolDeps } from './tools.js'
@@ -64,7 +65,12 @@ interface ContextLike {
 }
 
 export { resolveConfig, resolveEffectiveConfig, createInteractionRegistry }
+export { describeIm, imLogLine } from './channels.js'
+export { CHAT_CHANNEL_NAME, CHAT_API_MIN_VERSION, CHAT_SERVICE, createChatChannel, imRequiredHint, probeChatInteraction } from './chat-channel.js'
 export type { EffectiveConfig, InteractionGateConfig, InteractionRegistry }
+export type { ImChannelMode, ImChannelReport } from './channels.js'
+export type { ChatApiLike, ChatChannelHandle, ChatChannelOptions, ChatProbe } from './chat-channel.js'
+export type { ImConfig } from './config.js'
 
 /** The log file the raw row names, before validation (so config problems have a sink). */
 function rawLogFile(config: unknown): string {
@@ -96,6 +102,28 @@ export function apply(ctx: Context, config: unknown = {}): void {
         log.info('disabled by the host (enabled=false)')
         return
     }
+
+    // --- the optional IM channel: probe BEFORE anything is registered ---------
+    // `off` never touches the service at all (today's behaviour, byte for byte):
+    // no lookup, no property read, no method call. `auto` and `required` probe
+    // through the same total function — a throwing accessor, an old apiVersion
+    // and a partial object all mean "no IM channel", never a crash.
+    const imMode = resolved.im.channel
+    let imProbe: ChatProbe | undefined
+    if (imMode !== 'off') {
+        const getter = (ctx as unknown as Partial<ContextLike>).get
+        imProbe =
+            typeof getter === 'function'
+                ? probeChatInteraction((service) => getter.call(ctx, service))
+                : { ok: false, reason: '运行时没有 ctx.get（无法查找 chatInteraction 服务）' }
+    }
+    if (imMode === 'required' && imProbe !== undefined && !imProbe.ok) {
+        // Refusing to run is the point of `required`: silently falling back to
+        // "no IM" would let every gate ask a human nobody can reach.
+        log.error(imRequiredHint(imProbe.reason))
+        return
+    }
+
     try {
         const context = ctx as unknown as ContextLike
         const logger = createLogger({
@@ -135,6 +163,61 @@ export function apply(ctx: Context, config: unknown = {}): void {
         }
 
         const disposers: (() => void)[] = []
+
+        // --- the optional IM channel: register it over the verified api --------
+        let imReport: ImChannelReport
+        if (imMode === 'off') {
+            imReport = { mode: 'off', registered: false, reason: '宿主未启用（im.channel=off）' }
+        } else if (imProbe === undefined || !imProbe.ok) {
+            imReport = { mode: imMode, registered: false, reason: imProbe === undefined ? '未探测' : imProbe.reason }
+            // "Not installed" is a fact the doctor must state, not an absence:
+            // `im()` is the authoritative line, and the bounded problem list
+            // carries the same reason for anyone reading only `problems()`.
+            registry.reportProblem(`IM 通道不可用（im.channel=${imMode}）：${imReport.reason}（本次仅本地通道）`)
+        } else {
+            try {
+                const handle = createChatChannel({
+                    api: imProbe.api,
+                    ...(resolved.im.channelId === undefined ? {} : { channelId: resolved.im.channelId }),
+                    // The IM api gets the host ceiling as its own deadline; a tool
+                    // that asks for less still ends earlier, because `wait()` uses
+                    // the registry's remaining budget and aborts this ask.
+                    askTimeoutMs: resolved.askTimeoutMs,
+                    redactPatterns: resolved.redactPatterns,
+                    logger,
+                    note: (message) => registry.reportProblem(message),
+                })
+                const unregister = registry.register(handle.channel)
+                if (registry.get(CHAT_CHANNEL_NAME) !== handle.channel) {
+                    handle.dispose()
+                    imReport = { mode: imMode, registered: false, reason: '注册被拒绝（同名通道已存在或通道形状非法）' }
+                    registry.reportProblem(`IM 通道注册被拒绝：${imReport.reason}`)
+                } else {
+                    disposers.push(() => {
+                        unregister()
+                        handle.dispose()
+                    })
+                    imReport = {
+                        mode: imMode,
+                        registered: true,
+                        name: CHAT_CHANNEL_NAME,
+                        apiVersion: imProbe.apiVersion,
+                        ...(imProbe.pluginVersion === undefined ? {} : { pluginVersion: imProbe.pluginVersion }),
+                        ...(resolved.im.channelId === undefined ? {} : { channelId: resolved.im.channelId }),
+                        reason: `chat-interaction api v${imProbe.apiVersion} 可用`,
+                    }
+                }
+            } catch (error) {
+                imReport = { mode: imMode, registered: false, reason: `创建 IM 通道适配器失败：${error instanceof Error ? error.message : String(error)}` }
+                registry.reportProblem(`IM 通道不可用：${imReport.reason}`)
+            }
+        }
+        if (imMode === 'required' && !imReport.registered) {
+            logger.error(imRequiredHint(imReport.reason))
+            return
+        }
+        registry.setIm(imReport)
+        logger.info(imLogLine(imReport))
 
         // --- the service channel plugins register with -------------------------
         let serviceState: string
@@ -190,7 +273,8 @@ export function apply(ctx: Context, config: unknown = {}): void {
         logger.info(
             `applied (tools: ${tools.registered.join(', ') || 'none'}${tools.failed.length === 0 ? '' : `; failed: ${tools.failed.join(', ')}`}; ` +
                 `service=${serviceState}; ledger=${resolved.ledgerFile}; approvers=${resolved.approversFile}${resolved.requireApproverList ? '(required)' : ''}; ` +
-                `askTimeout=${resolved.askTimeoutMs}ms; notifyLevels=${resolved.notifyLevels.join(',')}; prompt=${resolved.prompt.enabled})`,
+                `askTimeout=${resolved.askTimeoutMs}ms; notifyLevels=${resolved.notifyLevels.join(',')}; prompt=${resolved.prompt.enabled}; ` +
+                `im=${imReport.registered ? `chat-interaction(api v${imReport.apiVersion})` : 'local'}(im.channel=${imMode}))`,
         )
     } catch (error) {
         log.error('apply failed:', error)

@@ -1,3 +1,25 @@
+## [未发布]
+
+### 新增 · IM 交互通道（可选，基于 `dsh-chat-interaction` v0.3.0）
+
+规格送审、部署 go/no-go、上线后验证这些"要人拍板"的环节，现在可以在**飞书/企微**里回答，
+前提是宿主挂了 `dsh-chat-interaction` 且它暴露 `chatInteraction.api`（`apiVersion >= 1`）。
+
+- **挂载条件**：`api.apiVersion >= 1`；服务缺席、版本过旧、对象不完整或访问抛错 = 没有 IM 通道，`apply` 照常完成。
+- **`im.channel`（宿主键）三档**：`auto`（默认：有则用、无则本地）/ `off`（**永不触碰**该服务，逐字节等于旧行为）/
+  `required`（必须存在，缺席时在 apply 阶段明确拒绝并给出安装指引）。
+- **只做路由**：连接/去重/卡片/等待/按钮一次性 token 由官方插件负责；本套件保留**自己的问题身份**（`q-<128bit>` 台账 token），
+  一次回答只消费一次——重放的点击或重复回答得到 `unknown-token`。
+- **失败关闭**：`timeout` / `aborted` / `send-failed` / `channel-unsupported` / `internal` 映射为
+  `timeout`/`cancelled`/`refused:<原因>` 并写台账；**超时不是同意**，门禁读不到"允许"。出站文本仍走既有脱敏。
+- 现状可见：`interaction` 注册表的描述/问题列表会显示 IM 通道是否已挂载、未挂载时为什么——"没配置"是一个**被陈述的事实**，不是空白。
+
+### 验证
+
+- `bash scripts/verify.sh`：**911 测试 / 910 通过 / 0 失败 / 1 如实跳过**（含 OPS SELFTEST GREEN）。
+- 说明：IM 通道目前是**用假 `chatInteraction` 做的单元级验证**（注册条件、卡片选项映射、一次性 token、重放拒绝、
+  失败关闭、脱敏）；**尚未对真实飞书/企微渠道做端到端验证**（需要凭证与真实会话）。
+
 ## [0.3.1] — 2026-10-19
 
 ### 兼容 · harness 0.2.1-rc.1 / rc.2

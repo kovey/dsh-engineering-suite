@@ -108,6 +108,64 @@ export interface ChannelInfo {
     order: number
 }
 
+/** The host's `im.channel` mode (see `config.ts`). */
+export type ImChannelMode = 'auto' | 'off' | 'required'
+
+/**
+ * The optional IM channel's verdict: registered or not, and WHY.
+ *
+ * This exists so "the IM channel is not registered" is a STATED fact on the
+ * doctor instead of an absence a reader has to interpret: `off` means the host
+ * disabled it, `auto` + absent means the IM plugin is not installed (and the
+ * suite behaves exactly as it did before the integration), and a broken/old
+ * service says which part was missing. `reason` is never empty.
+ */
+export interface ImChannelReport {
+    /** The configured mode this report is about. */
+    mode: ImChannelMode
+    registered: boolean
+    /** The registered channel name (present when `registered`). */
+    name?: string
+    /** `chatInteraction.api.apiVersion` that was accepted. */
+    apiVersion?: number
+    /** The IM plugin's own version, when it reported one. */
+    pluginVersion?: string
+    /** The IM channel name pinned by `im.channelId`, when configured. */
+    channelId?: string
+    /** Why it is (or is not) registered — always non-empty. */
+    reason: string
+}
+
+/**
+ * One line the doctor shows for the IM channel.
+ * @param report - the current verdict.
+ */
+export function describeIm(report: ImChannelReport): string {
+    if (report.registered) {
+        const version = report.apiVersion === undefined ? 'api v?' : `api v${report.apiVersion}`
+        const plugin = report.pluginVersion === undefined ? '' : `，插件 v${report.pluginVersion}`
+        const target = report.channelId === undefined ? '' : `，渠道 ${report.channelId}`
+        return `${report.name ?? 'chat-interaction'}（${version}${plugin}${target}）：需要人决定的提问走 IM，通知/进度仍走本进程通道`
+    }
+    if (report.mode === 'off') {
+        return `未注册（im.channel=off：宿主未启用）：仅本地通道，行为与未集成时一致`
+    }
+    return `未注册（im.channel=${report.mode}：${report.reason}）：仅本地通道，行为与未集成时一致`
+}
+
+/**
+ * The log line that states which path is active.
+ *
+ * Exactly one of these is logged on every `apply`, so "did questions go to IM
+ * or not" is answerable from the log without inspecting the host.
+ * @param report - the current verdict.
+ */
+export function imLogLine(report: ImChannelReport): string {
+    if (report.registered) return `interaction channel: chat-interaction(api v${report.apiVersion ?? '?'})`
+    if (report.mode === 'off') return 'interaction channel: local only (im.channel=off)'
+    return `interaction channel: local only (chat-interaction absent: ${report.reason})`
+}
+
 /** How an ask ended. */
 export type AwaitOutcome = 'answered' | 'timeout' | 'cancelled' | 'unknown-token'
 
@@ -192,6 +250,17 @@ export interface InteractionRegistry {
     droppedAnswers(): number
     /** Channel defects observed so far (bounded), for the doctor. */
     problems(): string[]
+    /**
+     * The optional IM channel's verdict (registered or not, and why).
+     *
+     * Always available — "not registered" is a fact with a reason, not an
+     * absence. `setIm()` is the plugin's report; consumers only read.
+     */
+    im(): ImChannelReport
+    /** Record the IM channel verdict (the plugin, during/after `apply`). */
+    setIm(report: ImChannelReport): void
+    /** Record one channel-layer defect in the bounded `problems()` list. */
+    reportProblem(message: string): void
 }
 
 /** An unpredictable one-shot token. 128 bits, hex — never derived from a clock or a counter. */
@@ -266,6 +335,11 @@ export function createInteractionRegistry(options: {
     const pending = new Map<string, Pending>()
     const problems: string[] = []
     let dropped = 0
+
+    // The IM channel's verdict starts as "not probed yet" rather than as an
+    // absence: a doctor that runs before/without the probe still states that
+    // fact, and the plugin replaces it in `apply`.
+    let imReport: ImChannelReport = { mode: 'auto', registered: false, reason: '尚未探测：插件还没有执行 IM 通道探测' }
 
     const note = (message: string): void => {
         problems.push(message)
@@ -554,6 +628,18 @@ export function createInteractionRegistry(options: {
 
         problems(): string[] {
             return [...problems]
+        },
+
+        im(): ImChannelReport {
+            return { ...imReport }
+        },
+
+        setIm(report: ImChannelReport): void {
+            imReport = { ...report }
+        },
+
+        reportProblem(message: string): void {
+            note(message)
         },
     }
     return registry

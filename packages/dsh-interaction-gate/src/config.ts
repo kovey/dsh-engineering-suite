@@ -31,6 +31,7 @@
  */
 
 import { loadProjectConfig, type Layout, type LayoutOptions } from 'dsh-eng-core'
+import type { ImChannelMode } from './channels.js'
 
 /** Levels a notification may carry. `progress` is its own tool, not a level. */
 export type NotifyLevel = 'info' | 'warn' | 'error'
@@ -56,6 +57,27 @@ export const MAX_MAX_PAYLOAD_CHARS = 200_000
 
 /** Most extra redaction patterns a profile/project may declare. */
 export const MAX_REDACT_PATTERNS = 64
+
+/** Every accepted value of `im.channel` (the IM routing mode). */
+export const IM_CHANNEL_MODES: readonly ImChannelMode[] = ['auto', 'off', 'required']
+
+/** The host-owned `im` block. */
+export interface ImConfig {
+    /**
+     * `auto` (default): route questions through the installed IM plugin when
+     * its `chatInteraction` service exposes `api.apiVersion >= 1`, else keep
+     * today's local-only behaviour and log which path is active.
+     * `off`: never touch the service at all (byte-for-byte today's behaviour).
+     * `required`: refuse to apply when the service is absent/too old instead of
+     * running silently without it.
+     */
+    channel: ImChannelMode
+    /**
+     * The IM plugin's channel name (`feishu`/`wecom`/…) to pin. Omitted = the
+     * IM plugin resolves its own active chat across channels.
+     */
+    channelId?: string
+}
 
 /** Resolved plugin configuration. */
 export interface InteractionGateConfig {
@@ -96,6 +118,11 @@ export interface InteractionGateConfig {
     maxPayloadChars: number
     /** Extra regexes: a payload matching one of them is REFUSED, not sent. */
     redactPatterns: string[]
+    /**
+     * The optional IM routing (host-owned): whether `interaction_ask` goes
+     * through the installed IM plugin's `chatInteraction.api`.
+     */
+    im: ImConfig
 }
 
 /** Untrusted configuration input. */
@@ -187,6 +214,31 @@ export function resolveConfig(input: unknown, warn?: (message: string) => void):
         warn?.('profile 配置: redactPatterns 必须是字符串数组，已按空处理')
     }
 
+    // `im.channel` decides whether questions may leave the process through the
+    // IM plugin. An unknown value is NOT silently promoted to `required` (that
+    // would refuse to boot on a typo) nor trusted as-is: it keeps the default
+    // `auto` and says why, like every other unusable value in this suite.
+    const rawIm = raw['im']
+    if (rawIm !== undefined && !isRecord(rawIm)) {
+        warn?.(`profile 配置: im 必须是对象（{ channel: 'auto' | 'off' | 'required', channelId?: string }），收到 ${JSON.stringify(rawIm)}，已按默认 im.channel=auto 处理`)
+    }
+    const imBlock = isRecord(rawIm) ? rawIm : {}
+    const rawMode = imBlock['channel']
+    let imMode: ImChannelMode = 'auto'
+    if (rawMode !== undefined) {
+        if (typeof rawMode === 'string' && (IM_CHANNEL_MODES as readonly string[]).includes(rawMode)) {
+            imMode = rawMode as ImChannelMode
+        } else {
+            warn?.(`profile 配置: im.channel 只能是 ${IM_CHANNEL_MODES.map((mode) => `"${mode}"`).join(' / ')}（收到 ${JSON.stringify(rawMode)}），已按默认 "auto" 处理`)
+        }
+    }
+    const rawChannelId = imBlock['channelId']
+    let imChannelId: string | undefined
+    if (rawChannelId !== undefined) {
+        if (typeof rawChannelId === 'string' && rawChannelId.trim() !== '') imChannelId = rawChannelId.trim()
+        else warn?.(`profile 配置: im.channelId 必须是非空字符串（IM 渠道名，如 "feishu"），收到 ${JSON.stringify(rawChannelId)}，已忽略（改由 IM 插件解析 active chat）`)
+    }
+
     return {
         enabled: bool(raw['enabled'], true),
         logFile: str(raw['logFile'], '~/.dsh/interaction-gate.log'),
@@ -210,6 +262,7 @@ export function resolveConfig(input: unknown, warn?: (message: string) => void):
         preferredChannels: preferred ?? [],
         maxPayloadChars: payload < MIN_MAX_PAYLOAD_CHARS || payload > MAX_MAX_PAYLOAD_CHARS ? DEFAULT_MAX_PAYLOAD_CHARS : payload,
         redactPatterns: (redact ?? []).slice(0, MAX_REDACT_PATTERNS),
+        im: { channel: imMode, ...(imChannelId === undefined ? {} : { channelId: imChannelId }) },
     }
 }
 
@@ -246,6 +299,10 @@ export const HOST_OWNED_KEYS: readonly { key: string; why: string }[] = [
     { key: 'askTimeoutMs', why: '等待人的时长是宿主上限（调用方只能缩短），仓库不得抬高' },
     { key: 'requireApproverList', why: '审批人名单是否强制是宿主决定；由仓库关闭等于自我豁免' },
     { key: 'maxPayloadChars', why: '出站载荷上限按通道能力设定，属宿主' },
+    {
+        key: 'im',
+        why: 'IM 通道是否启用是宿主决定：仓库能打开/关闭一条把问题发出进程的通道，等于自行改写审批边界',
+    },
 ]
 
 /** One resolved configuration plus where it came from. */
