@@ -1,6 +1,6 @@
 # dsh-engineering-suite
 
-**v0.3.1** · 兼容基线 `@deepseek-ai/dsh-*` **`>=0.2.0-rc.1 <0.2.2-0`**（cordis `~4.0.4`；已在 **0.2.1-rc.2** 上验证）
+**v0.4.0** · 兼容基线 `@deepseek-ai/dsh-*` **`>=0.2.0-rc.1 <0.2.2-0`**（cordis `~4.0.4`；已在 **0.2.1-rc.2** 上验证）
 · [变更记录](./CHANGELOG.md) · [升级指南](./UPGRADE.md) · [验证证据](./docs/VERIFICATION.md)
 
 > 把 [docs.md](./docs.md) 描述的「Agent 时代软件工程落地方案」实现为一组可独立挂载的
@@ -58,7 +58,7 @@ spec-gate  test-design-  spec-gate  role-  quality-   evidence-gate
 | `dsh-evidence-gate` | `evidence-gate` | Mission → Evidence → Gate → Receipt，缺失证据 fail closed | `evidence_record`、`evidence_status`、`mission_complete` |
 | `dsh-audit-trail` | `audit-trail` | 全量工具调用 JSONL 审计 + 写前快照 + 按轮次回滚 | `audit_report`、`audit_rewind` |
 | `dsh-orchestrator` | `orchestrator` | 阶段流水线、入口/出口门禁、回退、熔断、断点恢复、按难度选模型、阶段自主派发 | `orchestrate` |
-| `dsh-interaction-gate` | `interaction-gate` | 交互层：统一 ask / notify / progress，多通道注册、一次性 token、决定台账、fail-closed 超时 | `interaction_ask`、`interaction_notify`、`interaction_progress`、`interaction_status` |
+| `dsh-interaction-gate` | `interaction-gate` | 交互层：统一 ask / notify / progress，多通道注册、一次性 token、决定台账、fail-closed 超时 | `interaction_ask`、`interaction_notify`、`interaction_progress`、`interaction_status` |；可选 IM 通道（`dsh-chat-interaction` v0.3.0 的 `apiVersion=1`，未配置则本地问答不变） |
 | `dsh-suite-doctor` | `suite-doctor` | 统一入口与自检：阶段、门禁配置、缺失项、待审批、台账规模（离线判定 + 运行时事实） | `suite_status` |
 | `dsh-deploy-gate` | `deploy-gate` | 部署层：环境清单、go/no-go、人工批准、灰度/回滚、上线后验证、部署台账 | `deploy_plan`、`deploy_run`、`deploy_verify`、`deploy_rollback`、`deploy_status` |
 | `dsh-knowledge-base` | `knowledge-base` | 项目知识库：把规格/决策/交付台账/文档/代码索引成可比对的本地检索，回答项目问题必须**带引用** | `kb_index`、`kb_search`、`kb_status` |

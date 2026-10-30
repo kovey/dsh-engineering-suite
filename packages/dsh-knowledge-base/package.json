@@ -1,6 +1,6 @@
 {
   "name": "dsh-knowledge-base",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "Project knowledge base for DeepSeek Harness: build a deterministic lexical index over a repository's own specifications, decisions, delivery trail, documentation and code, then answer project questions with path:line citations — no embeddings, no network, named gaps for everything the index does not cover.",
   "type": "module",
   "main": "./dist/index.js",
