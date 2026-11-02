@@ -32,8 +32,11 @@ import path from 'node:path'
 import { readJson } from './io.js'
 import type { Logger } from './log.js'
 import { archiveFootprint } from './archive.js'
+import { mandateState, policyDifferences, policyFingerprint, readPolicySnapshot, type PolicyChange } from './mandate.js'
+import { MissionStore } from './mission.js'
 import { projectConfigFile } from './project-config.js'
 import { resolveLayout, type Layout } from './paths.js'
+import type { MissionRecord } from './types.js'
 
 /** The six phases this suite organises itself around. */
 export type PhaseName = 'plan' | 'build' | 'test' | 'interact' | 'deliver' | 'deploy'
@@ -90,6 +93,14 @@ export interface DoctorRuntimeFacts {
         blocked: boolean
         specApproved: boolean
         lastGate?: { id: string; state: string; source: string; reason: string; checkedAt: number }
+        /**
+         * The mission's recorded authorisation, as a fact.
+         *
+         * `legacy` is stated explicitly (a mission approved before mandates
+         * existed), never counted as a defect: `strength` says which rule
+         * applies and `stale` says whether the trust root still matches.
+         */
+        mandate?: { strength: string; policyVersion: string; stale: boolean; withdrawnBy?: string }
     }
     /** Interaction asks still waiting for a human. */
     pendingAsks?: { id: string; title: string; at: number; ageMs: number }[]
@@ -195,6 +206,165 @@ function countSpecBudgets(specsDir: string): { files: number; total: number } {
         }
     }
     return { files, total }
+}
+
+/** How many affected missions the mandate check names by id. */
+const MANDATE_DETAIL_LIMIT = 5
+
+/** One in-flight mission whose mandate no longer matches the trust root. */
+interface MandateDrift {
+    id: string
+    status: string
+    recorded: string
+    current: string
+    /** `undefined` when the approval-time snapshot is missing (cannot name files). */
+    changed?: PolicyChange[]
+}
+
+/** First 12 hex chars of a policy version (or a readable placeholder). */
+function shortVersion(version: string): string {
+    if (version === '') return '(未记录)'
+    return version.length <= 12 ? version : `${version.slice(0, 12)}…`
+}
+
+/** One Chinese line describing why a mandate is stale. */
+function describeMandateDrift(drift: MandateDrift): string {
+    const changed =
+        drift.changed === undefined
+            ? '改动文件未知（缺少审批时的 policy-fingerprint.json 快照）'
+            : drift.changed.length === 0
+              ? '文件清单与快照相同（版本不一致但未能定位到具体文件）'
+              : `改动文件：${drift.changed
+                    .slice(0, 5)
+                    .map((entry) => `${entry.path}（${entry.change === 'added' ? '新增' : entry.change === 'removed' ? '删除' : '修改'}）`)
+                    .join('、')}${drift.changed.length > 5 ? ` 等 ${drift.changed.length} 个` : ''}`
+    return `mission ${drift.id}（${drift.status}）：policy ${shortVersion(drift.recorded)} → ${shortVersion(drift.current)}；${changed}`
+}
+
+/**
+ * `mandate.policy` — does every in-flight mission's recorded authorisation still
+ * match the workspace trust root?
+ *
+ * The mandate is a statement about a RULE SET, so the rules changing after the
+ * approval is a real fact about the authorisation, not a detail: `required` when
+ * an in-flight mission's recorded `policyVersion` no longer matches, `ok` when
+ * every mandate still matches, `unknown` when there is nothing to judge (and the
+ * reason is always stated — "nothing to compare" is not a pass).
+ *
+ * Legacy missions (approved before mandates existed) are reported as a FACT in
+ * the detail, never as a defect: compatibility is the agreed behaviour, not a
+ * gap. A mission whose mandate a person withdrew is likewise a fact, not drift.
+ * @param layout - the resolved trail layout.
+ */
+function mandatePolicyCheck(layout: Layout): DoctorCheck {
+    const store = new MissionStore({ layout })
+    const missions = store.list()
+    // Delivered work is history, not a live authorisation: only in-flight
+    // missions can still be resumed, so only they are revalidated.
+    const inFlight: MissionRecord[] = missions.filter((mission) => mission.status !== 'delivered')
+    const fingerprint = policyFingerprint(layout.cwd, { rootDir: layout.rootDir })
+    const stale: MandateDrift[] = []
+    const broken: { id: string; reason: string }[] = []
+    const legacy: string[] = []
+    const stopped: string[] = []
+    let matching = 0
+    for (const mission of inFlight) {
+        // A mission whose approval was revoked (a specification revision is in
+        // progress) has a mandate on file but no live authorisation: there is
+        // nothing to revalidate until it is approved again.
+        if (mission.spec?.approvedAt === undefined) continue
+        const state = mandateState(mission)
+        if (state.kind === 'absent') continue
+        if (state.kind === 'invalid') {
+            broken.push({ id: mission.id, reason: state.reason })
+            continue
+        }
+        if (state.kind === 'legacy') {
+            legacy.push(mission.id)
+            continue
+        }
+        if (state.mandate.withdrawn !== undefined) {
+            stopped.push(mission.id)
+            continue
+        }
+        if (state.mandate.policyVersion === fingerprint.version) {
+            matching += 1
+            continue
+        }
+        const snapshot = readPolicySnapshot(store, mission.id)
+        stale.push({
+            id: mission.id,
+            status: mission.status,
+            recorded: state.mandate.policyVersion,
+            current: fingerprint.version,
+            ...(snapshot === undefined ? {} : { changed: policyDifferences(snapshot, fingerprint) }),
+        })
+    }
+    const facts: string[] = []
+    if (legacy.length > 0) {
+        facts.push(
+            `${legacy.length} 个在飞 mission 为 legacy 审批（mandate 之前的历史记录，按 explicit 兼容处理——这是事实，不是缺陷）：` +
+                `${legacy.slice(0, MANDATE_DETAIL_LIMIT).join('、')}${legacy.length > MANDATE_DETAIL_LIMIT ? ' 等' : ''}`,
+        )
+    }
+    if (stopped.length > 0) {
+        facts.push(`${stopped.length} 个 mandate 已由人工撤回（不参与策略比对）：${stopped.slice(0, MANDATE_DETAIL_LIMIT).join('、')}${stopped.length > MANDATE_DETAIL_LIMIT ? ' 等' : ''}`)
+    }
+    if (stale.length > 0 || broken.length > 0) {
+        const detail = [
+            ...stale.slice(0, MANDATE_DETAIL_LIMIT).map(describeMandateDrift),
+            ...(stale.length > MANDATE_DETAIL_LIMIT ? [`…另有 ${stale.length - MANDATE_DETAIL_LIMIT} 个 mission 的 mandate 已过期`] : []),
+            ...broken.slice(0, MANDATE_DETAIL_LIMIT).map((entry) => `mission ${entry.id}：mandate 记录损坏（${entry.reason}）`),
+            ...(broken.length > MANDATE_DETAIL_LIMIT ? [`…另有 ${broken.length - MANDATE_DETAIL_LIMIT} 个 mission 的 mandate 记录损坏`] : []),
+            ...facts,
+        ]
+        return {
+            id: 'mandate.policy',
+            area: 'plan',
+            state: 'missing',
+            severity: 'required',
+            label: 'mission 授权（mandate）与信任根策略一致',
+            detail: `${detail.join('；')}；受影响 ${stale.length + broken.length} 个在飞 mission：策略变了，授权就必须重新取得`,
+            fix:
+                'git diff -- .dsh 查看是哪个信任根文件改了，然后为每个受影响 mission 重新走 spec_create → test_design_review → spec_approve' +
+                '（mandate 不可改写：策略变化后旧 mission 无法续期，必须在新的 mission 上重新取得授权）',
+        }
+    }
+    if (inFlight.length === 0) {
+        return {
+            id: 'mandate.policy',
+            area: 'plan',
+            state: 'unknown',
+            severity: 'recommended',
+            label: 'mission 授权（mandate）与信任根策略一致',
+            detail:
+                missions.length === 0
+                    ? '本工作区还没有 mission：没有可复核的授权（"没有 mission"不是"策略一致"）'
+                    : `本工作区有 ${missions.length} 个 mission，但都已交付：没有在飞 mission，也就没有可复核的授权`,
+        }
+    }
+    if (matching === 0) {
+        return {
+            id: 'mandate.policy',
+            area: 'plan',
+            state: 'unknown',
+            severity: 'recommended',
+            label: 'mission 授权（mandate）与信任根策略一致',
+            detail:
+                `本工作区有 ${inFlight.length} 个在飞 mission，但没有一个带有可复核的 mandate（尚未审批，或为 legacy 记录）：` +
+                `没有可比的 policyVersion${facts.length === 0 ? '' : `；${facts.join('；')}`}`,
+        }
+    }
+    return {
+        id: 'mandate.policy',
+        area: 'plan',
+        state: 'ok',
+        severity: 'recommended',
+        label: 'mission 授权（mandate）与信任根策略一致',
+        detail:
+            `${matching} 个在飞 mission 的 mandate 与当前信任根一致（policy ${shortVersion(fingerprint.version)}）` +
+            `${facts.length === 0 ? '' : `；${facts.join('；')}`}`,
+    }
 }
 
 /** Root-level `*.jsonl` ledgers that exist under the trail, as repo-relative paths. */
@@ -430,6 +600,10 @@ export function checkWorkspace(options: DoctorOptions): DoctorReport {
         detail: roleFiles > 0 ? `${roleFiles} 个角色文件` : '没有仓库级角色文件：使用 role-guard 的内置角色（developer/reviewer/qa）',
         ...(roleFiles > 0 ? {} : { fix: '如需项目专属角色/模型/权限：在 .dsh/roles/ 下新增 <role>.md（见 role-guard README 的 frontmatter 格式）' }),
     })
+
+    // The recorded authorisation every resume revalidates: a policy that has
+    // changed since the approval is a fact about the authorisation, not a detail.
+    add(mandatePolicyCheck(layout))
 
     // ---- build ------------------------------------------------------------
     const quality = readProjectConfig(layout, 'quality-gate')
@@ -881,6 +1055,13 @@ export function withRuntime(report: DoctorReport, runtime: DoctorRuntimeFacts): 
                 mission.specApproved ? '规格已审批' : '规格未审批',
                 mission.blocked ? '已被熔断阻断' : undefined,
                 mission.lastGate === undefined ? '无门禁记录' : `最近门禁 ${mission.lastGate.state}（${mission.lastGate.source}）`,
+                mission.mandate === undefined
+                    ? undefined
+                    : `mandate ${mission.mandate.strength}${
+                          mission.mandate.strength === 'legacy'
+                              ? '（mandate 之前的历史审批，按 explicit 兼容处理——事实，不是缺陷）'
+                              : `（policy ${shortVersion(mission.mandate.policyVersion)}${mission.mandate.stale ? '，与当前信任根不一致' : '，与当前信任根一致'}）`
+                      }${mission.mandate.withdrawnBy === undefined ? '' : `；已由 ${mission.mandate.withdrawnBy} 撤回`}`,
             ]
                 .filter((part): part is string => part !== undefined)
                 .join('；'),

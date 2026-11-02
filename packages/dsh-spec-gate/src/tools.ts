@@ -8,7 +8,11 @@ import path from 'node:path'
 import { tuiReview, type NvimTuiLike, type ReviewArtifacts } from './review.js'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import {
+    approvalStrength,
+    approverAllowlist,
     approverName,
+    describeMandate,
+    effectiveMandate,
     ensureDir,
     formatTime,
     normalizeApprovalReply,
@@ -16,10 +20,17 @@ import {
     renderApprovalContext,
     type ApprovalLike,
     parentSessionIdOf,
+    mandateScopeOf,
+    mandateState,
+    MANDATE_BASIS,
+    MANDATE_VERSION,
     nextStepsAfter,
+    POLICY_SNAPSHOT_ARTIFACT,
+    policyFingerprint,
     scanGaps,
     scanWorkspace,
     sessionIdOf,
+    scopeWidened,
     sha256,
     specReviewDigest,
     writeJsonAtomic,
@@ -28,6 +39,7 @@ import {
     type AmendRequest,
     type GapReport,
     type Layout,
+    type Mandate,
     type MissionRecord,
     type MissionStoreRegistry,
     type ScanResult,
@@ -787,6 +799,44 @@ export function registerTools(
                         )
                     }
                 }
+                // ---- the mandate this approval would produce ------------------
+                // Checked BEFORE a human is asked: widening a mandate or
+                // re-approving a stopped one is refused on the record, not
+                // after someone spent a review round on it.
+                const existingMandate = mandateState(mission)
+                if (existingMandate.kind === 'invalid') {
+                    throw new Error(
+                        [
+                            `mission ${mission.id} 的 mandate 记录损坏，拒绝审批（fail closed）：${existingMandate.reason}`,
+                            '下一步：检查 .dsh/missions/<id>/mission.json（它属于信任根，只能由插件写入）；确认后新建 mission 重新审批。',
+                        ].join('\n'),
+                    )
+                }
+                const declaredScope = mandateScopeOf(mission.spec)
+                if (existingMandate.kind === 'present') {
+                    const withdrawn = existingMandate.mandate.withdrawn
+                    if (withdrawn !== undefined) {
+                        throw new Error(
+                            [
+                                `mission ${mission.id} 的 mandate 已于 ${formatTime(withdrawn.at)} 由 ${withdrawn.by} 撤回（${withdrawn.reason}）：拒绝重新审批。`,
+                                '撤回是一个人的停止决定，一次新的审批不能覆盖它（mandate 不可改写）。',
+                                '下一步：用 spec_create 新建 mission 重新提交规格，再 spec_approve。',
+                            ].join('\n'),
+                        )
+                    }
+                    const widened = scopeWidened(existingMandate.mandate.scope, declaredScope)
+                    if (widened.length > 0) {
+                        const current = existingMandate.mandate.scope
+                        throw new Error(
+                            [
+                                `mission ${mission.id} 已有更窄的 mandate（paths: ${current.paths.join('、') || '(未收窄)'}；phases: ${current.phases.join('、') || '(未收窄)'}），本次规格声明的范围更大，拒绝扩大授权。`,
+                                `扩大的部分：${widened.join('、')}。`,
+                                'mandate 不可改写：更宽的范围需要一个新 mission（这也是它防住"先拿窄授权、再悄悄改宽"的方式）。',
+                                '下一步：用 spec_create 新建 mission 重新审批；或把本次规格收敛回原范围内再送审。',
+                            ].join('\n'),
+                        )
+                    }
+                }
                 const decision = await requestApproval(deps, exec, mission, args.note, effective)
                 if ('outcome' in decision) {
                     // Rejected (or cancelled): record the round, keep the human's
@@ -798,8 +848,39 @@ export function registerTools(
                 // it came from, and the ledger keeps both. A terminal answerer that
                 // reports no identity still records `approval`.
                 const approvedBy = approverName(decision)
+                // Strength is COMPUTED from durable facts (allowlist, deciding
+                // session, channel), never claimed by the caller or the model.
+                const strength = approvalStrength({
+                    approvedBy,
+                    ...(decision.source === '' ? {} : { source: decision.source }),
+                    ...(agent === undefined ? {} : { agent }),
+                    allowlist: approverAllowlist(mission.cwd, { rootDir: store.layout.rootDir }),
+                    automatic: effective.approval === 'auto',
+                })
+                const policy = policyFingerprint(mission.cwd, { rootDir: store.layout.rootDir })
+                const mandateToWrite: Mandate | undefined =
+                    existingMandate.kind === 'present'
+                        ? undefined
+                        : {
+                              version: MANDATE_VERSION,
+                              strength: strength.strength,
+                              basis: MANDATE_BASIS,
+                              scope: declaredScope,
+                              policyVersion: policy.version,
+                              approvedBy,
+                              at: Date.now(),
+                          }
+                // The snapshot is what lets a later revalidation NAME the
+                // changed trust-root files; it is written before the mandate so
+                // a stored mandate never exists without one.
+                if (mandateToWrite !== undefined) {
+                    store.writeArtifact(mission.id, POLICY_SNAPSHOT_ARTIFACT, `${JSON.stringify(policy, undefined, 2)}\n`)
+                }
                 const approved = store.update(mission.id, (record) => ({
                     status: 'spec-approved',
+                    // Write-once: a later approval never rewrites an existing
+                    // mandate (immutability is the whole point of the record).
+                    ...(record.mandate === undefined && mandateToWrite !== undefined ? { mandate: mandateToWrite } : {}),
                     spec:
                         record.spec === undefined
                             ? undefined
@@ -835,8 +916,16 @@ export function registerTools(
                           ]
                 return [
                     `规格已审批（mission ${mission.id}，by ${approvedBy}${decision.source === '' ? '' : ` via ${decision.source}`}${decision.messageId === '' ? '' : ` #${decision.messageId}`}，${formatTime(Date.now())}）。`,
+                    `mandate：${strength.strength}（${strength.why}）；policy ${policy.version.slice(0, 12)}；${
+                        existingMandate.kind === 'present' ? '沿用已记录的 mandate（不可改写，未刷新策略版本）' : '已作为不可改写记录写入 mission.json'
+                    }。`,
                     ...recordPlan(deps, store.layout, effective, approvalRows),
-                    '写操作现已放行。下一步：按规格实现 → evidence_record 登记验证输出 → quality_gate_run 跑门禁 → mission_complete 交付。',
+                    ...(strength.strength === 'inferred'
+                        ? [
+                              '⚠️ 本次批准强度为 inferred：写操作仍会被拒绝（inferred 的 observe 模式尚未实现）。',
+                              '下一步：由允许清单内的审批人在新 mission 上重新审批——同一 mission 的 mandate 不可改写。',
+                          ]
+                        : ['写操作现已放行。下一步：按规格实现 → evidence_record 登记验证输出 → quality_gate_run 跑门禁 → mission_complete 交付。']),
                 ].join('\n')
             },
         }),
@@ -1221,6 +1310,17 @@ export function registerTools(
                         `；规划台账: ${describePlanFile(store.layout, planLedgerFile(store.layout, statusConfig))}`,
                 )
                 lines.push(`负面约束：${describeConstraints(mission.spec?.negativeConstraints ?? [])}`)
+                lines.push(describeMandate(effectiveMandate(mission)))
+                const mandateView = mandateState(mission)
+                if (mandateView.kind === 'present' && mandateView.mandate.strength !== 'inferred') {
+                    const currentPolicy = policyFingerprint(mission.cwd, { rootDir: store.layout.rootDir })
+                    if (currentPolicy.version !== mandateView.mandate.policyVersion) {
+                        lines.push(
+                            `  ⚠️ 信任根策略已变化（当前 ${currentPolicy.version.slice(0, 12)}）：本 mission 的授权已过期，unblock 会被拒绝；` +
+                                '需要新 mission 重新审批（suite_status 的 mandate.policy 会列出改动的文件）。',
+                        )
+                    }
+                }
                 // 非功能预算：声明 + 验证状态。未验证要写清楚含义 —— 一个预算旁边空着，
                 // 看起来像"通过了"。
                 const declaredBudgets = readSpecBudgets(mission.spec)

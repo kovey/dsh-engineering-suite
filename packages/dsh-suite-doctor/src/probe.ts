@@ -31,6 +31,8 @@
 import { SUITE_PLUGINS } from './config.js'
 import {
     PHASES,
+    mandateState,
+    policyVersion,
     type AgentLike,
     type CheckState,
     type DoctorCheck,
@@ -521,10 +523,11 @@ export async function probeInteraction(ctx: ProbeContext, timeoutMs: number, now
 /** The mission fact, as the store reports it (never a hand-read `mission.json`). */
 export type MissionFacts = NonNullable<DoctorRuntimeFacts['mission']>
 
-function missionFactsOf(store: MissionStore, id: string): MissionFacts | undefined {
+function missionFactsOf(store: MissionStore, id: string, cwd: string): MissionFacts | undefined {
     const record = store.read(id)
     if (record === undefined) return undefined
     const gate = store.lastGate(record.id)
+    const mandate = mandateState(record)
     return {
         id: record.id,
         title: record.title,
@@ -532,6 +535,20 @@ function missionFactsOf(store: MissionStore, id: string): MissionFacts | undefin
         ...(record.stage === undefined ? {} : { stage: record.stage }),
         blocked: record.status === 'blocked',
         specApproved: record.spec?.approvedAt !== undefined,
+        // The recorded authorisation is a FACT about the mission: a `legacy`
+        // approval (no mandate record) is stated as such, never as a defect.
+        ...(mandate.kind === 'present' || mandate.kind === 'legacy'
+            ? {
+                  mandate: {
+                      strength: mandate.mandate.strength,
+                      policyVersion: mandate.mandate.policyVersion,
+                      stale:
+                          mandate.kind === 'present' &&
+                          mandate.mandate.policyVersion !== policyVersion(cwd, { rootDir: store.layout.rootDir }),
+                      ...(mandate.mandate.withdrawn === undefined ? {} : { withdrawnBy: mandate.mandate.withdrawn.by }),
+                  },
+              }
+            : {}),
         ...(gate === undefined
             ? {}
             : { lastGate: { id: gate.id, state: gate.state, source: gate.source, reason: gate.reason, checkedAt: gate.checkedAt } }),
@@ -638,7 +655,7 @@ export async function probeRuntime(options: RuntimeProbeOptions): Promise<Runtim
     // ---- mission ---------------------------------------------------------
     const store = options.stores.for(options.cwd)
     if (options.missionId !== undefined && options.missionId !== '') {
-        const mission = missionFactsOf(store, options.missionId)
+        const mission = missionFactsOf(store, options.missionId, options.cwd)
         if (mission === undefined) {
             const known = store.list().map((record) => record.id)
             throw new Error(
@@ -663,7 +680,7 @@ export async function probeRuntime(options: RuntimeProbeOptions): Promise<Runtim
                 fix: 'spec_create 或 orchestrate({ action: "start" }) 建立/绑定 mission；已有 mission 时用 suite_status({ missionId: "…" }) 指定',
             })
         } else {
-            const mission = missionFactsOf(store, record.id)
+            const mission = missionFactsOf(store, record.id, options.cwd)
             if (mission !== undefined) facts.mission = mission
         }
     }

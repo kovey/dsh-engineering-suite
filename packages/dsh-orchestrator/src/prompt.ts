@@ -48,6 +48,8 @@ export function sectionText(config: OrchestratorConfig): string {
         '- **门禁失败是回退，不是跳过**：退出型门禁（质量验证、交付）不通过时，流程回退到该阶段的 `onFail` 阶段，并把失败记录落盘，绝不放行到下一阶段。',
         '- 同一阶段反复失败会触发**迭代熔断**：达到 `maxAttempts` 后 mission 被置为 `blocked`，需要人工介入（查看 `stages/`、`gates/`、`evidence.jsonl`）后用 `orchestrate({ action: "rerun" })` 重开。',
         '- 中途中断（会话重启/上下文丢失）用 `orchestrate({ action: "resume" })` 从 `mission.stage` 的断点继续。',
+        '- **解除熔断前会先复核授权（mandate）**：`unblock` 会核对审批时的策略版本、审批人是否仍在允许清单、以及授权是否已被人工撤回；任一项不成立就拒绝（mission 保持 blocked）并给出下一步——通常是新建 mission 重新审批。',
+        '- **停止是一条命令**：`orchestrate({ action: "stop", summary: "<原因>" })` 记录 `mandate.withdrawn`（谁、何时、为什么）并把 mission 置为 blocked；停止之后 `unblock` 不会解除它，继续同一项工作需要新 mission。',
         '',
         '所有阶段的裁决只由确定性事实决定（`mission.spec.approvedAt`、`mission.testDesign`、`store.lastGate`、`store.readReceipts`），模型自述不算证据。',
     )

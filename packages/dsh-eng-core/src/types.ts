@@ -288,6 +288,81 @@ export interface StageResult {
     }
 }
 
+/**
+ * How strong an approval is — **computed** at approval time, never claimed.
+ *
+ * - `explicit`: a person who is allowed to decide (the role-guard allowlist
+ *   contains them, or no allowlist is configured and the decision came from the
+ *   local operator session) approved;
+ * - `inferred`: the decision exists, but it is not proof of a person's grant
+ *   (an allowlist that does not contain the approver, a subagent session, an IM
+ *   click with no allowlist, an automatic approval). Fail closed: an enforcing
+ *   gate does NOT accept it (see `dsh-spec-gate`'s write guard);
+ * - `legacy`: a mission approved before mandates existed. It has no mandate
+ *   record, is READ as this strength, and is treated like `explicit` for
+ *   compatibility. Reports state it as a fact, never as a defect.
+ *
+ * `legacy` is never written: it only exists in the view of an old mission.
+ */
+export type MandateStrength = 'explicit' | 'inferred' | 'legacy'
+
+/**
+ * What one mandate authorises, as far as the specification declares it.
+ *
+ * An empty list means **not narrowed** (nothing was declared), never "nothing
+ * is allowed": an empty scope must not be read as a deny-all.
+ */
+export interface MandateScope {
+    /** Orchestrator phases the approval covers; empty = not narrowed. */
+    phases: string[]
+    /** Workspace-relative paths/patterns the approval covers; empty = not narrowed. */
+    paths: string[]
+}
+
+/** A person's stop of the mission's authorisation. */
+export interface MandateWithdrawal {
+    /** Epoch milliseconds (a supplied clock where the caller has one). */
+    at: number
+    /** Who stopped it (the identity the caller could prove). */
+    by: string
+    /** Why — mandatory: "stopped" without a reason is not auditable. */
+    reason: string
+}
+
+/**
+ * The recorded authorisation of a mission (`mission.mandate`).
+ *
+ * Written once by `spec_approve` and **immutable** afterwards: a later approval
+ * does not rewrite it (a wider scope needs a NEW mission, and the attempt is
+ * refused). Immutability is what makes "this work was allowed from the start"
+ * a provable statement instead of a claim: the record cannot be refreshed to
+ * match whatever the world looks like now.
+ *
+ * It is NOT a live permission. Every resume revalidates it (policy version,
+ * approver, withdrawal), and an `inferred` mandate never satisfies an enforcing
+ * gate.
+ */
+export interface Mandate {
+    /** Schema version of this record (1). */
+    version: 1
+    strength: MandateStrength
+    /** What produced the grant: a human spec approval. */
+    basis: 'spec-approved'
+    scope: MandateScope
+    /**
+     * `policyVersion` of the workspace trust root (`.dsh/**` configuration) at
+     * approval time. The approval is a statement about a RULE SET, so a rule
+     * set that has changed since must be re-authorised, not silently inherited.
+     */
+    policyVersion: string
+    /** Recorded approver (`approval` when the channel named nobody). */
+    approvedBy: string
+    /** Approval time (epoch ms). */
+    at: number
+    /** A person's stop. Absent while the authorisation stands. */
+    withdrawn?: MandateWithdrawal
+}
+
 /** Versioned workspace state of one mission. */
 export interface MissionRecord {
     id: string
@@ -317,6 +392,13 @@ export interface MissionRecord {
      * makes "第 2 次送审" visible to both sides.
      */
     approval?: MissionApproval
+    /**
+     * The recorded authorisation this mission started under (see {@link Mandate}).
+     *
+     * Absent on missions approved before mandates existed — those are READ as
+     * `strength: 'legacy'` and treated like `explicit` for compatibility.
+     */
+    mandate?: Mandate
     /** Free-form labels. */
     labels?: string[]
 }

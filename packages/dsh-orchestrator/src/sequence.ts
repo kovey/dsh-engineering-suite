@@ -14,12 +14,20 @@
 import path from 'node:path'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import {
+    agentIdOf,
+    approverAllowlist,
     formatTime,
+    mandateState,
+    normalizeApprover,
+    policyDifferences,
+    policyFingerprint,
+    readPolicySnapshot,
     sessionIdOf,
     type AgentLike,
     type MissionRecord,
     type MissionStore,
     type MissionStoreRegistry,
+    type PolicyChange,
     type StageResult,
 } from 'dsh-eng-core'
 import type { OrchestratorConfig } from './config.js'
@@ -77,9 +85,9 @@ function budgetOf(deps: SequenceDeps, stage: StageConfig): number {
 }
 
 /** Every action the single tool exposes. */
-export type OrchestrateAction = 'start' | 'status' | 'advance' | 'rerun' | 'resume' | 'stages' | 'retro' | 'unblock' | 'metrics'
+export type OrchestrateAction = 'start' | 'status' | 'advance' | 'rerun' | 'resume' | 'stages' | 'retro' | 'unblock' | 'stop' | 'metrics'
 
-const ACTIONS: readonly OrchestrateAction[] = ['start', 'status', 'advance', 'rerun', 'resume', 'stages', 'retro', 'unblock', 'metrics']
+const ACTIONS: readonly OrchestrateAction[] = ['start', 'status', 'advance', 'rerun', 'resume', 'stages', 'retro', 'unblock', 'stop', 'metrics']
 
 /** Arguments of `orchestrate`. */
 export interface OrchestrateArgs {
@@ -88,6 +96,8 @@ export interface OrchestrateArgs {
     stageId?: string
     summary?: string
     verdict?: Verdict
+    /** `action: 'stop'`：谁停止的（默认记录调用方的 session/agent 标识）。 */
+    by?: string
     /** `action: 'metrics'` 的窗口天数（覆盖 `config.metrics.windowDays`）。 */
     windowDays?: number
     /** `action: 'metrics'` 的在飞列表上限（覆盖 `config.metrics.maxInFlight`）。 */
@@ -127,7 +137,7 @@ interface CallContext {
 
 /** The english model-facing description of `orchestrate`. */
 export const ORCHESTRATE_DESCRIPTION =
-    'Drive the engineering stage pipeline of the current mission (dsh-orchestrator): list stages, start, report status, advance, rerun or resume, and read the read-only delivery metrics of this repository. Stage gates are deterministic — a stage cannot be entered while a plugin it requires is not mounted, a stage whose exit gate fails rolls back to its onFail stage instead of advancing, and a stage that exceeds maxAttempts blocks the mission (circuit breaker). Always call this tool to move between stages instead of assuming the next step.'
+    'Drive the engineering stage pipeline of the current mission (dsh-orchestrator): list stages, start, report status, advance, rerun or resume, stop (a person\'s end of the mission: it withdraws the recorded mandate and the mission can no longer be resumed), and read the read-only delivery metrics of this repository. Stage gates are deterministic — a stage cannot be entered while a plugin it requires is not mounted, a stage whose exit gate fails rolls back to its onFail stage instead of advancing, and a stage that exceeds maxAttempts blocks the mission (circuit breaker). Always call this tool to move between stages instead of assuming the next step.'
 
 function agentOf(exec: unknown): AgentLike | undefined {
     return (exec as { agent?: AgentLike }).agent
@@ -657,6 +667,19 @@ async function startAction(deps: SequenceDeps, probes: Record<string, PluginProb
  */
 function blockedRefusal(mission: MissionRecord, action: string): string | undefined {
     if (mission.status !== 'blocked') return undefined
+    const mandate = mandateState(mission)
+    const withdrawn = mandate.kind === 'present' ? mandate.mandate.withdrawn : undefined
+    // A stopped mission is `blocked` too, but it is a STRONGER state than the
+    // breaker: `unblock` will refuse it (the authorisation is gone), so the
+    // message must not send the caller into that loop.
+    if (withdrawn !== undefined) {
+        return [
+            `mission ${mission.id} 已被人工停止（blocked；授权已由 ${withdrawn.by} 于 ${formatTime(withdrawn.at)} 撤回：${withdrawn.reason}），拒绝执行 ${action}。`,
+            '撤回是一个人的停止决定：unblock 也会因"授权已撤回"被拒绝，这条 mission 不能再继续。',
+            '',
+            '下一步：需要继续这项工作就新建 mission（spec_create → spec_approve）；只需查看现状用 orchestrate({ action: "status" })。',
+        ].join('\n')
+    }
     return [
         `mission ${mission.id} 处于熔断状态（blocked），拒绝执行 ${action}。`,
         '熔断是给人看的结论：继续推进只会重复同一轮失败。',
@@ -668,12 +691,183 @@ function blockedRefusal(mission: MissionRecord, action: string): string | undefi
     ].join('\n')
 }
 
-/** `unblock` — the human's explicit release of a circuit breaker. */
+/**
+ * Approvers a record cannot judge: a legacy/unnamed decision (`by: 'approval'`
+ * is how the terminal path has always recorded "a human, unnamed"), not a
+ * person's own id. Refusing those would break every pre-mandate mission.
+ */
+const PLACEHOLDER_APPROVERS: readonly string[] = ['approval', 'auto', 'unknown', 'seam', 'tui', 'terminal', 'cli', 'human', 'cancelled', 'timeout']
+
+/** One mandate revalidation: the verdict plus what the report should say. */
+interface MandateRevalidation {
+    ok: boolean
+    /** Chinese lines: a refusal's reasons, or the facts a success relies on. */
+    lines: string[]
+    /** Flat, non-prose facts for the evidence row. */
+    facts: Record<string, string | number | boolean>
+}
+
+/**
+ * Revalidate a mission's mandate before it resumes.
+ *
+ * Recording a grant that is never re-checked would only prove it existed once.
+ * Four checks, in the order the record answers them:
+ *
+ *  1. a mandate exists — a mission approved before mandates existed reads as
+ *     `legacy` and is treated like `explicit` (compatibility; a stated fact, not
+ *     a defect);
+ *  2. the recorded `policyVersion` still matches the workspace trust root — a
+ *     rule set that changed after the approval must be re-authorised;
+ *  3. the approver is still allowed (when an allowlist is configured) — a person
+ *     removed from the list cannot keep resuming other people's missions;
+ *  4. the mandate was not withdrawn by a person.
+ *
+ * `legacy` skips only what it cannot answer (no policy version, no withdrawal
+ * record) and applies check 3 for a CONCRETE identity only.
+ * @param cwd - workspace root (the policy fingerprint's base).
+ * @param mission - the mission about to resume.
+ * @param store - the mission's store (reads the approval-time fingerprint snapshot).
+ */
+function revalidateMandate(cwd: string, mission: MissionRecord, store: MissionStore): MandateRevalidation {
+    const state = mandateState(mission)
+    if (state.kind === 'absent') {
+        return {
+            ok: true,
+            lines: ['mandate：尚无（该 mission 没有已审批的规格，本次解除不涉及授权复核）'],
+            facts: { mandate: 'absent' },
+        }
+    }
+    if (state.kind === 'invalid') {
+        return {
+            ok: false,
+            facts: { mandate: 'invalid' },
+            lines: [
+                'mandate 复核失败：记录损坏，无法确认授权（fail closed）。',
+                `问题：${state.reason}`,
+                '下一步：检查 .dsh/missions/<id>/mission.json（信任根，只能由插件写入）；确认后新建 mission 重新审批。',
+            ],
+        }
+    }
+    const mandate = state.mandate
+    // The trail root is the store's: a host that relocates `.dsh` must not be
+    // compared against this process's default root.
+    const allowlist = approverAllowlist(cwd, { rootDir: store.layout.rootDir })
+    const concrete = !PLACEHOLDER_APPROVERS.includes(normalizeApprover(mandate.approvedBy))
+    const approverAllowed = !allowlist.configured || !concrete || allowlist.approvers.some((entry) => normalizeApprover(entry) === normalizeApprover(mandate.approvedBy))
+    if (state.kind === 'legacy') {
+        if (!approverAllowed) {
+            return {
+                ok: false,
+                facts: { mandate: 'legacy', reason: 'approver-not-allowed', approvedBy: mandate.approvedBy },
+                lines: [
+                    `mandate 复核失败：该 mission 是 legacy 审批（无 mandate 记录），审批人 ${mandate.approvedBy} 已不在允许清单里（${allowlist.files.join('、')}）。`,
+                    '下一步：由清单内的审批人重新审批——在新 mission 上执行 spec_create → spec_approve。',
+                ],
+            }
+        }
+        return {
+            ok: true,
+            facts: { mandate: 'legacy', approvedBy: mandate.approvedBy, approverChecked: allowlist.configured && concrete },
+            lines: [
+                `mandate：legacy（mandate 之前的历史审批，审批人 ${mandate.approvedBy}；没有 policyVersion 可比，按 explicit 兼容处理——事实，不是缺陷）`,
+            ],
+        }
+    }
+    const current = policyFingerprint(cwd, { rootDir: store.layout.rootDir })
+    if (mandate.policyVersion !== current.version) {
+        const snapshot = readPolicySnapshot(store, mission.id)
+        const changed: PolicyChange[] = snapshot === undefined ? [] : policyDifferences(snapshot, current)
+        const changedLine =
+            snapshot === undefined
+                ? '改动的信任根文件：无法定位（缺少审批时的 policy-fingerprint.json 快照）'
+                : changed.length === 0
+                  ? '改动的信任根文件：文件清单与快照相同（版本不一致但未能定位到具体文件）'
+                  : `改动的信任根文件：${changed
+                        .map((entry) => `${entry.path}（${entry.change === 'added' ? '新增' : entry.change === 'removed' ? '删除' : '修改'}）`)
+                        .join('、')}`
+        return {
+            ok: false,
+            facts: {
+                mandate: mandate.strength,
+                reason: 'policy-changed',
+                recorded: mandate.policyVersion,
+                current: current.version,
+                changedFiles: changed.map((entry) => entry.path).join(','),
+            },
+            lines: [
+                'mandate 复核失败：信任根策略在审批之后变了。',
+                `审批时的 policyVersion：${mandate.policyVersion}`,
+                `当前 policyVersion：${current.version}`,
+                changedLine,
+                '策略是这条授权的一部分：规则变了，授权就必须重新取得，而不是静默继承。',
+                '下一步：重新提交规格审批——用 spec_create 新建 mission（同一 mission 的 mandate 不可改写、无法在策略变化后续期），再走 test_design_review → spec_approve。',
+            ],
+        }
+    }
+    if (!approverAllowed) {
+        return {
+            ok: false,
+            facts: { mandate: mandate.strength, reason: 'approver-not-allowed', approvedBy: mandate.approvedBy },
+            lines: [
+                `mandate 复核失败：审批人 ${mandate.approvedBy} 已不在允许清单里（${allowlist.files.join('、')}）。`,
+                '允许清单会事后改变：一个人被移出名单后，不能再继续解除他批准的任务。',
+                '下一步：由清单内的人重新审批（spec_create → spec_approve 新建 mission，mandate 不可改写）。',
+            ],
+        }
+    }
+    if (mandate.withdrawn !== undefined) {
+        return {
+            ok: false,
+            facts: { mandate: mandate.strength, reason: 'withdrawn', withdrawnBy: mandate.withdrawn.by, withdrawnAt: mandate.withdrawn.at },
+            lines: [
+                `mandate 复核失败：授权已被 ${mandate.withdrawn.by} 于 ${formatTime(mandate.withdrawn.at)} 撤回（${mandate.withdrawn.reason}）。`,
+                '撤回是一个人的停止决定，只有新 mission 能重新开始这项工作。',
+                '下一步：spec_create 新建 mission 并重新 spec_approve。',
+            ],
+        }
+    }
+    return {
+        ok: true,
+        facts: {
+            mandate: mandate.strength,
+            policyVersion: mandate.policyVersion,
+            approvedBy: mandate.approvedBy,
+            approverInAllowlist: allowlist.configured && concrete,
+        },
+        lines: [
+            `mandate：${mandate.strength}，审批人 ${mandate.approvedBy}，policy ${mandate.policyVersion.slice(0, 12)} 与当前信任根一致` +
+                `${allowlist.configured ? `；审批人${concrete ? '在' : '是占位标识，无法比对'}允许清单里` : '；未配置允许清单'}`,
+        ],
+    }
+}
+
+/** `unblock` — the human's explicit release of a circuit breaker, mandate revalidated first. */
 function unblockAction(deps: SequenceDeps, ctx: CallContext, args: OrchestrateArgs): string {
     const mission = ctx.mission
     if (mission === undefined) return '当前会话没有 mission。\n\n下一步：orchestrate({ action: "start" })。'
     if (mission.status !== 'blocked') {
         return `mission ${mission.id} 的状态是 ${mission.status}，不需要解除熔断。\n\n下一步：orchestrate({ action: "status" })。`
+    }
+    // Revalidate BEFORE the latch moves: a resume is the moment the grant is
+    // used again, so "does it still hold?" belongs here, not at approval time
+    // (the world changes in between).
+    const revalidation = revalidateMandate(mission.cwd, mission, ctx.store)
+    if (!revalidation.ok) {
+        // Fail closed: the status is untouched, and the refusal becomes a durable
+        // row in the mission's own trail (not just a message the model saw once).
+        ctx.store.appendEvidence(mission.id, {
+            kind: 'manual',
+            summary: `mandate 复核拒绝解除熔断：${revalidation.lines[0] ?? '授权不再成立'}`,
+            recordedBy: 'dsh-orchestrator',
+            data: { action: 'unblock', result: 'refused', reason: 'mandate', ...revalidation.facts },
+        })
+        return [
+            `mission ${mission.id} 的熔断未解除：mandate 复核未通过（fail closed，状态仍是 blocked）。`,
+            '',
+            ...revalidation.lines,
+            '',
+            '本次拒绝已写入证据账本（evidence.jsonl）。',
+        ].join('\n')
     }
     const restored: MissionRecord['status'] = mission.spec?.approvedAt === undefined ? 'draft' : 'spec-approved'
     ctx.store.setStatus(mission.id, restored)
@@ -681,13 +875,93 @@ function unblockAction(deps: SequenceDeps, ctx: CallContext, args: OrchestrateAr
         kind: 'manual',
         summary: `人工解除熔断：${args.summary ?? '(未填写原因)'}`,
         recordedBy: 'dsh-orchestrator',
-        data: { action: 'unblock', from: 'blocked', to: restored },
+        data: { action: 'unblock', from: 'blocked', to: restored, result: 'allowed', ...revalidation.facts },
     })
     return [
         `mission ${mission.id} 的熔断已解除（blocked → ${restored}），本次解除已记入证据账本。`,
         `原因：${args.summary ?? '(未填写)'}`,
+        ...revalidation.lines,
         '',
         `下一步：orchestrate({ action: "resume" }) 回到阶段 ${mission.stage ?? '(空)'}，或 orchestrate({ action: "status" }) 先看状态。`,
+    ].join('\n')
+}
+
+/**
+ * `stop` — a person's end of the mission.
+ *
+ * This is the ONLY thing that withdraws a mandate: the recorded grant keeps its
+ * strength, scope, policy version, approver and time, and gains a `withdrawn`
+ * block naming who stopped it, when and why. The mission is then `blocked`, and
+ * `unblock` refuses it — a stop that a later `unblock` could undo would not be a
+ * stop.
+ *
+ * A `legacy` mission has no mandate record, so there is nothing to withdraw and
+ * the report says so: inventing one here would fabricate a grant nobody made.
+ * The stop itself is still recorded in the evidence ledger.
+ */
+function stopAction(deps: SequenceDeps, ctx: CallContext, args: OrchestrateArgs): string {
+    const mission = ctx.mission
+    if (mission === undefined) return '当前会话没有 mission 可以停止。\n\n下一步：orchestrate({ action: "start" })。'
+    if (mission.status === 'delivered') {
+        return `mission ${mission.id} 已交付（delivered）：没有在飞的授权可以停止。\n\n下一步：orchestrate({ action: "status" })。`
+    }
+    const reason = args.summary?.trim() ?? ''
+    if (reason === '') {
+        return [
+            `停止 mission ${mission.id} 需要说明原因：orchestrate({ action: "stop", summary: "<为什么停止>" })。`,
+            '没有原因的"停止"不是可审计的结论，也不会被记入 mandate。',
+        ].join('\n')
+    }
+    const by = args.by?.trim() ?? ''
+    const identity = by !== '' ? by : ctx.sessionId !== undefined ? `session:${ctx.sessionId}` : agentIdOf(ctx.agent) ?? 'human'
+    const now = Date.now()
+    const state = mandateState(mission)
+    if (state.kind === 'invalid') {
+        return [
+            `mission ${mission.id} 的 mandate 记录损坏，拒绝停止（fail closed）：${state.reason}`,
+            '下一步：检查 .dsh/missions/<id>/mission.json；确认后新建 mission。',
+        ].join('\n')
+    }
+    if (state.kind === 'present') {
+        if (state.mandate.withdrawn !== undefined) {
+            return [
+                `mission ${mission.id} 的授权已于 ${formatTime(state.mandate.withdrawn.at)} 由 ${state.mandate.withdrawn.by} 撤回（${state.mandate.withdrawn.reason}）：保留第一次停止的记录，不重复写入。`,
+                '下一步：orchestrate({ action: "status" }) 查看现状；继续这项工作需要新 mission。',
+            ].join('\n')
+        }
+        const result = ctx.store.withdrawMandate(mission.id, { at: now, by: identity, reason })
+        if (result.mandate === undefined) {
+            return `mission ${mission.id} 的 mandate 未能撤回：${result.refusal ?? '未知原因'}\n\n下一步：orchestrate({ action: "status" }) 查看现状。`
+        }
+        ctx.store.setStatus(mission.id, 'blocked')
+        ctx.store.appendEvidence(mission.id, {
+            kind: 'manual',
+            summary: `人工停止 mission（mandate 已撤回）：${reason}`,
+            recordedBy: 'dsh-orchestrator',
+            data: { action: 'stop', mandateWithdrawn: true, by: identity, reason, policyVersion: result.mandate.policyVersion },
+        })
+        return [
+            `mission ${mission.id} 已停止：mandate 记入 withdrawn（by ${identity}，${formatTime(now)}，原因：${reason}），状态置为 blocked。`,
+            '这次停止是持久的：mandate 的其余字段（强度/范围/策略版本/审批人）保持不变，unblock 会因"授权已撤回"被拒绝；继续这项工作需要新 mission。',
+            '',
+            '下一步：需要继续时 spec_create 新建 mission 并重新 spec_approve；回顾用 orchestrate({ action: "status" })。',
+        ].join('\n')
+    }
+    // No mandate record (never approved, or a legacy pre-mandate approval):
+    // stop the work, but be honest that there is no authorisation to withdraw.
+    ctx.store.setStatus(mission.id, 'blocked')
+    ctx.store.appendEvidence(mission.id, {
+        kind: 'manual',
+        summary: `人工停止 mission（无可撤回的 mandate）：${reason}`,
+        recordedBy: 'dsh-orchestrator',
+        data: { action: 'stop', mandateWithdrawn: false, by: identity, reason, mandateState: state.kind },
+    })
+    return [
+        `mission ${mission.id} 已停止（状态置为 blocked），本次停止已记入证据账本。`,
+        state.kind === 'legacy'
+            ? '该 mission 是 legacy 审批（mandate 之前的历史记录）：没有可撤回的对象，因此这次停止只存在于证据账本里。'
+            : '该 mission 还没有已审批的规格：本来就没有授权可以撤回。',
+        '下一步：需要继续时 spec_create 新建 mission 并重新 spec_approve。',
     ].join('\n')
 }
 
@@ -1115,6 +1389,8 @@ export async function runOrchestrate(deps: SequenceDeps, args: OrchestrateArgs, 
             return retroAction(deps, ctx)
         case 'unblock':
             return unblockAction(deps, ctx, args)
+        case 'stop':
+            return stopAction(deps, ctx, args)
         case 'metrics':
             return metricsAction(deps, ctx, args)
         default:
@@ -1238,10 +1514,14 @@ export function registerTools(
                     required: true,
                     enum: [...ACTIONS],
                     description:
-                        'start = create/bind the mission and enter the first stage; status = pipeline view; advance = settle the current stage and enter the next one (only the current stage); rerun = re-enter a stage (attempt + 1); resume = re-enter the persisted mission.stage; stages = list the configured pipeline with capability probing; retro = fold the finished mission into a retrospective (返工信号 + 候选经验) and append it to the cross-run ledger; unblock = the human release of a blocked (熔断) mission; metrics = READ-ONLY delivery metrics of this repository over a window (lead time, approval wait, gate failure rate, deployment/rollback rate, in flight, recent releases) — it writes nothing at all.',
+                        'start = create/bind the mission and enter the first stage; status = pipeline view; advance = settle the current stage and enter the next one (only the current stage); rerun = re-enter a stage (attempt + 1); resume = re-enter the persisted mission.stage; stages = list the configured pipeline with capability probing; retro = fold the finished mission into a retrospective (返工信号 + 候选经验) and append it to the cross-run ledger; unblock = the human release of a blocked (熔断) mission, which first revalidates the mission\'s mandate (policy version, approver, withdrawal) and refuses when it no longer holds; stop = a person\'s end of the mission: it records mandate.withdrawn (immutable) and blocks the mission so it cannot be resumed; metrics = READ-ONLY delivery metrics of this repository over a window (lead time, approval wait, gate failure rate, deployment/rollback rate, in flight, recent releases) — it writes nothing at all.',
                 },
                 missionId: { type: 'string', description: 'Mission to act on (default: the mission bound to this session or its delegating parent; pass an explicit id to drive another one). Ignored by action "metrics", which reports the whole repository.' },
                 stageId: { type: 'string', description: 'Stage to act on for rerun (default: the current stage).' },
+                by: {
+                    type: 'string',
+                    description: 'For action "stop": who is stopping the mission (recorded in the mandate\'s withdrawal). Default: the calling session/agent identity.',
+                },
                 summary: { type: 'string', description: 'One-line summary of what the stage did; recorded with the stage result.' },
                 verdict: {
                     type: 'string',

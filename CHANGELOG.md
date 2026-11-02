@@ -1,3 +1,28 @@
+## [未发布]
+
+### 新增 · Mandate v2：准入记录 + 策略版本 + 恢复前重校验
+
+补上"授权前史"：`spec_approve` 现在写一条**不可变**的授权记录（强度 / 范围 / 策略版本 / 批准人 / 时间），
+外加 write-once 的 `missions/<id>/policy-fingerprint.json`（批准时刻的信任根逐文件摘要）。
+
+- **强度是算出来的**：子代理一律 `inferred`（即使在白名单里）；配了白名单 ⇒ 只有名单内的人算 `explicit`（IM 途径同样适用）；
+  没配白名单 ⇒ 仅本地/终端来源且非子代理算 `explicit`，未知来源按远端处理；`approval: auto` 只有**没有**白名单时才算 `explicit`。
+  白名单以只读方式取自信任根 `.dsh/role-guard.json`（`approvers`/`allowlist`）与交互层的 `approversFile`。
+- **`inferred` 今天失败关闭**：被记录并被点名，但不满足强制门禁——需要"已批准规格"的写操作仍被拒绝，理由点名 `inferred`。
+- **不可变**：再次批准不覆盖旧记录；**要更宽的范围必须开新 mission**（会被拒绝并说明）。
+- **只有人的 stop 撤销它**：新增 `orchestrate({ action: 'stop' })` 记录 `withdrawn`；`mission_complete` 不撤销任何东西。
+- **恢复前重校验**：`orchestrate({ action: 'unblock' })` 校验策略版本 / 批准人仍在名单 / 未撤销 / 记录未损坏，不通过则
+  **失败关闭**（仍 blocked，写 `result:"refused"` 台账行）。因记录不可变，**策略漂移的修复办法是新建 mission 重新送审**
+  （拒绝信息与医生建议都这么说）。
+- **可见性**：医生新增 `mandate.policy` 检查（在飞 mission 的策略版本不一致 = 必需级缺口，列出 ≤5 个 mission 与改动的信任根文件）；
+  `legacy`（本机制引入前批准的 mission）按 `explicit` 兼容处理，并在报告里作为**事实**陈述。
+
+### 验证
+
+- `bash scripts/verify.sh`：**944 测试 / 943 通过 / 0 失败 / 1 如实跳过**（含 OPS SELFTEST GREEN）。
+- `scripts/e2e-mission.sh`：**E2E GREEN，15/15 插件**，且真机会话里确认 mandate 已落盘
+  （`strength: explicit`、`scope.paths` 来自规格、`policyVersion` 为空信任根的既定值）。
+
 ## [0.4.0] — 2026-10-30
 
 ### 新增 · IM 交互通道（可选，基于 `dsh-chat-interaction` v0.3.0）

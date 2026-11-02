@@ -20,6 +20,7 @@ import { missionId as buildMissionId, sha256, shortDigest, stamp } from './diges
 import { appendJsonl, ensureDir, listDir, readJson, readJsonl, readText, writeJsonAtomic, writeOnce, writeTextAtomic } from './io.js'
 import { createLogger } from './log.js'
 import type { Logger } from './log.js'
+import { withdrawalOf } from './mandate.js'
 import { isInside, missionDir, resolveLayout, sessionStateFile, specFile } from './paths.js'
 import type { Layout, LayoutOptions } from './paths.js'
 import { parentSessionIdOf, sessionIdOf } from './session.js'
@@ -30,6 +31,7 @@ import type {
     GateRecord,
     GateState,
     GitFingerprint,
+    Mandate,
     MissionApproval,
     MissionRecord,
     MissionStatus,
@@ -312,6 +314,29 @@ export class MissionStore {
                 ? { spec: { ...record.spec, approvedAt: undefined, approvedBy: undefined, updatedAt: Date.now() } }
                 : {}),
         }))
+    }
+
+    /**
+     * Record a person's stop of the mission's authorisation.
+     *
+     * The mandate is immutable in every field except `withdrawn`: the recorded
+     * strength, scope, policy version and approver stay exactly as approved, so
+     * a stop can never be used to re-issue or widen a grant.
+     * @param id - mission id.
+     * @param input - who stopped it, when, and why (the reason is mandatory).
+     * @returns the updated record and/or why the withdrawal does not apply.
+     */
+    withdrawMandate(id: string, input: { at: number; by: string; reason: string }): { record?: MissionRecord; mandate?: Mandate; refusal?: string } {
+        const current = this.read(id)
+        if (current === undefined) return { refusal: `mission ${id} 不存在或 mission.json 损坏，无法撤回 mandate` }
+        const result = withdrawalOf(current, input)
+        if (result.mandate === undefined) return result.refusal === undefined ? {} : { refusal: result.refusal }
+        const record = this.update(id, () => ({ mandate: result.mandate }))
+        return {
+            mandate: result.mandate,
+            ...(record === undefined ? {} : { record }),
+            ...(result.refusal === undefined ? {} : { refusal: result.refusal }),
+        }
     }
 
     /** The 1-based round the next submission will be. */

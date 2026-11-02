@@ -711,7 +711,7 @@ test('the tool schema rejects an out-of-contract call before the handler runs', 
     // The action enum is an exact set on purpose (the schema refuses an
     // out-of-contract call before the handler runs). Adding `metrics` to the
     // surface legitimately extends this list — updated here, not silently.
-    assert.match(String(unknownAction.content), /must be one of \["start","status","advance","rerun","resume","stages","retro","unblock","metrics"\]/)
+    assert.match(String(unknownAction.content), /must be one of \["start","status","advance","rerun","resume","stages","retro","unblock","stop","metrics"\]/)
 
     const missingAction = await fake.runTool('orchestrate', {})
     assert.equal(missingAction.isError, true)

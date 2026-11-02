@@ -11,7 +11,7 @@
  * @module dsh-spec-gate/guard
  */
 
-import { isInside, isReallyInside, pathMatchesAny, pathMatchesPattern, resolvePath, type MissionStore, type MissionStoreRegistry } from 'dsh-eng-core'
+import { isInside, isReallyInside, mandateState, pathMatchesAny, pathMatchesPattern, resolvePath, type Mandate, type MissionStore, type MissionStoreRegistry } from 'dsh-eng-core'
 import path from 'node:path'
 import type { AgentLike } from 'dsh-eng-core'
 import { evaluateConstraints, type ConstraintViolation } from './constraints.js'
@@ -68,6 +68,33 @@ function noMissionReason(sessionId: string | undefined): string {
     ].join('\n')
 }
 
+/**
+ * A write refused because the mission's mandate is `inferred`.
+ *
+ * The distinction matters to the model: the specification IS approved, so
+ * telling it "no approved spec" would send it to re-approve forever. The honest
+ * answer is "this approval is not strong enough", plus the way out.
+ */
+function inferredMandateReason(missionId: string, mandate: Mandate): string {
+    return [
+        `spec-gate: mission ${missionId} 的授权强度是 inferred（已记录，但不满足强制门禁），写操作被拒绝。`,
+        `审批人：${mandate.approvedBy}（policy ${mandate.policyVersion.slice(0, 12)}，${new Date(mandate.at).toISOString()}）。`,
+        'inferred 的含义：这条批准不能证明是一个"被允许的人"做的决定（可能是允许清单之外的审批人、子代理会话、未配置名单时的 IM 点击，或自动审批）。',
+        '下一步：由允许清单内的审批人在本地会话重新审批——但同一 mission 的 mandate 不可改写，因此需要新 mission：',
+        'spec_create（重新提交规格）→ test_design_review → spec_approve。',
+        '（inferred 授权的 observe 模式是下一阶段，尚未实现；在那之前它一律不放行写操作。）',
+    ].join('\n')
+}
+
+/** A write refused because the stored mandate cannot be trusted (fail closed). */
+function invalidMandateReason(missionId: string, reason: string): string {
+    return [
+        `spec-gate: mission ${missionId} 的 mandate 记录损坏，写操作被拒绝（fail closed）。`,
+        `问题：${reason}`,
+        '下一步：检查 .dsh/missions/<id>/mission.json（它属于信任根，只能由插件写入）；确认后新建 mission 重新审批。',
+    ].join('\n')
+}
+
 function notApprovedReason(missionId: string, status: string): string {
     return [
         `spec-gate: 规格 ${missionId} 尚未审批（当前状态 ${status}），写操作被拒绝。`,
@@ -78,11 +105,14 @@ function notApprovedReason(missionId: string, status: string): string {
 /**
  * Build the write guard.
  *
- * Two deterministic checks, in order:
- *  1. the mission has an approved specification (docs.md §3.2);
+ * Three deterministic checks, in order:
+ *  1. the mission has an approved specification (docs.md §3.2) **and its mandate
+ *     satisfies this gate** — an `inferred` approval is recorded but does not
+ *     authorise writes (see `dsh-eng-core/mandate.ts`; fail closed);
  *  2. the target path is inside the specification's declared **file
  *     boundaries** (docs.md §1.2/§9 — a boundary the host never checks is a
- *     comment, not a constraint).
+ *     comment, not a constraint);
+ *  3. the target is outside the engineering trail (the gate's trust root).
  *
  * @param deps - configuration, mission stores and the test-design probe.
  * @returns the guard plus a denial counter.
@@ -203,6 +233,22 @@ export function createWriteGuard(deps: WriteGuardDeps): WriteGuard {
         if (mission.spec === undefined || mission.spec.approvedAt === undefined) {
             bump(store.layout.rootDir)
             return notApprovedReason(mission.id, mission.status)
+        }
+        // The approval is only as strong as the mandate it produced. An
+        // `inferred` mandate (an allowlist that does not contain the approver, a
+        // subagent, an IM click with no allowlist, an automatic approval) is
+        // RECORDED and REPORTED, but it does not satisfy an enforcing gate: the
+        // write is refused here, with the reason naming `inferred` instead of
+        // pretending no specification exists. Legacy (no record) passes: it is a
+        // pre-mandate approval, treated like explicit for compatibility.
+        const mandate = mandateState(mission)
+        if (mandate.kind === 'invalid') {
+            bump(store.layout.rootDir)
+            return invalidMandateReason(mission.id, mandate.reason)
+        }
+        if (mandate.kind === 'present' && mandate.mandate.strength === 'inferred') {
+            bump(store.layout.rootDir)
+            return inferredMandateReason(mission.id, mandate.mandate)
         }
         if (!config.enforceBoundaries) return undefined
         // A shell tool that we could not attribute is judged by the host policy.

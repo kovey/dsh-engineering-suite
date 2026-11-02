@@ -589,6 +589,41 @@ IM 侧的职责（不在本仓库）：卡片按钮不可伪造且一次性、�
 **这个设计的要点**：IM 是**通道**，不是授权来源。授权仍然由台账 + 门禁记录 + 回执构成；换个通道改变的是"人在哪里被问"，
 不改变"什么算允许"。
 
+### 5.19 授权前史：Mandate v2（准入记录 + 策略版本 + 恢复前重校验）
+
+在此之前，套件只能证明"这次交付被允许"，不能证明"这项工作从一开始就被允许、依据的是哪一版规则"。
+`spec_approve` 只写了 `approvedBy`/`approvedAt`。Mandate v2 补的正是这段**授权前史**，其语义来自
+`deepseek-ai/dsh-superagent-prototype` 的 Gate + Mandate + Revalidation（研究原型，仅借语义，不引入其运行时）。
+
+**记录**（`spec_approve` 写入，不可变）：
+
+```json
+{ "version": 1, "strength": "explicit|inferred|legacy", "basis": "spec-approved",
+  "scope": { "phases": [], "paths": ["src/**"] },
+  "policyVersion": "<.dsh 信任根的 sha256>", "approvedBy": "…", "at": 0 }
+```
+
+外加 write-once 的 `missions/<id>/policy-fingerprint.json`（批准时刻的信任根逐文件摘要），用于事后回答"当时是什么规则"。
+
+**四条硬规则**（每条都在补一个真实的洞）：
+
+1. **不可变**：再次批准不覆盖旧 mandate；**要更宽的范围就开新 mission**（拒绝并说明）。否则"批准"会变成一个可以被悄悄放宽的字段。
+2. **强度是算出来的，不是声称的**：子代理会话一律 `inferred`（即使在白名单里）；配了白名单 ⇒ 只有名单内的 `approvedBy` 才 `explicit`
+   （IM 途径同样适用）；没配白名单 ⇒ 仅"本地/终端这类来源且非子代理"算 `explicit`，未知来源一律按远端处理；
+   `approval: auto` 只有在**没有**白名单时才算 `explicit`（有白名单时它等于"没人真的批过"）。
+3. **只有人的 stop 才能撤销**：新增 `orchestrate({ action: 'stop' })` 记录 `withdrawn:{at,by,reason}`；
+   `mission_complete`（交付完成）**不**撤销任何东西——交付是"做完"，不是"收回授权"。
+4. **恢复前重校验**：`orchestrate({ action: 'unblock' })` 先校验 policyVersion、批准人是否仍在名单、是否已撤销、mandate 是否损坏；
+   不通过就**失败关闭**（mission 仍 blocked，写一条 `result:"refused"` 的台账行并给出具体下一步）。
+   因为 mandate 不可变，**策略漂移无法用"重新批准同一个 mission"来修**——拒绝信息与医生的修复建议都指向"新建 mission 并重新送审"。
+
+**`inferred` 今天是失败关闭的**：它会被记录并在报告里点名，但**不满足**强制门禁——需要"已批准规格"的写操作仍被拒绝，
+且拒绝理由点名 `inferred` 而不是"没有规格"。（"先影子观察再收紧"的 observe 模式属于下一阶段，尚未实现。）
+
+**可见性**：医生新增 `mandate.policy` 检查——有在飞 mission 的 mandate 版本与当前不符时是**必需级缺口**
+（列出 ≤5 个 mission id 与改动的信任根文件，修复命令是"新建 mission 重新送审"）；全都一致为 ok；无可判断时为 unknown 并说明原因。
+`legacy`（本机制引入前批准的 mission）在报告里**永远作为事实陈述**，不是缺陷，且按 `explicit` 兼容处理。
+
 ## 6. 为什么这样切分
 
 - **一个关注点一个插件**：门禁可以单独失效（例如先只上 quality-gate），不影响其它环节。
