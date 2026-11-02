@@ -26,10 +26,18 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import {
+    CONFORMANCE_DIMENSION_LABEL,
+    CONFORMANCE_DIMENSION_STATES,
+    CONFORMANCE_DIMENSIONS,
+    CONFORMANCE_HEADLINES,
+    DEFAULT_CONFORMANCE_WINDOW,
+    buildConformanceContext,
     cell,
+    conformanceRollup,
     formatTime,
     listDir,
     readText,
+    type ConformanceRollup,
     type GateRecord,
     type GateState,
     type Layout,
@@ -639,6 +647,14 @@ export interface DeliveryMetrics {
     }
     inFlight: InFlightFact[]
     gaps: string[]
+    /**
+     * 跨 mission 的一致性分布（`dsh-eng-core` 的 conformance）。
+     *
+     * 它**不是**评分：同一组维度的计数 + 头行状态计数 + 趋势行。`collectMetrics`
+     * 总会填上它；`computeMetrics` 只吃 `Trail`，所以这里是可选的（纯函数不读
+     * 一致性台账）。
+     */
+    conformance?: ConformanceRollup
 }
 
 /** 最新一次门禁（`checkedAt` 最大，平局取 id 大的），可限定在某个时点之前。 */
@@ -804,7 +820,14 @@ function deployProblemsOf(trail: Trail): string[] {
 
 /** 采集 + 计算（I/O 只发生在 `collectTrail` 里）。 */
 export function collectMetrics(options: CollectOptions): DeliveryMetrics {
-    return computeMetrics(collectTrail(options))
+    const metrics = computeMetrics(collectTrail(options))
+    // 一致性分布读的是同一份 trail（再加仓库级台账），窗口按"最新 N 个 mission"
+    // 而不是"最近 N 天"：同一棵树、同一批 mission 必须给出同一组数字。
+    const conformance = conformanceRollup(
+        buildConformanceContext({ layout: options.store.layout, now: options.now }),
+        DEFAULT_CONFORMANCE_WINDOW,
+    )
+    return { ...metrics, conformance }
 }
 
 // --- 渲染 --------------------------------------------------------------------
@@ -914,6 +937,55 @@ function gateFailureRow(metrics: DeliveryMetrics): string {
         return `| 门禁失败率（交付前最后一次门禁 ≠ PASS） | 没有数据：窗口内没有已交付的 mission（没有回执就没有"交付前"这个时点） | n=0 | ${cell(scope)} |`
     }
     return `| 门禁失败率（交付前最后一次门禁 ≠ PASS） | ${ratio(gateFailure.failures.length, gateFailure.delivered)}个已交付 mission | n=${gateFailure.delivered} | ${cell(scope)} |`
+}
+
+/**
+ * 一致性分布（跨 mission）。
+ *
+ * 只给**同一组维度的计数**，不给加权分数：一个总分只会掩盖"哪个维度坏了"，
+ * 也会诱导优化分数本身。头行状态同样取最差维度——`unknown` 不优于 `partial`。
+ * @param metrics - 已采集的度量（`conformance` 缺失时如实说没有计算）。
+ */
+function renderConformance(metrics: DeliveryMetrics): string[] {
+    const distribution = metrics.conformance
+    const lines = [
+        '',
+        `### 一致性分布（最新 ${distribution?.limit ?? DEFAULT_CONFORMANCE_WINDOW} 个 mission；头行 = 五个维度里最差的一个）`,
+        '',
+    ]
+    if (distribution === undefined) {
+        lines.push('- 没有计算：本次调用没有读一致性台账（这不是"全部一致"）。')
+        return lines
+    }
+    if (distribution.window.length === 0) {
+        lines.push('- 没有 mission：没有可比较的一致性样本（这不是"全部一致"）。')
+    } else {
+        lines.push(
+            `- 头行状态（${distribution.window.length} 个）：${CONFORMANCE_HEADLINES.map(
+                (state) => `${state} ${distribution.headlines[state]}`,
+            ).join('、')}`,
+        )
+        for (const dimension of CONFORMANCE_DIMENSIONS) {
+            const counts = distribution.dimensions[dimension]
+            const known = CONFORMANCE_DIMENSION_STATES[dimension].map((state) => `${state} ${counts[state] ?? 0}`)
+            const extra = Object.keys(counts)
+                .filter((state) => !CONFORMANCE_DIMENSION_STATES[dimension].includes(state))
+                .sort()
+                .map((state) => `${state} ${counts[state] ?? 0}`)
+            lines.push(`- ${CONFORMANCE_DIMENSION_LABEL[dimension]}：${[...known, ...extra].join('、')}`)
+        }
+        if (distribution.trend !== undefined) lines.push(`- ${distribution.trend.line}`)
+    }
+    lines.push(
+        `- 盲区：${
+            distribution.blind.length === 0
+                ? '无（这份分布没有已知缺口；它仍然只描述被记录的 mission）'
+                : distribution.blind.join('；')
+        }`,
+    )
+    lines.push('')
+    lines.push('（这是一组维度的分布，不是把维度压成一个数字：那会掩盖"哪个维度坏了"，也会诱导优化数字本身。）')
+    return lines
 }
 
 /** 1. 指标表。 */
@@ -1096,6 +1168,7 @@ export function renderMetrics(metrics: DeliveryMetrics, options: RenderOptions):
     if (options.note !== undefined && options.note !== '') lines.push(`- 参数：${options.note}`)
     lines.push('')
     lines.push(...renderTable(metrics, options))
+    lines.push(...renderConformance(metrics))
     lines.push(...renderGateReasons(metrics))
     lines.push(...renderInFlight(metrics, options))
     lines.push(...renderReleases(metrics, options.cwd))

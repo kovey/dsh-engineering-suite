@@ -51,12 +51,12 @@
 
 | 工具 | 作用 |
 |---|---|
-| `suite_status({ missionId?, json? })` | 跑离线自检 → 合并运行时事实（`withRuntime`）→ 按"需要我 / 健康 / 历史"的顺序输出中文报告（见下「操作者视图」）；`json: true` 给机器读（同一份判定）。`missionId` 不存在时**拒绝**（fail closed），而不是换一个任务报告。 |
+| `suite_status({ missionId?, json? })` | 跑离线自检 → 合并运行时事实（`withRuntime`）→ 按"需要我 / 健康 / 一致性 / 历史"的顺序输出中文报告（见下「操作者视图」）；`json: true` 给机器读（同一份判定）。`missionId` 不存在时**拒绝**（fail closed），而不是换一个任务报告。 |
 
 **严格只读**：不写门禁记录、不落盘、不改 mission、不创建 `.dsh/`；也**不授予任何权限**。测试里有一条
 "工作区前后逐字节一致"（对整个 `.dsh` 树做内容哈希比对，另加一条"没有台账的工作区不会长出 `.dsh/`"）。
 
-### 操作者视图：三个问题，按顺序
+### 操作者视图：四个问题，按顺序
 
 文本输出回答的是操作者的顺序，`json: true` 仍然是同一份合并报告（机器读）：
 
@@ -65,9 +65,38 @@
    以及**带理由**的过期标注（策略版本变了 / 等太久 / mission 已结束）。过期的提问仍然列出；队列**读不到**时写"未知"
    并给出下一步——那不是"没事"，也**不会**变成一条 blocker（一次探测失败是这份报告的缺口，不是工作区的问题）。
 2. **系统是否健康？**——既有的全部检查，原样给出：全绿时**只占一行**，否则输出完整报告。
-3. **历史**——只给指路（`spec_status` / `audit_report` / `orchestrate({ action: "retro" })`），不在这里重复。
+3. **一致性（这一项离规则允许的范围有多远）**——当前（或最新）mission 的一致性总览（`dsh-eng-core`
+   的 `conformance`）：头行状态、五个维度各一行、有盲区时一行 `盲区：…`、以及下一步。
+   详见下节。
+4. **历史**——只给指路（`spec_status` / `audit_report` / `orchestrate({ action: "retro" })`），不在这里重复。
 
 测试固定住的三条不变量：**表头数字 = 显示的行数 + 隐藏的行数**；**健康状态只占一行**；**截断必须说明还有多少条**。
+
+## 一致性（第 3 节）
+
+这一节回答的是"**这次交付离规则允许的范围有多远**"，**不**回答"能不能交付"——后者仍只由
+门禁记录 + 回执决定（`mission_complete` 直接读它们；任何门禁都不读这一节）。
+
+它读的是当前会话的 mission（没有绑定就是最新的一个；`missionId` 显式指定优先），五个维度全部由
+现有台账确定性算出（不新增记录）：
+
+| 维度 | 读什么 | 取值 |
+|---|---|---|
+| 授权 | `mission.mandate`（强度/范围/策略版本/撤回）、`legacy`、`spec.approvedAt` | `ok` / `stale` / `legacy` / `withdrawn` / `missing` |
+| 证据 | 回执、`gate.scope.full`、交付要求的门禁来源与必填证据类型 | `full` / `partial` / `absent` |
+| 门禁 | 每个 `source` 最新记录；`observations` 里的影子 `would` **只进明细，不进裁决** | `pass` / `warn` / `block` / `no-record` |
+| 新鲜度 | `policyVersion` 与当前信任根、工作区指纹与最新门禁指纹、规范基线、知识库索引自述 | `fresh` / `stale` / `unknown` |
+| 一致性 | 回执/证据引用的工件是否存在、`evidence.jsonl` 是否可解析、`mandate.at` 与 `spec.approvedAt`、部署/发布台账引用 | `consistent` / `divergent` / `unknown` |
+
+- **头行 = 最差维度**（`conformant` / `partial` / `divergent` / `unknown`），且 **`unknown` 永远不优于
+  `partial`**；全为未知才输出 `unknown`。
+- 每行是"状态 token + 一句可读的原因"；`legacy` 授权作为**事实**呈现（按 explicit 兼容处理），
+  不计入 `divergent`。
+- **盲区行**在该写的时候一定出现：缺 `plan.jsonl`/`releases.jsonl`/`deployments.jsonl`、读不到的
+  mission 工件、legacy 授权没有的策略版本、索引是否落后……都点名。
+- **不做加权分数**：这里只有状态，没有"总分"。要跨 mission 比较用
+  `orchestrate({ action: "metrics" })` 的一致性分布。
+- **只读**：这一节不写门禁、不落盘、不改 mission；测试用 `.dsh` 前后内容哈希快照断言。
 
 ## 影子聚合（`gate.observe`）
 

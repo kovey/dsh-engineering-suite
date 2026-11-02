@@ -17,11 +17,12 @@
  */
 
 import assert from 'node:assert/strict'
+import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import test, { after } from 'node:test'
 import { execFileSync } from 'node:child_process'
-import type { DoctorReport } from 'dsh-eng-core'
+import { MissionStore, resolveLayout, type DoctorReport, type GateRecord, type MissionRecord, type SpecRecord } from 'dsh-eng-core'
 import { createFakeHost, runText, tempWorkspace, type FakeHost } from 'dsh-eng-core/testing'
 import { apply } from '../dist/index.js'
 import { HISTORY_POINTER, OPERATOR_QUESTIONS, renderOperatorView, type OperatorInput } from '../dist/operator.js'
@@ -94,9 +95,10 @@ function reportOf(input: { blockers?: number; advice?: number; checks?: number; 
 }
 
 /** The content lines of one section, without its heading and blank lines. */
-function sectionOf(text: string, index: 1 | 2 | 3): string[] {
+function sectionOf(text: string, index: 1 | 2 | 3 | 4): string[] {
     const lines = text.split('\n')
-    const start = lines.findIndex((line) => line.startsWith(`## ${index}. `))
+    // Section 3 is `## 3 一致性…` (no dot) by design; the rest are `## N. …`.
+    const start = lines.findIndex((line) => new RegExp(`^## ${index}[. ]`).test(line))
     assert.ok(start >= 0, `缺少第 ${index} 节`)
     const out: string[] = []
     for (const line of lines.slice(start + 1)) {
@@ -111,7 +113,7 @@ function operatorText(input: Partial<OperatorInput> & { report: DoctorReport }):
     return renderOperatorView(input as OperatorInput)
 }
 
-test('三问按顺序出现：需要我 → 健康 → 历史（历史只给指路，不重复）', async () => {
+test('四问按顺序出现：需要我 → 健康 → 一致性 → 历史（历史只给指路，不重复）', async () => {
     const cwd = repo()
     const fake = host(cwd)
     const text = runText(await fake.runTool('suite_status', {}))
@@ -119,11 +121,15 @@ test('三问按顺序出现：需要我 → 健康 → 历史（历史只给指�
     const positions = OPERATOR_QUESTIONS.map((question) => text.indexOf(question))
     for (const [index, position] of positions.entries()) assert.ok(position >= 0, `第 ${index + 1} 问没有出现`)
     assert.ok(positions[0]! < positions[1]!, '第一问必须排在健康之前')
-    assert.ok(positions[1]! < positions[2]!, '历史必须排在最后')
+    assert.ok(positions[1]! < positions[2]!, '一致性必须排在健康之后')
+    assert.ok(positions[2]! < positions[3]!, '历史必须排在最后')
     assert.ok(positions[0]! < text.indexOf('配置'), '先回答"要不要我"，再讲配置')
+    assert.equal(OPERATOR_QUESTIONS.length, 4)
+    assert.equal(text.includes('## 3 一致性（这一项离规则允许的范围有多远）'), true, '第 3 节标题是设计稿指定的')
+    assert.equal(text.includes('## 4. 历史'), true, '历史节重编号为 4')
 
-    // Question 3 is a POINTER: one line, no duplicated history.
-    const history = sectionOf(text, 3)
+    // Question 4 is a POINTER: one line, no duplicated history.
+    const history = sectionOf(text, 4)
     assert.deepEqual(history, [`- ${HISTORY_POINTER}`])
     assert.match(history[0] ?? '', /spec_status/)
     assert.match(history[0] ?? '', /audit_report/)
@@ -265,4 +271,192 @@ test('空列表且没有观察过台账 → unknown，而不是"没有需要你�
     assert.match(queue[0] ?? '', /未知/)
     assert.match(queue[0] ?? '', /不等于"没有人在等回答"/)
     assert.equal(queue.some((line) => line.includes('没有需要你处理的提问')), false)
+})
+
+// --- 第 3 节：一致性（离规则允许的范围有多远） --------------------------------
+
+/** A spec as spec-gate would leave it. */
+function specOf(at: number): SpecRecord {
+    return {
+        title: '测试规格',
+        background: '',
+        requirements: [],
+        acceptanceCriteria: [],
+        fileBoundaries: [],
+        negativeConstraints: [],
+        revision: 1,
+        createdAt: at,
+        updatedAt: at,
+        approvedAt: at,
+        approvedBy: 'alice',
+    }
+}
+
+function mandateOf(policyVersion: string, at: number): MissionRecord['mandate'] {
+    return {
+        version: 1,
+        strength: 'explicit',
+        basis: 'spec-approved',
+        scope: { phases: [], paths: [] },
+        policyVersion,
+        approvedBy: 'alice',
+        at,
+    }
+}
+
+/** A complete delivery: PASS gate with full scope, two evidence kinds, one receipt. */
+function seedDelivery(cwd: string, id: string, input: { mandate?: MissionRecord['mandate']; spec?: SpecRecord } = {}): void {
+    const store = new MissionStore({ layout: resolveLayout(cwd) })
+    const at = Date.now() - 60_000
+    store.create({ id, title: `任务 ${id}`, cwd })
+    const created = store.read(id)
+    assert.ok(created !== undefined)
+    store.save({
+        ...created,
+        status: 'delivered',
+        spec: input.spec ?? specOf(at),
+        ...(input.mandate === undefined ? {} : { mandate: input.mandate }),
+    })
+    const gate: GateRecord = {
+        id: 'GATE-01',
+        missionId: id,
+        source: 'dsh-quality-gate',
+        state: 'PASS',
+        checkedAt: at,
+        reason: '测试门禁',
+        results: [
+            { id: 'test', name: '测试', command: 'node --test', required: true, exitCode: 0, signal: null, durationMs: 1, timedOut: false, output: 'ok', outputDigest: 'a'.repeat(64) },
+        ],
+        scope: { selected: ['test'], total: 1, full: true },
+    }
+    store.writeArtifact(id, path.join('gates', 'GATE-01.json'), `${JSON.stringify(gate)}\n`)
+    const rows = [
+        { id: 'EV-001', missionId: id, kind: 'command', summary: '命令证据', recordedAt: at, recordedBy: 'agent', exitCode: 0 },
+        { id: 'EV-002', missionId: id, kind: 'test', summary: '测试证据', recordedAt: at, recordedBy: 'agent', exitCode: 0 },
+    ]
+    store.writeArtifact(id, 'evidence.jsonl', `${rows.map((row) => JSON.stringify(row)).join('\n')}\n`)
+    const relative = path.join('receipts', 'RCP-01.json')
+    const receipt = {
+        id: 'RCP-01',
+        missionId: id,
+        issuedAt: at,
+        issuedBy: 'dsh-evidence-gate',
+        digest: 'b'.repeat(64),
+        gateId: 'GATE-01',
+        evidenceIds: ['EV-001', 'EV-002'],
+        path: path.relative(cwd, path.join(store.layout.missionsDir, id, relative)),
+    }
+    store.writeArtifact(id, relative, `${JSON.stringify(receipt)}\n`)
+}
+
+/** Content hash of every file under `.dsh` (the read-only assertion). */
+function snapshotDsh(cwd: string): Record<string, string> {
+    const root = path.join(cwd, '.dsh')
+    const files: Record<string, string> = {}
+    const walk = (dir: string): void => {
+        for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+            const full = path.join(dir, entry.name)
+            if (entry.isDirectory()) walk(full)
+            else files[path.relative(cwd, full)] = crypto.createHash('sha256').update(fs.readFileSync(full)).digest('hex')
+        }
+    }
+    if (fs.existsSync(root)) walk(root)
+    return files
+}
+
+test('第 3 节：空仓库 ⇒ 五维全 unknown + 原因，头行 unknown，绝不"看起来健康"', async () => {
+    const cwd = repo()
+    const text = runText(await host(cwd).runTool('suite_status', {}))
+    const section = sectionOf(text, 3)
+    assert.match(section[0] ?? '', /^- mission：.*还没有 mission/)
+    assert.match(section[1] ?? '', /^- 头行：unknown — /)
+    for (const label of ['授权', '证据', '门禁', '新鲜度', '一致性']) {
+        const line = section.find((entry) => entry.startsWith(`- ${label}：`))
+        assert.ok(line !== undefined, `missing dimension line: ${label}`)
+        assert.match(line ?? '', /^\- .+：unknown — .+$/, `${label} must be unknown WITH a reason`)
+    }
+    assert.ok(section.some((line) => line.startsWith('- 盲区：')), 'the blind-spot line must appear')
+    assert.match(section.at(-1) ?? '', /^- 下一步：/)
+    for (const claim of ['看起来健康', '一切正常', '全部一致']) {
+        assert.equal(section.some((line) => line.includes(claim) && !line.includes('不是')), false, `must not claim ${claim}`)
+    }
+})
+
+test('第 3 节：stale 授权 + full 证据都被列出，头行取最差', async () => {
+    const cwd = repo()
+    seedDelivery(cwd, 'm-mixed', { mandate: mandateOf('b'.repeat(64), Date.now() - 60_000) })
+    const text = runText(await host(cwd).runTool('suite_status', {}))
+    const section = sectionOf(text, 3)
+    const authorization = section.find((line) => line.startsWith('- 授权：')) ?? ''
+    assert.match(authorization, /^- 授权：stale — /, 'stale is the state token; the reason is the detail')
+    assert.match(authorization, /策略版本已变/)
+    const evidence = section.find((line) => line.startsWith('- 证据：')) ?? ''
+    assert.match(evidence, /^- 证据：full — /)
+    assert.match(evidence, /scope\.full=true/)
+    assert.match(section.find((line) => line.startsWith('- 头行：')) ?? '', /^- 头行：partial — /)
+    assert.ok(section.some((line) => line.startsWith('- 盲区：')))
+    assert.match(section.at(-1) ?? '', /^- 下一步：/)
+})
+
+test('第 3 节：legacy 授权以事实呈现，不计入 divergent', async () => {
+    const cwd = repo()
+    seedDelivery(cwd, 'm-legacy')
+    const section = sectionOf(runText(await host(cwd).runTool('suite_status', {})), 3)
+    const authorization = section.find((line) => line.startsWith('- 授权：')) ?? ''
+    assert.match(authorization, /^- 授权：legacy — /)
+    assert.match(authorization, /事实，不是缺陷/)
+    const headline = section.find((line) => line.startsWith('- 头行：')) ?? ''
+    assert.doesNotMatch(headline, /divergent/, 'a legacy approval is never a divergence')
+})
+
+test('第 3 节：observations 里的影子 would: BLOCK 出现在门禁明细，但门禁仍是 pass', async () => {
+    const cwd = repo()
+    const store = new MissionStore({ layout: resolveLayout(cwd) })
+    const at = Date.now() - 60_000
+    store.create({ id: 'm-shadow', title: '影子任务', cwd })
+    store.writeArtifact(
+        'm-shadow',
+        path.join('gates', 'GATE-01.json'),
+        `${JSON.stringify({
+            id: 'GATE-01',
+            missionId: 'm-shadow',
+            source: 'dsh-quality-gate',
+            state: 'PASS',
+            checkedAt: at,
+            reason: '命令全部通过',
+            results: [],
+            observations: [{ rule: 'coverage', mode: 'observe', would: 'BLOCK', reason: '覆盖率 41% 低于 80%' }],
+        })}\n`,
+    )
+    const section = sectionOf(runText(await host(cwd).runTool('suite_status', {})), 3)
+    const gates = section.find((line) => line.startsWith('- 门禁：')) ?? ''
+    assert.match(gates, /^- 门禁：pass — /, 'a shadow would:BLOCK must not count as a block')
+    assert.match(gates, /coverage=would BLOCK/)
+    assert.match(gates, /覆盖率 41% 低于 80%/)
+    assert.match(gates, /不计入/)
+})
+
+test('第 3 节确定性：同一棵树两次运行逐字节相同（含维度顺序）', async () => {
+    const cwd = repo()
+    seedDelivery(cwd, 'm-repeat', { mandate: mandateOf('c'.repeat(64), Date.now() - 60_000) })
+    const fake = host(cwd)
+    const first = runText(await fake.runTool('suite_status', {}))
+    const second = runText(await fake.runTool('suite_status', {}))
+    assert.equal(first, second)
+    const section = sectionOf(first, 3)
+    const dimensionLines = section.filter((line) => /^- (授权|证据|门禁|新鲜度|一致性)：/.test(line))
+    assert.deepEqual(
+        dimensionLines.map((line) => line.slice(2, line.indexOf('：'))),
+        ['授权', '证据', '门禁', '新鲜度', '一致性'],
+        'the dimension order is part of the contract',
+    )
+})
+
+test('第 3 节只读：读取一致性前后 .dsh 逐字节一致', async () => {
+    const cwd = repo()
+    seedDelivery(cwd, 'm-readonly', { mandate: mandateOf('d'.repeat(64), Date.now() - 60_000) })
+    const fake = host(cwd)
+    const before = snapshotDsh(cwd)
+    assert.match(runText(await fake.runTool('suite_status', {})), /## 3 一致性/)
+    assert.deepEqual(snapshotDsh(cwd), before)
 })

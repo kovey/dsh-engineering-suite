@@ -37,6 +37,8 @@ import { MissionStore } from './mission.js'
 import { projectConfigFile } from './project-config.js'
 import { resolveLayout, type Layout } from './paths.js'
 import type { MissionRecord } from './types.js'
+import { MAX_DETAIL_FINDINGS, describeFinding, writersCheck } from './writer-check.js'
+import type { WriterFinding } from './writer-check.js'
 
 /** The six phases this suite organises itself around. */
 export type PhaseName = 'plan' | 'build' | 'test' | 'interact' | 'deliver' | 'deploy'
@@ -76,6 +78,15 @@ export interface DoctorCheck {
     detail: string
     /** The exact next step; omitted only when there is nothing to do. */
     fix?: string
+    /**
+     * Structured findings, when one check judged more than one thing.
+     *
+     * A check has ONE state, but `ledger.writers` judges every artifact of the
+     * trail: the state is the aggregate (worst finding wins) and this list is
+     * what each finding was, so a JSON consumer does not have to parse Chinese
+     * prose. Absent on checks that report a single fact.
+     */
+    findings?: WriterFinding[]
 }
 
 /** What the runtime layer (the plugin, with a live context) can add. */
@@ -901,6 +912,12 @@ export function checkWorkspace(options: DoctorOptions): DoctorReport {
         detail: readProjectConfig(layout, 'audit-trail').present ? '已配置' : '未配置：使用 profile 默认（快照与回滚策略以宿主为准）',
     })
 
+    // The writer discipline: every kind of state under `.dsh/` has exactly ONE
+    // writer, and the writer's name is recorded in the artifact itself. This is
+    // the check that turns that implicit fact into something a repository can
+    // fail — see `writers.ts` for the table and the honest boundary.
+    add(writersCheck(layout))
+
     // ---- deploy -----------------------------------------------------------
     const deploy = readProjectConfig(layout, 'deploy-gate')
     add({
@@ -1113,6 +1130,14 @@ export function renderDoctor(report: DoctorReport): string {
         for (const item of items) {
             lines.push(`- ${STATE_MARK[item.state]} ${item.label}${item.severity === 'required' ? '（必需）' : ''}`)
             lines.push(`  ${item.detail}`)
+            // Findings are one per line: a check that judged many artifacts must
+            // stay readable, and each finding names its path, expectation and
+            // observation (the shape a reader can act on).
+            const findings = item.findings ?? []
+            for (const finding of findings.slice(0, MAX_DETAIL_FINDINGS)) {
+                lines.push(`  - ${finding.kind === 'legacy' ? '（legacy 事实）' : finding.kind === 'unknown' ? '（无法判断）' : ''}${describeFinding(finding)}`)
+            }
+            if (findings.length > MAX_DETAIL_FINDINGS) lines.push(`  - …另有 ${findings.length - MAX_DETAIL_FINDINGS} 条（用 suite_status --json 看全部 findings）`)
             if (item.fix !== undefined && item.state !== 'ok') lines.push(`  → 下一步：${item.fix}`)
         }
     }

@@ -141,7 +141,7 @@ dsh 工程体系的**顶层流程编排插件**（docs.md §4）：定义“什�
 | `status` | — | 流水线视图：state / attempt / 进入与完成时间 / 门禁裁决 / 角色 + 插件挂载列；末尾列出未挂载插件 |
 | `rerun` | `stageId?`（默认当前阶段）、`summary?` | 重新进入该阶段（`attempt + 1`），同样受熔断约束 |
 | `resume` | — | 从 `mission.stage` 的断点恢复（保留原 `attempt` 与 `enteredAt`），并说明这是恢复 |
-| `metrics` | `windowDays?`（默认取 `config.metrics.windowDays`，90）、`maxInFlight?`（默认 20） | **只读**：本仓库的交付度量（lead time / 审批等待 / 门禁失败率 / 部署失败率与回滚 / 在飞 / 最近发布），每个数字都带样本量，末行是"下一步"；不写任何文件 |
+| `metrics` | `windowDays?`（默认取 `config.metrics.windowDays`，90）、`maxInFlight?`（默认 20） | **只读**：本仓库的交付度量（lead time / 审批等待 / 门禁失败率 / 部署失败率与回滚 / 在飞 / 最近发布）+ **最新 20 个 mission 的一致性分布**（头行/每维状态计数、与上一窗口相比、盲区；没有评分），每个数字都带样本量，末行是"下一步"；不写任何文件 |
 
 公共参数：`missionId?`（`store.resolveForAgent(exec.agent, { explicitId, fallbackLatest: true })`：
 显式 id → 本会话/委派父会话绑定 → 工作区最新 mission）与 `verdict?: PASS|WARN|BLOCK`。
@@ -270,8 +270,32 @@ orchestrate({ action: "unblock", summary: "根因已修复，人工放行" })
 - **收尾一行**是**最有行动价值的发现**，按优先级取一条：空 trail → 全在飞（含"还没批准的规格"）→
   `审批等待中位数 > lead time 中位数的一半`（→ 先把送审环节前置）→ 门禁失败率 ≥ 50%（→ 指出最常见的
   source 与原因）→ 部署失败/回滚 → 数据缺口 → 节奏基线。
-- 中文报告的形状：抬头（窗口/样本/台账）+ 指标表（每行带样本量）+ 门禁失败原因归组 + 在飞列表 +
-  最近发布 + 数据缺口 + `下一步：…`。
+- 中文报告的形状：抬头（窗口/样本/台账）+ 指标表（每行带样本量）+ **一致性分布** + 门禁失败原因归组 +
+  在飞列表 + 最近发布 + 数据缺口 + `下一步：…`。
+
+### 一致性分布（最新 20 个 mission，**不是评分**）
+
+指标表回答"交付节奏"；这一段回答"**每个 mission 离规则允许的范围有多远**"，并且给的是**同一组维度的
+分布**而不是一个总分（一个总分只会掩盖"哪个维度坏了"，也会诱导优化分数本身）。数据来自
+`dsh-eng-core` 的 `conformance`：
+
+```
+- 头行状态（20 个）：conformant 3、partial 12、divergent 4、unknown 1
+- 授权：ok 15、stale 3、legacy 1、withdrawn 1、missing 0
+- 证据：full 8、partial 9、absent 3
+- 门禁：pass 14、warn 2、block 3、no-record 1
+- 新鲜度：fresh 5、stale 2、unknown 13
+- 一致性：consistent 18、divergent 1、unknown 1
+- 与上一窗口相比（上一窗口 20 个 mission → 本窗口 20 个）：conformant 1→3、partial 14→12、…
+- 盲区：…（缺失的台账、profile 里读不到的证据要求、unknown 的样本量）
+```
+
+- **头行 = 五个维度里最差的一个**（`conformant` / `partial` / `divergent` / `unknown`），
+  且 `unknown` 永远不优于 `partial`；
+- **窗口是"最新 N 个 mission"**（默认 20，按 `createdAt` 倒序、同刻按 id），不是"最近 N 天"：
+  时间窗口会让同一批 mission 在不同日子给出不同分布；
+- **趋势只在与上一窗口（接下来的 20 个）都存在时输出**，形如"上一窗口 x → 本窗口 y"，不画线、不做加权；
+- **零权力**：它只是度量段里的一段文本；`mission_complete` 不读它，任何门禁也不读它。
 
 ### 这些数字**不**意味着什么（诚实边界）
 
@@ -286,8 +310,10 @@ orchestrate({ action: "unblock", summary: "根因已修复，人工放行" })
   中位数里（在飞的未批准数量会单独说）。
 - 度量**不**计算返工类信号（规格 revision、阶段回退、失败命令）：那是 `action: 'retro'` 的领域
   （`.dsh/retrospectives.jsonl`），两者是不同的问题，混在一张表里会让读数更难解释。
-- 也**不**读 `audit/<session>.jsonl`、`plan.jsonl`（工具调用与计划不是交付事实），**不**校验回执
-  digest、**不**读 git（重复发布/回滚的真实性由各门禁自己保证）。
+- 度量本身的数字**不**读 `audit/<session>.jsonl`、`plan.jsonl`（工具调用与计划不是交付事实），
+  **不**校验回执 digest、**不**读 git（重复发布/回滚的真实性由各门禁自己保证）。新加的**一致性分布**
+  是唯一会碰到 `plan.jsonl` 的地方，而且只读它的**存在性与 mission 引用**（用于命名盲区），不进入
+  任何交付指标。
 - 部署/发布台账按 `<layout.rootDir>/deployments.jsonl`、`<layout.rootDir>/releases.jsonl` 找，
   找不到再看默认位置 `<cwd>/.dsh/…`：如果宿主把 `ledgerFile`/`releasesFile` 挪到别处，报告会说
   "无部署台账/无发布台账"（这是**缺口**，不是"0 次失败"）。

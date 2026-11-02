@@ -22,10 +22,12 @@
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import {
     checkWorkspace,
+    conformanceOverview,
     resolveLayout,
     sessionCwd,
     withRuntime,
     type AgentLike,
+    type ConformanceOverview,
     type DoctorReport,
     type Logger,
     type MissionStoreRegistry,
@@ -142,7 +144,8 @@ export async function buildOperatorReport(
     deps: ToolDeps,
     agent: AgentLike | undefined,
     args: StatusArgs = {},
-): Promise<{ report: DoctorReport; attention: AttentionProbe }> {
+): Promise<{ report: DoctorReport; attention: AttentionProbe; conformance: ConformanceOverview }> {
+    const now = Date.now()
     const cwd = declaredCwdOf(agent)
     const config = deps.configFor(agent)
     if (!config.enabled) {
@@ -156,6 +159,7 @@ export async function buildOperatorReport(
         expectedPlugins: config.expectedPlugins,
         stores: deps.stores,
         cwd,
+        now,
         // The effective budget, not the raw key: a project value is clamped to the
         // host ceiling in resolveConfig/resolveEffectiveConfig, and the DEFAULT is
         // clamped here too (a host may lower the ceiling below the default).
@@ -167,14 +171,27 @@ export async function buildOperatorReport(
     // blocker/advice recomputation sees them: a runtime-only blocker (a mounted
     // but unusable core plugin) must reach the top of the report.
     const merged = withRuntime({ ...offline, checks: [...offline.checks, ...probe.checks] }, probe.facts)
+    // Question 3: how far the CURRENT (or newest) mission is from what the rules
+    // allow. The explicit id wins; the session's own mission is next; the newest
+    // mission is the documented fallback. Read-only, derived, deterministic.
+    const conformance = conformanceOverview({
+        layout,
+        now,
+        ...(args.missionId === undefined || args.missionId === ''
+            ? merged.runtime?.mission?.id === undefined
+                ? {}
+                : { missionId: merged.runtime.mission.id }
+            : { missionId: args.missionId }),
+    })
     if (deps.logger !== undefined) {
         loggerFor(deps.logger, cwd).info(
             `suite_status: ${merged.blockers.length} blocker(s), ${merged.advice.length} advice, ` +
                 `${probe.facts.mountedPlugins?.length ?? 0}/${config.expectedPlugins.length} plugin(s) usable, ` +
-                `${probe.attention.attentions?.length ?? 0} attention(s)`,
+                `${probe.attention.attentions?.length ?? 0} attention(s), ` +
+                `conformance=${conformance.mission.headline}`,
         )
     }
-    return { report: merged, attention: probe.attention }
+    return { report: merged, attention: probe.attention, conformance }
 }
 
 /**
@@ -203,7 +220,7 @@ export function registerTools(
         defineTool({
             name: 'suite_status',
             description:
-                'The operator view of this workspace, answering three questions IN ORDER. 1) Does anything need a person now? — the attention queue (unanswered questions that wait for a human), oldest first, bounded to 10 with "另有 N 条" when truncated, each row carrying whyYou (decision-required | result-usable), its age, and a stale badge WITH its reason (policy version changed / too old / mission ended); a queue that could not be read is stated as unknown, never as "nothing to do". 2) Is the system healthy? — the existing self-check (gate configs, ledger/gitignore traps, mission footprint, mounted plugins, the session mission, reachable channels, unimplemented phases), unchanged: one line when everything is ready, the full report otherwise. Four states: ok / partial / missing / unknown — unknown means "could not be read" and is NOT a pass. 3) History — a pointer to the per-mission views (spec_status / audit_report / orchestrate retro), deliberately not repeated here. Read-only: it records no gate, writes no file, changes no mission and never sweeps the attention queue. Run it at session start and before claiming a delivery is ready.',
+                'The operator view of this workspace, answering four questions IN ORDER. 1) Does anything need a person now? — the attention queue (unanswered questions that wait for a human), oldest first, bounded to 10 with "另有 N 条" when truncated, each row carrying whyYou (decision-required | result-usable), its age, and a stale badge WITH its reason (policy version changed / too old / mission ended); a queue that could not be read is stated as unknown, never as "nothing to do". 2) Is the system healthy? — the existing self-check (gate configs, ledger/gitignore traps, mission footprint, mounted plugins, the session mission, reachable channels, unimplemented phases), unchanged: one line when everything is ready, the full report otherwise. Four states: ok / partial / missing / unknown — unknown means "could not be read" and is NOT a pass. 3) How far is this delivery from what the rules allow? — the conformance overview of the current (or newest) mission: a headline state computed from five dimensions (authorization, evidence, gates, freshness, consistency) as the WORST one, one line per dimension with its reason, and a blind-spot line naming what could not be checked. It never grants permission: mission_complete still decides from gate records + receipts alone, and no gate reads this section. 4) History — a pointer to the per-mission views (spec_status / audit_report / orchestrate retro), deliberately not repeated here. Read-only: it records no gate, writes no file, changes no mission and never sweeps the attention queue. Run it at session start and before claiming a delivery is ready.',
             parameters: {
                 missionId: {
                     type: 'string',
@@ -223,6 +240,7 @@ export function registerTools(
                 if (args.json === true) return `${JSON.stringify(built.report, null, 2)}\n`
                 return renderOperatorView({
                     report: built.report,
+                    conformance: built.conformance,
                     ...(built.attention.attentions === undefined ? {} : { attentions: built.attention.attentions }),
                     ...(built.attention.problem === undefined ? {} : { attentionProblem: built.attention.problem }),
                     ...(built.attention.fix === undefined ? {} : { attentionFix: built.attention.fix }),

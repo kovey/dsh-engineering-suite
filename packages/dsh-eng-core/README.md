@@ -20,9 +20,12 @@ harness 相关的东西一律走结构化类型（`AgentLike`、`SubprocessLike`
 | `digest.ts` | `sha256`、`shortDigest`、`slugify`、`stamp`、`missionId`、`tail`、`head`、`formatTime` | 指纹与文本整形 |
 | `session.ts` | `AgentLike`、`sessionIdOf`、`agentIdOf`、`sessionCwd`、`parentSessionIdOf`、`isSubagent` | 从 agent 上读会话事实（含子代理继承父 mission 的依据） |
 | `types.ts` | `MissionRecord`、`SpecRecord`、`TestDesign`、`TestCase`、`EvidenceRecord`、`GateRecord`、`GateState`、`GateObservation`、`RuleMode`、`Receipt`、`StageResult`、`GitFingerprint` | 跨插件共享的值类型 |
+| `writers.ts` | `WRITERS`、`KNOWN_GATE_IDS`、`KNOWN_EVIDENCE_WRITERS`、`MISSION_KEYS`、`KNOWN_STATE_DIRS`、`renderWriterTable` | **写入者表**：`.dsh/` 下每种状态的唯一写入者（见下文「写入者纪律」）；文档与检查读同一份真相 |
+| `writer-check.ts` | `scanTrailWriters`、`writersCheck`、`WriterFinding`、`sortFindings` | `ledger.writers` 医生检查：只读扫描门禁/回执/证据/mission 形状/mandate 位置/指纹快照与未知目录，finding 按 state→path 稳定排序 |
 | `rule-mode.ts` | `applyRuleModes`、`parseRuleMode`、`RULE_MODES` | 门禁规则的**模式**（`observe` / `enforce`）：observe 规则照常评估一次、把 would-be 裁决记进 `observations`，但不参与门的有效裁决；未知 mode 是配置问题并保持 enforce |
 | `scan.ts` | `scanWorkspace`、`scanGaps`、`walkWorkspace`、`readCapped`、`languageOf` | 既有仓库的只读扫描：需求文档与候选条目、代码符号（函数/方法/类型/路由/CLI）、测试用例、构建文件与建议命令；再与当前 mission 工件对比得出缺口（详见下文）。`walkWorkspace` 是本包**唯一**的工作区遍历，`scan` 与 `metrics` 共用同一套边界 |
 | `metrics.ts` | `measureWorkspace`、`parseBaseline`、`compareToBaseline` | 代码度量的确定性一半：文件/函数规模、嵌套深度、`if`/`else` 块行数、参数个数、导出面、模块依赖方向与导入环；输出违规清单与基线对比（详见下文） |
+| `conformance.ts` | `missionConformance`、`conformanceRollup`、`conformanceOverview`、`buildConformanceContext`、`conformanceHeadline`、`HEADLINE_RANK`、`CONFORMANCE_DIMENSIONS` | **一致性总览**：一个 mission 的五个维度（授权/证据/门禁/新鲜度/一致性）+ 仓库级分布；头行 = 最差维度，`unknown` 不优于 `partial`；只读、派生、零权力（详见下文） |
 | `testing.ts` | `createFakeHost`、`tempWorkspace`、`fakeAgent`、`runText` | 单元测试用的假宿主：`tools.register/guard/get`、`on`、`effect`、`systemPrompt.section`、`get()`、`approval.request`、`subagents.start`、`subprocess.spawn`，外加 `emit` / `waterfall`（数组 payload 会展开成多参）/ `runTool` / `sectionText` / `dispose` |
 
 ## 用法
@@ -167,6 +170,125 @@ TS 模板串），TS/JS 的正则字面量按「`/` 出现在运算符/开括号
 抽查 `internal/spider/spider.go`（455 行、12 个函数）与 `Run`（69→153 行 = 85 行）逐一对得上。
 这三个数（`if` 块、导出、函数）都用独立预言机核对过：`go/ast` 逐块比对两个 Go 仓库（571/571 与 3138/3138 完全一致，
 超 20 行的块 3/3 一致），TypeScript 编译器 API 逐符号比对本仓库的 TS 文件。
+
+## 一致性总览（conformance）
+
+它回答的是**"这一次交付离规则允许的范围有多远，且能与别的 mission 比较"**——**不**回答
+"能不能交付"（那个问题由门禁记录 + 回执回答，`mission_complete` 直接读它们）。
+
+```ts
+import { resolveLayout } from 'dsh-eng-core'
+import { conformanceOverview, conformanceRollup, missionConformance, buildConformanceContext } from 'dsh-eng-core'
+
+const view = conformanceOverview({ layout: resolveLayout(cwd), now: Date.now() })
+view.mission    // 当前/最新 mission 的五维结论（headline + headlineReason + 每维 state/detail/facts/blind）
+view.rollup     // 最新 20 个 mission 的分布（头行计数 + 每维状态计数 + trend + blind）
+
+const context = buildConformanceContext({ layout, now })   // 只读一次：policy / 指纹 / 仓库级台账
+missionConformance(context, 'M-1')                          // 单个 mission（批量时复用 context）
+conformanceRollup(context, 20)                              // 分布（不传 limit 时默认 20）
+```
+
+五个维度全部由现有台账确定性算出（**不新增任何记录**）：
+
+| 维度 | 读什么 | 取值 |
+|---|---|---|
+| 授权 | `mission.mandate`（强度/范围/`policyVersion`/撤回）、`legacy`、`spec.approvedAt` | `ok` / `stale:<原因>` / `legacy` / `withdrawn` / `missing` |
+| 证据 | 回执、`gate.scope.full`、交付要求的门禁来源与必填证据类型 | `full` / `partial` / `absent` |
+| 门禁 | `gates/*.json` 每个 `source` 的最新记录（含 `observations` 影子项） | `pass` / `warn` / `block` / `no-record` |
+| 新鲜度 | `policyVersion` 与当前信任根、工作区指纹与最新门禁指纹、规范基线、知识库索引自述 | `fresh` / `stale:<原因>` / `unknown` |
+| 一致性 | 回执/证据引用的工件是否存在、`evidence.jsonl` 是否可解析、`mandate.at` 与 `spec.approvedAt`、部署/发布台账引用 | `consistent` / `divergent:<原因>` / `unknown` |
+
+**头行状态 = 最差维度**，只有四个取值：`conformant` / `partial` / `divergent` / `unknown`。
+排序只写在 `HEADLINE_RANK` 一处：`divergent` < `partial` < `conformant`，并且
+**`unknown` 永远不优于 `partial`**（全为未知时才输出 `unknown`）。**不做加权分数**：要比较就给
+同一组维度的分布，要趋势用既有的 `metrics`。
+
+三条边界：
+
+1. **只读、派生、可复现**：不写任何文件；时钟由调用方注入；同一份台账 → 同一份输出（含维度顺序）；
+2. **零权力**：任何门禁都不得读它（测试机械检查 `packages/*/src`：只有 eng-core / suite-doctor /
+   orchestrator 出现这个名字）；`mission_complete` 的裁决不受它影响；
+3. **盲区必须说出来**：每维的 `blind` 点名"没核对到什么"（未记录的 mission、legacy 授权、缺失的
+   台账、读不到的索引），报告里渲染成一行 `盲区：…`；`unknown` 必须带原因，绝不输出"看起来健康"。
+
+`stale` 的细节：授权 stale 会点名改动的信任根文件（读审批时的 `policy-fingerprint.json` 快照）；
+新鲜度 stale 会点名 HEAD/分支/diff/改动数的变化、缺基线的规范阈值、或索引自述的不完整。
+
+## 写入者纪律：每种状态只有一个写入者（`ledger.writers`）
+
+`.dsh/` 下的每一类状态**只有一个**写入者；其他人只读，或者去求那个写入者。这条纪律一直成立，
+但从来没有被写下来、也没有被检查过——而它正是整个审计故事的地基：如果任何插件（或一次手工编辑）
+都能往 `gates/` 里追加一条 PASS，"这条门禁 PASS 过"就什么也不证明了。
+
+**表就是代码**：`src/writers.ts` 的 `WRITERS`（冻结列表，`{ state, pattern, writer, checkable }`），
+下面这张表由 `renderWriterTable()` 渲染，README 与检查读的是同一份真相（测试会逐行比对，文档漂移会红）。
+
+| 状态 | 路径（相对 `.dsh/`） | 唯一写入者 | 只读可查 | 检查什么 |
+|---|---|---|---|---|
+| `mission` | `missions/*/mission.json` | MissionStore（dsh-eng-core，经 spec-gate / orchestrator / evidence-gate 的工具） | ✅ | 顶层键必须都在文档化的 mission 形状里；mandate 只允许出现在这里 |
+| `stages` | `missions/*/stages/*.json` | dsh-orchestrator（stage 进入与结算） | — | 不查：StageResult 里没有任何写入者字段（stageId/attempt/state/route），只读扫描没有任何可以比对的 provenance：多写一次与正常结算在字节上无法区分 |
+| `gates` | `missions/*/gates/*.json` | 产生这条记录的门禁本身（source 必须是该门禁的 id） | ✅ | source 必须非空，且必须是本套件真实存在的门禁 id |
+| `receipts` | `missions/*/receipts/*.json` | 只有 dsh-evidence-gate（issuedBy） | ✅ | issuedBy 必须等于 dsh-evidence-gate |
+| `evidence` | `missions/*/evidence.jsonl` | 记录这条证据的插件（recordedBy），只追加 | ✅ | 每行都有 recordedBy；dsh-* 形状的值必须是已知写入者（agent 身份是文档化的第二种值） |
+| `impact` | `missions/*/impact/*.json` | dsh-impact-gate | — | 不查：本轮检查不覆盖——产物里其实带 plugin 字段，但约定的六条规则只覆盖 gates/receipts/evidence，检查不假装查了它 |
+| `policy-fingerprint` | `missions/*/policy-fingerprint.json` | dsh-spec-gate（写一次，在 mandate 之前） | ✅ | 记录的 version/at 必须与 mandate 一致：比 mandate 新就是写了第二次 |
+| `plan` | `plan.jsonl` | dsh-spec-gate | — | 不查：计划行里没有写入者字段（by 是发起的人/会话，不是插件）：只读扫描分不出是谁追加的 |
+| `releases` | `releases.jsonl` | dsh-evidence-gate | — | 不查：发布行记录的是发布本身（版本/tag/mission），没有插件 id 字段：无法判定追加者 |
+| `deployments` | `deployments.jsonl` | dsh-deploy-gate | — | 不查：部署行没有写入者字段：无法判定追加者 |
+| `interaction` | `interaction/*.jsonl` | dsh-interaction-gate | — | 不查：提问/注意力行没有写入者字段：无法判定追加者 |
+| `kb` | `kb/**` | dsh-knowledge-base | — | 不查：索引是构建产物（chunks/postings/manifest），形状里没有写入者字段：重建一次与写坏一次无法区分 |
+| `trust-root` | `*.json（信任根配置）、roles/**` | 只有人（信任根；agent 的写工具一律拒绝） | — | 不查：只读扫描无法区分"人评审后写的"与"代理偷偷写的"：没有第二个记录者可以比对——这一条只能靠写工具的拒绝（guard）来保证 |
+
+### 检查（`ledger.writers`，area `deliver`）
+
+只读扫描，只查它能看见的部分，并且**说出来**它查的是什么：
+
+1. 每条 `gates/*.json` 的 `source` 非空，且是本套件真实存在的门禁 id（`KNOWN_GATE_IDS`，从包里读出来的五个：
+   `dsh-quality-gate` / `dsh-standards-gate` / `dsh-coverage-gate` / `dsh-supply-chain-gate` / `dsh-deploy-gate`）；
+2. 每个 `receipts/*.json` 的 `issuedBy === 'dsh-evidence-gate'`；
+3. 每行 `evidence.jsonl` 都有 `recordedBy`；`dsh-*` 形状的值必须是已知写入插件（`agent`/`session` 身份是
+   `evidence_record` 记录"谁跑的这个工具"的第二种文档化取值，不是违规）；`kind: gate` 的行只有一个写入者
+   （`MissionStore.recordGate`，它把 `recordedBy` 盖成 `source`），所以这一行的 `recordedBy` 必须是已知门禁 id，
+   写成一个 agent 身份就是外来写入；
+4. `mission.json` 没有文档化形状之外的顶层键（"有人在这里写了不该写的状态"的信号）；
+5. `mandate` 只出现在 `mission.json` 里（没有复制进 `gates/`），且 `policy-fingerprint.json` 没有在首次写入之后
+   被重写（它记录的 `at`/`version` 必须与 mandate 的 `at`/`policyVersion` 一致——比 mandate 新就是写了第二次）；
+6. `.dsh/` 下不属于表、也不属于已知运行时清单的目录：报成**观察**（`recommended`），永远不是阻断项。
+
+严重度与设计一致：**(1)-(3) 是 `required`**（门禁/回执/证据行是本套件的证据，外来写入让"这条门禁 PASS 过"失去意义），
+**(4)-(6) 是 `recommended`**（可疑形状，不是已证实的外来写入）。一处刻意的加严：`mandate` 被复制进 `gates/` 是
+`required`——mission 状态出现在门禁文件里，本来就是"有人往 `gates/` 里写了不该写的"，属于 (1) 的同一族。
+
+**legacy 与违规怎么区分**（不是按时间猜，而是按"这个字段是不是该记录形状的一部分"）：
+
+- `source`、`issuedBy`、`recordedBy` 从本套件第一次提交起就是每个写入者都会写的字段（`git log -S` 在 `types.ts`
+  上可查：`6f19aed` 即有），所以"缺失"不可能是老记录 → 违规；
+- `policy-fingerprint.json` 从来没有 `at` 字段（`PolicyFingerprint` 就是 `{ version, files }`），所以"没有 `at`"
+  是 legacy 形状而不是缺陷：检查降级到用 `version` 与 mandate 比对，并在 detail 里说明用的是哪一种证据；
+- 有 mandate 但没有快照、或有快照但没有 mandate（mandate 之前的历史审批）：没有可比对象 → 记为 `legacy` **事实**，
+  绝不算违规，也绝不进 `blockers`；
+- 证据行里非 `dsh-*` 的 `recordedBy`：文档化的第二种取值（跑 `evidence_record` 的 agent/session），不是 legacy 也不是违规。
+
+`unknown`（而不是 `ok`）用在"没有任何可判断的写入"时，并一定给出原因——"还没有台账"不等于"写入纪律成立"。
+finding 的顺序是确定的（先按 state：`missing` → `partial` → `unknown` → `ok`，再按 path），同一棵树两次扫描逐字节一致；
+检查**只读**（测试对 `.dsh` 做前后字节快照）。
+
+### 诚实的边界（不要弱化它）
+
+只读扫描能抓到：**外来写入者**（不合法的 `source` / `issuedBy` / `recordedBy`）、**缺失字段**、**被复制的状态**
+（mandate 出现在 `gates/`）、**被重写的写一次文件**（指纹快照比 mandate 新）、**意外的文件**（未知目录）。
+
+它抓不到的是：**谁写了这个文件**。一条形状完全合法、但由别人写下的记录（一个"合法的谎"）在只读扫描下不可见——
+这正是那些字段存在的原因：把 provenance 写进产物本身，是写入者的责任，不是扫描的责任。这一条只能靠写入者自己
+记录来关闭，所以本检查的 `ok` 只意味着"没有明显的第二个写入者"，不意味着"写的人就是它声称的人"。
+
+### 为什么不用 mtime 判断"写过两次"
+
+文件 mtime 在 `git clone` / `cp -r` / 检出之后会被整体重置，用 mtime 判"重写"会把每个仓库都报一遍。
+检查因此只用**内容**证据：快照记录的 `at`（如果有，比 mandate 新就是第二次写入）与 `version`（与 mandate 的
+`policyVersion` 不一致说明它是在另一次策略指纹下重算的）。形状里没有 `at` 时（今天的形状），降级到 `version`
+并在报告里说明——降级是写出来的，不是悄悄发生的。
 
 ## 协作契约（不要改这些名字）
 

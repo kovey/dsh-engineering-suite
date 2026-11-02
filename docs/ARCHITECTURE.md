@@ -694,7 +694,7 @@ IM 侧的职责（不在本仓库）：卡片按钮不可伪造且一次性、�
 - **暂停只顺延**：等待期间若 mission 处于 blocked，`deadlineAt = askedAt + window + pausedMs`（精确相等，有测试）；
   等待**重新武装**而不是过期，超时文案写明"等待被延长 Nms"；恢复后从顺延后的截止时间继续。显式对应物是
   `interaction.pauseMission/resumeMission/supersedeMission/withdrawQuestion`。
-- **操作者视图（`suite_status`）只回答三个问题，按顺序**：`## 1 现在需要我做什么？`（队列，最老在前，≤10 条，
+- **操作者视图（`suite_status`）按顺序回答四个问题**：`## 1 现在需要我做什么？`（队列，最老在前，≤10 条，
   每条 mission/question id + `whyYou` + 年龄 + 陈旧徽章与原因；截断时写"另有 N 条（共 M 条）"；**读不出来就写"未知（读取失败，不是没有）"**）→
   `## 2 系统是否健康？`（既有检查不变，健康时只有一行）→ `## 3 历史`（一行指针，不重复已有页面）。
   断言的不变量：**计数等于它指向的列表长度**；健康时只有一行；截断必须说明隐藏了多少条；一次探测失败不产生任何阻塞/建议。
@@ -723,6 +723,54 @@ IM 侧的职责（不在本仓库）：卡片按钮不可伪造且一次性、�
 **仍然是"提示级"的部分**（诚实标注）：提示词里"回答必须带引用""索引里没有就说没有"这类要求是**建议**，
 机械保证只有"命中必带 `path:from-to`、没有就不返回"。也就是说：**引用是否准确仍要人核对**，
 我们能保证的是"不会因为检索到某段文字而放行"。
+
+### 5.24 单一写者纪律（每类状态只有一个写者）与它的可检查部分
+
+套件的事实一直遵循"每类状态只有一个写者、其余人只能读或请求写者"，但**此前既没有写成条文，也没有检查**。
+现在它是一张**代码里的表**（`dsh-eng-core/src/writers.ts` 的 `WRITERS`，并由 `renderWriterTable()` 渲染进 README——
+文档漂移即测试失败）加一条医生检查：
+
+| 状态 | 写者 |
+|---|---|
+| `missions/<id>/mission.json`（身份、状态、规格、mandate、撤回） | `MissionStore`（经 spec-gate / orchestrator / evidence-gate 的工具） |
+| `missions/<id>/stages/*.json` | `dsh-orchestrator` |
+| `missions/<id>/gates/*.json`（含 `observations`） | 产出它的那个门禁（`source` 必须是该门禁 id） |
+| `missions/<id>/receipts/*.json` | 只有 `dsh-evidence-gate`（`issuedBy`） |
+| `missions/<id>/evidence.jsonl` | 记录该证据的插件（`recordedBy`），只追加 |
+| `missions/<id>/impact/*.json` | `dsh-impact-gate` |
+| `missions/<id>/policy-fingerprint.json` | `dsh-spec-gate`（write-once） |
+| `plan.jsonl` / `releases.jsonl` / `deployments.jsonl` | spec-gate / evidence-gate / deploy-gate |
+| `interaction/{outbox,attention}.jsonl` | `dsh-interaction-gate` |
+| `kb/**` | `dsh-knowledge-base` |
+| `.dsh/*.json` 与 `roles/**` | **只有人**（信任根；写类工具被拒） |
+
+**医生 `ledger.writers`** 只查**只读扫描能看见的**违规：门禁记录的 `source` 是否为已知门禁、
+回执的 `issuedBy` 是否为 evidence-gate、证据行是否有 `recordedBy`（三者 `required`）；
+`mission.json` 是否出现文档外顶层键、是否把 `mandate` 复制进了 `gates/`（`required`）、
+`policy-fingerprint.json` 是否比 mandate 还新、是否存在未知的 `.dsh/` 子目录（`recommended`）。
+**它明确承认自己抓不到"谁写的"**：形状合法但由别人写下的记录（"合法的谎"）只读不可见——
+这正是那些字段存在的原因，`ok` 只等于"没有明显的第二个写入者"。另外 `stages/plan/releases/deployments/interaction/kb/信任根`
+没有可判定字段（表里逐行注明 `checkable: false` 与原因，不假装查了它）。
+
+### 5.25 一致性总览（Conformance）：回答"这一项离规则允许的范围有多远"
+
+三个面各答一件事之后，还缺第三件：`doctor` 说"装置配好了吗"、`metrics` 说"交付在变好还是变坏"，
+**没有一个输出能横向比较两个 mission 的整体状态**。设计见 `docs/CONFORMANCE.md`，实现是
+`dsh-eng-core/src/conformance.ts` 的五个维度 + 一个头行状态：
+
+| 维度 | 从哪算 |
+|---|---|
+| 授权 | mandate 的强度/范围/策略版本是否仍成立、是否撤回、`legacy`/缺失 |
+| 证据 | 最新回执 → 它引用的门禁：来源是否必需、`scope.full`、结果非空且 PASS、证据 id 是否覆盖必填种类 |
+| 门禁 | 每个来源的最新记录（BLOCK > WARN）；`observations`（影子）**在明细里可见但不计入裁决** |
+| 新鲜度 | 策略版本、门禁指纹 vs 当前工作区指纹（排除 `.dsh`）、基线、知识库 manifest 自述的陈旧 |
+| 一致性 | `evidence.jsonl` 可解析、回执/证据引用的工件存在、`mandate.at` 与 `spec.approvedAt` 一致、部署门禁 ↔ `deployments.jsonl` |
+
+**头行状态 = 最差维度**，且 **`unknown` 与 `partial` 同档**（`unknown` + `conformant` ⇒ `partial`，只有五维全未知才是 `unknown`）——
+这是"未知不是好消息"这条纪律的又一次落地。**零权力**：`suite_status` 与 `metrics` 读它，
+**任何门禁都不读**，`mission_complete` 仍然直接读门禁记录与回执；有一个测试用 grep 保证没有任何门禁包引用它。
+**它是只读、派生、可复现的**：不写任何文件，同一棵台账两次运行输出逐字节相同；**不做加权分数**（分数会掩盖"哪个维度坏了"，
+也会诱导优化分数本身），比较用同一组维度的分布，趋势用已有的 `metrics`。
 
 ## 6. 为什么这样切分
 

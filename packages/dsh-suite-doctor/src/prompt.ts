@@ -21,14 +21,17 @@ export const PROMPT_SECTION = 'eng:suite-doctor'
  */
 export function sectionText(config: SuiteDoctorConfig): string {
     return [
-        '套件自检（`suite_status`）是**操作者视图**，按顺序回答三个问题：',
+        '套件自检（`suite_status`）是**操作者视图**，按顺序回答四个问题：',
         '- ① **现在需要人做什么？**——待你处理的提问队列（最老在前，最多 10 条，超出会说"另有 N 条"），',
         '  每行带 `whyYou`（`decision-required`＝有门禁在等决定／`result-usable`＝有结果等人去用）、等待时长，',
         '  以及带理由的过期标记（策略版本变了／等太久／mission 已结束）。过期的提问**仍然列出**，不会被藏起来；',
         '  读不到队列会明说"未知"，**不是**"没有事"。',
         '- ② **系统是否健康？**——既有的全部检查（配置、台账、插件、mission、通道、未实现的阶段）：',
         '  全绿时只占一行，否则给出完整报告。',
-        '- ③ **历史**——不在这个视图里重复：每个 mission 看 `spec_status` / `audit_report` / `orchestrate({ action: "retro" })`。',
+        '- ③ **一致性（离规则允许的范围有多远）？**——当前（或最新）mission 的五个维度（授权／证据／门禁／新鲜度／',
+        '  一致性）与头行状态（取最差维度，`unknown` 不优于 `partial`），并列出盲区。它说的是**距离**，',
+        '  不是**许可**：交付与否仍只由 `mission_complete` 读取门禁记录与回执决定，任何门禁都不读它。',
+        '- ④ **历史**——不在这个视图里重复：每个 mission 看 `spec_status` / `audit_report` / `orchestrate({ action: "retro" })`。',
         '- **会话开始时**先跑一次（`suite_status({ json: true })` 给机器读）；**声称"可以交付"之前**再跑一次，',
         '  不要凭记忆断言门禁齐全、插件在线或证据已备。',
         '- 四种状态：✅ `ok` 已就绪；⚠️ `partial` 存在但不完整（例如插件已挂载却没注册签名工具）；',

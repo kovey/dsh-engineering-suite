@@ -33,11 +33,24 @@
  * @module dsh-suite-doctor/operator
  */
 
-import { renderDoctor, type DoctorReport } from 'dsh-eng-core'
+import {
+    CONFORMANCE_DIMENSION_LABEL,
+    CONFORMANCE_DIMENSIONS,
+    conformanceStateToken,
+    renderDoctor,
+    type ConformanceOverview,
+    type DoctorReport,
+    type MissionConformance,
+} from 'dsh-eng-core'
 import type { AttentionFact } from './probe.js'
 
-/** The three questions, in the order they are answered (and asserted in tests). */
-export const OPERATOR_QUESTIONS = ['现在需要我做什么？', '系统是否健康？', '历史'] as const
+/**
+ * The four questions, in the order they are answered (and asserted in tests).
+ *
+ * The third is the conformance overview: **how far this delivery is from what
+ * the rules allow** — never "may it be delivered".
+ */
+export const OPERATOR_QUESTIONS = ['现在需要我做什么？', '系统是否健康？', '一致性（这一项离规则允许的范围有多远）', '历史'] as const
 
 /** How many attention rows the queue shows before it summarises the rest. */
 export const MAX_ATTENTION_ROWS = 10
@@ -61,6 +74,14 @@ export interface OperatorInput {
     attentionFix?: string
     /** Row budget (default {@link MAX_ATTENTION_ROWS}). */
     maxRows?: number
+    /**
+     * The precomputed conformance overview (question 3).
+     *
+     * This module stays pure — it never reads a ledger itself — so the overview
+     * is handed in already computed. Absent = "not computed", which is rendered
+     * as unknown, never as "consistent".
+     */
+    conformance?: ConformanceOverview
 }
 
 /** The queue section, split into what a test (and a reader) needs. */
@@ -137,9 +158,77 @@ export function renderHealth(report: DoctorReport): string[] {
     return renderDoctor(report).split('\n')
 }
 
+/** Collapse whitespace and bound a one-line detail (the reason is never lost). */
+function shortDetail(value: string, max = 180): string {
+    const oneLine = value.replace(/\s+/g, ' ').trim()
+    return oneLine.length <= max ? oneLine : `${oneLine.slice(0, max)}…`
+}
+
+/** Join blind spots with a bound, so the line stays one line. */
+function shortBlind(entries: readonly string[], max = 6): string {
+    const shown = entries.slice(0, max).join('；')
+    return entries.length <= max ? shown : `${shown}；…另有 ${entries.length - max} 条（用 suite_status 指定该 mission 可看完整的五维结论）`
+}
+
 /**
- * Render the whole operator view: three questions, in order, and nothing else.
- * @param input - the report plus the attention queue.
+ * The next step for the conformance section.
+ *
+ * It never says "healthy" and never says "may deliver": the section measures
+ * DISTANCE, and delivery remains mission_complete's decision.
+ */
+export function conformanceNextStep(mission: MissionConformance): string {
+    if (mission.missionId === undefined) {
+        return '下一步：先建立 mission 并留下规格审批、门禁、证据与回执（spec_create → …）；空仓库的 unknown 不是"全部一致"。'
+    }
+    switch (mission.headline) {
+        case 'divergent':
+            return '下一步：先处理头行点名的最差维度（见上一行），再重新 suite_status；交付与否仍只由 mission_complete 读取门禁记录与回执决定（这一节不授予任何许可）。'
+        case 'partial':
+            return '下一步：把最差维度（见头行）推进到规则允许的状态——缺的记录先补齐，再重新 suite_status；unknown 不是通过。'
+        case 'unknown':
+            return '下一步：先补齐可核对的台账（mission.json、gates/、receipts/、evidence.jsonl），再重新 suite_status；unknown 不是通过。'
+        default:
+            return '下一步：一致性没有发现偏离（这是"离规则允许范围的远近"，不是交付许可）；交付仍需 mission_complete 的门禁记录与回执。'
+    }
+}
+
+/**
+ * Render the conformance section (question 3): the headline, one line per
+ * dimension, the blind-spot line when anything could not be checked, and a next
+ * step. Never a composite score, never "looks healthy".
+ * @param input - the precomputed overview, or `undefined` when not computed.
+ */
+export function renderConformanceSection(input: ConformanceOverview | MissionConformance | undefined): string[] {
+    if (input === undefined) {
+        return [
+            '- 头行：unknown（未计算：本次调用没有带入台账事实——这不是"一致"）',
+            '- 下一步：重新运行 suite_status 以读取一致性台账；这一节不给出任何判定。',
+        ]
+    }
+    const mission = 'mission' in input ? input.mission : input
+    const lines: string[] = []
+    if (mission.missionId === undefined) {
+        lines.push('- mission：（本工作区还没有 mission）')
+    } else if (mission.title === undefined) {
+        lines.push(`- mission：${mission.missionId}（未记录）`)
+    } else {
+        lines.push(`- mission：${mission.missionId}《${mission.title}》（${mission.status ?? '状态未记录'}）`)
+    }
+    lines.push(`- 头行：${mission.headline} — ${shortDetail(mission.headlineReason)}`)
+    for (const dimension of CONFORMANCE_DIMENSIONS) {
+        const entry = mission.dimensions[dimension]
+        lines.push(
+            `- ${CONFORMANCE_DIMENSION_LABEL[dimension]}：${conformanceStateToken(entry.state)} — ${shortDetail(entry.detail)}`,
+        )
+    }
+    if (mission.blind.length > 0) lines.push(`- 盲区：${shortBlind(mission.blind)}`)
+    lines.push(`- ${conformanceNextStep(mission)}`)
+    return lines
+}
+
+/**
+ * Render the whole operator view: four questions, in order, and nothing else.
+ * @param input - the report, the attention queue and the conformance overview.
  * @returns the text `suite_status` returns.
  */
 export function renderOperatorView(input: OperatorInput): string {
@@ -157,7 +246,12 @@ export function renderOperatorView(input: OperatorInput): string {
     lines.push('')
     lines.push(...renderHealth(input.report))
     lines.push('')
-    lines.push(`## 3. ${OPERATOR_QUESTIONS[2]}`)
+    // The exact title is pinned by the design: `## 3 ` (no dot after the number).
+    lines.push(`## 3 ${OPERATOR_QUESTIONS[2]}`)
+    lines.push('')
+    lines.push(...renderConformanceSection(input.conformance))
+    lines.push('')
+    lines.push(`## 4. ${OPERATOR_QUESTIONS[3]}`)
     lines.push('')
     lines.push(`- ${HISTORY_POINTER}`)
     return lines.join('\n')
