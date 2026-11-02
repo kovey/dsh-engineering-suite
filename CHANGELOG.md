@@ -1,5 +1,34 @@
 ## [未发布]
 
+### 新增 · 门禁规则影子模式（`observe`）：先测量，再收紧
+
+规则可带 `mode: 'observe' | 'enforce'`（**默认 `enforce`**，既有行为逐字节不变）。`observe` 下规则**照跑、结论照记**，
+但**不计入**门禁裁决：
+
+- 记录：`gates/*.json` 的 `observations: [{rule, mode:'observe', would, reason}]`（按规则 id 排序；无 observe 规则时不写该字段，
+  旧记录照常渲染）；影子结果行渲染为 `[影子 would=…]`，永不显示成 PASS/FAIL/BLOCK。
+- 报告专段：`影子（observe）：本会拦下 N 条 …` + 每规则一行 + 切换前的下一步；未知 `mode` 报"配置问题"并保持 `enforce`。
+- **不削弱强制裁决**：强制 BLOCK + 影子通过 = BLOCK，且只点名强制规则。
+- 医生新增 `gate.observe`（**建议级，永不是阻塞项**）：读最近 20 个 mission，汇总"本会拦下"总数、按规则分组与连续零差异次数，
+  建议"同一规则连续 5 次零差异后再切 enforce"。
+- 跨包细节：**影子预算行不写进 `results`**，因为 `spec-gate` 的 plan ledger 由 `gate.state` + 结果 id 推导"预算已验证"，
+  未执行的预算不能读成已验证。
+- 刻意不做：`contract_check` 暂无 `mode`；**规格里声明的预算不能自带 `mode`**（规格是模型可写的，会变成自我豁免）；
+  无法测量的 observe 预算仍**拒绝**。
+
+### 修复 · 一条超时用例的假失败（flake）
+
+`interaction-gate` 的"超时记拒绝"用例用 `timeoutMs: 60`，而通道会把超时夹到 1s 下限；重负载下发送侧预检可能先输掉这场赛跑，
+于是报 `send-failed` 而不是断言的 `timeout`。**断言不改**（仍然精确要求 `refused:timeout`），只把该用例的截止时间提到 3000ms
+给出余量；连续 5 次全绿，之后的全量 verify 也不再出现。它此前会伪装成别人改动的失败，这类 flake 必须钉死。
+
+### 验证
+
+- `bash scripts/verify.sh`：**969 测试 / 968 通过 / 0 失败 / 1 如实跳过**（含 OPS SELFTEST GREEN）。
+- 包内计数：eng-core 119→127、quality-gate 81→92、suite-doctor 35→41。
+
+## [未发布]
+
 ### 新增 · Mandate v2：准入记录 + 策略版本 + 恢复前重校验
 
 补上"授权前史"：`spec_approve` 现在写一条**不可变**的授权记录（强度 / 范围 / 策略版本 / 批准人 / 时间），

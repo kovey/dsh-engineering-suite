@@ -38,22 +38,27 @@ import path from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { setTimeout as sleepPromise } from 'node:timers/promises'
 import {
+    applyRuleModes,
     containedPath,
     ensureDir,
     exists,
     formatTime,
     outputDigestOf,
+    parseRuleMode,
     readJson,
     runCommand,
     splitCommand,
     tail,
     type GateCommandResult,
+    type GateObservation,
     type GateScope,
     type GateState,
+    type RuleMode,
     type RunOutcome,
     type RunSpec,
 } from 'dsh-eng-core'
 import type { GateCommandConfig, QualityGateConfig } from './config.js'
+import { renderObservations } from './observations.js'
 
 /** How a budget's number is obtained. */
 export type BudgetMetric = 'durationMs' | 'number' | 'bytes'
@@ -94,6 +99,15 @@ export interface BudgetConfig {
      * delivery can show "需求 AC-003 的性能预算已按规格验证".
      */
     requirementIds?: string[]
+    /**
+     * `observe` measures the budget without letting it block (its would-be
+     * verdict is recorded); absent = `enforce`. Mode is a HOST-configuration
+     * decision: a specification can declare a budget, never mark it as a shadow
+     * rule (that would let the model write itself an exemption).
+     */
+    mode?: RuleMode
+    /** The reported problem when the configured `mode` was unusable (rule stays enforce). */
+    modeProblem?: string
 }
 
 /** One recorded measurement in a budget's append-only history. */
@@ -142,6 +156,8 @@ export interface BudgetEvaluation {
     origin: 'config' | 'spec'
     /** The requirements/criteria the budget guards (`AC-003`), when declared. */
     requirementIds?: string[]
+    /** Set only for a shadow (`observe`) budget: its verdict is a recording. */
+    mode?: RuleMode
     baseline: {
         file: string
         /** `true` when this run appended a new history entry. */
@@ -240,6 +256,10 @@ export type BudgetRun =
           conflicts: BudgetConflict[]
           /** What this run covered of the specification's declaration. */
           spec: SpecCoverage
+          /** Shadow (`observe`) verdicts, ordered by rule id (never a gate verdict). */
+          observations: GateObservation[]
+          /** Recoverable rule-mode configuration problems (unknown `mode`). */
+          problems: string[]
       }
     | { ok: false; problem: string }
 
@@ -294,6 +314,11 @@ export function parseBudget(input: unknown, index: number): { budget: BudgetConf
     const regex = optionalText(input['regex'])
     const unit = optionalText(input['unit'])
     const baselineFile = optionalText(input['baselineFile'])
+    // `mode` is read here (host config) and NEVER in `parseSpecBudgets`: a
+    // specification may declare WHAT to measure, but only the host may decide
+    // that the rule is a shadow one.
+    const parsedMode = parseRuleMode(input['mode'], `budgets[${index}] (${id})`)
+    if (parsedMode.problem !== undefined) problems.push(parsedMode.problem)
     const budget: BudgetConfig = {
         id,
         name: optionalText(input['name']) ?? id,
@@ -303,6 +328,8 @@ export function parseBudget(input: unknown, index: number): { budget: BudgetConf
         ...(regex === undefined ? {} : { regex }),
         ...(unit === undefined ? {} : { unit }),
         ...(baselineFile === undefined ? {} : { baselineFile }),
+        ...(parsedMode.mode === 'observe' ? { mode: parsedMode.mode } : {}),
+        ...(parsedMode.problem === undefined ? {} : { modeProblem: parsedMode.problem }),
     }
     const takeBound = (key: 'max' | 'min' | 'maxRegressionPercent'): void => {
         if (input[key] === undefined) return
@@ -1525,6 +1552,9 @@ export async function runBudgets(options: BudgetRunOptions): Promise<BudgetRun> 
 
     const evaluations: BudgetEvaluation[] = []
     const pending: { file: string; budgetId: string; entry: BaselineEntry }[] = []
+    // A budget whose configured `mode` was unusable keeps enforce and its problem
+    // is surfaced by the report (never silently dropped).
+    const modeProblems = budgets.flatMap((budget) => (budget.modeProblem === undefined ? [] : [budget.modeProblem]))
     for (const budget of budgets) {
         const resolved = resolveTarget(budget, config, options.cwd)
         if ('problem' in resolved) return { ok: false, problem: resolved.problem }
@@ -1549,6 +1579,9 @@ export async function runBudgets(options: BudgetRunOptions): Promise<BudgetRun> 
             }
         }
         const evaluation = measured.evaluation
+        // The measurement itself is mode-independent (an observe budget still
+        // measures and still records its baseline); only the verdict is shadowed.
+        if (budget.mode === 'observe') evaluation.mode = 'observe'
         evaluations.push(evaluation)
         if (evaluation.baseline.recorded && evaluation.value !== undefined) {
             pending.push({
@@ -1595,8 +1628,14 @@ export async function runBudgets(options: BudgetRunOptions): Promise<BudgetRun> 
         }
     }
 
-    const blocked = evaluations.filter((evaluation) => evaluation.state === 'BLOCK')
-    const state: GateState = blocked.length === 0 ? 'PASS' : 'BLOCK'
+    // The gate's own verdict comes ONLY from enforcing budgets. An observe budget
+    // still appears once in `observations` (sorted by id) with what it would say.
+    const outcome = applyRuleModes(
+        budgets.map((budget) => ({ id: budget.id, mode: budget.mode })),
+        evaluations.map((evaluation) => ({ rule: evaluation.id, state: evaluation.state, reason: evaluation.reason })),
+    )
+    const state: GateState = outcome.effective.state
+    const blocked = outcome.effective.rules.filter((verdict) => verdict.state === 'BLOCK')
     const firstRun = evaluations.every((evaluation) => evaluation.baseline.history === 0)
     const specEvaluations = evaluations.filter((evaluation) => evaluation.origin === 'spec')
     const specNote =
@@ -1610,17 +1649,31 @@ export async function runBudgets(options: BudgetRunOptions): Promise<BudgetRun> 
                   )
                   .join('；')}`
     const conflictNote = merged.conflicts.length === 0 ? '' : `；宿主配置与规格有 ${merged.conflicts.length} 处阈值冲突（宿主配置生效，见报告）`
+    const shadowBlocks = outcome.observations.filter((observation) => observation.would === 'BLOCK').length
+    const shadowNote =
+        outcome.observations.length === 0
+            ? ''
+            : `；${outcome.observations.length} 条 observe 预算只记录（would BLOCK ${shadowBlocks} 条），不计入裁决`
     return {
         ok: true,
         evaluations,
         state,
         reason:
             (state === 'PASS'
-                ? `预算裁决：${evaluations.length}/${merged.budgets.length} 条全部在界限内${firstRun ? '；基线已记录（均为首次测量）' : ''}`
-                : `预算裁决：${blocked.map((evaluation) => evaluation.id).join(', ')} 越界`) +
+                ? outcome.observations.length === 0
+                    ? `预算裁决：${evaluations.length}/${merged.budgets.length} 条全部在界限内${firstRun ? '；基线已记录（均为首次测量）' : ''}`
+                    : `预算裁决：${outcome.effective.rules.length}/${merged.budgets.length} 条执行规则在界限内${firstRun ? '；基线已记录（均为首次测量）' : ''}${shadowNote}`
+                : `预算裁决：${blocked.map((verdict) => verdict.rule).join(', ')} 越界${shadowNote}`) +
             specNote +
             conflictNote,
-        results: evaluations.map((evaluation) => budgetResult(evaluation)),
+        // A shadow budget's row is deliberately NOT in `results`: downstream
+        // readers (spec-gate's plan ledger) read "was this budget verified" from
+        // the gate record by id, and a rule that was not enforced must not read
+        // as a verified PASS/BLOCK there. `observations` carries its would-be
+        // verdict; the human report prints the full measurement.
+        results: evaluations.filter((evaluation) => evaluation.mode !== 'observe').map((evaluation) => budgetResult(evaluation)),
+        observations: outcome.observations,
+        problems: [...modeProblems, ...outcome.problems],
         scope: {
             selected: budgets.map((budget) => budget.id),
             total: merged.budgets.length,
@@ -1661,6 +1714,7 @@ export function budgetResult(evaluation: BudgetEvaluation): GateCommandResult {
         name: `预算：${evaluation.name}`,
         command: evaluation.command,
         required: true,
+        ...(evaluation.mode === 'observe' ? { mode: 'observe' as const } : {}),
         exitCode: evaluation.state === 'PASS' ? 0 : 1,
         signal: null,
         durationMs: evaluation.durationMs,
@@ -1679,6 +1733,8 @@ export function renderBudgets(run: Extract<BudgetRun, { ok: true }>, options: { 
         `范围：${run.scope.selected.length}/${run.scope.total} 条预算（${run.scope.selected.join('、')}）；` +
             '预算裁决的 `scope.full` 恒为 false —— 它执行的不是宿主的门禁命令集，因此**不构成交付依据**。',
     )
+    if (run.problems.length > 0) lines.push(`配置问题：${run.problems.join('；')}`)
+    lines.push(...renderObservations(run.observations, run.state))
     if (run.spec.declared > 0) {
         lines.push(
             `规格预算：声明 ${run.spec.declared} 条，本次覆盖 ${run.spec.covered} 条` +
@@ -1709,8 +1765,11 @@ export function renderBudgets(run: Extract<BudgetRun, { ok: true }>, options: { 
     }
     for (const evaluation of run.evaluations) {
         lines.push('')
+        // An observe budget's row is labelled with `影子 would=…`, never PASS or
+        // BLOCK: the measurement is real, the verdict is not.
+        const marker = evaluation.mode === 'observe' ? `影子 would=${evaluation.state}` : evaluation.state
         lines.push(
-            `[${evaluation.state === 'PASS' ? 'PASS' : 'BLOCK'}] ${evaluation.id}（${evaluation.name}）— ` +
+            `[${marker}] ${evaluation.id}（${evaluation.name}）— ` +
                 `${evaluation.value === undefined ? '未测到数值' : `${evaluation.value} ${evaluation.unit}`}，命令耗时 ${evaluation.durationMs}ms` +
                 `；${evaluation.origin === 'spec' ? SPEC_ORIGIN_LABEL : '来源：宿主配置'}`,
         )

@@ -29,6 +29,7 @@
  */
 
 import { SUITE_PLUGINS } from './config.js'
+import { gateObserveCheck } from './observe.js'
 import {
     PHASES,
     mandateState,
@@ -684,6 +685,12 @@ export async function probeRuntime(options: RuntimeProbeOptions): Promise<Runtim
             if (mission !== undefined) facts.mission = mission
         }
     }
+
+    // ---- shadow rules ----------------------------------------------------
+    // Aggregated from the durable gate records themselves (never from the live
+    // gate's memory): a bounded window of the newest missions keeps the check
+    // cheap and reproducible. `ok` while nothing observes; advice, never a block.
+    checks.push(gateObserveCheck(store))
 
     // ---- interaction -----------------------------------------------------
     const interaction = await probeInteraction(options.ctx, options.probeTimeoutMs, now)

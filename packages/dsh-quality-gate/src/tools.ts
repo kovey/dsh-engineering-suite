@@ -22,6 +22,7 @@ import { renderBudgets, runBudgets, type SpecBudgetSource } from './budget.js'
 import { renderContracts, runContracts } from './contract.js'
 import { describeScope, renderVerdict, runGate, selectCommands } from './gate.js'
 import { declaredCwdOf, type GateSessions } from './hooks.js'
+import { renderObservations } from './observations.js'
 
 const TEXT_OUTPUT = { type: 'string' } as const
 
@@ -145,7 +146,7 @@ function specBudgetSourceOf(mission: MissionRecord | undefined): SpecBudgetSourc
         defineTool({
             name: 'quality_gate_run',
             description:
-                'Run the host-configured quality-gate commands (tests, typecheck, lint) and return a PASS / WARN / BLOCK verdict. The command list comes from host configuration, never from this call: you cannot invent or substitute a command.',
+                'Run the host-configured quality-gate commands (tests, typecheck, lint) and return a PASS / WARN / BLOCK verdict. The command list comes from host configuration, never from this call: you cannot invent or substitute a command. A command configured with mode=observe is still executed and its would-be verdict is recorded in the gate record (observations) and printed in a dedicated shadow section, but it never contributes to PASS/WARN/BLOCK and never blocks; only enforcing rules decide the verdict.',
             parameters: {
                 missionId: { type: 'string', description: 'Mission to record the verdict against (default: the session mission).' },
                 only: { type: 'array', items: { type: 'string' }, description: 'Run only these command ids.' },
@@ -203,6 +204,7 @@ function specBudgetSourceOf(mission: MissionRecord | undefined): SpecBudgetSourc
                         results: verdict.results,
                         scope: verdict.scope,
                         fingerprint,
+                        ...(verdict.observations.length === 0 ? {} : { observations: verdict.observations }),
                     }).id
                 }
                 const next = verdict.aborted
@@ -229,7 +231,7 @@ function specBudgetSourceOf(mission: MissionRecord | undefined): SpecBudgetSourc
                 return [
                     renderVerdict(verdict, { heading: '质量门禁', outputBytes: 4_000 }),
                     '',
-                    `command set: ${config.commands.map((command) => `${command.id}[${command.phase}${command.required ? ',required' : ''}]`).join(', ') || '(未配置)'}（来源：${effective.source === 'project' ? effective.file ?? '项目级配置' : 'profile 配置'}）`,
+                    `command set: ${config.commands.map((command) => `${command.id}[${command.phase}${command.required ? ',required' : ''}${command.mode === 'observe' ? ',observe' : ''}]`).join(', ') || '(未配置)'}（来源：${effective.source === 'project' ? effective.file ?? '项目级配置' : 'profile 配置'}）`,
                     `gate record: ${
                         gateId ?? (verdict.aborted ? '(已取消，未记录)' : '(无 mission，未记录)')
                     }`,
@@ -244,7 +246,7 @@ function specBudgetSourceOf(mission: MissionRecord | undefined): SpecBudgetSourc
         defineTool({
             name: 'quality_gate_status',
             description:
-                'Show the configured gate commands, the latest recorded verdict for the mission, and the pending-write/corrective-steer counters of this session.',
+                'Show the configured gate commands, the latest recorded verdict for the mission, and the pending-write/corrective-steer counters of this session. Shadow (mode=observe) commands and the latest gate record\'s observations are listed with their would-be verdict; a legacy record without observations reads as "no observation" and is not an error.',
             parameters: {
                 missionId: { type: 'string', description: 'Mission to inspect (default: the session mission).' },
             },
@@ -266,7 +268,7 @@ function specBudgetSourceOf(mission: MissionRecord | undefined): SpecBudgetSourc
                 )
                 for (const command of config.commands) {
                     lines.push(
-                        `| ${command.id} | ${command.name} | \`${command.command}\` | ${command.phase} | ${command.required ? '是' : '否'} | ${command.timeoutMs}ms |`,
+                        `| ${command.id} | ${command.name}${command.mode === 'observe' ? '（影子 observe）' : ''} | \`${command.command}\` | ${command.phase} | ${command.required ? '是' : '否'} | ${command.timeoutMs}ms |`,
                     )
                 }
                 const store = deps.stores.for(sessionCwd(agent))
@@ -296,7 +298,20 @@ function specBudgetSourceOf(mission: MissionRecord | undefined): SpecBudgetSourc
                 if (gate !== undefined) {
                     lines.push(`  ${describeGateScope(gate)}`)
                     for (const result of gate.results) {
-                        lines.push(`  - [${result.exitCode === 0 ? 'PASS' : result.required ? 'FAIL' : 'WARN'}] ${result.id} exit=${result.exitCode ?? 'null'}`)
+                        const mark =
+                            result.mode === 'observe'
+                                ? `影子 would=${result.exitCode === 0 ? 'PASS' : result.required ? 'BLOCK' : 'WARN'}`
+                                : result.exitCode === 0
+                                  ? 'PASS'
+                                  : result.required
+                                    ? 'FAIL'
+                                    : 'WARN'
+                        lines.push(`  - [${mark}] ${result.id} exit=${result.exitCode ?? 'null'}`)
+                    }
+                    // A legacy record has no `observations`: it reads as "no
+                    // observation" and must never be an error.
+                    if (gate.observations !== undefined && gate.observations.length > 0) {
+                        for (const line of renderObservations(gate.observations, gate.state)) lines.push(`  ${line}`)
                     }
                     lines.push(`  ${describeDrift(store, gate)}`)
                 }
@@ -313,7 +328,7 @@ function specBudgetSourceOf(mission: MissionRecord | undefined): SpecBudgetSourc
         defineTool({
             name: 'budget_check',
             description:
-                'Measure the regression budgets and answer "did this get worse", which a PASS/BLOCK test verdict cannot: a duration, a bundle size, a count. Budgets come from TWO sources: the host configuration (config.budgets) and the MISSION\'S SPECIFICATION (declared by spec_create / spec_amend). A spec budget is used when the host declares no budget with that id (the report marks it 来源：规格); when both declare one id the HOST wins (it is the deployment\'s ceiling) and the differing threshold is REPORTED as a conflict naming both values and which one was applied — never resolved silently. Each budget runs its configured command (or a configured gate command via commandId) and compares the measured number against its absolute bounds (max/min) and against the BEST value ever recorded in the append-only baseline (<rootDir>/budgets.json) within maxRegressionPercent. The verdict\'s reason and rows name the linked requirement ids (关联需求：AC-003), so a delivery can show that requirement\'s budget was verified against the spec. The first measurement records the baseline and says so (that is "no data yet", not a pass). A command that did not succeed BLOCKs its own budget and records no measurement; a regex that matches nothing, or a capture that does not parse, is a REFUSAL that writes nothing at all — never a silent pass. With config.requireSpecBudgets=true the call also REFUSES when the specification declares budgets and this run covered none of them. Records a gate row on the mission with scope.full=false: a budget run is not the host gate command set and never authorises a delivery.',
+                'Measure the regression budgets and answer "did this get worse", which a PASS/BLOCK test verdict cannot: a duration, a bundle size, a count. Budgets come from TWO sources: the host configuration (config.budgets) and the MISSION\'S SPECIFICATION (declared by spec_create / spec_amend). A spec budget is used when the host declares no budget with that id (the report marks it 来源：规格); when both declare one id the HOST wins (it is the deployment\'s ceiling) and the differing threshold is REPORTED as a conflict naming both values and which one was applied — never resolved silently. Each budget runs its configured command (or a configured gate command via commandId) and compares the measured number against its absolute bounds (max/min) and against the BEST value ever recorded in the append-only baseline (<rootDir>/budgets.json) within maxRegressionPercent. The verdict\'s reason and rows name the linked requirement ids (关联需求：AC-003), so a delivery can show that requirement\'s budget was verified against the spec. The first measurement records the baseline and says so (that is "no data yet", not a pass). A command that did not succeed BLOCKs its own budget and records no measurement; a regex that matches nothing, or a capture that does not parse, is a REFUSAL that writes nothing at all — never a silent pass. A budget configured with mode=observe still measures and records its baseline, but its would-be verdict only goes into observations (never into the gate verdict, and never into results as a verification). With config.requireSpecBudgets=true the call also REFUSES when the specification declares budgets and this run covered none of them. Records a gate row on the mission with scope.full=false: a budget run is not the host gate command set and never authorises a delivery.',
             parameters: {
                 missionId: { type: 'string', description: 'Mission to record the budget verdict against (default: the session mission). Its specification is the second source of budgets.' },
                 only: { type: 'array', items: { type: 'string' }, description: 'Measure only these budget ids (must exist in the host configuration or in the mission\'s specification).' },
@@ -363,6 +378,7 @@ function specBudgetSourceOf(mission: MissionRecord | undefined): SpecBudgetSourc
                         results: run.results,
                         scope: run.scope,
                         fingerprint,
+                        ...(run.observations.length === 0 ? {} : { observations: run.observations }),
                     }).id
                 }
                 logger.info(

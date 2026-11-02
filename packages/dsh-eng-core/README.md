@@ -19,7 +19,8 @@ harness 相关的东西一律走结构化类型（`AgentLike`、`SubprocessLike`
 | `log.ts` | `createLogger`、`silentLogger` | 只写文件（或 `DSH_ENG_DEBUG=1` 时镜像 stderr），**绝不写 stdout** |
 | `digest.ts` | `sha256`、`shortDigest`、`slugify`、`stamp`、`missionId`、`tail`、`head`、`formatTime` | 指纹与文本整形 |
 | `session.ts` | `AgentLike`、`sessionIdOf`、`agentIdOf`、`sessionCwd`、`parentSessionIdOf`、`isSubagent` | 从 agent 上读会话事实（含子代理继承父 mission 的依据） |
-| `types.ts` | `MissionRecord`、`SpecRecord`、`TestDesign`、`TestCase`、`EvidenceRecord`、`GateRecord`、`GateState`、`Receipt`、`StageResult`、`GitFingerprint` | 跨插件共享的值类型 |
+| `types.ts` | `MissionRecord`、`SpecRecord`、`TestDesign`、`TestCase`、`EvidenceRecord`、`GateRecord`、`GateState`、`GateObservation`、`RuleMode`、`Receipt`、`StageResult`、`GitFingerprint` | 跨插件共享的值类型 |
+| `rule-mode.ts` | `applyRuleModes`、`parseRuleMode`、`RULE_MODES` | 门禁规则的**模式**（`observe` / `enforce`）：observe 规则照常评估一次、把 would-be 裁决记进 `observations`，但不参与门的有效裁决；未知 mode 是配置问题并保持 enforce |
 | `scan.ts` | `scanWorkspace`、`scanGaps`、`walkWorkspace`、`readCapped`、`languageOf` | 既有仓库的只读扫描：需求文档与候选条目、代码符号（函数/方法/类型/路由/CLI）、测试用例、构建文件与建议命令；再与当前 mission 工件对比得出缺口（详见下文）。`walkWorkspace` 是本包**唯一**的工作区遍历，`scan` 与 `metrics` 共用同一套边界 |
 | `metrics.ts` | `measureWorkspace`、`parseBaseline`、`compareToBaseline` | 代码度量的确定性一半：文件/函数规模、嵌套深度、`if`/`else` 块行数、参数个数、导出面、模块依赖方向与导入环；输出违规清单与基线对比（详见下文） |
 | `testing.ts` | `createFakeHost`、`tempWorkspace`、`fakeAgent`、`runText` | 单元测试用的假宿主：`tools.register/guard/get`、`on`、`effect`、`systemPrompt.section`、`get()`、`approval.request`、`subagents.start`、`subprocess.spawn`，外加 `emit` / `waterfall`（数组 payload 会展开成多参）/ `runTool` / `sectionText` / `dispose` |
@@ -43,6 +44,36 @@ apply(fake.ctx as never, { logFile: '/tmp/x.log' })
 const run = await fake.runTool('my_tool', { a: 1 })
 assert.match(runText(run), /ok/)
 ```
+
+## 门禁规则的模式（observe / enforce）
+
+一条门禁规则要么通过、要么阻断，回答不了「如果我现在打开它，会拦下什么」。`rule-mode.ts` 给出
+唯一的降级实现（`applyRuleModes`），规则条目因此可以带 `mode`：
+
+- `mode` 缺省 = `enforce`：**既有行为逐字节不变**（记录里不会多出空数组）；
+- `mode: 'observe'`：规则仍然**评估且只评估一次**（匹配与否都算），结果以
+  `{ rule, mode: 'observe', would: 'PASS'|'WARN'|'BLOCK', reason }` 记入 `GateRecord.observations`
+  （按 rule id 排序），但**不计入**门（gate）的有效裁决；它永远不会让门通过，也永远不会让门阻断；
+- 未知值 = 配置问题：**保持 `enforce`**、报出可接受值，绝不静默当成 observe（否则一个拼写错误就能把门禁降级成测量）。
+
+```ts
+import { applyRuleModes } from 'dsh-eng-core'
+
+const outcome = applyRuleModes(
+    [{ id: 'shadow-test', mode: 'observe' }, { id: 'host-test' }], // 配置里的 rules
+    [
+        { rule: 'shadow-test', state: 'BLOCK', reason: '必需命令失败（exit=2）' },
+        { rule: 'host-test', state: 'PASS', reason: '通过（exit=0）' },
+    ],
+)
+outcome.effective.state            // 'PASS' —— 只由 enforce 规则折叠
+outcome.effective.rules            // [{ rule: 'host-test', … }] —— 可以点名是谁在阻断
+outcome.observations               // 影子记录（would: 'BLOCK'），按 rule id 排序
+```
+
+`effective.rules` 是**参与裁决的**规则（含没有配置条目的合成检查，例如改动文件数上限——只有被宿主
+标记的规则才可能是影子）。调用方必须先把每条选中的规则都评估一次，再把裁决交给本函数：helper 不会
+替任何人执行规则，因此「observe 仍然评估一次」不会被降级逻辑破坏。
 
 ## 工作区扫描（scan）
 

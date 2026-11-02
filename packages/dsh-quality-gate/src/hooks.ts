@@ -199,6 +199,9 @@ function recordOnMission(
         results: verdict.results,
         scope: verdict.scope,
         ...(fingerprint === undefined ? {} : { fingerprint }),
+        // Shadow verdicts are part of the record (auditable), never part of the
+        // state above (which `state: verdict.state` already reports honestly).
+        ...(verdict.observations.length === 0 ? {} : { observations: verdict.observations }),
     })
     return record.id
 }

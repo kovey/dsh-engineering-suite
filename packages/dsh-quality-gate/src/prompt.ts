@@ -57,6 +57,19 @@ export function sectionText(config: QualityGateConfig, projectFile?: string): st
             `- 改动预算：一次任务的改动文件数不得超过 ${config.limits.maxChangedFiles}（\`.dsh/\` 台账不计入）。超限视为范围失控，门禁会阻断。`,
         )
     }
+    // Shadow rules are still evaluated, but their verdict is only recorded:
+    // saying so in the prompt stops the model from reading a PASS as "everything
+    // passed" when a shadow rule would have blocked.
+    const shadowRules = [
+        ...config.commands.filter((command) => command.mode === 'observe').map((command) => `命令 \`${command.id}\``),
+        ...config.budgets.filter((budget) => budget.mode === 'observe').map((budget) => `预算 \`${budget.id}\``),
+    ]
+    if (shadowRules.length > 0) {
+        lines.push(
+            `- 影子规则（observe）：${shadowRules.join('、')} 仍会执行并记录 \`would\`（本会 PASS/WARN/BLOCK），` +
+                '但**不计入**本次门禁裁决；报告里会单列"影子（observe）"小节。不要因为影子规则没拦住就认为它已通过。',
+        )
+    }
 
     // --- budgets -----------------------------------------------------------
     lines.push('')

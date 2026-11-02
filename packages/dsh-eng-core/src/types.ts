@@ -161,6 +161,38 @@ export interface EvidenceRecord {
 /** Three-state gate outcome (docs.md §3.4). */
 export type GateState = 'PASS' | 'WARN' | 'BLOCK'
 
+/**
+ * How one gate rule contributes to the gate's own verdict.
+ *
+ * - `enforce` (the default, and the only behaviour that existed before this
+ *   type): the rule's verdict counts — a blocking rule blocks;
+ * - `observe`: the rule is still evaluated exactly once and its result is
+ *   RECORDED as "what it would have decided", but it does not contribute to the
+ *   gate's verdict. This is how a rule is measured before it is switched on.
+ *
+ * An unknown value is a configuration problem: the rule stays `enforce` and the
+ * problem is reported with the accepted values. It is never silently read as
+ * `observe` — a typo must not be able to turn a gate rule into a no-op.
+ */
+export type RuleMode = 'observe' | 'enforce'
+
+/**
+ * One shadow (`observe`) verdict recorded on a gate.
+ *
+ * It is deliberately NOT a verdict: `would` says what the rule would have
+ * decided, and the gate's own `state` is computed only from enforcing rules.
+ */
+export interface GateObservation {
+    /** Rule id (`commands[].id`, `budgets[].id`). */
+    rule: string
+    /** Always `observe` — an enforcing rule can never be an observation. */
+    mode: 'observe'
+    /** What an enforcing run of this rule would have decided. */
+    would: GateState
+    /** One-line, machine-stable reason for `would`. */
+    reason: string
+}
+
 /** One deterministic command registered by the host for a gate. */
 export interface GateCommandResult {
     id: string
@@ -175,6 +207,11 @@ export interface GateCommandResult {
     /** Bounded tail of stdout/stderr. */
     output: string
     outputDigest: string
+    /**
+     * Set only for a shadow rule's row. The row is a RECORDING of what the rule
+     * would have decided, never a verdict; consumers must not count it as one.
+     */
+    mode?: RuleMode
 }
 
 /** What a gate run actually covered (a partial run may not authorise delivery). */
@@ -204,6 +241,14 @@ export interface GateRecord {
      * consumers must treat an absent scope as "unknown", never as "full".
      */
     scope?: GateScope
+    /**
+     * Shadow (`observe`) verdicts of this run, ordered by rule id.
+     *
+     * Absent on records written before shadow mode existed, and on runs with no
+     * observing rule: consumers read an absent list as "no observation", never
+     * as an error. `state` — the gate's own verdict — never includes these.
+     */
+    observations?: GateObservation[]
 }
 
 /** Immutable delivery receipt (docs.md §3.5). */

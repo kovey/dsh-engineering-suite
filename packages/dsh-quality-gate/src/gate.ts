@@ -16,18 +16,21 @@
 
 import path from 'node:path'
 import {
+    applyRuleModes,
     gitFingerprint,
     outputDigestOf,
     runCommand,
     splitCommand,
     tail,
     type GateCommandResult,
+    type GateObservation,
     type GateScope,
     type GateState,
     type GitFingerprint,
-    type RunOutcome,
+    type RuleVerdict,
 } from 'dsh-eng-core'
 import type { GateCommandConfig, QualityGateConfig } from './config.js'
+import { renderObservations } from './observations.js'
 
 /** Structural view of `ctx.subprocess`. */
 export interface SubprocessLike {
@@ -61,6 +64,16 @@ export interface GateVerdict {
      * verdict, so callers must not record it nor clear their pending-write state.
      */
     aborted: boolean
+    /**
+     * Shadow (`observe`) rule verdicts of this run, ordered by rule id. They are
+     * recorded, never folded into `state`.
+     */
+    observations: GateObservation[]
+    /**
+     * Recoverable rule-mode configuration problems (an unknown `mode`). The rule
+     * stays enforcing and the run's verdict is unchanged.
+     */
+    problems: string[]
 }
 
 /** Options for {@link runGate}. */
@@ -125,8 +138,27 @@ export function describeScope(scope: GateScope): string {
           }）— 不构成完整的交付依据，只有跑完整个命令集的裁决才能放行`
 }
 
-function failed(outcome: RunOutcome): boolean {
-    return outcome.exitCode !== 0
+/**
+ * The verdict ONE command would contribute if it were enforcing.
+ * @param result - the command's exit facts.
+ */
+function stateOfResult(result: GateCommandResultExt): GateState {
+    if (result.exitCode === 0) return 'PASS'
+    return result.required ? 'BLOCK' : 'WARN'
+}
+
+/**
+ * A one-line, machine-stable reason for one rule's verdict.
+ *
+ * Deliberately built from stable facts only (exit code / timeout / required):
+ * an observation is compared across runs by the doctor, so durations or output
+ * order must not make two identical shadows look different.
+ * @param result - the command's exit facts.
+ */
+function reasonOfResult(result: GateCommandResultExt): string {
+    const outcome = result.timedOut ? '超时' : `exit=${result.exitCode ?? 'null'}`
+    if (result.exitCode === 0) return `通过（${outcome}）`
+    return `${result.required ? '必需命令失败' : '非必需命令失败'}（${outcome}）`
 }
 
 /**
@@ -155,6 +187,8 @@ export async function runGate(config: QualityGateConfig, options: RunGateOptions
             results: [],
             scope: scopeOf(config, []),
             aborted: false,
+            observations: [],
+            problems: [],
         }
     }
     if (commands.length === 0) {
@@ -169,12 +203,15 @@ export async function runGate(config: QualityGateConfig, options: RunGateOptions
             results: [],
             scope: scopeOf(config, []),
             aborted: false,
+            observations: [],
+            problems: [],
         }
     }
     const results: GateCommandResultExt[] = []
     const executed: string[] = []
-    let blocked = false
-    let warned = false
+    // A rule whose configured `mode` was unusable stays enforcing; its problem
+    // rides along to the report (never silently dropped, never read as observe).
+    const problems = commands.flatMap((command) => (command.modeProblem === undefined ? [] : [command.modeProblem]))
     for (const command of commands) {
         const outcome = await runCommand(
             {
@@ -202,6 +239,9 @@ export async function runGate(config: QualityGateConfig, options: RunGateOptions
             output: tail(output, 4_000),
             outputDigest: outputDigestOf(outcome.stdout, outcome.stderr),
             ...(outcome.aborted === true ? { aborted: true } : {}),
+            // The row is a RECORDING for an observe rule, marked so no reader
+            // (report, retrospective, ledger) can mistake it for a verdict.
+            ...(command.mode === 'observe' ? { mode: 'observe' as const } : {}),
         }
         results.push(result)
         // A cancelled command never ran (or was killed by the cancellation): the
@@ -215,15 +255,13 @@ export async function runGate(config: QualityGateConfig, options: RunGateOptions
                 results,
                 scope: scopeOf(config, executed, true),
                 aborted: true,
+                observations: [],
+                problems: [],
             }
         }
         executed.push(command.id)
-        if (failed(outcome) || outcome.spawnError !== undefined) {
-            if (command.required) blocked = true
-            else warned = true
-            if (outcome.spawnError !== undefined) {
-                result.output = `${result.output}\n[spawn error] ${outcome.spawnError}`
-            }
+        if (outcome.spawnError !== undefined) {
+            result.output = `${result.output}\n[spawn error] ${outcome.spawnError}`
         }
     }
     // Host-configured change budget (docs.md §9: "最大改动文件数…都应从插件的
@@ -248,7 +286,6 @@ export async function runGate(config: QualityGateConfig, options: RunGateOptions
                     : detail,
                 outputDigest: outputDigestOf(detail, ''),
             })
-            if (exceeded) blocked = true
         } else {
             results.push({
                 id: 'limit-changed-files',
@@ -262,31 +299,53 @@ export async function runGate(config: QualityGateConfig, options: RunGateOptions
                 output: '工作区不是 git 仓库：无法统计改动文件数，按 fail closed 处理（把 limits.maxChangedFiles 设为 0 可关闭该检查）。',
                 outputDigest: outputDigestOf('not-a-repo', ''),
             })
-            blocked = true
         }
     }
-    const state: GateState = blocked ? 'BLOCK' : warned ? 'WARN' : 'PASS'
-    const failing = results.filter((result) => result.exitCode !== 0)
+    // Every evaluated rule produced exactly one verdict above (a rule is never
+    // skipped because of its mode). `applyRuleModes` is the single place that
+    // decides which of them may veto the gate and which are only recorded.
+    const outcome = applyRuleModes(
+        commands.map((command) => ({ id: command.id, mode: command.mode })),
+        results.map((result) => ({
+            rule: result.id,
+            state: stateOfResult(result),
+            reason: reasonOfResult(result),
+        })),
+    )
+    const state: GateState = outcome.effective.state
+    const enforcing = outcome.effective.rules
+    const blockedRules = enforcing.filter((verdict) => verdict.state === 'BLOCK')
+    const warnedRules = enforcing.filter((verdict) => verdict.state === 'WARN')
+    const shadowBlocks = outcome.observations.filter((observation) => observation.would === 'BLOCK').length
+    const shadowNote =
+        outcome.observations.length === 0
+            ? ''
+            : `；${outcome.observations.length} 条 observe 规则只记录（would BLOCK ${shadowBlocks} 条），不计入裁决`
     return {
         state,
         reason:
             state === 'PASS'
-                ? `${results.length} 个命令全部通过`
+                ? `${enforcing.length === 0 ? '没有执行规则（全部为 observe）' : `${enforcing.length} 个命令全部通过`}${shadowNote}`
                 : state === 'WARN'
-                  ? `${failing.filter((result) => !result.required).length} 个非必需命令失败（不阻断交付）`
-                  : `${failing.filter((result) => result.required).length} 个必需命令失败：${failing
-                        .filter((result) => result.required)
-                        .map((result) => result.id)
-                        .join(', ')}`,
+                  ? `${warnedRules.length} 个非必需命令失败（不阻断交付）${shadowNote}`
+                  : `${blockedRules.length} 个必需命令失败：${blockedRules.map((verdict) => verdict.rule).join(', ')}${shadowNote}`,
         results,
         scope: scopeOf(config, executed),
         aborted: false,
+        observations: outcome.observations,
+        problems: [...problems, ...outcome.problems],
     }
 }
 
-/** Status glyph for one command result. */
+/**
+ * Status glyph for one command result.
+ *
+ * A shadow row is never labelled PASS/FAIL/WARN: those read as verdicts. It
+ * says `影子 would=…` so the reader sees the measurement, not a decision.
+ */
 function glyph(result: GateCommandResultExt): string {
     if (result.aborted === true) return 'SKIP'
+    if (result.mode === 'observe') return `影子 would=${stateOfResult(result)}`
     return result.exitCode === 0 ? 'PASS' : result.required ? 'FAIL' : 'WARN'
 }
 
@@ -304,6 +363,8 @@ export function renderVerdict(
     lines.push(`${verdict.state === 'PASS' ? '✅' : verdict.state === 'WARN' ? '⚠️' : '⛔'} ${heading}：${verdict.state}`)
     lines.push(`原因：${verdict.reason}`)
     lines.push(describeScope(verdict.scope))
+    if (verdict.problems.length > 0) lines.push(`配置问题：${verdict.problems.join('；')}`)
+    lines.push(...renderObservations(verdict.observations, verdict.state))
     for (const result of verdict.results) {
         lines.push('')
         lines.push(
@@ -322,6 +383,8 @@ export function renderVerdict(
  * @param verdict - the evaluated gate.
  */
 export function failureSignature(verdict: GateVerdict): string {
-    const failing = verdict.results.filter((result) => result.exitCode !== 0)
+    // Shadow failures never contribute: an observe rule must not be able to
+    // change the loop breaker's key for an enforcing failure.
+    const failing = verdict.results.filter((result) => result.exitCode !== 0 && result.mode !== 'observe')
     return `${verdict.state}:${failing.map((result) => `${result.id}@${result.outputDigest}`).join('|')}`
 }

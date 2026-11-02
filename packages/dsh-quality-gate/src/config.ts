@@ -4,7 +4,15 @@
  * @module dsh-quality-gate/config
  */
 
-import { containedPath, loadProjectConfig, type Layout, type LayoutOptions, type Logger } from 'dsh-eng-core'
+import {
+    containedPath,
+    loadProjectConfig,
+    parseRuleMode,
+    type Layout,
+    type LayoutOptions,
+    type Logger,
+    type RuleMode,
+} from 'dsh-eng-core'
 import {
     DEFAULT_BASELINE_LOCK_RETRY_MS,
     DEFAULT_BASELINE_LOCK_STALE_MS,
@@ -35,6 +43,17 @@ export interface GateCommandConfig {
     phase: CommandPhase
     /** Extra environment entries. */
     env?: Record<string, string>
+    /**
+     * How this rule contributes to the verdict: `observe` records what it WOULD
+     * decide without letting it block; absent = `enforce` (the old behaviour).
+     * @see RuleMode
+     */
+    mode?: RuleMode
+    /**
+     * The reported configuration problem when `mode` was unusable. The rule is
+     * kept in force (enforce) and the problem is surfaced by the run report.
+     */
+    modeProblem?: string
 }
 
 /** Resolved plugin configuration. */
@@ -317,7 +336,7 @@ export function resolveEffectiveConfig(host: QualityGateConfig, layout: Layout, 
             const parsed: GateCommandConfig[] = []
             let failed = 0
             for (const [index, entry] of entries.entries()) {
-                const command = parseCommand(entry, index, host.defaultTimeoutMs)
+                const command = parseCommand(entry, index, host.defaultTimeoutMs, (problem) => { problems.push(problem); logger?.warn(problem) })
                 if ('error' in command) {
                     failed += 1
                     const problem = `${file.file}: ${command.error}`
@@ -380,12 +399,14 @@ export function resolveEffectiveConfig(host: QualityGateConfig, layout: Layout, 
  * @param input - the untrusted config entry.
  * @param index - position, used to build a fallback id.
  * @param defaultTimeoutMs - deadline applied when the entry omits one.
+ * @param report - sink for a recoverable problem (an unknown `mode`).
  * @returns the parsed command, or an error message.
  */
 export function parseCommand(
     input: unknown,
     index: number,
     defaultTimeoutMs: number,
+    report: (problem: string) => void = () => undefined,
 ): GateCommandConfig | { error: string } {
     if (!isRecord(input)) return { error: `commands[${index}]: must be an object` }
     const command = typeof input['command'] === 'string' ? input['command'].trim() : ''
@@ -393,6 +414,8 @@ export function parseCommand(
     const id = str(input['id'], `cmd-${index + 1}`)
     if (!/^[a-z0-9][a-z0-9-_]*$/i.test(id)) return { error: `commands[${index}]: invalid id "${id}"` }
     const phase = input['phase'] === 'lint' ? 'lint' : 'gate'
+    const parsedMode = parseRuleMode(input['mode'], `commands[${index}] ("${id}")`)
+    if (parsedMode.problem !== undefined) report(parsedMode.problem)
     const env = isRecord(input['env'])
         ? Object.fromEntries(
               Object.entries(input['env']).filter((entry): entry is [string, string] => typeof entry[1] === 'string'),
@@ -408,6 +431,10 @@ export function parseCommand(
         required: bool(input['required'], phase === 'gate'),
         timeoutMs: num(input['timeoutMs'], defaultTimeoutMs),
         phase,
+        // Only `observe` is stored: an explicit `enforce` is the default, and
+        // keeping it out preserves the resolved config shape of old profiles.
+        ...(parsedMode.mode === 'observe' ? { mode: parsedMode.mode } : {}),
+        ...(parsedMode.problem === undefined ? {} : { modeProblem: parsedMode.problem }),
         ...(env === undefined ? {} : { env }),
     }
 }
@@ -496,7 +523,7 @@ export function resolveConfig(input: unknown, warn: (message: string) => void = 
     const commands: GateCommandConfig[] = []
     if (Array.isArray(raw['commands'])) {
         for (const [index, entry] of raw['commands'].entries()) {
-            const parsed = parseCommand(entry, index, defaultTimeoutMs)
+            const parsed = parseCommand(entry, index, defaultTimeoutMs, warn)
             if ('error' in parsed) {
                 warn(parsed.error)
                 continue

@@ -14,6 +14,7 @@
 | **能不能问到人**、有没有人正在等回答 | `interaction` 服务（`describeAll()` / `pending()` / `ledgers()` / `problems()`） | 通道是进程内注册的 |
 | **这一版套件没实现的阶段** | 阶段 → 插件表 ∩ `expectedPlugins` | 需要知道本部署装载了哪些插件 |
 | **可选能力有没有装载**（补全交互/部署/入口自检的三个 bundle） | 单独一条 `runtime.mounts-optional`（⚠️ 建议，不是阻塞） | 缺哪个、缺了会怎样，只有运行时知道 |
+| **影子规则（`observe`）会拦下什么** | 读最近 20 个 mission 的 gate 记录，按 rule id 聚合 `observations` 的 `would`（`gate.observe`，⚠️ 建议） | 需要把散在许多 `gates/*.json` 里的影子记录汇总成一个可操作的数字 |
 
 ## 六个阶段与四种状态
 
@@ -53,6 +54,25 @@
 
 **严格只读**：不写门禁记录、不落盘、不改 mission、不创建 `.dsh/`；也**不授予任何权限**。测试里有一条
 "工作区前后逐字节一致"（对整个 `.dsh` 树做内容哈希比对，另加一条"没有台账的工作区不会长出 `.dsh/`"）。
+
+## 影子聚合（`gate.observe`）
+
+`observe` 规则是「**先测量、不拦截**」：门禁照常执行它，把它本会给出的裁决记进
+`.dsh/missions/<id>/gates/<gate-id>.json` 的 `observations`，但不让它影响门的 PASS/WARN/BLOCK。
+要回答「现在切 enforce 会怎样」，人需要的是**跨多次运行的统计**，所以 `suite_status` 多一条
+`gate.observe` 检查（area = 测试）：
+
+- **窗口有界且写在报告里**：最近 **20 个 mission**（按 `updatedAt` 倒序，同刻按 id），读取它们的
+  **全部** gate 记录。不用"最近 30 天"：时间窗口会让同一个仓库在不同日子给出不同数字，而规则并没有变；
+- 报告 `影子记录 N 条，其中 would BLOCK M 条；按规则：<id>：n 条（would BLOCK/WARN/PASS …），当前连续 k 次零差异`；
+- 状态：没有任何 observe 记录 → ✅ `ok` + `recommended`；有影子记录 → ⚠️ `partial` + `recommended`；
+  **永远不会是 `required`，也永远不会进 `blockers`**——影子规则是进行中的测量，不是缺陷；
+- 下一步是具体数字：同一规则**连续 5 次零差异（would=PASS）**后再切 `enforce`（删掉 `mode` 或改成
+  `enforce`），然后重跑一次完整 `quality_gate_run` 确认裁决仍为 PASS；
+- 旧记录没有 `observations` 字段 → 按「没有观察」读取（detail 里会数出「其中 X 条旧记录没有 observations
+  字段」），**不是错误**；`observations` 里无法识别的条目也只被计数并忽略，不让一份手改坏的文件把自检弄崩。
+
+读取面是结构化的（`MissionStore.list()` + `readGates()`），所以这条检查是纯函数、测试里可用合成台账驱动。
 
 ## 配置
 

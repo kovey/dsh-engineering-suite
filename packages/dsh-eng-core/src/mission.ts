@@ -28,6 +28,7 @@ import type { AgentLike } from './session.js'
 import type {
     EvidenceKind,
     EvidenceRecord,
+    GateObservation,
     GateRecord,
     GateState,
     GitFingerprint,
@@ -89,6 +90,12 @@ export interface GateInput {
     fingerprint?: GitFingerprint
     /** Coverage of the run; omit when the caller cannot prove it covered everything. */
     scope?: GateScope
+    /**
+     * Shadow (`observe`) verdicts, ordered by rule id. Omit when the run had no
+     * observing rule: an absent field means "no observation", and old records
+     * are read the same way.
+     */
+    observations?: GateObservation[]
 }
 
 /** Input for {@link MissionStore.issueReceipt}. */
@@ -358,6 +365,11 @@ export class MissionStore {
             results: input.results,
             ...(input.fingerprint === undefined ? {} : { fingerprint: input.fingerprint }),
             ...(input.scope === undefined ? {} : { scope: input.scope }),
+            // Only a run that HAS shadow verdicts grows the field: a run with no
+            // observing rule keeps the record shape it always had, byte for byte.
+            ...(input.observations === undefined || input.observations.length === 0
+                ? {}
+                : { observations: input.observations }),
         }
         writeJsonAtomic(path.join(dir, `${record.id}.json`), record)
         this.appendEvidence(id, {

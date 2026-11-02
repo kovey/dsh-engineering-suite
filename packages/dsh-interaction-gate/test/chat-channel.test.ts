@@ -318,7 +318,11 @@ test('IM 通道：超时与通道级失败 → 台账记拒绝并写明原因，
     const cwd = tempWorkspace('interaction-chat-')
     const chat = makeChat()
     const { fake, registry } = assemble(cwd, {}, { chatInteraction: chat.layer })
-    const run = await fake.runTool('interaction_ask', { question: '还在吗？', options: ['allowed-once', 'rejected'], timeoutMs: 60 })
+    // A short deadline used to mean 60 ms, which the channel clamps to its 1 s floor:
+    // the send-side pre-flight could then lose the race under load and the test saw
+    // `send-failed` instead of the `timeout` it asserts. The assertion stays exact —
+    // give the deadline enough room that "nobody answered" is the only way to fail.
+    const run = await fake.runTool('interaction_ask', { question: '还在吗？', options: ['allowed-once', 'rejected'], timeoutMs: 3000 })
     assert.equal(run.isError, true)
     assert.ok(runText(run).includes('refused:timeout'), runText(run))
     const rows = rowsOf(cwd)

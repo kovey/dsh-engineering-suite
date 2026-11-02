@@ -44,6 +44,58 @@
 `runCommand` 对已 abort 的 signal 返回 `{ aborted: true }`，这种结果同样**不是裁决**——
 不会写 gate 记录，也不会清零 `pendingWrites`。
 
+## 影子模式（`observe`）：先测量，再启用
+
+一条门禁规则要么通过、要么阻断——这回答不了「如果我现在打开它，它会拦下什么」。所以 `commands[]` 与
+`budgets[]` 的条目可以带 `mode: 'observe'`：
+
+```json
+{
+  "commands": [
+    { "id": "test", "command": "go test ./...", "required": true },
+    { "id": "race", "command": "go test -race ./...", "required": true, "mode": "observe" }
+  ],
+  "budgets": [
+    { "id": "bundle", "metric": "bytes", "command": "node scripts/size.mjs",
+      "regex": "size=(\\d+)", "max": 200000, "mode": "observe" }
+  ]
+}
+```
+
+固定语义（由 `dsh-eng-core` 的 `applyRuleModes` 唯一实现，本插件不复制降级逻辑）：
+
+- `mode` **缺省 = `enforce`**：既有行为逐字节不变；
+- `observe` 规则**仍然执行且只执行一次**（命令照跑、预算照测、基线照记），它的 would-be 裁决被记录下来，
+  但**不参与**本次门禁的有效裁决：会 BLOCK 的影子规则不能阻断，会 PASS 的影子规则也不会替门禁背书；
+- **未知值 = 配置问题**：规则保持 `enforce`，报告以「配置问题：…」列出可接受值（`observe` / `enforce`），
+  绝不静默当作 observe；
+- 影子绝不削弱/清除强制裁决：一个强制 BLOCK + 一个影子 PASS 仍然是 BLOCK，报告的「必需命令失败」只点名
+  强制规则；一个影子 BLOCK 的 `would` 在任何地方都不会显示成门的 PASS/BLOCK。
+
+记录（`.dsh/missions/<id>/gates/<gate-id>.json`）在**有**影子规则时多一个字段，按 rule id 排序：
+
+```jsonc
+observations: [
+  { "rule": "race", "mode": "observe", "would": "BLOCK", "reason": "必需命令失败（exit=2）" }
+]
+```
+
+- 没有影子规则的运行**不写**这个字段（旧记录也没有）：消费方把「缺字段」读作「没有观察」，绝不是错误；
+- 每条 observe 规则的 `results` 行带 `mode: "observe"`，报告里标成 `[影子 would=…]`，绝不显示成 PASS/FAIL/BLOCK；
+- 报告的影子小节：`影子（observe）：本会拦下 N 条（… 不计入本次裁决）`，每条规则一行（`would` + 原因）；
+  N > 0 时给下一步：「把 `mode: 'observe'` 改成 `'enforce'`（或删掉 mode 键）后，上述 N 条会真的阻断门禁」。
+- 预算的影子行**不会**进入 `results`：`dsh-spec-gate` 的 plan ledger 按预算 id 从记录里读「是否已验证」，
+  一条没有强制的预算不能在那里读成已通过的验证；它的测量值与 `would` 在报告和 `observations` 里都保留。
+- 规格里声明的预算（`来源：规格`）**不能**自带 `mode`：规格是模型可写的，能开 observe 就等于能给自己
+  开豁免。模式只由宿主配置（或项目级配置）决定。
+- observe 只降级**裁决**，不放宽 fail-closed 的测量前提：一个测不到数字的 observe 预算（regex 不匹配、
+  捕获不是数字、命令没正常退出）仍然**拒绝整次运行**，不会变成一条 `would=BLOCK` 的影子记录——"没有数值"
+  不是一种裁决。
+- `scope.full` 与收尾门禁的指纹/新鲜度语义不变：observe 规则照样执行、照样算进覆盖范围，它只是不投票。
+
+操作统计见 `dsh-suite-doctor` 的 `gate.observe` 检查：最近 20 个 mission 的 would-BLOCK 按规则聚合，
+`ok`（没有影子）或建议（有影子时），永远不会成为阻塞项；切换建议是「同一规则连续 5 次零差异后再 enforce」。
+
 ## 项目级配置（同一个 dsh 进程服务多个仓库）
 
 profile 配置是**上限**，每个仓库可以用自己的 `.dsh/quality-gate.json` 细化：
@@ -52,7 +104,8 @@ profile 配置是**上限**，每个仓库可以用自己的 `.dsh/quality-gate.
 {
   "commands": [
     { "id": "test", "name": "单元测试", "command": "cargo test", "required": true, "phase": "gate" },
-    { "id": "clippy", "name": "clippy", "command": "cargo clippy", "required": false, "phase": "lint" }
+    { "id": "clippy", "name": "clippy", "command": "cargo clippy", "required": false, "phase": "lint" },
+    { "id": "nextest", "name": "全量测试", "command": "cargo nextest run", "required": true, "phase": "gate", "mode": "observe" }
   ],
   "budgets": [
     { "id": "bundle", "name": "发布包体积", "metric": "bytes", "command": "node scripts/size.mjs",

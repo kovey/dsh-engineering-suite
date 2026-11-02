@@ -12,6 +12,7 @@
  */
 
 export * from './types.js'
+export * from './rule-mode.js'
 export * from './log.js'
 export * from './paths.js'
 export * from './digest.js'
