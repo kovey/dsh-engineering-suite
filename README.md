@@ -181,7 +181,8 @@ bash scripts/project-config.sh --write --test "pnpm vitest run" --lint "pnpm esl
 细节见 [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md)（分层与协作契约）、
 [docs/PLUGIN-CONVENTIONS.md](./docs/PLUGIN-CONVENTIONS.md)（新增插件的接口约定）、
 [docs/VERIFICATION.md](./docs/VERIFICATION.md)（验证记录与复现步骤）、
-[docs/KNOWN-LIMITS.md](./docs/KNOWN-LIMITS.md)（七项已知边界的现状、启用方式与验证方法）。
+[docs/KNOWN-LIMITS.md](./docs/KNOWN-LIMITS.md)（已知边界的现状、启用方式与验证方法）、
+[docs/REJECTED-DESIGNS.md](./docs/REJECTED-DESIGNS.md)（刻意不做的设计，以及什么时候该重新考虑）。
 
 ## 开发
 
