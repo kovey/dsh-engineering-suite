@@ -57,6 +57,24 @@ export interface ChannelSendResult {
     messageId?: string
     /** Why it failed, in Chinese, when `ok` is false. */
     error?: string
+    /**
+     * `true` when retrying can never help: the channel is gone/not found, it
+     * does not support this payload (a notify on an ask-only channel), or the
+     * request expired before delivery. The outbox settles such a question as
+     * `dropped` instead of retrying it (see `outbox.ts`).
+     *
+     * Absent = "unknown, treat as transient": the safe direction, because a
+     * transient failure is retried and a wrong `dropped` would lose a question.
+     */
+    permanent?: boolean
+    /**
+     * `true` when the card was NOT sent and that is not a FAILURE: the channel
+     * is temporarily unavailable (not connected, no active chat yet, one
+     * question already outstanding). The outbox records a `deferred` row and
+     * does NOT increment `attempts` — a busy channel must not exhaust the retry
+     * budget of a question.
+     */
+    defer?: boolean
 }
 
 /** One answer. */
@@ -79,6 +97,13 @@ export interface InteractionAnswer {
  */
 export interface InteractionChannel {
     readonly name: string
+    /**
+     * The CONVERSATION this channel sends into (an IM chat id), when it can name
+     * one, so the outbox can keep one outstanding question per conversation.
+     * Absent = the channel has one implicit conversation and all its asks
+     * serialize (conservative: never two questions racing in one chat).
+     */
+    readonly chatId?: string
     /** fire-and-forget; must never throw */
     send(message: {
         kind: 'ask' | 'notify' | 'progress'
@@ -86,7 +111,7 @@ export interface InteractionChannel {
         body: string
         questionId?: string
         buttons?: { value: string; label: string }[]
-    }): Promise<{ ok: boolean; messageId?: string; error?: string }>
+    }): Promise<{ ok: boolean; messageId?: string; error?: string; permanent?: boolean; defer?: boolean }>
     /** wait for the answer to `questionId`; resolve null on timeout/abort */
     wait?(
         questionId: string,
@@ -480,7 +505,9 @@ export function createInteractionRegistry(options: {
 
         async send(name: string, message: InteractionMessage): Promise<ChannelSendResult> {
             const channel = channels.get(name)
-            if (channel === undefined) return { ok: false, error: `通道 "${name}" 未注册` }
+            // "Not registered" is permanent: no later replay can make a channel
+            // exist, so the outbox must not keep retrying the question.
+            if (channel === undefined) return { ok: false, error: `通道 "${name}" 未注册`, permanent: true }
             try {
                 const result = await channel.send(message)
                 if (typeof result !== 'object' || result === null) {
@@ -489,7 +516,13 @@ export function createInteractionRegistry(options: {
                     return { ok: false, error }
                 }
                 if (result.ok !== true) {
-                    return { ok: false, ...(result.messageId === undefined ? {} : { messageId: result.messageId }), error: result.error ?? '通道未说明失败原因' }
+                    return {
+                        ok: false,
+                        ...(result.messageId === undefined ? {} : { messageId: result.messageId }),
+                        error: result.error ?? '通道未说明失败原因',
+                        ...(result.permanent === true ? { permanent: true } : {}),
+                        ...(result.defer === true ? { defer: true } : {}),
+                    }
                 }
                 return { ok: true, ...(result.messageId === undefined ? {} : { messageId: result.messageId }) }
             } catch (error) {

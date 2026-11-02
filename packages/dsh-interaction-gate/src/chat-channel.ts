@@ -473,27 +473,40 @@ export function createChatChannel(options: ChatChannelOptions): ChatChannelHandl
 
     const channel: InteractionChannel = {
         name: CHAT_CHANNEL_NAME,
+        // The pinned IM channel is the conversation we can NAME without asking
+        // the api (a chat id needs an inbound message to exist). Without a pin
+        // the api resolves its own active chat per send, so every ask through
+        // this adapter shares one implicit conversation — conservative on
+        // purpose: at most one outstanding question in that chat.
+        ...(options.channelId === undefined ? {} : { chatId: options.channelId }),
 
-        async send(message): Promise<{ ok: boolean; messageId?: string; error?: string }> {
-            if (disposed) return { ok: false, error: 'IM 通道已释放（插件已卸载）' }
+        async send(message): Promise<{ ok: boolean; messageId?: string; error?: string; permanent?: boolean; defer?: boolean }> {
+            // Permanent in the outbox's sense: this adapter will never deliver
+            // anything again in this process, so a replayed question must not be
+            // re-sent through it.
+            if (disposed) return { ok: false, error: 'IM 通道已释放（插件已卸载）', permanent: true }
             if (message.kind !== 'ask') {
                 return {
                     ok: false,
                     error: `本通道只转发"需要人决定"的提问（kind=ask）：${message.kind} 不经过 IM 通道（通知/进度由宿主 IM 插件自己负责）`,
+                    permanent: true,
                 }
             }
             const questionId = (message.questionId ?? '').trim()
             if (questionId === '') {
-                return { ok: false, error: '提问缺少一次性令牌（questionId）：拒绝发出一张无法归属答案的卡片' }
+                return { ok: false, error: '提问缺少一次性令牌（questionId）：拒绝发出一张无法归属答案的卡片', permanent: true }
             }
             prune()
             const live = [...asks.values()].find((entry) => entry.state === 'live')
             if (live !== undefined) {
+                // "No free slot" is a DEFERRAL, not a channel failure: the ask
+                // must not burn its retry budget on a chat that is simply busy.
                 return {
                     ok: false,
                     error:
                         `同一 IM 渠道已有一次待回答的提问（令牌 ${live.questionId}）：并发提问的答案无法区分归属，` +
                         '因此拒绝再发一张卡（等这次有结果或超时后重试）',
+                    defer: true,
                 }
             }
 
@@ -514,13 +527,18 @@ export function createChatChannel(options: ChatChannelOptions): ChatChannelHandl
                 return {
                     ok: false,
                     error: `载荷疑似含凭据，已拒绝发送（绝不"打码后照发"）：命中 ${verdict.hits.map((hit) => hit.rule).join(', ')}`,
+                    // A credential does not disappear on a retry: never re-send it.
+                    permanent: true,
                 }
             }
 
             const ready = preflight()
             if (!ready.ok) {
+                // Temporarily unavailable (not connected / no active chat yet):
+                // the human can fix it without changing anything here, so this is
+                // a deferral — retry later, do not count it as a send failure.
                 note(`IM 通道不可用：${ready.reason}`)
-                return { ok: false, error: `IM 通道不可用：${ready.reason}` }
+                return { ok: false, error: `IM 通道不可用：${ready.reason}`, defer: true }
             }
             const target = ready.target
 

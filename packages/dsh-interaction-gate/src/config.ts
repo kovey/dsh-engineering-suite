@@ -32,6 +32,7 @@
 
 import { loadProjectConfig, type Layout, type LayoutOptions } from 'dsh-eng-core'
 import type { ImChannelMode } from './channels.js'
+import { DEFAULT_OUTBOX_FILE } from './outbox.js'
 
 /** Levels a notification may carry. `progress` is its own tool, not a level. */
 export type NotifyLevel = 'info' | 'warn' | 'error'
@@ -106,6 +107,12 @@ export interface InteractionGateConfig {
     approversFile: string
     /** Append-only decision ledger, relative to the workspace. */
     ledgerFile: string
+    /**
+     * Append-only ask outbox, relative to the workspace: the durability layer
+     * around the send (`intent` → `sent`/`send-failed`/`dropped`). A runtime
+     * file next to the ledger, so the doctor's ignore list already covers it.
+     */
+    outboxFile: string
     /** Which `interaction_notify` levels are actually pushed. */
     notifyLevels: NotifyLevel[]
     /**
@@ -258,6 +265,7 @@ export function resolveConfig(input: unknown, warn?: (message: string) => void):
         requireApproverList: bool(raw['requireApproverList'], false),
         approversFile: str(raw['approversFile'], '.dsh/interaction-approvers.txt'),
         ledgerFile: str(raw['ledgerFile'], '.dsh/interaction/decisions.jsonl'),
+        outboxFile: str(raw['outboxFile'], DEFAULT_OUTBOX_FILE),
         notifyLevels: levels ?? (NOTIFY_LEVELS.filter((level) => level !== 'info') as NotifyLevel[]),
         preferredChannels: preferred ?? [],
         maxPayloadChars: payload < MIN_MAX_PAYLOAD_CHARS || payload > MAX_MAX_PAYLOAD_CHARS ? DEFAULT_MAX_PAYLOAD_CHARS : payload,
@@ -299,6 +307,7 @@ export const HOST_OWNED_KEYS: readonly { key: string; why: string }[] = [
     { key: 'askTimeoutMs', why: '等待人的时长是宿主上限（调用方只能缩短），仓库不得抬高' },
     { key: 'requireApproverList', why: '审批人名单是否强制是宿主决定；由仓库关闭等于自我豁免' },
     { key: 'maxPayloadChars', why: '出站载荷上限按通道能力设定，属宿主' },
+    { key: 'outboxFile', why: '提问出站耐久记录的位置是宿主配置（与台账并列的运行时目录）' },
     {
         key: 'im',
         why: 'IM 通道是否启用是宿主决定：仓库能打开/关闭一条把问题发出进程的通道，等于自行改写审批边界',

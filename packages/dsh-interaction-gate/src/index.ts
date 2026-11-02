@@ -17,6 +17,10 @@
  *  - keep the append-only ledger (`<repo>/.dsh/interaction/decisions.jsonl`) and
  *    the project approver list (`<repo>/.dsh/interaction-approvers.txt`) — both
  *    inside `dsh-spec-gate`'s trust root, so the model cannot edit either;
+ *  - keep the ask OUTBOX (`<repo>/.dsh/interaction/outbox.jsonl`): the intent of
+ *    a question is written BEFORE the channel is touched, every later transition
+ *    is its own row, and a replay settles what can never be asked again instead
+ *    of asking a second time (see `outbox.ts` for the exact rules);
  *  - state the honest limits in the prompt section: a channel that cannot answer
  *    makes `interaction_ask` REFUSE, and a ledger row records what happened
  *    without granting anything.
@@ -36,8 +40,9 @@ import { MissionStoreRegistry, createLogger, expandHome, type AgentLike } from '
 import { createInteractionRegistry, imLogLine, type ImChannelReport } from './channels.js'
 import { CHAT_CHANNEL_NAME, createChatChannel, imRequiredHint, probeChatInteraction, type ChatProbe } from './chat-channel.js'
 import { resolveConfig, resolveEffectiveConfig, type EffectiveConfig, type InteractionGateConfig } from './config.js'
+import { createOutbox, describeReplay, type Outbox } from './outbox.js'
 import { PROMPT_SECTION, sectionText } from './prompt.js'
-import { registerTools, type ToolDeps } from './tools.js'
+import { artifactPathOf, registerTools, type ToolDeps } from './tools.js'
 import type { InteractionRegistry } from './channels.js'
 
 export const name = 'dsh-interaction-gate'
@@ -71,6 +76,8 @@ export type { EffectiveConfig, InteractionGateConfig, InteractionRegistry }
 export type { ImChannelMode, ImChannelReport } from './channels.js'
 export type { ChatApiLike, ChatChannelHandle, ChatChannelOptions, ChatProbe } from './chat-channel.js'
 export type { ImConfig } from './config.js'
+export type { Outbox, OutboxRecord, OutboxReplayReport, OutboxRow, OutboxState, OutboxSummary } from './outbox.js'
+export { BACKOFF_BASE_MS, BACKOFF_MAX_MS, DEFAULT_OUTBOX_FILE, ORDER_FAILURE_LIMIT, createOutbox, describeReplay, outboxIdOf, readOutbox } from './outbox.js'
 
 /** The log file the raw row names, before validation (so config problems have a sink). */
 function rawLogFile(config: unknown): string {
@@ -153,11 +160,29 @@ export function apply(ctx: Context, config: unknown = {}): void {
             }
         }
 
+        // One outbox handle per outbox FILE, for the lifetime of this plugin
+        // instance: the file is the truth, the handle only carries the live
+        // payloads of questions that are being asked right now.
+        const outboxes = new Map<string, Outbox>()
+        const outboxFor = (cwd: string, config: InteractionGateConfig): Outbox => {
+            const file = artifactPathOf(cwd, config.outboxFile)
+            const cached = outboxes.get(file)
+            if (cached !== undefined) return cached
+            const created = createOutbox({
+                file,
+                now: () => Date.now(),
+                note: (message) => registry.reportProblem(message),
+            })
+            outboxes.set(file, created)
+            return created
+        }
+
         const deps: ToolDeps = {
             config: resolved,
             configFor,
             stores,
             registry,
+            outboxFor,
             logger,
             now: () => Date.now(),
         }
@@ -239,6 +264,23 @@ export function apply(ctx: Context, config: unknown = {}): void {
         if (tools.failed.length > 0) logger.warn(`tools that failed to register: ${tools.failed.join(', ')}`)
         disposers.push(...tools.disposers)
 
+        // Replay on plugin apply — possible only when the outbox path is
+        // ABSOLUTE (a profile that names one workspace). Otherwise the plugin
+        // does not know a workspace at apply time (one profile serves many
+        // repositories: guessing one would settle another repo's questions), and
+        // the first tool call that knows a workspace replays instead. An idle
+        // session therefore does not retry until something runs — the honest
+        // boundary of a session-scoped plugin that is not a daemon.
+        const absoluteOutbox = expandHome(resolved.outboxFile)
+        if (path.isAbsolute(absoluteOutbox)) {
+            void outboxFor('', { ...resolved, outboxFile: absoluteOutbox })
+                .replay('apply')
+                .then((report) => {
+                    if (report.considered > 0) logger.info(describeReplay(report))
+                })
+                .catch((error: unknown) => logger.warn('outbox 重放失败：', error))
+        }
+
         if (resolved.prompt.enabled) {
             disposers.push(
                 context.systemPrompt.section({
@@ -272,7 +314,7 @@ export function apply(ctx: Context, config: unknown = {}): void {
 
         logger.info(
             `applied (tools: ${tools.registered.join(', ') || 'none'}${tools.failed.length === 0 ? '' : `; failed: ${tools.failed.join(', ')}`}; ` +
-                `service=${serviceState}; ledger=${resolved.ledgerFile}; approvers=${resolved.approversFile}${resolved.requireApproverList ? '(required)' : ''}; ` +
+                `service=${serviceState}; ledger=${resolved.ledgerFile}; outbox=${resolved.outboxFile}; approvers=${resolved.approversFile}${resolved.requireApproverList ? '(required)' : ''}; ` +
                 `askTimeout=${resolved.askTimeoutMs}ms; notifyLevels=${resolved.notifyLevels.join(',')}; prompt=${resolved.prompt.enabled}; ` +
                 `im=${imReport.registered ? `chat-interaction(api v${imReport.apiVersion})` : 'local'}(im.channel=${imMode}))`,
         )

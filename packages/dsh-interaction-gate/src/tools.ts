@@ -49,6 +49,7 @@ import {
     type AwaitResult,
     type ChannelInfo,
     type InteractionChannel,
+    type InteractionMessage,
     type InteractionRegistry,
 } from './channels.js'
 import { DEFAULT_MAX_PAYLOAD_CHARS, describeSource, NOTIFY_LEVELS, type EffectiveConfig, type InteractionGateConfig, type NotifyLevel } from './config.js'
@@ -64,6 +65,18 @@ import {
     PROGRESS,
     type LedgerRow,
 } from './ledger.js'
+import {
+    describeConversation,
+    describeReplay,
+    isOutboxSettled,
+    ORDER_FAILURE_LIMIT,
+    OUTBOX_STATES,
+    outboxRecords,
+    readOutbox,
+    summarizeOutbox,
+    type Outbox,
+    type OutboxDeliver,
+} from './outbox.js'
 import { checkOutgoing, compileRedactPatterns, describeHits, scanApprovalContext, truncate, type SecretRule } from './redact.js'
 
 const TEXT_OUTPUT = { type: 'string' } as const
@@ -89,6 +102,11 @@ export interface ToolDeps {
     stores: MissionStoreRegistry
     /** The channel registry this plugin provides as `interaction`. */
     registry: InteractionRegistry
+    /**
+     * The ask outbox of one workspace (one file). The plugin owns the cache, so
+     * every tool call of a session sees the same records.
+     */
+    outboxFor: (cwd: string, config: InteractionGateConfig) => Outbox
     logger?: Logger
     /** Injected clock (no clock inside pure helpers). */
     now: () => number
@@ -143,6 +161,19 @@ function declaredCwdOf(agent: AgentLike | undefined): string {
         )
     }
     return cwd
+}
+
+/**
+ * The conversation a channel sends into, when the channel can name one.
+ *
+ * The outbox keys its ordering by `(channel, chatId)`: two questions in one IM
+ * chat go out in order, two questions in different chats never wait for each
+ * other. A channel without `chatId` has one implicit conversation (its asks
+ * serialize), which is the conservative reading of "we cannot tell them apart".
+ */
+export function chatIdOf(channel: InteractionChannel): string | undefined {
+    const raw = (channel as { chatId?: unknown }).chatId
+    return typeof raw === 'string' && raw.trim() !== '' ? raw.trim() : undefined
 }
 
 /** Resolve a workspace-relative artifact path (an absolute value stays absolute). */
@@ -416,6 +447,75 @@ function countLines(counts: Record<string, number>, empty = '（无）', maxChar
     return entries.length === 0 ? empty : entries.map(([key, value]) => `${bounded(key, maxChars)}=${value}`).join('，')
 }
 
+/** What one ask's delivery path needs (built once per ask; a replay reuses it). */
+export interface AskDelivererDeps {
+    /** Only `send` is used: the delivery path must not arm, wait or decide anything. */
+    registry: Pick<InteractionRegistry, 'send'>
+    /** The workspace decision ledger: its `ask` row is the RECEIPT of a delivery. */
+    ledgerFile: string
+    /** The exact card payload (the same object for every attempt and every replay). */
+    message: InteractionMessage
+    questionId: string
+    now: () => number
+    missionId?: string
+}
+
+/**
+ * Build the ONE delivery path of an ask: send, then write the ledger `ask` row
+ * at most once per `(question, channel)`.
+ *
+ * The ledger row is the receipt — it is written only AFTER a successful send,
+ * so finding one for the same question and channel means the card already left
+ * the process. A replay then reuses that row instead of asking a human a second
+ * time: a replayed question never becomes a second question in the ledger.
+ *
+ * @param deps - registry, ledger path, payload, token and clock.
+ * @returns the deliverer the outbox calls for `intent`/`send-failed` records.
+ */
+export function createAskDeliverer(deps: AskDelivererDeps): OutboxDeliver {
+    return async (record) => {
+        const already = readLedger(deps.ledgerFile).rows.find(
+            (row) => row.kind === 'ask' && row.questionId === deps.questionId && row.channel === record.channel,
+        )
+        if (already !== undefined) {
+            return {
+                ok: true,
+                ...(already.messageId === undefined ? {} : { messageId: already.messageId }),
+                ledgerRowId: already.id,
+                ledgerReused: true,
+            }
+        }
+        const sent = await deps.registry.send(record.channel, deps.message)
+        if (!sent.ok) {
+            return {
+                ok: false,
+                error: sent.error ?? '通道未说明失败原因',
+                ...(sent.permanent === true ? { permanent: true } : {}),
+                ...(sent.defer === true ? { deferred: true } : {}),
+            }
+        }
+        const pending: LedgerRow = {
+            at: deps.now(),
+            id: newRowId(),
+            kind: 'ask',
+            title: deps.message.title,
+            questionId: deps.questionId,
+            channel: record.channel,
+            ...(deps.missionId === undefined ? {} : { missionId: deps.missionId }),
+            ...(sent.messageId === undefined ? {} : { messageId: sent.messageId }),
+        }
+        const appended = appendLedgerRow(deps.ledgerFile, pending)
+        if (!appended.ok) {
+            return {
+                ok: true,
+                ...(sent.messageId === undefined ? {} : { messageId: sent.messageId }),
+                ledgerProblem: appended.problem ?? '台账写入失败',
+            }
+        }
+        return { ok: true, ...(sent.messageId === undefined ? {} : { messageId: sent.messageId }), ledgerRowId: pending.id }
+    }
+}
+
 /**
  * Register the four tools.
  * @param ctx - the tool runtime (narrow structural view of `ctx.tools`).
@@ -465,6 +565,14 @@ export function registerTools(
         messageId?: string
         missionId?: string
         extraLines?: string[]
+        /**
+         * The outbox this ask wrote to (when one was touched). Its records are
+         * settled with `settle` and their state is reported in the refusal: the
+         * outbox must never be able to turn "no decision" into a decision, and
+         * a refusal that leaves a question silently retryable would be a lie.
+         */
+        outbox?: Outbox
+        settle?: { state: 'timeout' | 'withdrawn'; reason: string }
     }): never {
         const row: LedgerRow = {
             at: deps.now(),
@@ -480,6 +588,13 @@ export function registerTools(
             ...(params.missionId === undefined ? {} : { missionId: params.missionId }),
         }
         const appended = write(params.ledgerFile, row)
+        const outboxLines: string[] = []
+        if (params.outbox !== undefined) {
+            if (params.settle !== undefined) {
+                params.outbox.settleQuestion(params.questionId, params.settle.state, params.settle.reason)
+            }
+            outboxLines.push(...params.outbox.linesFor(params.questionId))
+        }
         throw new Error(
             [
                 `interaction_ask 拒绝（${refusalOf(params.reason)}）：${params.detail}`,
@@ -488,6 +603,7 @@ export function registerTools(
                 appended.ok
                     ? `- 台账：${params.ledgerFile}（行 ${row.id}，决定 ${refusalOf(params.reason)}）`
                     : `- ⚠️ 台账写入失败：${appended.problem ?? '未知原因'}`,
+                ...outboxLines,
                 `下一步：${params.next}`,
             ].join('\n'),
         )
@@ -550,6 +666,13 @@ export function registerTools(
 
                 const ledgerFile = artifactPathOf(cwd, config.ledgerFile)
                 deps.registry.trackLedger(ledgerFile)
+                const outbox = deps.outboxFor(cwd, config)
+                // Replay happens on the next OPPORTUNITY, never on a timer: this
+                // plugin is session-scoped, not a daemon. "Just before a new ask"
+                // is that moment (the other one is `apply`, when a workspace is
+                // knowable). An idle session does not retry — that is the boundary.
+                const replayed = await outbox.replay('ask')
+                if (replayed.considered > 0) deps.logger?.info(describeReplay(replayed))
                 const missionId = missionIdOf(deps, cwd, agent, args.missionId)
                 const questionId = newQuestionToken()
                 const contextInput = normalizeApprovalContextInput(args.context)
@@ -649,47 +772,139 @@ export function registerTools(
                         ...(missionId === undefined ? {} : { missionId }),
                     })
                 }
+                // One payload for every candidate AND every replay: a re-sent card
+                // is byte-identical to the first attempt, so a human cannot tell
+                // two questions apart that were meant to be one.
+                const askMessage: InteractionMessage = {
+                    kind: 'ask',
+                    title: titleOut.text,
+                    body: body.text,
+                    questionId,
+                    ...(declared.length === 0 ? {} : { buttons: declared.map((option) => ({ value: option, label: option })) }),
+                }
+                const deliverAsk = createAskDeliverer({
+                    registry: deps.registry,
+                    ledgerFile,
+                    message: askMessage,
+                    questionId,
+                    now: deps.now,
+                    ...(missionId === undefined ? {} : { missionId }),
+                })
+
                 const failures: string[] = []
+                /** Deferrals and retry facts: stated in the report, never swallowed. */
+                const outboxNotes: string[] = []
+                /** Which kind of obstacle the candidates hit (the refusal names it). */
+                let sawDeferral = false
+                let sendFailed = false
                 for (const candidate of selection.candidates) {
                     const channel = deps.registry.get(candidate.name)
                     if (channel === undefined) {
+                        sendFailed = true
                         failures.push(`- ${candidate.name}：通道在发送前被注销`)
                         continue
                     }
-                    const send = await deps.registry.send(candidate.name, {
-                        kind: 'ask',
-                        title: titleOut.text,
-                        body: body.text,
-                        questionId,
-                        ...(declared.length === 0 ? {} : { buttons: declared.map((option) => ({ value: option, label: option })) }),
-                    })
-                    if (!send.ok) {
-                        failures.push(`- ${candidate.name}：${send.error ?? '发送失败'}`)
+
+                    // ① The intent row is on disk BEFORE the channel is touched.
+                    const chatId = chatIdOf(channel)
+                    const begun = outbox.begin({ questionId, channel: candidate.name, ...(chatId === undefined ? {} : { chatId }) })
+                    if (begun.problem !== undefined) {
+                        deps.registry.retire(questionId)
+                        refuseAsk({
+                            ledgerFile,
+                            reason: 'outbox-unwritable',
+                            detail:
+                                `提问的意图记录写不进 outbox（${outbox.file}），崩溃/重启后就没人能说明"我们问过谁"，所以这里不发卡片：` +
+                                begun.problem,
+                            title: titleOut.text,
+                            questionId,
+                            durationMs: deps.now() - startedAt,
+                            extraLines: ['- 说明：意图先落盘、再发卡片——没有那一行就不发。'],
+                            next: `修好 ${outbox.file} 的写入（目录存在且可写）后重试；需要人决定的事不要因为写不进记录就自己拍板。`,
+                            ...(missionId === undefined ? {} : { missionId }),
+                        })
+                    }
+                    const recordId = begun.record.id
+                    if (!begun.created && isOutboxSettled(begun.record.state)) {
+                        deps.registry.retire(questionId)
+                        refuseAsk({
+                            ledgerFile,
+                            reason: 'outbox-settled',
+                            detail:
+                                `同一个内容寻址的 outbox 记录（${recordId}）已经结案（state=${begun.record.state}）：` +
+                                '一次提问只有一条记录——重放不会再造第二道提问，旧的决定也不会被当成新的决定',
+                            title: titleOut.text,
+                            questionId,
+                            durationMs: deps.now() - startedAt,
+                            outbox,
+                            next: '重新提问（会生成新令牌与新记录）；重复出现说明调用方在复用同一个令牌，检查调用方。',
+                            ...(missionId === undefined ? {} : { missionId }),
+                        })
+                    }
+
+                    // ② Per-conversation order: a later send WAITS while an earlier
+                    //    question of the same (channel, chatId) is unsettled. The
+                    //    wait is a deferral — it never touches `attempts`.
+                    const slot = await outbox.awaitSlot(recordId, startedAt + timeoutMs)
+                    if (!slot.ok) {
+                        const waiting = slot.blockedBy === undefined ? '更早的提问' : `${slot.blockedBy.id}（已失败 ${slot.blockedBy.attempts} 次）`
+                        sawDeferral = true
+                        failures.push(`- ${candidate.name}：同会话排队超时（等了 ${Math.round(slot.waitedMs)}ms，${waiting} 仍未落定）`)
+                        outboxNotes.push(
+                            `- ⚠️ 发送被延后（deferral，不是失败）：${describeConversation(begun.record)} 里 ${waiting} 还没落定，` +
+                                '同一会话按顺序发送、attempts 没有增加；等它落定（或失败 3 次）后重试。',
+                        )
                         continue
                     }
-                    const pending: LedgerRow = {
-                        at: deps.now(),
-                        id: newRowId(),
-                        kind: 'ask',
-                        title: titleOut.text,
-                        questionId,
-                        channel: candidate.name,
-                        ...(missionId === undefined ? {} : { missionId }),
-                        ...(send.messageId === undefined ? {} : { messageId: send.messageId }),
+                    if (slot.deferrals > 0) {
+                        outboxNotes.push(
+                            `- 同会话排队：${describeConversation(begun.record)} 里更早的提问还没落定，等 ${Math.round(slot.waitedMs)}ms 才轮到这里` +
+                                '（同一会话按顺序发送；排队不算失败，attempts 不变）',
+                        )
                     }
-                    const appended = write(ledgerFile, pending)
-                    if (!appended.ok) {
+
+                    // ③ The send goes through the outbox: `sent` / `send-failed` /
+                    //    `dropped` are appended together with the attempt, never
+                    //    inferred afterwards from an absence.
+                    outbox.attach(recordId, deliverAsk, { deadlineAt: startedAt + timeoutMs })
+                    const delivered = await outbox.deliver(recordId)
+                    outbox.detach(recordId)
+                    const sendResult = { messageId: delivered.delivery?.messageId }
+                    if (!delivered.ok) {
+                        const error = delivered.delivery?.error ?? delivered.problem ?? '发送失败'
+                        if (delivered.delivery?.deferred === true) sawDeferral = true
+                        else sendFailed = true
+                        failures.push(`- ${candidate.name}：${error}`)
+                        if (delivered.record?.state === 'send-failed') {
+                            outboxNotes.push(
+                                `- outbox ${recordId}：已记 send-failed（第 ${delivered.record.attempts} 次失败，退避到 ` +
+                                    `${formatTime(delivered.record.nextAttemptAt ?? deps.now())}）；下一次机会只会重投仍然存活的提问，` +
+                                    '令牌失效后按 dropped 结案——不会重新问一次，也不会因此放行任何东西。',
+                            )
+                        } else if (delivered.record?.state === 'dropped') {
+                            outboxNotes.push(`- outbox ${recordId}：已记 dropped（${bounded(error, 160)}）——永久失败，不再重投。`)
+                        } else if (delivered.record?.state === 'deferred') {
+                            outboxNotes.push(
+                                `- outbox ${recordId}：已记 deferred（${bounded(error, 160)}）——通道暂时不可用，这不是失败，` +
+                                    'attempts 没有增加；等通道可用后重新提问即可。',
+                            )
+                        }
+                        continue
+                    }
+                    if (delivered.delivery?.ledgerProblem !== undefined) {
                         deps.registry.retire(questionId)
                         refuseAsk({
                             ledgerFile,
                             reason: 'ledger-unwritable',
-                            detail: `台账写不进去，这张卡片的提问就没有可审计的记录：${appended.problem ?? '未知原因'}`,
+                            detail: `台账写不进去，这张卡片的提问就没有可审计的记录：${delivered.delivery.ledgerProblem}`,
                             title: titleOut.text,
                             questionId,
                             durationMs: deps.now() - startedAt,
                             channel: candidate.name,
-                            ...(send.messageId === undefined ? {} : { messageId: send.messageId }),
-                            next: `修好台账路径（${ledgerFile}）后重试；卡片已发出但这次不算数，请让通道作废它（messageId ${send.messageId ?? '未知'}）。`,
+                            ...(sendResult.messageId === undefined ? {} : { messageId: sendResult.messageId }),
+                            outbox,
+                            settle: { state: 'withdrawn', reason: '台账写不进去：这张卡片不算数，也不再等待决定' },
+                            next: `修好台账路径（${ledgerFile}）后重试；卡片已发出但这次不算数，请让通道作废它（messageId ${sendResult.messageId ?? '未知'}）。`,
                             ...(missionId === undefined ? {} : { missionId }),
                         })
                     }
@@ -711,7 +926,9 @@ export function registerTools(
                                 questionId,
                                 durationMs,
                                 channel: candidate.name,
-                                ...(send.messageId === undefined ? {} : { messageId: send.messageId }),
+                                ...(sendResult.messageId === undefined ? {} : { messageId: sendResult.messageId }),
+                                outbox,
+                                settle: { state: 'withdrawn', reason: 'refused:cancelled：等待被取消，这次提问不再等待决定' },
                                 next: '在未被取消的轮次重新提问；不要因为"这次没等到"就自己决定。',
                                 ...(missionId === undefined ? {} : { missionId }),
                             })
@@ -725,6 +942,8 @@ export function registerTools(
                                 questionId,
                                 durationMs,
                                 channel: candidate.name,
+                                outbox,
+                                settle: { state: 'withdrawn', reason: 'refused:token-lost：一次性令牌在等待期间失效，答案无处归属' },
                                 next: '重新提问（会生成新令牌）；如果重复出现，说明有通道在替这次提问作答，查通道实现。',
                                 ...(missionId === undefined ? {} : { missionId }),
                             })
@@ -739,9 +958,11 @@ export function registerTools(
                             questionId,
                             durationMs,
                             channel: candidate.name,
-                            ...(send.messageId === undefined ? {} : { messageId: send.messageId }),
+                            ...(sendResult.messageId === undefined ? {} : { messageId: sendResult.messageId }),
                             extraLines: [`- 超时上限：${timeoutMs}ms（配置 askTimeoutMs=${configuredTimeout}ms；调用方只能缩短，不能延长）`],
-                            next: `确认人真的收到了卡片（messageId ${send.messageId ?? '未知'}）；要么在 ${timeoutMs}ms 内回答重试，要么把问题拆小/换通道。超时**不是**拒绝，也**不是**同意：不要据此继续。`,
+                            outbox,
+                            settle: { state: 'timeout', reason: 'refused:timeout：期限内没有回答（超时不是同意，也不是拒绝）' },
+                            next: `确认人真的收到了卡片（messageId ${sendResult.messageId ?? '未知'}）；要么在 ${timeoutMs}ms 内回答重试，要么把问题拆小/换通道。超时**不是**拒绝，也**不是**同意：不要据此继续。`,
                             ...(missionId === undefined ? {} : { missionId }),
                         })
                     }
@@ -760,6 +981,8 @@ export function registerTools(
                             channel: candidate.name,
                             ...(by === '' ? {} : { userId: by }),
                             extraLines: ['- 命中规则：', ...describeHits(answerVerdict.hits, compiled.rules)],
+                            outbox,
+                            settle: { state: 'withdrawn', reason: 'refused:secret：回答疑似含凭据，未落账（无决定）' },
                             next: '请回答者把凭据从答案里去掉后重新回答（重新提问）；不要把疑似密钥写进台账。',
                             ...(missionId === undefined ? {} : { missionId }),
                         })
@@ -776,6 +999,8 @@ export function registerTools(
                             channel: candidate.name,
                             ...(by === '' ? {} : { userId: by }),
                             ...(answer.messageId === undefined ? {} : { messageId: answer.messageId }),
+                            outbox,
+                            settle: { state: 'withdrawn', reason: 'refused:unauthorized：回答者未获授权（无决定）' },
                             next: `让名单里的人回答（由人维护 ${config.approversFile}）；未授权的回答只算"发生了这件事"，不算决定。`,
                             ...(missionId === undefined ? {} : { missionId }),
                         })
@@ -796,12 +1021,14 @@ export function registerTools(
                             channel: candidate.name,
                             ...(by === '' ? {} : { userId: by }),
                             ...(answer.messageId === undefined ? {} : { messageId: answer.messageId }),
+                            outbox,
+                            settle: { state: 'withdrawn', reason: 'refused:unknown-answer：答非所问，没有可用的决定' },
                             next: '按声明选项重新问一次（或把选项改成人真正会选的那几个）；答非所问不是"默认通过"。',
                             ...(missionId === undefined ? {} : { missionId }),
                         })
                     }
-                    const normalized = normalizeDecision(mapped, by, answer.messageId ?? send.messageId, candidate.name)
-                    const carrier = answer.messageId ?? send.messageId
+                    const normalized = normalizeDecision(mapped, by, answer.messageId ?? sendResult.messageId, candidate.name)
+                    const carrier = answer.messageId ?? sendResult.messageId
                     // A free-text answer is stored verbatim as the decision, so it
                     // is bounded HERE: an unbounded answer would grow the ledger
                     // (and every report that renders it) without limit. The bound
@@ -826,6 +1053,7 @@ export function registerTools(
                     }
                     const decided = write(ledgerFile, row)
                     if (!decided.ok) {
+                        outbox.settle(recordId, 'withdrawn', '台账写入失败：回答没有被记录，这次提问没有可审计的决定')
                         throw new Error(
                             [
                                 `interaction_ask 拒绝（${refusalOf('ledger-unwritable')}）：答案收到了（${JSON.stringify(truncate(answer.value, 200).text)}，回答者 ${by === '' ? '未提供身份' : by}，通道 ${candidate.name}），但台账写不进去，这次决定拿不到可审计的行 id：${decided.problem ?? '未知原因'}`,
@@ -835,6 +1063,11 @@ export function registerTools(
                             ].join('\n'),
                         )
                     }
+
+                    // The ledger decided; the outbox only RECORDS that it did. A
+                    // terminal outbox row is never read as a decision anywhere.
+                    outbox.settle(recordId, 'answered', `决定 ${bounded(storedDecision, 80)}（回答者 ${by === '' ? '通道未提供身份' : by}，通道 ${candidate.name}）`)
+                    outbox.settleQuestion(questionId, 'withdrawn', `同一提问已由 ${candidate.name} 投递并落定：这条候选记录不再重放`)
 
                     const notes: string[] = []
                     if (contextInput.problems.length > 0) notes.push(...contextInput.problems.map((problem) => `- ⚠️ ${problem}`))
@@ -847,6 +1080,7 @@ export function registerTools(
                         )
                     }
                     if (compiled.problems.length > 0) notes.push(...compiled.problems.map((problem) => `- ⚠️ ${problem}`))
+                    if (outboxNotes.length > 0) notes.push(...outboxNotes)
                     if (failures.length > 0) notes.push('- 先尝试失败的通道：', ...failures)
                     if (missionId !== undefined) notes.push(`- mission：${missionId}`)
                     return [
@@ -854,9 +1088,10 @@ export function registerTools(
                         `- 问题：${headline(prose, 120)}`,
                         `- 决定：${storedDecision}${declared.length === 0 ? '（自由文本回答）' : '（声明选项之一）'}`,
                         `- 回答者：${by === '' ? '（通道未提供身份）' : by}${config.requireApproverList ? `（项目审批人名单：${approvers.ids.length} 个 id）` : '（未启用审批人名单：通道内的任何参与者都可回答）'}`,
-                        `- 通道：${candidate.name}${(answer.messageId ?? send.messageId) === undefined ? '' : `（消息 ${answer.messageId ?? send.messageId}）`}`,
+                        `- 通道：${candidate.name}${(answer.messageId ?? sendResult.messageId) === undefined ? '' : `（消息 ${answer.messageId ?? sendResult.messageId}）`}`,
                         `- 一次性令牌：${questionId}（一次性，已作废）`,
                         `- 台账：${ledgerFile}（行 ${row.id}）`,
+                        `- outbox：${recordId}（answered；${describeConversation({ channel: candidate.name, ...(chatId === undefined ? {} : { chatId }) })} 上的下一次提问不会再为它排队）`,
                         `- 耗时：${durationMs}ms（等待上限 ${timeoutMs}ms）`,
                         ...(SUITE_DECISIONS.includes(normalized.decision)
                             ? [
@@ -872,6 +1107,23 @@ export function registerTools(
 
                 // Every candidate refused to even deliver the card.
                 deps.registry.retire(questionId)
+                if (sawDeferral && !sendFailed) {
+                    // Nothing failed — the question was DEFERRED (a busy chat, a
+                    // channel that is temporarily unavailable). Say exactly that,
+                    // and point at the fix that actually works.
+                    refuseAsk({
+                        ledgerFile,
+                        reason: 'deferred',
+                        detail: '所有候选通道都没有失败，但没有接单：同一会话里更早的提问还没落定，或通道暂时不可用（deferral，不是失败）',
+                        title: titleOut.text,
+                        questionId,
+                        durationMs: deps.now() - startedAt,
+                        extraLines: ['- 各通道的情况：', ...failures, ...outboxNotes],
+                        outbox,
+                        next: '先让同一会话里更早的提问落定（或让它失败 3 次，它就不再挡住后面的提问），或把通道恢复可用（连接/active chat），再重新提问；也可以换一个没人排队的会话（prefer 或项目级 preferredChannels）。排队等待不是失败，也不是同意。',
+                        ...(missionId === undefined ? {} : { missionId }),
+                    })
+                }
                 if (failures.length === 0) {
                     refuseAsk({
                         ledgerFile,
@@ -891,8 +1143,9 @@ export function registerTools(
                     title: titleOut.text,
                     questionId,
                     durationMs: deps.now() - startedAt,
-                    extraLines: ['- 各通道的失败原因：', ...failures],
-                    next: '修好通道（webhook/网络/凭据）后重试；卡片没发出去 = 没有人被问过，不要自己决定。',
+                    extraLines: ['- 各通道的失败原因：', ...failures, ...outboxNotes],
+                    outbox,
+                    next: '修好通道（webhook/网络/凭据）后重试；卡片没发出去 = 没有人被问过，不要自己决定（outbox 里留下的是"没有投递成功"，不是答案）。',
                     ...(missionId === undefined ? {} : { missionId }),
                 })
             },
@@ -1174,7 +1427,7 @@ export function registerTools(
         defineTool({
             name: 'interaction_status',
             description:
-                'Read-only doctor for the interaction layer: registered channels with their capability report (canAsk / canNotify and WHY not), the effective configuration and its provenance, the project approver-list state, ledger counts by decision, and the asks that are still PENDING (rows with no decision, with their age). Writes nothing.',
+                'Read-only doctor for the interaction layer: registered channels with their capability report (canAsk / canNotify and WHY not), the effective configuration and its provenance, the project approver-list state, ledger counts by decision, the asks that are still PENDING (rows with no decision, with their age), and the ask OUTBOX — how many questions are queued behind another of the same conversation, how old the oldest unsettled one is, which records failed three times (a system problem) and which were dropped with their reason. Writes nothing: an outbox row is never a decision.',
             parameters: {
                 missionId: { type: 'string', description: 'Only count rows of one mission (default: the whole ledger).' },
             },
@@ -1187,6 +1440,13 @@ export function registerTools(
                 const only = args.missionId !== undefined && args.missionId !== '' ? assertSafeId(args.missionId, 'mission id') : undefined
                 const ledgerFile = artifactPathOf(cwd, config.ledgerFile)
                 deps.registry.trackLedger(ledgerFile)
+                // The outbox is read, never replayed, from here: a doctor that
+                // writes (or retries) is no longer a doctor. `sync()` only feeds
+                // the derived defects into the bounded problem list, once each.
+                const outbox = deps.outboxFor(cwd, config)
+                outbox.sync()
+                const outboxRead = readOutbox(outbox.file)
+                const outboxSummary = summarizeOutbox(outboxRecords(outboxRead.rows), deps.now(), outbox.file, outboxRead)
                 const read = readLedger(ledgerFile)
                 const selected = only === undefined ? read.rows : read.rows.filter((row) => row.missionId === only)
                 const summary = summarizeLedger(selected, deps.now(), read.skipped)
@@ -1233,6 +1493,39 @@ export function registerTools(
                 lines.push(`- 按决定计数：${countLines(summary.byDecision, '（无）', config.maxPayloadChars)}`)
                 lines.push(`- 拒绝原因：${countLines(summary.refusedReasons, '（无）', config.maxPayloadChars)}`)
                 lines.push(`- 通知失败行：${summary.notifyFailed}`)
+
+                // The outbox: the durability layer around the send. Counts per
+                // state, what is waiting (`behind`), how old the oldest unsettled
+                // row is, and every dropped record WITH its reason — a dropped
+                // question must never read as a sent one.
+                lines.push('', `提问 outbox（意图先落盘、再发卡片）：${outbox.file}（存在=${outboxRead.present}，行数 ${outboxRead.lines}，可用记录 ${outboxSummary.total}，跳过 ${outboxSummary.skipped}）`)
+                for (const problem of outboxSummary.problems) lines.push(`  ⚠️ ${problem}`)
+                lines.push(`- 按状态：${OUTBOX_STATES.map((state) => `${state}=${outboxSummary.byState[state]}`).join('，')}`)
+                lines.push(`- 排队中（behind：同一会话里更早的提问还没落定）：${outboxSummary.behind} 个`)
+                if (outboxSummary.oldestUnsettled === undefined) {
+                    lines.push('- 未落定的提问：0 个（没有在途提问）')
+                } else {
+                    lines.push(
+                        `- 最老未落定：${Math.round((outboxSummary.oldestUnsettledAgeMs ?? 0) / 1000)}s（${outboxSummary.oldestUnsettled.id}，` +
+                            `${describeConversation(outboxSummary.oldestUnsettled)}，state=${outboxSummary.oldestUnsettled.state}）`,
+                    )
+                }
+                if (outboxSummary.dropped.length > 0) {
+                    lines.push(`- 已丢弃（dropped，永久失败，不会再重试，也**不是**已发出的提问）：${outboxSummary.dropped.length} 个`)
+                    for (const record of outboxSummary.dropped.slice(-3)) {
+                        lines.push(`  ${record.id}（${describeConversation(record)}）：${bounded(record.settleReason ?? '未说明原因', 120)}`)
+                    }
+                }
+                if (outboxSummary.tripped.length > 0) {
+                    lines.push(`- ⚠️ 连续失败≥${ORDER_FAILURE_LIMIT} 次（系统问题，见上方通道缺陷）：${outboxSummary.tripped.length} 个`)
+                    for (const record of outboxSummary.tripped.slice(-3)) {
+                        lines.push(
+                            `  ${record.id}（${describeConversation(record)}）：失败 ${record.attempts} 次，` +
+                                `${bounded(record.settleReason ?? '未说明原因', 120)}——它不再阻塞该会话的后续提问`,
+                        )
+                    }
+                }
+
                 lines.push('', `未决定的提问（按年龄，共 ${summary.pending.length} 个）：`)
                 if (summary.pending.length === 0) lines.push('  （无）')
                 for (const pending of summary.pending) {
@@ -1248,7 +1541,8 @@ export function registerTools(
                 lines.push(
                     '',
                     '说明：台账记录发生过什么，**不授予任何权限**；`allowed-once` 这种决定只对当时问的那一件事有效。',
-                    '下一步：没有可用通道就先注册通道；有未决定的提问就等人回答或重新提问（超时/越权都不是同意）；审批人名单由人维护。',
+                    '说明：outbox 里 intent/sent/deferred/send-failed/dropped 都表示"还没有人的决定"——它们不是答案，门禁照旧拒绝。',
+                    '下一步：没有可用通道就先注册通道；有未决定的提问就等人回答或重新提问（超时/越权都不是同意）；outbox 里 dropped/连续失败的记录要修通道或重新提问；审批人名单由人维护。',
                 )
                 return lines.join('\n')
             },
