@@ -142,6 +142,8 @@ profile（宿主上限）与 `<repo>/.dsh/interaction-gate.json`（项目只能�
     requireApproverList: false           # true = 只有名单里的人能回答
     approversFile: .dsh/interaction-approvers.txt
     ledgerFile: .dsh/interaction/decisions.jsonl
+    attentionFile: .dsh/interaction/attention.jsonl   # 注意力旁路（whyYou / 作废 / 暂停区间）
+    attentionMaxAgeMs: 86400000          # 超过 24h 未回答 → 标 stale（仍列出）
     notifyLevels: [warn, error]          # info 默认不推
     preferredChannels: []                # 空 = 全部已注册通道（注册顺序）
     maxPayloadChars: 4000
@@ -163,6 +165,7 @@ profile（宿主上限）与 `<repo>/.dsh/interaction-gate.json`（项目只能�
 - `askTimeoutMs`：等待人的时长决定一轮对话能挂多久，仓库抬高它等于给自己放长绳；
 - `requireApproverList`：仓库若能否掉它，就是把自己的审批人名单关掉。
 - `im`：打开/关闭一条"把问题发到聊天"的通道，等于改写审批边界；这必须是宿主的决定（`channelId` 也是宿主配置）。
+- `attentionFile` / `attentionMaxAgeMs`：注意力旁路的位置，以及"多久算过期的提问"——仓库能放宽它，就等于让已经作废的提问继续看起来新鲜。
 
 数值不做猜测：不可用的值**保留 profile 的值**并记一条问题（`interaction_status` 会写"（N 条配置问题）"）。
 
@@ -175,8 +178,9 @@ profile（宿主上限）与 `<repo>/.dsh/interaction-gate.json`（项目只能�
 {"at":1759000042000,"id":"il-7b41…","kind":"ask","title":"需要决定：把这个交付放出去？","questionId":"q-9c1d…","channel":"im","userId":"user-7","decision":"allowed-once","messageId":"card-9","durationMs":42000}
 ```
 
-- 字段固定为 `{at, id, kind, questionId?, channel?, userId?, decision?, title, missionId?, messageId?, durationMs?}`；
-  `at` 是 epoch 毫秒（与套件其他工件一致）。
+- 字段固定为 `{at, id, kind, questionId?, channel?, userId?, decision?, title, missionId?, messageId?, durationMs?, windowMs?}`；
+  `at` 是 epoch 毫秒（与套件其他工件一致）；`windowMs` 是这次提问**被允许等多久**（一次提问的截止时间 =
+  `askedAt + windowMs + pausedMs`，见「注意力」）。
 - **一次提问两行**：发出卡片时写 **pending 行**（没有 `decision`），落定时写 **决定行**（同一个 `questionId`）。
   所以"崩溃时正在等的提问"在台账里是看得见的 pending 行，而不是消失；`interaction_status` 与服务的
   `pending()` 把**没有决定、且没有被同令牌的决定行取代**的提问列出来（带年龄）。
@@ -187,11 +191,51 @@ profile（宿主上限）与 `<repo>/.dsh/interaction-gate.json`（项目只能�
 - `decision` 是封闭词汇：套件四词之一 / 声明的选项 / 自由文本答案（限量） / `refused:<原因>` /
   `notified` / `notify-failed` / `progress` / `filtered`。`refused:` 的原因有：
   `no-channel`、`channel-unusable`、`approvers-missing`、`timeout`、`cancelled`、`unauthorized`、
-  `unknown-answer`、`secret`、`send-failed`、`token-lost`、`ledger-unwritable`、`bad-request`。
+  `unknown-answer`、`secret`、`send-failed`、`token-lost`、`ledger-unwritable`、`bad-request`、
+  `superseded`（提问已作废，迟到的答案被拒绝）、`withdrawn`（提问已被撤回）。
 - 读取**容忍截断的尾行**（崩溃不是台账损坏），并且**计数**跳过了几行：`interaction_status` 会写
   "行数 N，可用行 M，跳过 K"——"0 行"和"解析不了"绝不长得一样。
 - 台账写不进去 = **拒绝**：一次决定如果拿不到可审计的行 id，`interaction_ask` 不会把它交出去
   （通知/进度的台账失败只报告，因为推送已经发生、且不涉及决定）。
+
+## 注意力：谁还在等人，为什么，还该不该等
+
+台账回答"发生过什么"，操作者要问的是另外三件事：**为什么问我**、**这条还作数吗**、**阻塞的 mission 会不会把提问的期限烧掉**。
+"注意力"（attention）就是这三件事的一等概念，而且它是**派生**的：
+
+- **派生（读时算）**：台账里有 `ask` 行、且它的令牌没有决定行 → 这就是一条注意力。答案、回答者、通道、年龄全部来自台账；
+  本模块**不存答案**、不授予任何权限，决定仍然只来自"一次性令牌 + 台账"；
+- **存下来的只有台账装不下的三样**：`whyYou`、`superseded`/`withdrawn`（作废/撤回的转移）、暂停区间（`pausedFrom`/`pausedTo`）。
+
+旁路文件 `<repo>/.dsh/interaction/attention.jsonl` 一行一个转移（append-only，按目标"最后一个生效"）：
+
+```json
+{"at":1759000000000,"id":"ar-1f0c…","kind":"why","questionId":"q-9c1d…","whyYou":"decision-required"}
+{"at":1759000100000,"id":"ar-2b7e…","kind":"pausedFrom","missionId":"m-1","from":1759000100000}
+{"at":1759000900000,"id":"ar-3c81…","kind":"pausedTo","missionId":"m-1","from":1759000100000,"to":1759000900000}
+{"at":1759001000000,"id":"ar-4d92…","kind":"superseded","missionId":"m-1","reason":"mission m-1 已交付（delivered）：这道提问已不再有意义"}
+```
+
+- **`whyYou`**：`decision-required`（有门禁在等决定；**没有记录时的默认值**）或 `result-usable`（有结果等人去用）。没有第三个值：
+  传别的值 `interaction_ask` 直接 `refused:bad-request`（"没有第三个"写在拒绝文本里）。
+- **过期（`stale`）在读取时算，并且给出理由**：mission 的授权策略版本与当前信任根不一致 / 等待超过 `attentionMaxAgeMs` /
+  mission 已结束。过期的注意力**仍然列出**并标注——藏起来只会让套件看起来很平静。
+- **作废（`superseded`）**：mission 交付（`delivered`）或授权被撤回（人工停止）时，它名下没回答的提问作废——**一个 mission 记一行**，
+  带原因与 mission id；重复扫描不会再记，**已经回答过的提问永远不会被作废**。
+- **撤回（`withdrawn`）**：提问者不再需要这个答案时记一行（例如台账写不进去、回答无处可放）。它不是答案，也不是批准。
+- **迟到的答案是拒绝**：对已作废/已撤回的提问作答，`interaction_ask` 用同一种拒绝形态
+  （`interaction_ask 拒绝（refused:superseded）：…` / `refused:withdrawn`）拒绝，**不落任何决定**——台账里不会出现 `allowed-once`，
+  "已决定的提问"计数不变。
+- **暂停只推迟期限，不烧掉它**：mission 处于 `blocked` 期间提问的期限不流逝，报告的截止时间是
+  `askedAt + window + pausedMs`（`pausedMs` 是暂停区间的累计，`window` 是台账 `ask` 行的 `windowMs`）。
+  正在等答案的工具调用不会在暂停期间超时；超时信息会写明"等待被延长 Nms"，恢复后从顺延后的截止时间继续。
+  **谁写暂停区间**：本进程**采样 mission store**（`blocked` → 记 `pausedFrom`，解除 → 记 `pausedTo`），并把累计暂停时长作为
+  `awaitAnswer` 的 extension 喂回去；宿主/orchestrator 也可以显式上报：`ctx.get('interaction').pauseMission('m-1')` /
+  `resumeMission('m-1')` / `supersedeMission('m-1', 原因)` / `withdrawQuestion('q-…', 原因)`。
+  `dsh-orchestrator` 今天**没有**向本插件推送状态变化的钩子，所以"采样"是实际生效的那条路（写入的是同样的
+  `pausedFrom`/`pausedTo` 行，两者可以并存）。
+- 服务的 `attentions()` 是给体检/操作者视图用的只读派生（最老在前）；`interaction_status` 把作废/撤回的提问从
+  "未决定的提问"里剔出来（它们不再等人回答），并单独报数量与原因。
 
 ## 与套件其他插件的分工
 
@@ -204,7 +248,7 @@ profile（宿主上限）与 `<repo>/.dsh/interaction-gate.json`（项目只能�
 | `dsh-orchestrator` | 长阶段用 `interaction_progress` 报"还在跑"（不是日志），阶段进入/失败用 `interaction_notify` |
 | `dsh-chat-interaction`（外部插件） | 可选：`im.channel: auto/required` 时本插件把它的 `api` 适配成 `chat-interaction` 通道（本 README「可选 IM 通道」）；它负责连接/去重/卡片/等待/`/命令`，本插件只转发提问 |
 | 其他 IM 桥（不在本仓库） | 也可以自己注册一个通道：`ctx.get('interaction').register({ name: 'im', send, wait, describe })`；推送型通道在点击到达时 `submit(questionId, { value, by, messageId })` |
-| 体检/doctor 插件 | 只读消费 `describeAll()`（通道能力 + 为什么不能）与 `pending()`（还在等人的提问） |
+| 体检/doctor 插件 | 只读消费 `describeAll()`（通道能力 + 为什么不能）、`pending()`（还在等人的提问）与 `attentions()`（注意力队列：whyYou / 年龄 / 过期理由 / 顺延后的截止时间） |
 | 宿主审批接缝 | **两条路**：宿主的 `ctx.get('approval')` 仍然服务 harness 自己的提示；本插件的台账**不给宿主任何权限**，也不假装给 |
 
 ## 诚实的边界

@@ -36,7 +36,10 @@ export function sectionText(
         '  答案必须对得上声明选项；没有可用通道、超时、回答者不在项目审批人名单、答非所问 → 一律**拒绝**，绝不由你替人猜一个"是"。',
         '- `interaction_notify`：状态变化（门禁 BLOCK、阶段完成、环境变更）。**通知不是许可**：推送失败不会让门禁通过，也不会让它失败。',
         '- `interaction_progress`：长阶段报"还在跑"。它**不是日志**——同样的内容会在窗口内被去重抑制，别拿它当调试输出。',
-        '- `interaction_status`：只读的体检（通道能力、生效配置、审批人名单、台账里**未决定**的提问）。',
+        '- 提问要说明 **whyYou**：`decision-required`（有门禁在等决定，默认）或 `result-usable`（有结果等人去用），',
+        '  只有这两个值。提问是有生命周期的：mission 结束/被停止后没回答的提问会作废（superseded），迟到的答案**不算决定**；',
+        '  mission 处于 blocked 时等待期限不流逝（暂停多久，截止时间就顺延多久）。',
+        '- `interaction_status`：只读的体检（通道能力、生效配置、审批人名单、台账里**未决定**的提问、作废/撤回的提问）。',
         `- 生效配置来源：${describeSource(effective)}${problems.length === 0 ? '' : `（${problems.length} 条配置问题，见插件日志）`}；` +
             `提问超时上限 ${effective.config.askTimeoutMs}ms（只能缩短）；审批人名单${effective.config.requireApproverList ? '**必须**' : '不强制'}。`,
         channels.length === 0

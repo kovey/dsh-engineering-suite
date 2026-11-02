@@ -1,5 +1,31 @@
 ## [未发布]
 
+### 新增 · 注意力一等化（`Attention`）与"暂停只顺延"
+
+- **派生而非第三真值源**：一个问题 = 台账 `ask` 行且 token 无决定行；只有无法派生的（`whyYou`、`superseded`/`withdrawn`、暂停区间）
+  落盘到 `.dsh/interaction/attention.jsonl`。**回答仍只来自一次性 token + 台账**。
+- **`whyYou` 两值**：`decision-required` / `result-usable`（未知默认前者；第三值被拒绝）。
+- **`stale` 读时计算并给理由**（策略版本变了 / 等得太久（默认 24h）/ mission 已结束），**仍列出并打标记**，绝不静默隐藏。
+- **取代与撤回**：mission 交付或授权撤回 → 每个未决问题**恰好一条** `superseded`；**迟到答案一律拒绝**（`refused:superseded`
+  / `refused:withdrawn`）且**不写任何决定**——否则"当时的问题"可能几小时后被点成批准。
+- **暂停只顺延**：`deadlineAt = askedAt + window + pausedMs`（精确相等），等待重新武装而非过期，超时文案写明"延长了 Nms"；
+  恢复后从顺延后的截止继续。`suite_status` / `interaction_status` 保持只读（不扫单），所以已结束 mission 的旧问题在被下一次提问扫到前
+  会显示为 `stale(mission-ended)`。
+- **`suite_status` 只回答三个问题**（需要我做什么 / 系统健康 / 历史），并钉住不变量：计数等于列表长度、健康时一行、
+  截断说明隐藏数量、一次探测失败不算问题、读不出来要写"未知（读取失败，不是没有）"。
+
+### 修复 · 注册表计时器与通道超时的竞态（既有问题）
+
+通道侧会在截止时间前 1ms 记"等待回答超时"，而注册表自己的计时器可能与它同时触发，导致 `problems()` 偶发为空。
+现在注册表计时器在截止后 **5ms** 才触发（`TIMEOUT_GRACE_MS`），让通道记录先落定。
+
+### 验证
+
+- `bash scripts/verify.sh`：**998 测试 / 997 通过 / 0 失败 / 1 如实跳过**（含 OPS SELFTEST GREEN）。
+- 包内计数：`dsh-interaction-gate` 42→53、`dsh-suite-doctor` 41→47。
+
+## [未发布]
+
 ### 新增 · 提问的持久化 outbox（提问不再随进程消失）
 
 此前"要人拍板"是内联发送并等待：进程死掉/宿主重启/渠道抖动发生在"决定要问"与"卡片离开进程"之间时，问题**无声消失**，

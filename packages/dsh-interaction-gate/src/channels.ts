@@ -32,6 +32,7 @@
  */
 
 import { randomBytes } from 'node:crypto'
+import type { Attention, AttentionSource } from './attention.js'
 import { readLedger, summarizeLedger } from './ledger.js'
 
 /** What the suite is sending. */
@@ -198,13 +199,64 @@ export type AwaitOutcome = 'answered' | 'timeout' | 'cancelled' | 'unknown-token
 export interface AwaitResult {
     outcome: AwaitOutcome
     answer: InteractionAnswer | null
+    /**
+     * How much a paused mission EXTENDED this wait (ms). Absent/0 = the wait ran
+     * on its own clock. A timeout that was extended must say so: "we waited 15
+     * minutes" and "we waited 15 minutes plus the 40 minutes the mission was
+     * blocked" are different statements.
+     */
+    extensionMs?: number
 }
+
+/**
+ * How a wait learns that it must not burn its deadline.
+ *
+ * While the mission behind a question is blocked/paused the deadline does not
+ * run. The waiter therefore re-reads the accumulated paused time from the
+ * recorded pause interval (`pausedFrom`/`pausedTo` rows) instead of trusting a
+ * single `setTimeout`: every time the timer fires, `pausedMs()` may return MORE
+ * than it did before, which moves the deadline further out.
+ */
+export interface AwaitExtension {
+    /** Injected clock (the same one the pause interval is recorded with). */
+    now: () => number
+    /** Accumulated paused ms of this question at the current clock. May record a pause it observes. */
+    pausedMs: () => number
+    /** Whether the mission is paused RIGHT NOW (a paused wait must not expire at all). */
+    paused?: () => boolean
+}
+
+/** How often an extended (paused) wait re-checks its deadline. */
+export const EXTENSION_POLL_MS = 200
+
+/** How many times one wait may re-arm itself (a bound on a pathological clock). */
+export const MAX_EXTENSION_POLLS = 100_000
+
+/** How many times an extended wait may re-issue a channel's own `wait`. */
+export const MAX_EXTENSION_ATTEMPTS = 64
+
+/**
+ * How much later than the deadline the REGISTRY's own timer fires.
+ *
+ * A channel's `wait` reports its own timeout a hair before the deadline (the IM
+ * channel fires 1 ms early so it can record WHY there was no answer). Without a
+ * small grace the registry's timer wins that race under load and the ask ends
+ * with no channel-side reason recorded at all — the timeout would still be a
+ * refusal, but the "who was asked and why it ended" fact would be lost. The
+ * grace only ever ADDS a few milliseconds to a wait that is already failing.
+ */
+export const TIMEOUT_GRACE_MS = 5
 
 /** Options for {@link InteractionRegistry.awaitAnswer}. */
 export interface AwaitOptions {
     /** The chosen channel's own `wait`, when it has one (the pull path). */
     wait?: (questionId: string, timeoutMs: number, signal?: AbortSignal) => Promise<InteractionAnswer | null>
     signal?: AbortSignal
+    /**
+     * Make a paused mission EXTEND the wait instead of burning it (see
+     * {@link AwaitExtension}). Absent = today's behaviour, byte for byte.
+     */
+    extension?: AwaitExtension
 }
 
 /** One ask that is still waiting for a human (derived from the ledger). */
@@ -273,6 +325,36 @@ export interface InteractionRegistry {
     awaitAnswer(questionId: string, timeoutMs: number, options?: AwaitOptions): Promise<AwaitResult>
     /** Answers dropped because the token was unknown, retired, or not the one asked. */
     droppedAnswers(): number
+    /**
+     * Attach one workspace's attention sidecar, so `attentions()` can read it.
+     *
+     * Idempotent per ledger file: a process that serves several repositories
+     * keeps one source per workspace and never mixes their questions.
+     */
+    attachAttention(source: AttentionSource): void
+    /**
+     * Every question that is STILL waiting for a person, oldest first.
+     *
+     * Derived (a ledger `ask` row with no decision yet, minus the questions the
+     * sidecar recorded as superseded/withdrawn) — this never stores an answer and
+     * writes nothing. Only workspaces this process has attached are read, exactly
+     * like `pending()`.
+     */
+    attentions(): Attention[]
+    /** Record a pause interval for a mission (the hook a host/orchestrator can call). */
+    pauseMission(missionId: string, reason?: string): boolean
+    /** Close the pause interval of a mission. */
+    resumeMission(missionId: string): boolean
+    /**
+     * Supersede every unanswered question of a mission (it ended, was stopped, or
+     * its mandate was withdrawn). Returns how many questions it closed.
+     */
+    supersedeMission(missionId: string, reason: string): number
+    /**
+     * Record that one question's answer is no longer needed (the asker gave up).
+     * Not an answer, not an approval: a late answer stays refused.
+     */
+    withdrawQuestion(questionId: string, reason: string): boolean
     /** Channel defects observed so far (bounded), for the doctor. */
     problems(): string[]
     /**
@@ -413,6 +495,20 @@ export function createInteractionRegistry(options: {
     }
 
     const ledgers = new Set<string>()
+    /** One attention sidecar per workspace, keyed by the ledger it derives from. */
+    const attentionSources = new Map<string, AttentionSource>()
+    /** The sources that actually know a mission (the only ones a pause may write to). */
+    const sourcesFor = (missionId: string): AttentionSource[] => {
+        const out: AttentionSource[] = []
+        for (const source of attentionSources.values()) {
+            try {
+                if (source.records().some((record) => record.missionId === missionId)) out.push(source)
+            } catch (error) {
+                note(`读取 attention 失败（${source.file}）：${error instanceof Error ? error.message : String(error)}（该工作区不参与暂停记录）`)
+            }
+        }
+        return out
+    }
 
     const registry: InteractionRegistry = {
         // Total by contract: a rejected registration is RECORDED (problems() +
@@ -582,21 +678,90 @@ export function createInteractionRegistry(options: {
                 return buffered
             }
             const signal = awaitOptions.signal
+            const extension = awaitOptions.extension
             return await new Promise<AwaitResult>((resolve) => {
                 let settled = false
+                let timer: ReturnType<typeof setTimeout> | undefined
+                const clock = (): number => (extension === undefined ? Date.now() : extension.now())
+                const startedAt = clock()
+                /** How much the pause interval added so far (re-read on every deadline check). */
+                let extensionMs = 0
+                let pausedNow = false
+                let polls = 0
+                let lastClock = startedAt
+                const deadlineAt = (): number => startedAt + timeoutMs + extensionMs
                 const finish = (result: AwaitResult): void => {
                     if (settled) return
                     settled = true
-                    clearTimeout(timer)
+                    if (timer !== undefined) clearTimeout(timer)
                     if (signal !== undefined) signal.removeEventListener('abort', onAbort)
                     pending.delete(questionId)
                     entry.settle = undefined
-                    resolve(result)
+                    resolve(extensionMs === 0 ? result : { ...result, extensionMs })
                 }
                 const onAbort = (): void => finish({ outcome: 'cancelled', answer: null })
-                const timer = setTimeout(() => finish({ outcome: 'timeout', answer: null }), Math.max(0, timeoutMs))
-                // A long timer must not keep the process alive on its own.
-                if (typeof timer === 'object' && timer !== null && 'unref' in timer) (timer as { unref: () => void }).unref()
+                /**
+                 * Re-read the pause interval. A throw is "no extension" (never a
+                 * silently longer wait): the recorded rows are the only source.
+                 */
+                const sample = (): void => {
+                    if (extension === undefined) return
+                    try {
+                        extensionMs = Math.max(0, Math.floor(extension.pausedMs()))
+                    } catch (error) {
+                        note(`读取暂停区间失败：${error instanceof Error ? error.message : String(error)}（本次等待按原期限计）`)
+                        extensionMs = 0
+                    }
+                    try {
+                        pausedNow = extension.paused?.() === true
+                    } catch {
+                        pausedNow = false
+                    }
+                }
+                /** Arm (or re-arm) the deadline timer against the EXTENDED deadline. */
+                const arm = (): void => {
+                    if (timer !== undefined) clearTimeout(timer)
+                    const remaining = Math.max(0, deadlineAt() - clock())
+                    // While the mission is paused the deadline does not run, so
+                    // the timer only ever asks again — it never expires the wait.
+                    // Otherwise the grace lets a channel report its own timeout
+                    // first (see TIMEOUT_GRACE_MS).
+                    const delay = pausedNow ? Math.max(EXTENSION_POLL_MS, remaining) : remaining + TIMEOUT_GRACE_MS
+                    timer = setTimeout(onDeadline, delay)
+                    // A long timer must not keep the process alive on its own.
+                    if (typeof timer === 'object' && timer !== null && 'unref' in timer) (timer as { unref: () => void }).unref()
+                }
+                /**
+                 * The deadline check. A pause MOVES the deadline, so the answer is
+                 * "re-arm" whenever the clock says there is time left or the
+                 * mission is paused; a clock that does not move cannot extend
+                 * anything and fails closed instead of spinning.
+                 */
+                const onDeadline = (): void => {
+                    if (settled) return
+                    const nowMs = clock()
+                    sample()
+                    const deadline = deadlineAt()
+                    const mustWait = pausedNow || nowMs < deadline
+                    if (!mustWait) {
+                        finish({ outcome: 'timeout', answer: null })
+                        return
+                    }
+                    if (nowMs <= lastClock || polls >= MAX_EXTENSION_POLLS) {
+                        // No progress is possible: report the timeout we DO know
+                        // about rather than waiting on a clock that will not move.
+                        if (pausedNow) {
+                            note(`等待已延长 ${extensionMs}ms（mission 处于暂停），但时钟没有前进：按超时结束，避免永久挂起`)
+                        }
+                        finish({ outcome: 'timeout', answer: null })
+                        return
+                    }
+                    lastClock = nowMs
+                    polls += 1
+                    arm()
+                }
+                pausedNow = false
+                arm()
                 if (signal !== undefined) {
                     if (signal.aborted) {
                         finish({ outcome: 'cancelled', answer: null })
@@ -607,7 +772,6 @@ export function createInteractionRegistry(options: {
                 entry.settle = finish
                 const wait = awaitOptions.wait
                 if (wait === undefined) return
-                const realStart = Date.now()
                 let attempts = 0
                 // Pull in a loop: an answer that belongs to ANOTHER token is
                 // dropped and the ask keeps waiting (the deadline, not the
@@ -616,7 +780,7 @@ export function createInteractionRegistry(options: {
                 // us — the outer timer still ends the ask.
                 const pull = (): void => {
                     attempts += 1
-                    const remaining = Math.max(1, timeoutMs - (Date.now() - realStart))
+                    const remaining = Math.max(1, deadlineAt() - clock())
                     void (async (): Promise<void> => {
                         let raw: unknown
                         try {
@@ -630,7 +794,16 @@ export function createInteractionRegistry(options: {
                             return
                         }
                         if (raw === null || raw === undefined) {
-                            // The channel gave up (its own timeout/abort): no answer arrived.
+                            // The channel gave up (its own timeout/abort). That is
+                            // only the END of the ask when the (possibly extended)
+                            // deadline has really passed: a channel that gave up
+                            // inside a pause must be re-pulled, not obeyed.
+                            sample()
+                            const canContinue = pausedNow || clock() < deadlineAt()
+                            if (canContinue && attempts < MAX_WAIT_ATTEMPTS + MAX_EXTENSION_ATTEMPTS) {
+                                pull()
+                                return
+                            }
                             finish({ outcome: 'timeout', answer: null })
                             return
                         }
@@ -657,6 +830,61 @@ export function createInteractionRegistry(options: {
 
         droppedAnswers(): number {
             return dropped
+        },
+
+        attachAttention(source: AttentionSource): void {
+            if (typeof source !== 'object' || source === null || typeof source.attentions !== 'function') {
+                note('拒绝挂载一个非法的 attention 来源（必须实现 attentions()）')
+                return
+            }
+            attentionSources.set(source.ledgerFile, source)
+        },
+
+        attentions(): Attention[] {
+            const out: Attention[] = []
+            for (const source of attentionSources.values()) {
+                try {
+                    out.push(...source.attentions())
+                } catch (error) {
+                    note(`读取 attention 失败（${source.file}）：${error instanceof Error ? error.message : String(error)}（该工作区不参与注意力统计）`)
+                }
+            }
+            out.sort((left, right) => left.askedAt - right.askedAt || left.questionId.localeCompare(right.questionId))
+            return out
+        },
+
+        pauseMission(missionId: string, reason?: string): boolean {
+            if (missionId === '') return false
+            let changed = false
+            for (const source of sourcesFor(missionId)) {
+                if (source.pauseMission(missionId, reason)) changed = true
+            }
+            return changed
+        },
+
+        resumeMission(missionId: string): boolean {
+            if (missionId === '') return false
+            let changed = false
+            for (const source of sourcesFor(missionId)) {
+                if (source.resumeMission(missionId)) changed = true
+            }
+            return changed
+        },
+
+        supersedeMission(missionId: string, reason: string): number {
+            if (missionId === '') return 0
+            let closed = 0
+            for (const source of sourcesFor(missionId)) closed += source.supersede({ missionId, reason })
+            return closed
+        },
+
+        withdrawQuestion(questionId: string, reason: string): boolean {
+            if (questionId === '') return false
+            let changed = false
+            for (const source of attentionSources.values()) {
+                if (source.withdraw(questionId, reason)) changed = true
+            }
+            return changed
         },
 
         problems(): string[] {

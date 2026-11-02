@@ -12,6 +12,7 @@
 | 插件**挂载了但能力不完整** | 服务或同插件的其它工具在线，而签名工具没注册 → `partial` | 只看配置文件会把这种"半挂"当成没问题 |
 | 当前 **mission**（id/状态/阶段/熔断/规格已审批/最近门禁） | mission store 自己的 API（`resolveForAgent` / `lastGate`），**不手读 `mission.json`** | 会话绑定只存在于运行时 |
 | **能不能问到人**、有没有人正在等回答 | `interaction` 服务（`describeAll()` / `pending()` / `ledgers()` / `problems()`） | 通道是进程内注册的 |
+| **现在有没有事需要人处理**（注意力队列 + `whyYou` + 过期理由） | `interaction` 服务的 `attentions()`（派生：还在等人的提问，最老在前） | 队列要读本进程观察到的台账与 mission 状态，离线脚本没有 |
 | **这一版套件没实现的阶段** | 阶段 → 插件表 ∩ `expectedPlugins` | 需要知道本部署装载了哪些插件 |
 | **可选能力有没有装载**（补全交互/部署/入口自检的三个 bundle） | 单独一条 `runtime.mounts-optional`（⚠️ 建议，不是阻塞） | 缺哪个、缺了会怎样，只有运行时知道 |
 | **影子规则（`observe`）会拦下什么** | 读最近 20 个 mission 的 gate 记录，按 rule id 聚合 `observations` 的 `would`（`gate.observe`，⚠️ 建议） | 需要把散在许多 `gates/*.json` 里的影子记录汇总成一个可操作的数字 |
@@ -50,10 +51,23 @@
 
 | 工具 | 作用 |
 |---|---|
-| `suite_status({ missionId?, json? })` | 跑离线自检 → 合并运行时事实（`withRuntime`）→ 输出中文报告；`json: true` 给机器读（同一份判定）。`missionId` 不存在时**拒绝**（fail closed），而不是换一个任务报告。 |
+| `suite_status({ missionId?, json? })` | 跑离线自检 → 合并运行时事实（`withRuntime`）→ 按"需要我 / 健康 / 历史"的顺序输出中文报告（见下「操作者视图」）；`json: true` 给机器读（同一份判定）。`missionId` 不存在时**拒绝**（fail closed），而不是换一个任务报告。 |
 
 **严格只读**：不写门禁记录、不落盘、不改 mission、不创建 `.dsh/`；也**不授予任何权限**。测试里有一条
 "工作区前后逐字节一致"（对整个 `.dsh` 树做内容哈希比对，另加一条"没有台账的工作区不会长出 `.dsh/`"）。
+
+### 操作者视图：三个问题，按顺序
+
+文本输出回答的是操作者的顺序，`json: true` 仍然是同一份合并报告（机器读）：
+
+1. **现在需要我做什么？**——注意力队列（`dsh-interaction-gate` 的 `attentions()` 派生：还在等人的提问），最老在前，
+   最多 10 条，超出会写"另有 N 条（共 M 条）"；每行带 `whyYou`（`decision-required` / `result-usable`）、等待时长、
+   以及**带理由**的过期标注（策略版本变了 / 等太久 / mission 已结束）。过期的提问仍然列出；队列**读不到**时写"未知"
+   并给出下一步——那不是"没事"，也**不会**变成一条 blocker（一次探测失败是这份报告的缺口，不是工作区的问题）。
+2. **系统是否健康？**——既有的全部检查，原样给出：全绿时**只占一行**，否则输出完整报告。
+3. **历史**——只给指路（`spec_status` / `audit_report` / `orchestrate({ action: "retro" })`），不在这里重复。
+
+测试固定住的三条不变量：**表头数字 = 显示的行数 + 隐藏的行数**；**健康状态只占一行**；**截断必须说明还有多少条**。
 
 ## 影子聚合（`gate.observe`）
 
@@ -147,7 +161,11 @@ profile（宿主上限）：
 - **阶段覆盖是声明而不是证明**：`runtime.phases` 只说"这版套件里没有该阶段的插件"，
   不代表该阶段的工作被跳过了。
 - **`interaction` 服务不是本套件的插件**：它的形状在这里是**结构化探测**（`describeAll()`/`describe()`/
-  `channels`/`list`，`pending()`/`pendingAsks()`/…，`ledgers()`，以及可选的 `problems()`），
-  所以它换个构建时这里会如实退化成 `unknown`，而不会假装"没有通道"。
+  `channels`/`list`，`pending()`/`pendingAsks()`/…，`attentions()`/`attentionQueue()`，`ledgers()`，以及可选的 `problems()`），
+  所以它换个构建时这里会如实退化成 `unknown`，而不会假装"没有通道"或"没有待办的提问"。
+- **注意力队列读不到 ≠ 没事**：`attentions()` 只读本进程观察到的台账，所以空列表在没有观察到任何台账时
+  报 `unknown`；读失败（一次探测超时/网络错误）只让这一节写"未知 + 下一步"，**不会**变成 blocker 或检查项。
+- **过期标注不是判定**：`stale` 的理由由 `dsh-interaction-gate` 计算（策略版本/年龄/mission 已结束），
+  本插件只照抄渲染；它不重新推导，也不因为过期就下任何结论。
 
 更多见 `docs/KNOWN-LIMITS.md`。

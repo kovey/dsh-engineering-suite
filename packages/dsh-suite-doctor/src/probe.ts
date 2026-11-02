@@ -299,6 +299,30 @@ export interface PendingAsk {
     ageMs: number
 }
 
+/**
+ * One ATTENTION: a question that is waiting for a person, as the interaction
+ * layer derived it (unanswered ledger row minus the superseded/withdrawn ones).
+ *
+ * The layer owns the derivation; the doctor renders it. `whyYou` has exactly two
+ * legal values, and an unknown one is read as `decision-required` (the specified
+ * default) — this report never invents a third.
+ */
+export interface AttentionFact {
+    questionId: string
+    missionId?: string
+    title: string
+    /** Epoch ms the question was asked. */
+    askedAt: number
+    ageMs: number
+    whyYou: string
+    /** Present when the layer computed a reason it is out of date; it is still listed. */
+    stale?: { reason: string; detail: string }
+    /** Paused time that moved the deadline out (ms). */
+    pausedMs?: number
+    /** `askedAt + window + pausedMs`, as the layer reports it. */
+    deadlineAt?: number
+}
+
 /** What the interaction service could (not) answer. */
 export interface InteractionProbe {
     /** `undefined` = could not be read; the report renders that as `unknown`. */
@@ -314,6 +338,12 @@ export interface InteractionProbe {
     serviceProblems?: string[]
     /** Ledgers the service has observed in this process (`ledgers()`). */
     observedLedgers?: string[]
+    /** Every question still waiting for a person, oldest first (`undefined` = unreadable). */
+    attentions?: AttentionFact[]
+    /** Why the attention fact is unknown. */
+    attentionsProblem?: string
+    /** The exact next step for the attention fact, when it is unknown. */
+    attentionsFix?: string
 }
 
 /**
@@ -334,6 +364,15 @@ const CHANNEL_ACCESSORS: readonly string[] = ['describeAll', 'describe', 'channe
  * silently degrading to `unknown`.
  */
 const ASK_ACCESSORS: readonly string[] = ['pending', 'pendingAsks', 'listPending', 'asks']
+
+/**
+ * The attention-queue accessors, in the order we try them.
+ *
+ * `attentions()` is the interaction gate's name for "the questions a person
+ * still has to look at". It is the OPERATOR's view: derived on read, oldest
+ * first, labelled with `whyYou` and a stale reason.
+ */
+const ATTENTION_ACCESSORS: readonly string[] = ['attentions', 'attentionQueue', 'attention']
 
 /** Await a probe with a deadline; a hung channel plugin must not hang the doctor. */
 async function settled<T>(value: Promise<T>, timeoutMs: number): Promise<{ value?: T; problem?: string }> {
@@ -424,6 +463,55 @@ function parseAsks(value: unknown, now: number): { asks?: PendingAsk[]; problem?
     return { asks }
 }
 
+/** Parse the attention queue; an unusable entry is a problem, never a silently shorter list. */
+function parseAttentions(value: unknown, now: number): { attentions?: AttentionFact[]; problem?: string } {
+    const list = Array.isArray(value)
+        ? value
+        : typeof value === 'object' && value !== null && Array.isArray((value as { attentions?: unknown }).attentions)
+          ? ((value as { attentions: unknown[] }).attentions as unknown[])
+          : undefined
+    if (list === undefined) return { problem: `返回的不是注意力列表（收到 ${preview(value)}）` }
+    const attentions: AttentionFact[] = []
+    for (const entry of list) {
+        if (typeof entry !== 'object' || entry === null) return { problem: `注意力列表里有无法识别的项：${preview(entry)}` }
+        const record = entry as Record<string, unknown>
+        const id = [record['questionId'], record['id']].find((candidate): candidate is string => typeof candidate === 'string' && candidate !== '')
+        if (id === undefined) return { problem: `注意力项没有 questionId：${preview(entry)}` }
+        const at =
+            [record['askedAt'], record['at'], record['since']].find((candidate): candidate is number => typeof candidate === 'number' && Number.isFinite(candidate)) ??
+            now
+        const ageMs = typeof record['ageMs'] === 'number' && Number.isFinite(record['ageMs']) ? Math.max(0, Math.floor(record['ageMs'])) : Math.max(0, now - at)
+        const title = typeof record['title'] === 'string' && record['title'] !== '' ? record['title'] : id
+        const missionId = typeof record['missionId'] === 'string' && record['missionId'] !== '' ? record['missionId'] : undefined
+        // Exactly two values exist. An unknown one is the DEFAULT, never a third.
+        const whyYou = record['whyYou'] === 'result-usable' ? 'result-usable' : 'decision-required'
+        const staleRaw = record['stale']
+        let stale: { reason: string; detail: string } | undefined
+        if (typeof staleRaw === 'object' && staleRaw !== null && !Array.isArray(staleRaw)) {
+            const staleRecord = staleRaw as Record<string, unknown>
+            const reason = typeof staleRecord['reason'] === 'string' && staleRecord['reason'] !== '' ? staleRecord['reason'] : undefined
+            const detail = typeof staleRecord['detail'] === 'string' && staleRecord['detail'] !== '' ? staleRecord['detail'] : undefined
+            if (reason !== undefined) stale = { reason, detail: detail ?? reason }
+        }
+        const pausedMs =
+            typeof record['pausedMs'] === 'number' && Number.isFinite(record['pausedMs']) ? Math.max(0, Math.floor(record['pausedMs'])) : undefined
+        const deadlineAt =
+            typeof record['deadlineAt'] === 'number' && Number.isFinite(record['deadlineAt']) ? Math.floor(record['deadlineAt']) : undefined
+        attentions.push({
+            questionId: id,
+            ...(missionId === undefined ? {} : { missionId }),
+            title,
+            askedAt: at,
+            ageMs,
+            whyYou,
+            ...(stale === undefined ? {} : { stale }),
+            ...(pausedMs === undefined ? {} : { pausedMs }),
+            ...(deadlineAt === undefined ? {} : { deadlineAt }),
+        })
+    }
+    return { attentions }
+}
+
 /**
  * Read the `interaction` service, when the host mounts one.
  *
@@ -506,6 +594,38 @@ export async function probeInteraction(ctx: ProbeContext, timeoutMs: number, now
         }
     }
 
+    // The attention queue: the operator's first question ("does anything need
+    // me NOW?"). Same empty-list rule as `pending()`: `[]` from a service that
+    // has not read this workspace's ledger yet is NOT "nothing needs you".
+    const attentionAccessor = ATTENTION_ACCESSORS.find((key) => record[key] !== undefined)
+    if (attentionAccessor === undefined) {
+        out.attentionsProblem = `interaction 服务没有暴露注意力队列（试过 ${ATTENTION_ACCESSORS.map((key) => `${key}()`).join(' / ')}）：无法判断"现在有没有事需要人处理"`
+        out.attentionsFix =
+            '部署/升级一个暴露 attentions() 的 interaction 服务（dsh-interaction-gate）后重启会话：' +
+            '"没有待处理的提问"和"读不到"不是一回事，这条不能当成"没事"'
+    } else {
+        const read = await readAccessor(record, attentionAccessor, timeoutMs)
+        if (read.problem !== undefined) {
+            out.attentionsProblem = `interaction.${attentionAccessor}() 失败：${read.problem}`
+            out.attentionsFix = `恢复 interaction.${attentionAccessor}()（服务自己的日志里有原始错误）后重新 suite_status`
+        } else {
+            const parsed = parseAttentions(read.value, now)
+            if (parsed.attentions === undefined) {
+                out.attentionsProblem = `interaction.${attentionAccessor}(): ${parsed.problem ?? '无法解析注意力队列'}`
+                out.attentionsFix = `修好 interaction.${attentionAccessor}() 的返回（应为提问数组）后重新 suite_status`
+            } else if (parsed.attentions.length > 0) {
+                out.attentions = parsed.attentions
+            } else if (out.observedLedgers !== undefined && out.observedLedgers.length > 0) {
+                out.attentions = []
+            } else {
+                out.attentionsProblem =
+                    `interaction.${attentionAccessor}() 返回空列表，而本进程还没有观察到任何交互台账：` +
+                    `"[]"在这里**不等于"没有人在等回答"**（${attentionAccessor}() 只读它见过的台账）`
+                out.attentionsFix = '先在本工作区跑一次 interaction_status（或任何会碰到台账的交互工具），让本进程观察到台账后重新 suite_status'
+            }
+        }
+    }
+
     // `problems()` is the service's own defect log (a channel that failed to
     // register, an unreadable ledger). Reporting it here keeps a channel defect
     // from existing only inside the interaction gate's own files.
@@ -584,6 +704,22 @@ export interface RuntimeProbe {
     checks: DoctorCheck[]
     /** Non-fatal notes for the log (never part of the report text). */
     problems: string[]
+    /**
+     * The operator's attention queue: `attentions` when it could be read (an
+     * empty array IS the healthy answer), `problem`/`fix` when it could not.
+     *
+     * It is deliberately NOT a doctor check: a probe that failed once (a timed-out
+     * service call, a flapping channel) is a gap in this report, not a defect of
+     * the workspace — it must not become a blocker.
+     */
+    attention: AttentionProbe
+}
+
+/** What the runtime could (not) read about the attention queue. */
+export interface AttentionProbe {
+    attentions?: AttentionFact[]
+    problem?: string
+    fix?: string
 }
 
 /**
@@ -756,9 +892,18 @@ export async function probeRuntime(options: RuntimeProbeOptions): Promise<Runtim
         })
     }
 
+    const attention: AttentionProbe =
+        interaction.attentions === undefined
+            ? {
+                  problem: interaction.attentionsProblem ?? '无法读取注意力队列',
+                  ...(interaction.attentionsFix === undefined ? {} : { fix: interaction.attentionsFix }),
+              }
+            : { attentions: interaction.attentions }
+    if (attention.problem !== undefined) problems.push(`注意力队列：${attention.problem}`)
+
     // ---- phases this build does not implement ----------------------------
     const notImplemented = PHASES.filter((phase) => PHASE_PLUGINS[phase].every((plugin) => !options.expectedPlugins.includes(plugin)))
     if (notImplemented.length > 0) facts.notImplementedPhases = [...notImplemented]
 
-    return { facts, checks, problems }
+    return { facts, checks, problems, attention }
 }

@@ -22,7 +22,6 @@
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import {
     checkWorkspace,
-    renderDoctor,
     resolveLayout,
     sessionCwd,
     withRuntime,
@@ -32,7 +31,8 @@ import {
     type MissionStoreRegistry,
 } from 'dsh-eng-core'
 import { effectiveProbeTimeoutMs, type SuiteDoctorConfig } from './config.js'
-import { probeRuntime, type ProbeContext } from './probe.js'
+import { renderOperatorView } from './operator.js'
+import { probeRuntime, type AttentionProbe, type ProbeContext } from './probe.js'
 
 const TEXT_OUTPUT = { type: 'string' } as const
 
@@ -123,6 +123,26 @@ function loggerFor(logger: Logger, workspace: string): Logger {
  * @returns the merged report (offline checks + runtime facts).
  */
 export async function buildReport(deps: ToolDeps, agent: AgentLike | undefined, args: StatusArgs = {}): Promise<DoctorReport> {
+    return (await buildOperatorReport(deps, agent, args)).report
+}
+
+/**
+ * Build the operator's report: the merged doctor report PLUS the attention queue.
+ *
+ * The two travel together because they answer two different questions ("does
+ * anything need me now?" / "is the system healthy?"), and the attention fact is
+ * deliberately NOT a doctor check: a queue that could not be read is a gap in
+ * this report, not a defect of the workspace.
+ * @param deps - resolved configuration and host accessors.
+ * @param agent - the calling agent.
+ * @param args - `missionId` / `json`.
+ * @returns the merged report and the attention probe.
+ */
+export async function buildOperatorReport(
+    deps: ToolDeps,
+    agent: AgentLike | undefined,
+    args: StatusArgs = {},
+): Promise<{ report: DoctorReport; attention: AttentionProbe }> {
     const cwd = declaredCwdOf(agent)
     const config = deps.configFor(agent)
     if (!config.enabled) {
@@ -150,10 +170,11 @@ export async function buildReport(deps: ToolDeps, agent: AgentLike | undefined, 
     if (deps.logger !== undefined) {
         loggerFor(deps.logger, cwd).info(
             `suite_status: ${merged.blockers.length} blocker(s), ${merged.advice.length} advice, ` +
-                `${probe.facts.mountedPlugins?.length ?? 0}/${config.expectedPlugins.length} plugin(s) usable`,
+                `${probe.facts.mountedPlugins?.length ?? 0}/${config.expectedPlugins.length} plugin(s) usable, ` +
+                `${probe.attention.attentions?.length ?? 0} attention(s)`,
         )
     }
-    return merged
+    return { report: merged, attention: probe.attention }
 }
 
 /**
@@ -182,7 +203,7 @@ export function registerTools(
         defineTool({
             name: 'suite_status',
             description:
-                'One entry point for "where are we, what is configured, what is missing" in this workspace. It runs the offline self-check (gate configs, ledger/gitignore traps, mission footprint) and merges the facts only a live host has: which suite plugins are actually mounted (and which are mounted but not exposing their signature tool), the session mission (id/status/stage/blocked/spec-approved/last gate), whether an interaction channel can reach a human and whether anyone is waiting for an answer, and which of the six phases this build does not implement. Four states: ok / partial / missing / unknown — unknown means "could not be read" and is NOT a pass. Read-only: it records no gate, writes no file and changes no mission. Run it at session start and before claiming a delivery is ready.',
+                'The operator view of this workspace, answering three questions IN ORDER. 1) Does anything need a person now? — the attention queue (unanswered questions that wait for a human), oldest first, bounded to 10 with "另有 N 条" when truncated, each row carrying whyYou (decision-required | result-usable), its age, and a stale badge WITH its reason (policy version changed / too old / mission ended); a queue that could not be read is stated as unknown, never as "nothing to do". 2) Is the system healthy? — the existing self-check (gate configs, ledger/gitignore traps, mission footprint, mounted plugins, the session mission, reachable channels, unimplemented phases), unchanged: one line when everything is ready, the full report otherwise. Four states: ok / partial / missing / unknown — unknown means "could not be read" and is NOT a pass. 3) History — a pointer to the per-mission views (spec_status / audit_report / orchestrate retro), deliberately not repeated here. Read-only: it records no gate, writes no file, changes no mission and never sweeps the attention queue. Run it at session start and before claiming a delivery is ready.',
             parameters: {
                 missionId: {
                     type: 'string',
@@ -197,10 +218,15 @@ export function registerTools(
             async execute(args: StatusArgs = {} as StatusArgs, exec) {
                 const signal = signalOf(exec)
                 assertNotCancelled(signal)
-                const report = await buildReport(deps, agentOf(exec), args)
+                const built = await buildOperatorReport(deps, agentOf(exec), args)
                 assertNotCancelled(signal)
-                if (args.json === true) return `${JSON.stringify(report, null, 2)}\n`
-                return renderDoctor(report)
+                if (args.json === true) return `${JSON.stringify(built.report, null, 2)}\n`
+                return renderOperatorView({
+                    report: built.report,
+                    ...(built.attention.attentions === undefined ? {} : { attentions: built.attention.attentions }),
+                    ...(built.attention.problem === undefined ? {} : { attentionProblem: built.attention.problem }),
+                    ...(built.attention.fix === undefined ? {} : { attentionFix: built.attention.fix }),
+                })
             },
         }),
         'suite_status',

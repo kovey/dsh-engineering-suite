@@ -74,6 +74,16 @@ export interface LedgerRow {
     messageId?: string
     /** How long the ask waited (ask rows only). */
     durationMs?: number
+    /**
+     * How long this question was allowed to wait (ask rows only, epoch ms).
+     *
+     * It is recorded on the row, not only in the configuration, because the
+     * deadline an attention reports is `askedAt + windowMs + pausedMs`: a caller
+     * that asked for a SHORTER window than the host ceiling must not be reported
+     * as still waiting long after its own deadline. Rows written before this
+     * field existed fall back to the configured ceiling.
+     */
+    windowMs?: number
 }
 
 /** A refusal decision for one reason. */
@@ -118,6 +128,7 @@ export function parseLedgerRow(value: unknown): LedgerRow | undefined {
         return typeof entry === 'string' && entry !== '' ? entry : undefined
     }
     const durationMs = raw['durationMs']
+    const windowMs = raw['windowMs']
     return {
         at,
         id,
@@ -130,6 +141,7 @@ export function parseLedgerRow(value: unknown): LedgerRow | undefined {
         ...(optional('missionId') === undefined ? {} : { missionId: optional('missionId') as string }),
         ...(optional('messageId') === undefined ? {} : { messageId: optional('messageId') as string }),
         ...(typeof durationMs === 'number' && Number.isFinite(durationMs) ? { durationMs: Math.max(0, Math.floor(durationMs)) } : {}),
+        ...(typeof windowMs === 'number' && Number.isFinite(windowMs) ? { windowMs: Math.max(0, Math.floor(windowMs)) } : {}),
     }
 }
 

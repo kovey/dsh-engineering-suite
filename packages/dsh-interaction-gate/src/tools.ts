@@ -44,6 +44,14 @@ import {
     type MissionStoreRegistry,
 } from 'dsh-eng-core'
 import {
+    DEFAULT_WHY_YOU,
+    describeWhyYou,
+    isWhyYou,
+    WHY_YOU_VALUES,
+    type AttentionSource,
+    type WhyYou,
+} from './attention.js'
+import {
     describeIm,
     newQuestionToken,
     type AwaitResult,
@@ -107,6 +115,12 @@ export interface ToolDeps {
      * every tool call of a session sees the same records.
      */
     outboxFor: (cwd: string, config: InteractionGateConfig) => Outbox
+    /**
+     * The attention sidecar of one workspace (one file). The plugin owns the
+     * cache, so the derivation, the wait extension and the doctor all read the
+     * same rows.
+     */
+    attentionFor: (cwd: string, config: InteractionGateConfig) => AttentionSource
     logger?: Logger
     /** Injected clock (no clock inside pure helpers). */
     now: () => number
@@ -120,6 +134,7 @@ interface AskArgs {
     missionId?: string
     context?: Record<string, unknown>
     prefer?: string
+    whyYou?: string
 }
 
 /** Arguments of `interaction_notify`. */
@@ -458,6 +473,13 @@ export interface AskDelivererDeps {
     questionId: string
     now: () => number
     missionId?: string
+    /**
+     * The wait window this question is allowed (epoch ms). Recorded on the
+     * ledger `ask` row so an attention's reported deadline
+     * (`askedAt + windowMs + pausedMs`) is the DEADLINE THIS ASK HAD, not the
+     * host ceiling it was clamped from.
+     */
+    windowMs?: number
 }
 
 /**
@@ -503,6 +525,7 @@ export function createAskDeliverer(deps: AskDelivererDeps): OutboxDeliver {
             channel: record.channel,
             ...(deps.missionId === undefined ? {} : { missionId: deps.missionId }),
             ...(sent.messageId === undefined ? {} : { messageId: sent.messageId }),
+            ...(deps.windowMs === undefined ? {} : { windowMs: Math.max(0, Math.floor(deps.windowMs)) }),
         }
         const appended = appendLedgerRow(deps.ledgerFile, pending)
         if (!appended.ok) {
@@ -609,6 +632,18 @@ export function registerTools(
         )
     }
 
+    /**
+     * Refuse an unusable `whyYou` (a declaration, so the caller's control flow
+     * knows it threw). Exactly two values exist and a third is never invented.
+     */
+    function refuseBadWhyYou(value: unknown): never {
+        throw new Error(
+            `interaction_ask 拒绝（refused:bad-request）：whyYou 只能是 ${WHY_YOU_VALUES.map((entry) => `"${entry}"`).join(' 或 ')}` +
+                `（收到 ${JSON.stringify(value)}）。这两个值分别表示"有门禁在等你的决定"和"有一个结果等你去用"——没有第三个。` +
+                '下一步：按这道提问真正需要人做的那一件事选一个（不确定就省略，默认 decision-required）。',
+        )
+    }
+
     register(
         defineTool({
             name: 'interaction_ask',
@@ -629,6 +664,12 @@ export function registerTools(
                     description: 'Optional approval-context fields for the card: kind / missionId / title / revision / risk / artifacts / facts / channelHints. Unknown fields are ignored and reported, not invented into the block.',
                 },
                 prefer: { type: 'string', description: 'Force one channel by name. If it is not registered or cannot answer, the ask is REFUSED rather than sent somewhere else.' },
+                whyYou: {
+                    type: 'string',
+                    enum: ['decision-required', 'result-usable'],
+                    description:
+                        'WHAT a person must do: decision-required (a gate cannot proceed — the default) or result-usable (a result exists someone can use). There is no third value.',
+                },
             },
             output: { schema: TEXT_OUTPUT, render: (_args, value) => [{ type: 'text', text: value }] },
             async execute(args: AskArgs = {} as AskArgs, exec) {
@@ -673,6 +714,25 @@ export function registerTools(
                 // knowable). An idle session does not retry — that is the boundary.
                 const replayed = await outbox.replay('ask')
                 if (replayed.considered > 0) deps.logger?.info(describeReplay(replayed))
+                // The attention sidecar of THIS workspace: `whyYou`, the
+                // superseded/withdrawn transitions and the pause interval. The
+                // question itself is derived from the ledger as always.
+                const attention = deps.attentionFor(cwd, config)
+                deps.registry.attachAttention(attention)
+                // A question whose mission ended, was stopped or lost its
+                // mandate is moot; recording that once (not on every read) is
+                // what keeps the operator's queue honest.
+                const swept = attention.sweep()
+                if (swept.superseded > 0) deps.logger?.info(`attention：${swept.superseded} 个提问因 mission 结束/被停止而作废（superseded）`)
+                // `whyYou` is validated before anything is sent: a question that
+                // does not say WHICH of the two things it wants from a person is
+                // not worth sending.
+                const whyYou: WhyYou =
+                    args.whyYou === undefined || args.whyYou === null || args.whyYou === ''
+                        ? DEFAULT_WHY_YOU
+                        : isWhyYou(args.whyYou)
+                          ? args.whyYou
+                          : refuseBadWhyYou(args.whyYou)
                 const missionId = missionIdOf(deps, cwd, agent, args.missionId)
                 const questionId = newQuestionToken()
                 const contextInput = normalizeApprovalContextInput(args.context)
@@ -760,6 +820,9 @@ export function registerTools(
                     })
                 }
 
+                // Recorded BEFORE the card leaves: a crash between "we asked" and
+                // "why we asked" would leave a question nobody can act on.
+                attention.recordWhy(questionId, whyYou)
                 if (!deps.registry.arm(questionId)) {
                     refuseAsk({
                         ledgerFile,
@@ -789,6 +852,7 @@ export function registerTools(
                     questionId,
                     now: deps.now,
                     ...(missionId === undefined ? {} : { missionId }),
+                    windowMs: timeoutMs,
                 })
 
                 const failures: string[] = []
@@ -910,11 +974,65 @@ export function registerTools(
                     }
 
                     const wait = typeof channel.wait === 'function' ? channel.wait.bind(channel) : undefined
+                    // The pause hook: while THIS mission is blocked the waiter
+                    // re-reads the recorded pause interval instead of burning its
+                    // deadline. Sampling the mission store is what records a pause
+                    // that started mid-wait — the orchestrator has no push hook to
+                    // this package, so observation is the hook that exists (the
+                    // explicit one is `interaction.pauseMission`/`resumeMission`).
+                    const sampleMission = (): void => {
+                        if (missionId === undefined) return
+                        const synced = attention.syncMission(missionId)
+                        if (synced.superseded > 0) deps.logger?.info(`attention：mission ${missionId} 已结束，${synced.superseded} 个提问作废（superseded）`)
+                    }
+                    sampleMission()
                     const outcome: AwaitResult = await deps.registry.awaitAnswer(questionId, timeoutMs, {
                         ...(wait === undefined ? {} : { wait }),
                         ...(signal === undefined ? {} : { signal }),
+                        extension: {
+                            now: deps.now,
+                            pausedMs: () => {
+                                sampleMission()
+                                if (missionId === undefined) return 0
+                                return attention.pausedMsFor({ missionId, questionId, from: startedAt, to: deps.now() })
+                            },
+                            paused: () => {
+                                sampleMission()
+                                return missionId === undefined ? false : attention.pausedNow({ missionId, questionId, at: deps.now() })
+                            },
+                        },
                     })
                     const durationMs = deps.now() - startedAt
+                    // A question that became moot while we were waiting must not
+                    // become an approval: the answer is refused in the SAME
+                    // refusal shape, naming the transition.
+                    if (outcome.outcome === 'answered' && outcome.answer !== null) {
+                        sampleMission()
+                        const state = attention.stateOf(questionId)
+                        if (state === 'superseded' || state === 'withdrawn') {
+                            const closure = attention.records().find((record) => record.questionId === questionId)?.closure
+                            const by = (outcome.answer.by ?? '').trim()
+                            refuseAsk({
+                                ledgerFile,
+                                reason: state,
+                                detail:
+                                    `这道提问已经${state === 'superseded' ? '作废（superseded）' : '被撤回（withdrawn）'}，迟到的回答不算决定：` +
+                                    `${closure?.reason ?? (missionId === undefined ? '提问已不再需要回答' : `mission ${missionId} 已结束或被停止`)}`,
+                                title: titleOut.text,
+                                questionId,
+                                durationMs,
+                                channel: candidate.name,
+                                ...(by === '' ? {} : { userId: by }),
+                                ...(outcome.answer.messageId === undefined ? {} : { messageId: outcome.answer.messageId }),
+                                outbox,
+                                settle: { state: 'withdrawn', reason: `refused:${state}：提问已不再等待回答，迟到的答案不算决定` },
+                                next:
+                                    '重新提出一个仍然需要的提问（新令牌）；已结束/被停止的 mission 不要再靠旧卡片推进——' +
+                                    '如果这件事还要继续，先新建 mission 并重新审批。',
+                                ...(missionId === undefined ? {} : { missionId }),
+                            })
+                        }
+                    }
 
                     if (outcome.outcome !== 'answered' || outcome.answer === null) {
                         if (outcome.outcome === 'cancelled') {
@@ -948,12 +1066,16 @@ export function registerTools(
                                 ...(missionId === undefined ? {} : { missionId }),
                             })
                         }
+                        const extensionMs = outcome.extensionMs ?? 0
                         refuseAsk({
                             ledgerFile,
                             reason: 'timeout',
                             detail:
                                 `等待超时：通道 "${candidate.name}" 在 ${timeoutMs}ms 内没有返回任何答案` +
-                                `（截止 ${formatTime(startedAt + timeoutMs)}）`,
+                                `（截止 ${formatTime(startedAt + timeoutMs + extensionMs)}）` +
+                                (extensionMs === 0
+                                    ? ''
+                                    : `；等待被延长 ${extensionMs}ms——mission ${missionId ?? '(未绑定)'} 在阻塞/暂停期间期限不流逝，恢复后从顺延后的截止时间继续`),
                             title: titleOut.text,
                             questionId,
                             durationMs,
@@ -1054,6 +1176,11 @@ export function registerTools(
                     const decided = write(ledgerFile, row)
                     if (!decided.ok) {
                         outbox.settle(recordId, 'withdrawn', '台账写入失败：回答没有被记录，这次提问没有可审计的决定')
+                        // The ledger holds a pending row and will never hold a
+                        // decision for it: record the withdrawal (once, with the
+                        // reason) so nobody keeps waiting for an answer that the
+                        // suite already lost.
+                        attention.withdraw(questionId, '台账写入失败：回答没有被记录，这道提问作废（不是答案，也不是批准）')
                         throw new Error(
                             [
                                 `interaction_ask 拒绝（${refusalOf('ledger-unwritable')}）：答案收到了（${JSON.stringify(truncate(answer.value, 200).text)}，回答者 ${by === '' ? '未提供身份' : by}，通道 ${candidate.name}），但台账写不进去，这次决定拿不到可审计的行 id：${decided.problem ?? '未知原因'}`,
@@ -1185,6 +1312,7 @@ export function registerTools(
                 const body = args.body ?? ''
                 const ledgerFile = artifactPathOf(cwd, config.ledgerFile)
                 deps.registry.trackLedger(ledgerFile)
+                deps.registry.attachAttention(deps.attentionFor(cwd, config))
                 const missionId = missionIdOf(deps, cwd, agent, args.missionId)
                 const boundedTitle = truncate(title, 200)
                 const boundedBody = truncate(body, config.maxPayloadChars)
@@ -1315,6 +1443,7 @@ export function registerTools(
                 }
                 const ledgerFile = artifactPathOf(cwd, config.ledgerFile)
                 deps.registry.trackLedger(ledgerFile)
+                deps.registry.attachAttention(deps.attentionFor(cwd, config))
                 const missionId = missionIdOf(deps, cwd, agent, args.missionId)
                 const title = `阶段进度：${headline(stage, 64)}`
                 const note = (args.note ?? '').trim()
@@ -1427,7 +1556,7 @@ export function registerTools(
         defineTool({
             name: 'interaction_status',
             description:
-                'Read-only doctor for the interaction layer: registered channels with their capability report (canAsk / canNotify and WHY not), the effective configuration and its provenance, the project approver-list state, ledger counts by decision, the asks that are still PENDING (rows with no decision, with their age), and the ask OUTBOX — how many questions are queued behind another of the same conversation, how old the oldest unsettled one is, which records failed three times (a system problem) and which were dropped with their reason. Writes nothing: an outbox row is never a decision.',
+                'Read-only doctor for the interaction layer: registered channels with their capability report (canAsk / canNotify and WHY not), the effective configuration and its provenance, the project approver-list state, ledger counts by decision, the asks that are still PENDING (rows with no decision, with their age, their whyYou and any stale/暂停 mark — the questions that became superseded/withdrawn are counted separately, they no longer wait for anyone), and the ask OUTBOX — how many questions are queued behind another of the same conversation, how old the oldest unsettled one is, which records failed three times (a system problem) and which were dropped with their reason. Writes nothing: an outbox row is never a decision.',
             parameters: {
                 missionId: { type: 'string', description: 'Only count rows of one mission (default: the whole ledger).' },
             },
@@ -1440,6 +1569,10 @@ export function registerTools(
                 const only = args.missionId !== undefined && args.missionId !== '' ? assertSafeId(args.missionId, 'mission id') : undefined
                 const ledgerFile = artifactPathOf(cwd, config.ledgerFile)
                 deps.registry.trackLedger(ledgerFile)
+                // Read-only: attaching only makes `attentions()` readable, and
+                // `records()` derives without writing (the doctor never sweeps).
+                const attention = deps.attentionFor(cwd, config)
+                deps.registry.attachAttention(attention)
                 // The outbox is read, never replayed, from here: a doctor that
                 // writes (or retries) is no longer a doctor. `sync()` only feeds
                 // the derived defects into the bounded problem list, once each.
@@ -1526,14 +1659,40 @@ export function registerTools(
                     }
                 }
 
-                lines.push('', `未决定的提问（按年龄，共 ${summary.pending.length} 个）：`)
-                if (summary.pending.length === 0) lines.push('  （无）')
-                for (const pending of summary.pending) {
+                // A question that is superseded or withdrawn is NOT waiting for a
+                // person any more, even though its ledger row has no decision (a
+                // refusal is what closes that row, and a moot question gets none).
+                // Listing it as pending would ask somebody to answer a question
+                // the suite has already given up on.
+                const attentionRecords = attention.records()
+                const closures = new Map(attentionRecords.filter((record) => record.closure !== undefined).map((record) => [record.questionId, record]))
+                const pendingAsks = summary.pending.filter((pending) => !closures.has(pending.questionId))
+                const byWhyYou = new Map(attentionRecords.filter((record) => record.state === 'open').map((record) => [record.questionId, record]))
+                lines.push('', `未决定的提问（按年龄，共 ${pendingAsks.length} 个）：`)
+                if (pendingAsks.length === 0) lines.push('  （无）')
+                for (const pending of pendingAsks) {
+                    const record = byWhyYou.get(pending.questionId)
                     lines.push(
                         `- ${pending.questionId}：年龄 ${Math.round(pending.ageMs / 1000)}s（${formatTime(pending.at)}，通道 ${pending.channel ?? '无'}` +
-                            `${pending.missionId === undefined ? '' : `，mission ${pending.missionId}`}，${headline(pending.title, 48)}）`,
+                            `${pending.missionId === undefined ? '' : `，mission ${pending.missionId}`}，${headline(pending.title, 48)}` +
+                            `${record === undefined ? '' : `；whyYou=${record.whyYou}（${describeWhyYou(record.whyYou)}${record.whyYouSource === 'recorded' ? '' : '；未记录，按默认值'}）`}` +
+                            `${record?.stale === undefined ? '' : `；⚠️ stale(${record.stale.reason})：${bounded(record.stale.detail, 100)}`}` +
+                            `${record === undefined || record.pausedMs === 0 ? '' : `；已暂停 ${Math.round(record.pausedMs / 1000)}s（期限顺延）`}）`,
                     )
                 }
+                const supersededCount = attentionRecords.filter((record) => record.state === 'superseded').length
+                const withdrawnCount = attentionRecords.filter((record) => record.state === 'withdrawn').length
+                if (supersededCount + withdrawnCount > 0) {
+                    lines.push(
+                        `- 已不再等待回答：作废（superseded）${supersededCount} 个、撤回（withdrawn）${withdrawnCount} 个——` +
+                            '它们**不是**已决定，也不是批准；迟到的答案会被拒绝。',
+                    )
+                    for (const record of attentionRecords.filter((entry) => entry.closure !== undefined).slice(-3)) {
+                        lines.push(`  ${record.questionId}（${record.closure?.kind}）：${bounded(record.closure?.reason ?? '', 120)}`)
+                    }
+                }
+                const staleCount = attentionRecords.filter((record) => record.stale !== undefined).length
+                if (staleCount > 0) lines.push(`- ⚠️ 过期（stale）的待回答提问：${staleCount} 个（仍然列出并标注，不会被藏起来）`)
                 if (summary.last !== undefined) {
                     lines.push('', `最近记录（最多 ${STATUS_RECENT_ROWS} 行，最新在前）：`)
                     for (const row of [...selected].reverse().slice(0, STATUS_RECENT_ROWS)) lines.push(describeRow(row, config.maxPayloadChars))

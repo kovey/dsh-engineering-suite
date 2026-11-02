@@ -31,6 +31,7 @@
  */
 
 import { loadProjectConfig, type Layout, type LayoutOptions } from 'dsh-eng-core'
+import { DEFAULT_ATTENTION_FILE, DEFAULT_ATTENTION_MAX_AGE_MS } from './attention.js'
 import type { ImChannelMode } from './channels.js'
 import { DEFAULT_OUTBOX_FILE } from './outbox.js'
 
@@ -48,6 +49,12 @@ export const MIN_ASK_TIMEOUT_MS = 1_000
 
 /** Longest ask deadline a profile may set (24h: a turn must eventually fail closed). */
 export const MAX_ASK_TIMEOUT_MS = 24 * 60 * 60 * 1_000
+
+/** Shortest staleness bound a profile may set (a question can always wait an hour). */
+export const MIN_ATTENTION_MAX_AGE_MS = 60 * 60 * 1_000
+
+/** Longest staleness bound a profile may set (30 days). */
+export const MAX_ATTENTION_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1_000
 
 /** Default cap on one outgoing payload, in characters. */
 export const DEFAULT_MAX_PAYLOAD_CHARS = 4_000
@@ -113,6 +120,19 @@ export interface InteractionGateConfig {
      * file next to the ledger, so the doctor's ignore list already covers it.
      */
     outboxFile: string
+    /**
+     * Append-only attention sidecar, relative to the workspace: ONLY what a
+     * ledger row cannot carry — `whyYou`, the `superseded`/`withdrawn`
+     * transitions and the pause interval (`pausedFrom`/`pausedTo`). Whether a
+     * question IS an attention stays derived from the ledger.
+     */
+    attentionFile: string
+    /**
+     * How old an unanswered question may get before it is reported STALE
+     * (default {@link DEFAULT_ATTENTION_MAX_AGE_MS}). A stale attention is still
+     * listed and labelled: it is never silently hidden.
+     */
+    attentionMaxAgeMs: number
     /** Which `interaction_notify` levels are actually pushed. */
     notifyLevels: NotifyLevel[]
     /**
@@ -216,6 +236,14 @@ export function resolveConfig(input: unknown, warn?: (message: string) => void):
         warn?.(`profile 配置: preferredChannels 必须是字符串数组，已按空（= 全部已注册通道）处理`)
     }
 
+    const maxAge = int(raw['attentionMaxAgeMs'], DEFAULT_ATTENTION_MAX_AGE_MS)
+    if (maxAge < MIN_ATTENTION_MAX_AGE_MS || maxAge > MAX_ATTENTION_MAX_AGE_MS) {
+        warn?.(
+            `profile 配置: attentionMaxAgeMs=${maxAge} 超出 ${MIN_ATTENTION_MAX_AGE_MS}…${MAX_ATTENTION_MAX_AGE_MS}，已按默认值 ${DEFAULT_ATTENTION_MAX_AGE_MS} 处理` +
+                '（把过期判定调得太宽会让"作废的提问"看起来还新鲜）',
+        )
+    }
+
     const redact = raw['redactPatterns'] === undefined ? [] : stringList(raw['redactPatterns'])
     if (raw['redactPatterns'] !== undefined && redact === undefined) {
         warn?.('profile 配置: redactPatterns 必须是字符串数组，已按空处理')
@@ -266,6 +294,9 @@ export function resolveConfig(input: unknown, warn?: (message: string) => void):
         approversFile: str(raw['approversFile'], '.dsh/interaction-approvers.txt'),
         ledgerFile: str(raw['ledgerFile'], '.dsh/interaction/decisions.jsonl'),
         outboxFile: str(raw['outboxFile'], DEFAULT_OUTBOX_FILE),
+        attentionFile: str(raw['attentionFile'], DEFAULT_ATTENTION_FILE),
+        attentionMaxAgeMs:
+            maxAge < MIN_ATTENTION_MAX_AGE_MS || maxAge > MAX_ATTENTION_MAX_AGE_MS ? DEFAULT_ATTENTION_MAX_AGE_MS : maxAge,
         notifyLevels: levels ?? (NOTIFY_LEVELS.filter((level) => level !== 'info') as NotifyLevel[]),
         preferredChannels: preferred ?? [],
         maxPayloadChars: payload < MIN_MAX_PAYLOAD_CHARS || payload > MAX_MAX_PAYLOAD_CHARS ? DEFAULT_MAX_PAYLOAD_CHARS : payload,
@@ -308,6 +339,8 @@ export const HOST_OWNED_KEYS: readonly { key: string; why: string }[] = [
     { key: 'requireApproverList', why: '审批人名单是否强制是宿主决定；由仓库关闭等于自我豁免' },
     { key: 'maxPayloadChars', why: '出站载荷上限按通道能力设定，属宿主' },
     { key: 'outboxFile', why: '提问出站耐久记录的位置是宿主配置（与台账并列的运行时目录）' },
+    { key: 'attentionFile', why: '注意力旁路记录（whyYou/作废/暂停）的位置是宿主配置（与台账并列的运行时目录）' },
+    { key: 'attentionMaxAgeMs', why: '多久算"过期的提问"是宿主上限：仓库能放宽它就等于让作废的提问继续看起来新鲜' },
     {
         key: 'im',
         why: 'IM 通道是否启用是宿主决定：仓库能打开/关闭一条把问题发出进程的通道，等于自行改写审批边界',

@@ -37,6 +37,7 @@
 import path from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import { MissionStoreRegistry, createLogger, expandHome, type AgentLike } from 'dsh-eng-core'
+import { createAttentionSource, missionFactsOf, type AttentionSource } from './attention.js'
 import { createInteractionRegistry, imLogLine, type ImChannelReport } from './channels.js'
 import { CHAT_CHANNEL_NAME, createChatChannel, imRequiredHint, probeChatInteraction, type ChatProbe } from './chat-channel.js'
 import { resolveConfig, resolveEffectiveConfig, type EffectiveConfig, type InteractionGateConfig } from './config.js'
@@ -76,7 +77,19 @@ export type { EffectiveConfig, InteractionGateConfig, InteractionRegistry }
 export type { ImChannelMode, ImChannelReport } from './channels.js'
 export type { ChatApiLike, ChatChannelHandle, ChatChannelOptions, ChatProbe } from './chat-channel.js'
 export type { ImConfig } from './config.js'
+export type { Attention, AttentionRecord, AttentionSource, AttentionState, WhyYou } from './attention.js'
 export type { Outbox, OutboxRecord, OutboxReplayReport, OutboxRow, OutboxState, OutboxSummary } from './outbox.js'
+export {
+    DEFAULT_ATTENTION_FILE,
+    DEFAULT_ATTENTION_MAX_AGE_MS,
+    DEFAULT_WHY_YOU,
+    WHY_YOU_VALUES,
+    createAttentionSource,
+    deriveRecords,
+    describeWhyYou,
+    missionFactsOf,
+    readAttention,
+} from './attention.js'
 export { BACKOFF_BASE_MS, BACKOFF_MAX_MS, DEFAULT_OUTBOX_FILE, ORDER_FAILURE_LIMIT, createOutbox, describeReplay, outboxIdOf, readOutbox } from './outbox.js'
 
 /** The log file the raw row names, before validation (so config problems have a sink). */
@@ -177,12 +190,46 @@ export function apply(ctx: Context, config: unknown = {}): void {
             return created
         }
 
+        // One attention sidecar per (ledger, file) pair, for the lifetime of this
+        // plugin instance: the files are the truth, the cache only keeps two tool
+        // calls from parsing the same rows twice. Everything an attention IS
+        // (open / answered / superseded / withdrawn) stays derived on read; the
+        // sidecar carries only `whyYou`, the closing transitions and the pause
+        // interval.
+        const attentionSources = new Map<string, AttentionSource>()
+        const attentionFor = (cwd: string, config: InteractionGateConfig): AttentionSource => {
+            const ledgerFile = artifactPathOf(cwd, config.ledgerFile)
+            const file = artifactPathOf(cwd, config.attentionFile)
+            const key = `${ledgerFile}\u0000${file}`
+            const cached = attentionSources.get(key)
+            if (cached !== undefined) return cached
+            const created = createAttentionSource({
+                file,
+                ledgerFile,
+                now: () => Date.now(),
+                defaultWindowMs: config.askTimeoutMs,
+                maxAgeMs: config.attentionMaxAgeMs,
+                mission: (missionId) => {
+                    try {
+                        return missionFactsOf(stores.for(cwd), missionId)
+                    } catch (error) {
+                        logger.warn(`attention：读取 mission ${missionId} 的状态失败：${error instanceof Error ? error.message : String(error)}`)
+                        return undefined
+                    }
+                },
+                note: (message) => registry.reportProblem(message),
+            })
+            attentionSources.set(key, created)
+            return created
+        }
+
         const deps: ToolDeps = {
             config: resolved,
             configFor,
             stores,
             registry,
             outboxFor,
+            attentionFor,
             logger,
             now: () => Date.now(),
         }
@@ -271,6 +318,20 @@ export function apply(ctx: Context, config: unknown = {}): void {
         // the first tool call that knows a workspace replays instead. An idle
         // session therefore does not retry until something runs — the honest
         // boundary of a session-scoped plugin that is not a daemon.
+        // The attention sidecar is attachable without a session context only when
+        // BOTH paths are absolute (a profile that names one workspace); otherwise
+        // the first tool call that knows a workspace attaches it, and
+        // `attentions()` honestly reports nothing until then (the doctor renders
+        // that as `unknown`, never as "nobody is waiting").
+        const absoluteAttention = expandHome(resolved.attentionFile)
+        if (path.isAbsolute(absoluteLedger) && path.isAbsolute(absoluteAttention)) {
+            try {
+                registry.attachAttention(attentionFor('', resolved))
+            } catch (error) {
+                logger.warn('cannot attach the attention sidecar:', error)
+            }
+        }
+
         const absoluteOutbox = expandHome(resolved.outboxFile)
         if (path.isAbsolute(absoluteOutbox)) {
             void outboxFor('', { ...resolved, outboxFile: absoluteOutbox })
