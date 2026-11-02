@@ -216,6 +216,6 @@ export function gateObserveCheck(store: ObserveStoreLike, options: { windowMissi
         fix:
             `下一步：逐条核对影子记录的 would 与真实失败是否一致（影子只记录、不阻断，误报要在这里发现）；` +
             `同一规则连续 ${OBSERVE_ENFORCE_STREAK} 次零差异（would=PASS）后再切 enforce` +
-            '（把配置里的 mode: observe 删掉或改成 enforce），然后重跑一次完整 quality_gate_run 确认裁决仍为 PASS。',
+            '（把配置里的 mode: observe 删掉或改成 enforce），然后重跑一次对应的门禁确认裁决仍为 PASS——质量门禁是 quality_gate_run，规范门禁是 standards_check。',
     }
 }

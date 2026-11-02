@@ -18,6 +18,7 @@
 import path from 'node:path'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import {
+    applyRuleModes,
     ensureDir,
     formatTime,
     normalizeApprovalReply,
@@ -30,14 +31,29 @@ import {
     writeTextAtomic,
     type AgentLike,
     type FileMetrics,
+    type GateObservation,
     type LayerRule,
     type Logger,
     type MetricsResult,
     type MissionStoreRegistry,
     type RuleSet,
     type StandardsConfig,
+    type Violation,
 } from 'dsh-eng-core'
 import { compareViolations, countByRule, freezeBaseline, parseBaselineText, pruneBaseline, readBaseline, writeMeasurement } from './baseline.js'
+import {
+    configuredRuleIds,
+    declaredRuleIds,
+    enforcingKeys,
+    enforcingViolations,
+    isObserve,
+    noRuleModes,
+    parseRuleModes,
+    renderObservations,
+    ruleModeRules,
+    ruleVerdicts,
+    type RuleModeDeclaration,
+} from './rule-modes.js'
 import { runStructuralReview, selectReviewTargets, type SubagentsLike } from './review.js'
 import { trendsOf } from './trends.js'
 import type { StandardsGateConfig } from './config.js'
@@ -102,10 +118,29 @@ interface BootstrapArgs {
 interface CheckOutcome {
     cwd: string
     standards: StandardsConfig
+    /** The repository's declared rule modes (`rules` in the standards file). */
+    modes: RuleModeDeclaration
+    /** Rule-mode configuration problems, before the verdict fold. */
+    modeProblems: string[]
     result: MetricsResult
     comparison: ReturnType<typeof compareViolations>
     verdict: 'PASS' | 'WARN' | 'BLOCK'
     reason: string
+    /**
+     * Shadow (`observe`) rule verdicts of this run, ordered by rule id.
+     *
+     * They are recorded and reported, never folded into `verdict`; empty means
+     * "no rule is observing", and the gate record then keeps its old shape.
+     */
+    observations: GateObservation[]
+    /** Recoverable rule-mode configuration problems (unknown rule id, unusable mode). */
+    problems: string[]
+    /**
+     * The comparison split by mode. ONLY these two arrays may drive a baseline
+     * write (`accept` / pruning): a shadow measurement must never move a ratchet.
+     */
+    enforcing: { added: Violation[]; worsened: Violation[] }
+    shadow: { added: Violation[]; worsened: Violation[] }
     gateId?: string
     measurementFile?: string
 }
@@ -140,13 +175,24 @@ function declaredCwdOf(agent: AgentLike | undefined): string {
  *
  * Absent is not "no standards": the caller is told to bootstrap, so a repository
  * cannot end up ungated by accident.
+ *
+ * The optional `rules` map is read HERE, next to the thresholds it belongs to:
+ * a rule's mode and its threshold live in the same repository file (under the
+ * `.dsh/**` trust root), so the two can never drift apart, and a model cannot
+ * mark a rule `observe` on its own.
  */
-export function loadStandards(cwd: string, file: string, logger?: Logger): { standards?: StandardsConfig; problem?: string; path: string } {
+export function loadStandards(
+    cwd: string,
+    file: string,
+    logger?: Logger,
+): { standards?: StandardsConfig; modes: RuleModeDeclaration; problems: string[]; problem?: string; path: string } {
     const target = artifactPathOf(cwd, file)
     const raw = readJson<Record<string, unknown>>(target)
     if (raw === undefined) {
         return {
             path: target,
+            modes: noRuleModes(),
+            problems: [],
             problem:
                 `没有找到规范文件 ${target}。\n` +
                 '规范由**目标仓库自己拥有**，插件不会替你猜阈值。下一步：`standards_bootstrap({ action: "measure" })` 看现状与建议阈值，' +
@@ -155,7 +201,12 @@ export function loadStandards(cwd: string, file: string, logger?: Logger): { sta
     }
     const languages = raw['languages']
     if (typeof languages !== 'object' || languages === null || Array.isArray(languages)) {
-        return { path: target, problem: `${target} 缺少 languages 段（形如 { "languages": { "go": { "maxFileLines": 400 } } }）。` }
+        return {
+            path: target,
+            modes: noRuleModes(),
+            problems: [],
+            problem: `${target} 缺少 languages 段（形如 { "languages": { "go": { "maxFileLines": 400 } } }）。`,
+        }
     }
     const layers = Array.isArray(raw['layers'])
         ? (raw['layers'] as LayerRule[]).filter(
@@ -173,7 +224,106 @@ export function loadStandards(cwd: string, file: string, logger?: Logger): { sta
     if (Object.keys(standards.languages).length === 0) {
         logger?.warn(`${target} 的 languages 是空的：不会产生任何违规（这通常不是本意）`)
     }
-    return { standards, path: target }
+    const modes = parseRuleModes(raw['rules'], target)
+    const declared = new Set(declaredRuleIds(standards))
+    for (const rule of [...modes.modes.keys()].sort()) {
+        if (declared.has(rule)) continue
+        // A mode without a rule measures nothing: say it instead of leaving a
+        // shadow rule that silently never runs (the same reason an unknown mode
+        // value is a problem rather than an `observe`).
+        modes.problems.push(
+            `${target}: rules 里把 "${rule}" 标成了 ${modes.modes.get(rule)}，但规范文件没有声明对应的阈值/开关` +
+                '（例如 maxDepth 阈值、layers、forbidCycles），这条规则不会产生任何违规',
+        )
+    }
+    for (const problem of modes.problems) logger?.warn(problem)
+    return { standards, modes, problems: modes.problems, path: target }
+}
+
+/** The shadow note appended to a reason (empty when nothing observes). */
+function shadowNoteOf(observations: readonly GateObservation[]): string {
+    if (observations.length === 0) return ''
+    const blocks = observations.filter((observation) => observation.would === 'BLOCK').length
+    return `；${observations.length} 条 observe 规则只记录（would BLOCK ${blocks} 条），不计入裁决`
+}
+
+/**
+ * Fold one comparison into a verdict.
+ *
+ * Every declared rule is evaluated exactly once and handed to
+ * `applyRuleModes` — the ONE place that decides which verdicts may veto — so this
+ * gate cannot disagree with the quality gate about what `observe` means. The
+ * shadow observations are split out here (not in the report) because the same
+ * split decides what may be written to the baseline.
+ */
+function evaluateRun(input: {
+    standards: StandardsConfig
+    comparison: ReturnType<typeof compareViolations>
+    modes: RuleModeDeclaration
+    modeProblems: readonly string[]
+    truncated: boolean
+    maxFiles: number
+    filesScanned: number
+}): {
+    verdict: CheckOutcome['verdict']
+    reason: string
+    observations: GateObservation[]
+    problems: string[]
+    enforcing: { added: Violation[]; worsened: Violation[] }
+    shadow: { added: Violation[]; worsened: Violation[] }
+} {
+    const configured = configuredRuleIds(input.standards, input.modes)
+    const folded = applyRuleModes(ruleModeRules(configured, input.modes), ruleVerdicts(input.comparison, configured))
+    const blocking = folded.effective.rules.filter((verdict) => verdict.state === 'BLOCK')
+    const enforcing = {
+        added: enforcingViolations(input.comparison.added, input.modes),
+        worsened: enforcingViolations(input.comparison.worsened, input.modes),
+    }
+    const shadow = {
+        added: input.comparison.added.filter((violation) => isObserve(input.modes, violation.rule)),
+        worsened: input.comparison.worsened.filter((violation) => isObserve(input.modes, violation.rule)),
+    }
+    const failed = enforcing.added.length + enforcing.worsened.length
+    const shadowFailed = shadow.added.length + shadow.worsened.length
+    const known = input.comparison.known.length
+    const note = shadowNoteOf(folded.observations)
+    const verdict: CheckOutcome['verdict'] = failed > 0 ? 'BLOCK' : input.truncated ? 'WARN' : 'PASS'
+    const reason =
+        failed > 0
+            ? `新增 ${enforcing.added.length} 项、恶化 ${enforcing.worsened.length} 项规范违规（基线已接受 ${known} 项）：` +
+              `${blocking.map((verdict_) => verdict_.rule).join('、')}${note}`
+            : input.truncated
+              ? `本次扫描达到文件上限（${input.maxFiles}）：覆盖面不完整，结论按 WARN 处理${note}`
+              : shadowFailed > 0
+                ? `observe 规则记录到 ${shadowFailed} 项新增/恶化，未计入裁决（基线已接受 ${known} 项，本次扫描 ${input.filesScanned} 个文件）`
+                : `无新增违规（基线已接受 ${known} 项，本次扫描 ${input.filesScanned} 个文件）`
+    return {
+        verdict,
+        reason,
+        observations: folded.observations,
+        problems: [...input.modeProblems, ...folded.problems],
+        enforcing,
+        shadow,
+    }
+}
+
+/** Re-fold an outcome's comparison (the accept path rewrites it). */
+function applyEvaluation(outcome: CheckOutcome, config: StandardsGateConfig): void {
+    const evaluation = evaluateRun({
+        standards: outcome.standards,
+        comparison: outcome.comparison,
+        modes: outcome.modes,
+        modeProblems: outcome.modeProblems,
+        truncated: outcome.result.stats.truncated,
+        maxFiles: config.maxFiles,
+        filesScanned: outcome.result.stats.filesScanned,
+    })
+    outcome.verdict = evaluation.verdict
+    outcome.reason = evaluation.reason
+    outcome.observations = evaluation.observations
+    outcome.problems = evaluation.problems
+    outcome.enforcing = evaluation.enforcing
+    outcome.shadow = evaluation.shadow
 }
 
 /** Run one measurement and compare it with the baseline. */
@@ -190,16 +340,22 @@ function runCheck(deps: ToolDeps, cwd: string, config: StandardsGateConfig): Che
     const baselinePath = artifactPathOf(cwd, config.baselineFile)
     const baseline = readBaseline(baselinePath, deps.logger)
     const comparison = compareViolations(result.violations, baseline)
-    const failed = comparison.added.length + comparison.worsened.length
-    const verdict: CheckOutcome['verdict'] = failed > 0 ? 'BLOCK' : result.stats.truncated ? 'WARN' : 'PASS'
-    const reason =
-        failed > 0
-            ? `新增 ${comparison.added.length} 项、恶化 ${comparison.worsened.length} 项规范违规（基线已接受 ${comparison.known.length} 项）`
-
-            : result.stats.truncated
-              ? `本次扫描达到文件上限（${config.maxFiles}）：覆盖面不完整，结论按 WARN 处理`
-              : `无新增违规（基线已接受 ${comparison.known.length} 项，本次扫描 ${result.stats.filesScanned} 个文件）`
-    return { cwd, standards: loaded.standards, result, comparison, verdict, reason }
+    const outcome: CheckOutcome = {
+        cwd,
+        standards: loaded.standards,
+        modes: loaded.modes,
+        modeProblems: loaded.problems,
+        result,
+        comparison,
+        verdict: 'PASS',
+        reason: '',
+        observations: [],
+        problems: [],
+        enforcing: { added: [], worsened: [] },
+        shadow: { added: [], worsened: [] },
+    }
+    applyEvaluation(outcome, config)
+    return outcome
 }
 
 /** Render the measurement as the text a model/human reads. */
@@ -209,14 +365,29 @@ export function renderCheck(outcome: CheckOutcome, config: StandardsGateConfig):
         .sort((a, b) => b[1] - a[1])
         .map(([language, count]) => `${language} ${count}`)
         .join('、')
+    const wouldByRule = new Map(outcome.observations.map((observation) => [observation.rule, observation.would]))
+    // A shadow row is a RECORDING, never a verdict: it says `[影子 would=…]` so no
+    // reader (model, human, retrospective) can mistake it for PASS/FAIL/BLOCK.
+    const marker = (rule: string): string => {
+        const would = wouldByRule.get(rule)
+        return would === undefined ? '' : ` [影子 would=${would}]`
+    }
+    const violationRow = (violation: Violation): string =>
+        `${isObserve(outcome.modes, violation.rule) ? '[影子 would=BLOCK] ' : ''}${violation.detail}`
+    const enforcingFailed = outcome.enforcing.added.length + outcome.enforcing.worsened.length
+    const shadowAdded = outcome.shadow.added
+    const shadowWorsened = outcome.shadow.worsened
+    const shadowFixed = comparison.fixed.filter((key) => isObserve(outcome.modes, key.split('|')[0] ?? ''))
     const lines = [
         `## 规范检查（dsh-standards-gate）— ${outcome.verdict}`,
         '',
         `工作区：${outcome.cwd}`,
         `扫描：${result.stats.filesScanned} 个文件（豁免 ${result.stats.exempted} 个${result.stats.truncated ? '；**已达上限，结论不完整**' : ''}）${languages === '' ? '' : `；语言：${languages}`}`,
         `结论：${outcome.reason}`,
+        ...(outcome.problems.length === 0 ? [] : [`配置问题：${outcome.problems.join('；')}`]),
         ...(outcome.gateId === undefined ? [] : [`门禁记录：${outcome.gateId}`]),
         ...(outcome.measurementFile === undefined ? [] : [`度量明细：${outcome.measurementFile}`]),
+        ...renderObservations(outcome.observations, outcome.verdict, config.standardsFile),
         '',
         '### 违规（按规则统计）',
         '',
@@ -224,24 +395,30 @@ export function renderCheck(outcome: CheckOutcome, config: StandardsGateConfig):
             ? ['- 无']
             : Object.entries(countByRule(result.violations))
                   .sort((a, b) => b[1] - a[1])
-                  .map(([rule, count]) => `- ${rule}：${count}`)),
+                  .map(([rule, count]) => `- ${rule}：${count}${marker(rule)}`)),
         '',
         ...(comparison.added.length === 0
             ? ['### 新增违规', '', '- 无（与基线一致）']
             : [
-                  `### 新增违规（${comparison.added.length} 项：门禁失败的原因）`,
+                  outcome.enforcing.added.length > 0
+                      ? `### 新增违规（${comparison.added.length} 项：门禁失败的原因${shadowAdded.length === 0 ? '' : `，其中 ${shadowAdded.length} 项来自 observe 规则、不阻断`}）`
+                      : `### 新增违规（${comparison.added.length} 项：全部来自 observe 规则，不阻断门禁）`,
                   '',
-                  ...comparison.added.slice(0, 25).map((violation) => `- ${violation.detail}`),
+                  ...comparison.added.slice(0, 25).map((violation) => `- ${violationRow(violation)}`),
                   ...(comparison.added.length > 25 ? [`- …另有 ${comparison.added.length - 25} 项（见度量明细）`] : []),
               ]),
         ...(comparison.worsened.length === 0
             ? []
             : [
                   '',
-                  `### 恶化（${comparison.worsened.length} 项：基线接受过，但比当初更严重）`,
+                  outcome.enforcing.worsened.length > 0
+                      ? `### 恶化（${comparison.worsened.length} 项：基线接受过，但比当初更严重${shadowWorsened.length === 0 ? '' : `，其中 ${shadowWorsened.length} 项来自 observe 规则、不阻断`}）`
+                      : `### 恶化（${comparison.worsened.length} 项：全部来自 observe 规则，不阻断门禁）`,
                   '',
-                  ...comparison.worsened.slice(0, 15).map((violation) => `- ${violation.detail}`),
-                  '这些不是"新问题"，而是旧债变大：要么改回去，要么重新走一次 accept（人工批准）把新的尺度记进基线。',
+                  ...comparison.worsened.slice(0, 15).map((violation) => `- ${violationRow(violation)}`),
+                  ...(outcome.enforcing.worsened.length === 0
+                      ? []
+                      : ['这些不是"新问题"，而是旧债变大：要么改回去，要么重新走一次 accept（人工批准）把新的尺度记进基线。']),
               ]),
         ...(comparison.fixed.length === 0
             ? []
@@ -253,9 +430,20 @@ export function renderCheck(outcome: CheckOutcome, config: StandardsGateConfig):
                     `本次只扫了 ${result.stats.filesScanned} 个文件（已达上限）：这些"已消除"可能只是没被扫到。`,
                     '提高 maxFiles 或缩小工作区后重跑，再据此收紧基线。',
                 ]
-              : ['', `### 已消除（${comparison.fixed.length} 项）`, '', ...comparison.fixed.slice(0, 10).map((key) => `- ${key}`)]),
+              : [
+                    '',
+                    `### 已消除（${comparison.fixed.length} 项）`,
+                    '',
+                    ...comparison.fixed.slice(0, 10).map((key) => `- ${key}`),
+                    ...(shadowFixed.length === 0
+                        ? []
+                        : [
+                              `其中 ${shadowFixed.length} 项属于 observe 规则：它们**不会**被从基线里收紧——影子只测量，棘轮不动，` +
+                                  '切回 enforce 后仍按原基线判定。',
+                          ]),
+                ]),
         '',
-        ...(comparison.added.length === 0
+        ...(enforcingFailed === 0
             ? []
             : [
                   '### 怎么办',
@@ -384,6 +572,9 @@ function recordStandardsGate(
         results: [],
         scope: { selected: ['standards'], total: 1, full: !outcome.result.stats.truncated },
         fingerprint,
+        // Only a run that HAS shadow verdicts grows the field: a run with no
+        // observing rule keeps the record shape it always had, byte for byte.
+        ...(outcome.observations.length === 0 ? {} : { observations: outcome.observations }),
     }).id
 }
 
@@ -411,9 +602,22 @@ function writeStandardsArtifact(
             scanned: outcome.result.stats,
             sizes,
             violations: outcome.result.violations,
-            added: outcome.comparison.added.map((violation) => violation.key),
+            // `added` keeps its old meaning (what would fail the gate), so a
+            // consumer comparing two measurements is not suddenly fed shadow
+            // rows; the shadow measurement is preserved in its own field and in
+            // `observations` — it is READ by humans, never by the ratchet.
+            added: outcome.enforcing.added.map((violation) => violation.key),
             known: outcome.comparison.known.length,
             fixed: outcome.comparison.fixed,
+            ...(outcome.observations.length === 0
+                ? {}
+                : {
+                      observations: outcome.observations,
+                      shadow: {
+                          added: outcome.shadow.added.map((violation) => violation.key),
+                          worsened: outcome.shadow.worsened.map((violation) => violation.key),
+                      },
+                  }),
         })
         return file
     } catch (error) {
@@ -448,7 +652,7 @@ export function registerTools(
         defineTool({
             name: 'standards_check',
             description:
-                'Measure the workspace against the structural standards the repository declares in `<repo>/.dsh/standards.json` (file/function size, nesting depth, branch size, parameter count, exported surface, module dependency direction, import cycles) and record the verdict on the mission as a gate. Violations the baseline already accepted do not fail; NEW violations do. `accept: true` widens the baseline to today\'s violations — that requires human approval (the ratchet must not be loosenable by the model alone). Missing standards file → run standards_bootstrap.',
+                'Measure the workspace against the structural standards the repository declares in `<repo>/.dsh/standards.json` (file/function size, nesting depth, branch size, parameter count, exported surface, module dependency direction, import cycles) and record the verdict on the mission as a gate. Violations the baseline already accepted do not fail; NEW violations do. A rule the repository marks `observe` (in that file\'s `rules` map) is still measured and its would-be verdict is recorded in the gate record (observations) and printed in a dedicated shadow section, but it never contributes to PASS/WARN/BLOCK and never blocks; only enforcing rules decide the verdict, and a shadow measurement never touches the baseline (not by `accept`, not by pruning). `accept: true` widens the baseline to today\'s violations — that requires human approval (the ratchet must not be loosenable by the model alone). Missing standards file → run standards_bootstrap.',
             parameters: {
                 missionId: { type: 'string', description: 'Mission to record the gate on (default: the session mission).' },
                 accept: { type: 'boolean', description: 'Accept today\'s violations into the baseline (human approval required).' },
@@ -479,7 +683,19 @@ export function registerTools(
 
                 // Accepting today's violations is the only action that LOOSENS a
                 // check, so it is the only one that needs a person.
-                if (args.accept === true && outcome.comparison.added.length > 0) {
+                //
+                // THE RATCHET RULE: only ENFORCING rules may be accepted. A rule
+                // in `observe` still measures, but its violations are not
+                // grandfathered — otherwise observing today would hand the rule a
+                // baseline it never earned, and switching it to enforce would find
+                // tomorrow's verdict already bought.
+                const acceptable = outcome.enforcing.added
+                const shadowOnlyAdded = outcome.shadow.added
+                // A shadow rule's worsening is just as unaccepted as its addition:
+                // freezing it would record a magnitude it never earned.
+                const shadowOnlyWorsened = outcome.shadow.worsened
+                const shadowOnly = shadowOnlyAdded.length + shadowOnlyWorsened.length
+                if (args.accept === true && acceptable.length > 0) {
                     const approve = async (reason: string): Promise<boolean> => {
                         const seam = deps.approval()
                         if (seam === undefined) return false
@@ -497,18 +713,21 @@ export function registerTools(
                         return [
                             renderCheck(outcome, config),
                             '',
-                            `### 预演：accept 会把 ${outcome.comparison.added.length} 项违规写入基线（未写盘）`,
-                            ...outcome.comparison.added.slice(0, 10).map((violation) => `- ${violation.detail}`),
+                            `### 预演：accept 会把 ${acceptable.length} 项违规写入基线（未写盘）`,
+                            ...acceptable.slice(0, 10).map((violation) => `- ${violation.detail}`),
+                            ...(shadowOnlyAdded.length === 0
+                                ? []
+                                : [`（另有 ${shadowOnlyAdded.length} 项来自 observe 规则：**不会**写入基线，见下。）`]),
                         ].join('\n')
                     }
                     if (config.requireApprovalForBaseline) {
                         const allowed = await approve(
                             [
-                                `规范检查要求放宽基线：把 ${outcome.comparison.added.length} 项**新增**违规记为"已接受"。`,
+                                `规范检查要求放宽基线：把 ${acceptable.length} 项**新增**违规记为"已接受"。`,
                                 '',
-                                ...outcome.comparison.added.slice(0, 12).map((violation) => `- ${violation.detail}`),
-                                ...(outcome.comparison.added.length > 12
-                                    ? [`- …另有 ${outcome.comparison.added.length - 12} 项未列出（合计 ${outcome.comparison.added.length} 项）`]
+                                ...acceptable.slice(0, 12).map((violation) => `- ${violation.detail}`),
+                                ...(acceptable.length > 12
+                                    ? [`- …另有 ${acceptable.length - 12} 项未列出（合计 ${acceptable.length} 项）`]
                                     : []),
                                 '',
                                 `基线文件：${path.join(cwd, config.baselineFile)}`,
@@ -527,18 +746,30 @@ export function registerTools(
                         }
                     }
                     const baselinePath = artifactPathOf(cwd, config.baselineFile)
+                    // Only enforcing rules are frozen: an observe rule keeps its
+                    // violations OUT of the baseline, in both `accepted` and
+                    // `entries` (a magnitude is an acceptance too).
                     const accepted = freezeBaseline({
                         file: baselinePath,
-                        violations: outcome.result.violations,
+                        violations: enforcingViolations(outcome.result.violations, outcome.modes),
                         note:
                             args.note === undefined || args.note === ''
-                                ? `standards_check 接受 ${outcome.comparison.added.length} 项新增违规`
+                                ? `standards_check 接受 ${acceptable.length} 项新增违规`
                                 : args.note,
                     })
                     deps.logger?.for(cwd).info(`standards-gate: 基线已更新（${baselinePath}，接受 ${accepted.accepted.length} 项）`)
-                    outcome.comparison = { added: [], known: outcome.result.violations, fixed: outcome.comparison.fixed, worsened: [], present: true }
-                    outcome.verdict = outcome.result.stats.truncated ? 'WARN' : 'PASS'
-                    outcome.reason = `基线已更新：接受 ${accepted.accepted.length} 项违规（人工批准）`
+                    // The report after an accept: enforcing rules are accepted, so
+                    // only the SHADOW side is still "added"/"worsened" — it stays
+                    // unaccepted on purpose, and saying so is the honest shape.
+                    outcome.comparison = {
+                        added: shadowOnlyAdded,
+                        known: enforcingViolations(outcome.result.violations, outcome.modes),
+                        fixed: outcome.comparison.fixed,
+                        worsened: outcome.shadow.worsened,
+                        present: true,
+                    }
+                    applyEvaluation(outcome, config)
+                    outcome.reason = `基线已更新：接受 ${accepted.accepted.length} 项违规（人工批准，只含 enforce 规则）${shadowNoteOf(outcome.observations)}`
                     // The report says PASS, so the LEDGER must say PASS too: a
                     // version that returned here without recording left the old
                     // BLOCK in place while the tool printed a pass (an audit
@@ -555,7 +786,24 @@ export function registerTools(
                         `基线已写入 ${baselinePath}（${formatTime(Date.now())}）。`,
                         ...(acceptedGateId === undefined ? ['（没有 mission：未记录门禁）'] : [`门禁记录：${acceptedGateId}`]),
                         ...(measured === undefined ? [] : [`度量明细：${measured}`]),
+                        ...(shadowOnly === 0
+                            ? []
+                            : [
+                                  '',
+                                  `### accept 不动 observe 规则（${shadowOnly} 项未写入基线）`,
+                                  '',
+                                  '这些违规属于 observe 规则：影子只测量，不豁免。把它们记进基线等于先豁免再测量，',
+                                  '所以它们留在这里、并继续出现在报告的影子段落里；切回 enforce 时会照常判定（届时可以再决定是否 accept）。',
+                              ]),
                     ].join('\n')
+                }
+                // `accept` asked for, but every new violation belongs to an observe
+                // rule: nothing may be written, and the report says why instead of
+                // printing a silent no-op.
+                if (args.accept === true && shadowOnly > 0) {
+                    deps.logger
+                        ?.for(cwd)
+                        .info(`standards-gate: accept 未写入基线（${shadowOnly} 项新增/恶化全部来自 observe 规则）`)
                 }
 
                 const fingerprint = gitFingerprint(cwd)
@@ -571,10 +819,23 @@ export function registerTools(
                 // later revert cannot ride the old acceptance. Tightening only, so
                 // it needs no approval (and it is skipped when the scan was partial,
                 // because "not scanned" is not "fixed").
+                //
+                // THE RATCHET RULE, second half: pruning is a tightening write, and
+                // a shadow measurement must not tighten either — an observe rule's
+                // acceptance stays exactly as it was, so switching the rule back to
+                // enforce behaves as if the observe run never happened.
                 if (!outcome.result.stats.truncated && outcome.comparison.fixed.length > 0) {
-                    const pruned = pruneBaseline(artifactPathOf(cwd, config.baselineFile), outcome.comparison.fixed, readBaseline(artifactPathOf(cwd, config.baselineFile), deps.logger))
+                    const prunable = enforcingKeys(outcome.comparison.fixed, outcome.modes)
+                    const pruned =
+                        prunable.length === 0
+                            ? undefined
+                            : pruneBaseline(
+                                  artifactPathOf(cwd, config.baselineFile),
+                                  prunable,
+                                  readBaseline(artifactPathOf(cwd, config.baselineFile), deps.logger),
+                              )
                     if (pruned !== undefined) {
-                        deps.logger?.for(cwd).info(`standards-gate: 基线收紧（消除 ${outcome.comparison.fixed.length} 项）`)
+                        deps.logger?.for(cwd).info(`standards-gate: 基线收紧（消除 ${prunable.length} 项）`)
                     }
                 }
                 if (config.enforce === 'off') {
@@ -593,7 +854,18 @@ export function registerTools(
                     // fatter, and what a human reads when the gate says BLOCK.
                     outcome.measurementFile = writeStandardsArtifact(deps, store, mission.id, outcome)
                 }
-                return renderCheck(outcome, config)
+                return [
+                    renderCheck(outcome, config),
+                    ...(args.accept === true && shadowOnly > 0
+                        ? [
+                              '',
+                              `### accept 没有写入任何东西（${shadowOnly} 项新增/恶化全部来自 observe 规则）`,
+                              '',
+                              '影子规则的新增违规不会被记进基线：先测量、再决定，把它们豁免掉就等于跳过了这次测量。',
+                              '把该规则的 mode 改成 enforce（或删掉 rules 里的那条）后重跑，届时再决定是否 accept。',
+                          ]
+                        : []),
+                ].join('\n')
             },
         }),
         'standards_check',
@@ -699,10 +971,17 @@ export function registerTools(
 
                 const seam = deps.approval()
                 const merged = mergeThresholds(recommended, args.thresholds)
+                // Freezing thresholds must not silently drop the rule MODES an
+                // operator committed: a rule they marked `observe` would become
+                // enforcing again — a gate change nobody asked for. The existing
+                // `rules` map is carried over verbatim (validated by the reader).
+                const existing = readJson<Record<string, unknown>>(target)
+                const carriedRules = existing?.['rules']
                 const body = {
                     languages: merged,
                     exempt: [...DEFAULT_EXEMPT],
                     forbidCycles: true,
+                    ...(carriedRules === undefined ? {} : { rules: carriedRules }),
                     ...(args.note === undefined || args.note === '' ? {} : { note: args.note }),
                 }
                 if (config.requireApprovalForBaseline) {
@@ -819,7 +1098,7 @@ export function registerTools(
         defineTool({
             name: 'standards_status',
             description:
-                'Show the standards the workspace currently declares, the baseline it carries (how many violations are grandfathered, when it was frozen, why), and what the most recent standards gate recorded on the mission. Read-only: use it before deciding whether to fix code, exempt paths, or accept the debt.',
+                'Show the standards the workspace currently declares (including which rules are shadow `observe` ones), the baseline it carries (how many violations are grandfathered, when it was frozen, why), and what the most recent standards gate recorded on the mission — including that record\'s shadow observations; a legacy record without observations reads as "no observation" and is not an error. Read-only: use it before deciding whether to fix code, exempt paths, or accept the debt.',
             parameters: {
                 missionId: { type: 'string', description: 'Mission whose gate history to show (default: the session mission).' },
             },
@@ -857,6 +1136,21 @@ export function registerTools(
                         : ['', '### 依赖方向', '', ...loaded.standards.layers.map((layer) => `- \`${layer.path}\` 只能依赖：${layer.mayImport.join('、') || '(仅自身)'}`)]),
                     ...(loaded.standards?.forbidCycles === true ? ['', '- 禁止循环依赖：已开启'] : []),
                     ...(loaded.standards?.exempt === undefined ? [] : ['', `豁免：${loaded.standards.exempt.join('、')}`]),
+                    ...(loaded.modes.modes.size === 0
+                        ? []
+                        : [
+                              '',
+                              '### 规则模式（rules）',
+                              '',
+                              ...[...loaded.modes.modes.entries()]
+                                  .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+                                  .map(([rule, mode]) =>
+                                      mode === 'observe'
+                                          ? `- \`${rule}\`：observe（只测量、记进 observations，不阻断；**不会**写进基线）`
+                                          : `- \`${rule}\`：enforce`,
+                                  ),
+                          ]),
+                    ...(loaded.problems.length === 0 ? [] : ['', `配置问题：${loaded.problems.join('；')}`]),
                     '',
                     '### 基线（棘轮）',
                     '',
@@ -894,7 +1188,18 @@ export function registerTools(
                     '',
                     ...(last === undefined
                         ? ['- 本次 mission 还没有 standards 门禁记录']
-                        : [`- ${last.id}：${last.state}（${formatTime(last.checkedAt)}）`, `- 结论：${last.reason}`]),
+                        : [
+                              `- ${last.id}：${last.state}（${formatTime(last.checkedAt)}）`,
+                              `- 结论：${last.reason}`,
+                              // A record written before shadow mode existed has no
+                              // `observations`: that reads as "no observation" and
+                              // is never an error.
+                              ...(last.observations === undefined || last.observations.length === 0
+                                  ? []
+                                  : renderObservations(last.observations, last.state, config.standardsFile).map(
+                                        (line) => `  ${line}`,
+                                    )),
+                          ]),
                 ].join('\n')
             },
         }),

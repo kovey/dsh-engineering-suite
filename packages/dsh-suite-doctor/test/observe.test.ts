@@ -82,7 +82,11 @@ test('counts would-blocks by rule id over the window, with a concrete switch-on 
     assert.match(check.detail, /bundle：3 条（would BLOCK 0 \/ WARN 0 \/ PASS 3），当前连续 3 次零差异/)
     assert.match(check.detail, /lint：3 条（would BLOCK 1 \/ WARN 0 \/ PASS 2），当前连续 2 次零差异/)
     assert.match(check.fix ?? '', new RegExp(`连续 ${OBSERVE_ENFORCE_STREAK} 次零差异（would=PASS）后再切 enforce`))
-    assert.match(check.fix ?? '', /重跑一次完整 quality_gate_run/)
+    // The fix must name the gate the observation came from — quality and standards
+    // both write observations now, so naming only one of them is misleading.
+    assert.match(check.fix ?? '', /重跑一次对应的门禁/)
+    assert.match(check.fix ?? '', /quality_gate_run/)
+    assert.match(check.fix ?? '', /standards_check/)
     assert.notEqual(check.severity, 'required')
 })
 

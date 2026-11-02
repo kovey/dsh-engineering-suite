@@ -87,6 +87,32 @@ profile（宿主上限）与 `<repo>/.dsh/standards-gate.json`（项目只能细
 }
 ```
 
+## 影子模式：先把规则测一遍，再决定要不要拦
+
+新规则直接上 `enforce` 往往第一天就红了，于是没人敢开。所以一条规则可以先**观察**：
+
+```json
+{
+  "languages": { "go": { "maxFileLines": 400, "maxDepth": 4 } },
+  "rules": { "maxDepth": "observe" }
+}
+```
+
+- 规则照常测量**一次**，它的"本会 PASS/WARN/BLOCK"记进门禁记录的 `observations`（按规则 id 排序），
+  报告里单列一段 `影子（observe）：本会拦下 N 条 …`，并给出一行"把 mode 改成 enforce"的下一步；
+  影子行永远显示 `[影子 would=…]`，不会伪装成 PASS/FAIL/BLOCK；
+- **它不参与裁决**：`observe` 规则再多也不会让门禁失败；`enforce`（默认，或删掉 `mode`）照旧失败；
+- **棘轮不动**：这是本插件与其他门禁最大的不同。observe 期间的测量**不会**写进基线——
+  `accept` 只接受 enforce 规则的违规（影子违规即使勾了 accept 也一项都不写），
+  自动收紧（删除已消除的 key）也只删除 enforce 规则的条目。
+  否则"先测量"就变成了"先豁免"，切回 enforce 时明天的裁决已经被今天的观察买走了；
+- 测量本身不会丢：门禁记录的 `observations`、度量明细（`standards/` 下的 JSON）与报告影子段落都保留实测数字，
+  但这些是**只读产物**——门禁从不回读上一次测量，所以保留它们不会移动棘轮；
+- `mode` 写在 `rules` 里（与阈值同一个仓库文件、同一个信任根）：拼错的规则名、拼错的 mode 都是**配置问题**，
+  按 `enforce` 处理并在报告里点名——未知值绝不会被静默当成 `observe`。
+
+`standards_status` 会显示哪些规则在 observe，以及最近一条门禁记录里的影子结果（旧记录没有 `observations` 字段时按"没有观察"读取，不是错误）。
+
 ## 门禁记录与交付
 
 每次 `standards_check`（`enforce: gate`）都会写一条 `GateRecord`（`source: dsh-standards-gate`，

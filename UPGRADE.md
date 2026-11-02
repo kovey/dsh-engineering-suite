@@ -158,6 +158,18 @@ peer 范围不变，无破坏性变更。新增与变化如下：
 - **阻塞/暂停期间问题不会过期**：截止时间按暂停时长顺延，超时文案会写明"等待被延长 Nms"。
 - 新增运行时文件 `.dsh/interaction/attention.jsonl`（与 outbox 同目录，已被运行时忽略规则覆盖）。
 
+### 1.7j 规范门禁也能先观察（`.dsh/standards.json` 的 `rules`）
+
+```json
+{ "rules": { "maxDepth": "observe", "maxFunctionLines": "enforce" } }
+```
+
+- 与质量门禁同一套语义：规则照跑照记（`observations` / 报告里的 `[影子 would=…]`），但**不计入**裁决；
+  缺省 `enforce`，写错只会报"配置问题"并保持 `enforce`。
+- **一条硬规矩**：**影子测量不会写入基线**（棘轮只吃 enforce 规则，影子的"新增"与"恶化"都排除）。
+  所以"先观察一周"不会悄悄改变下周的裁决——这也是 observe 唯一说得通的用法。
+- `standards_check` 的报告与 `standards_status` 都会显示声明了哪些模式、以及最近一次记录里的影子观测。
+
 ### 1.7h 提问现在会落盘（`.dsh/interaction/outbox.jsonl`，v0.5.0 起）
 
 - 需要人拍板的问题会先写入 `.dsh/interaction/outbox.jsonl`（运行时目录，已被忽略规则覆盖；如果你的仓库手工配过忽略，确认含 `.dsh/interaction/`）。

@@ -1,3 +1,24 @@
+## [未发布]
+
+### 新增 · 影子模式推广到 `standards-gate`（含一条硬规矩），`impact-gate` 明确不适用
+
+- **`dsh-standards-gate`**：规则级 `mode: observe|enforce` 放在仓库自己的 `.dsh/standards.json` 的 `rules` 映射里
+  （与阈值同文件、同信任根；缺省 `enforce`；未知规则名/未知 mode/无对应阈值的 mode 都是配置问题并保持 enforce）。
+  规则 = 度量 id（`maxFileLines`/`maxFunctionLines`/`maxDepth`/`maxIfBlockLines`/`maxParams`/`maxExports`/`layer`/`cycle`），
+  每条恰好判定一次，统一走 core 的 `applyRuleModes`；记录 `observations`、报告 `影子（observe）…` 段与切换下一步。
+- **硬规矩（新）**：**影子测量永远不得写入基线（棘轮）**。规范门禁有只收紧的基线，若观察也参与写入，
+  "观察一天"就会改变明天的裁决。两条写路径都只吃 enforce 规则——`accept` 冻结基线、自动收紧按 `rule|path|label` 修剪；
+  并且**影子的"新增"与"恶化"都排除**（第一版只判断新增，被测试抓到）。影子测量保留在 `observations` 与度量明细工件里，门禁不回读。
+- **`dsh-impact-gate` 不适用（结论，非遗漏）**：它不写任何 `GateRecord`，输出是风险分类 + 选中测试命令，阈值是 core 里的代码常量，
+  也没有门禁消费 `risk`——造 `mode` 等于凭空发明规则条目。用两条"decision record"测试 + README 段落钉住这个判断。
+- 顺带修正医生 `gate.observe` 的修复文案：此前只说"重跑 `quality_gate_run`"，现在点名**两个**门禁
+  （`quality_gate_run` / `standards_check`），因为 observe 记录来自两者。
+
+### 验证
+
+- `bash scripts/verify.sh`：**1011 测试 / 1010 通过 / 0 失败 / 1 如实跳过**（含 OPS SELFTEST GREEN）。
+- 包内计数：`dsh-standards-gate` 24→35、`dsh-impact-gate` 60→62。
+
 ## [0.5.0] — 2026-11-02
 
 ### 文档 · 「上下文不是授权」写成硬规矩 + 被否决的设计清单

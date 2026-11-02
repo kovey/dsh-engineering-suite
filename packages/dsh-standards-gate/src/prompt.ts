@@ -32,6 +32,10 @@ export function sectionText(config: StandardsGateConfig, projectFile?: string): 
         '- 规范只覆盖可机械判定的部分（行数、嵌套、分支大小、参数、导出面、依赖方向、循环依赖）；',
         '  "高内聚、命名、抽象是否多余"这类判断**不要假装被门禁覆盖**：用 `standards_review` 派只读评审者按 rubric 看，',
         '  它的结论是**意见**（可复核但要人拍板），不构成门禁裁决。',
+        `- 规则可以先**影子测量**：${projectFile ?? config.standardsFile} 的 \`rules\` 里写 \`{ "maxDepth": "observe" }\`（同样由人提交）后，`,
+        '  该规则照常测量、结果进门禁记录的 `observations` 与报告的影子段落，但**不阻断**；影子期间的测量**不会**写进基线（棘轮不动），',
+        '  所以切回 enforce 时它仍从原基线判定——"先测量、再决定"不能变成"先豁免、再测量"。',
+        '  你**不能**自己给规则加 observe（那等于把门禁降级成观察）：把影子段落的结论报给人，由人改 mode。',
         config.enforce === 'warn'
             ? '（宿主当前设 enforce=warn：违规只报告、不阻断交付。）'
             : config.enforce === 'off'
