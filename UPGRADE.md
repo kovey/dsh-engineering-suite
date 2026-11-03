@@ -158,7 +158,7 @@ peer 范围不变，无破坏性变更。新增与变化如下：
 - **阻塞/暂停期间问题不会过期**：截止时间按暂停时长顺延，超时文案会写明"等待被延长 Nms"。
 - 新增运行时文件 `.dsh/interaction/attention.jsonl`（与 outbox 同目录，已被运行时忽略规则覆盖）。
 
-### 1.7j 规范门禁也能先观察（`.dsh/standards.json` 的 `rules`）
+### 1.7j 规范门禁也能先观察（`.dsh/standards.json` 的 `rules`，v0.6.0 起）
 
 ```json
 { "rules": { "maxDepth": "observe", "maxFunctionLines": "enforce" } }
