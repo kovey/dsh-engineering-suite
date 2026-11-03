@@ -578,20 +578,55 @@ function sample(at: number, value: number): BaselineEntry {
     return { at, value, metric: 'number', unit: 'count', command: 'x', exitCode: 0 }
 }
 
-test('budgets: two concurrent writers both end up in the history (an append is never lost)', async () => {
-    const cwd = tempWorkspace('budget-lock-race-')
-    const file = path.join(cwd, 'budgets.json')
-    fs.writeFileSync(file, `${JSON.stringify({ version: 1, budgets: {} }, null, 2)}\n`)
-    // The compiled module, so a REAL second process does the writing: this test's
-    // claim is about concurrency, and an interleaved stub cannot make it.
-    const modulePath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../dist/budget.js')
-    const worker = (value: number): Worker => {
-        const code = `
-            import { parentPort, workerData } from 'node:worker_threads'
-            import fs from 'node:fs'
-            const barrier = new Int32Array(workerData.barrier)
-            const index = workerData.value - 1
-            const file = workerData.file
+/**
+ * The failure a worker throws on purpose in the diagnosis test. It is deliberately
+ * distinctive: if it ever shows up as `屏障未会合`, the worker's own error was lost.
+ */
+const INJECTED_WORKER_FAILURE = '注入的 worker 自身错误：appendBaseline 之前的意外失败'
+
+/** One writer's report, exactly as the worker body posts it. */
+interface WriterReport {
+    ok: boolean
+    /** The worker's own stack, posted only when `ok` is false. */
+    error?: string
+    /** Length of the document the writer read before appending. */
+    before?: number
+    /** The budget ids in the document after its append. */
+    keys?: string[]
+}
+
+/** How the diagnosis test bends one worker's body before it does any real work. */
+interface WriterLaunch {
+    /** An error message the worker body throws before touching anything else. */
+    failWith?: string
+    /** Exit the worker with this code WITHOUT posting a report (a silent failure). */
+    exitSilently?: number
+}
+
+/**
+ * The body of one writer worker: a real second thread, a real `appendBaseline`, and
+ * a rendezvous that releases both writers within microseconds of each other.
+ *
+ * A worker NEVER dies silently: its whole body is inside the `try`, so any failure
+ * becomes a report carrying its own stack. Otherwise the main thread only sees a
+ * dead worker and the surviving one's rendezvous timeout — a failure that names
+ * somebody else.
+ */
+function writerSource(): string {
+    return `
+        import { parentPort, workerData } from 'node:worker_threads'
+        import fs from 'node:fs'
+        const barrier = new Int32Array(workerData.barrier)
+        const index = workerData.value - 1
+        const file = workerData.file
+        try {
+            // The diagnosis test launches one worker that throws HERE: what comes out
+            // is either this message (the worker reported itself) or a barrier timeout
+            // (it did not, and the failure was disguised as somebody else's).
+            if (workerData.failWith !== undefined) throw new Error(workerData.failWith)
+            // ...and one that dies without a report, which the main thread must fail
+            // with the exit facts instead of resolving into "both writers finished".
+            if (workerData.exitSilently !== undefined) process.exit(workerData.exitSilently)
             const entry = { at: Date.now(), value: workerData.value, metric: 'number', unit: 'count', command: 'x', exitCode: 0 }
             // A counting barrier for exactly these two writers, implemented with a
             // pure spin (no Atomics.wait: its timeout can fire even after another
@@ -599,11 +634,21 @@ test('budgets: two concurrent writers both end up in the history (an append is n
             // and 2 arrive, the LAST one pushes the counter to 3, and both then spin
             // until they observe it — so they leave this line within microseconds of
             // each other, which is what makes the read-modify-write window a window.
-            barrier[index] = 1
+            // EVERY access to the SharedArrayBuffer goes through Atomics: a plain
+            // \`barrier[index] = 1\` is not a guaranteed-visible write across workers,
+            // and an invisible arrival is exactly the phantom this test must not have.
+            Atomics.store(barrier, index, 1)
             if (Atomics.add(barrier, 2, 1) === 1) Atomics.store(barrier, 2, 3)
-            const deadline = Date.now() + 30_000
+            const started = Date.now()
+            const deadline = started + 5000
             while (Atomics.load(barrier, 2) !== 3) {
-                if (Date.now() > deadline) throw new Error('barrier timeout')
+                if (Date.now() > deadline) {
+                    throw new Error(
+                        '屏障未会合（另一个 worker 未到达屏障）：worker ' + index + ' 自旋了 ' +
+                        Math.round((Date.now() - started) / 1000) + 's，计数仍是 ' + Atomics.load(barrier, 2) +
+                        '（应为 3），所以这一次没有同时进入读-改-写窗口',
+                    )
+                }
             }
             const before = fs.readFileSync(file, 'utf8')
             let spin = 0
@@ -612,34 +657,155 @@ test('budgets: two concurrent writers both end up in the history (an append is n
             appendBaseline(file, 'b', entry, { lockRetryMs: 10000 })
             const document = JSON.parse(fs.readFileSync(file, 'utf8'))
             parentPort.postMessage({ ok: true, before: before.length, keys: Object.keys(document.budgets) })
-        `
-        return new Worker(code, {
-            eval: true,
-            type: 'module',
-            workerData: { file, modulePath, value, barrier: barrier.buffer },
-        })
-    }
+        } catch (error) {
+            // The main thread gets THIS stack, not a rendezvous timeout: a worker that
+            // fails must name its own cause.
+            parentPort.postMessage({ ok: false, error: String(error?.stack ?? error) })
+        }
+    `
+}
+
+/**
+ * Launch one writer per value and settle when each has reported.
+ *
+ * - a report is the worker's own account (`ok: false` carries its stack);
+ * - a worker that exits WITHOUT a report fails the run with its exit facts and its
+ *   index, instead of resolving into a misleading "both writers finished";
+ * - worker 'error' events are still listened for and still reject.
+ */
+async function spawnWriters(
+    file: string,
+    modulePath: string,
+    values: readonly number[],
+    launch: WriterLaunch = {},
+): Promise<{ barrier: Int32Array; reports: WriterReport[] }> {
     const barrier = new Int32Array(new SharedArrayBuffer(16))
-    const results: { ok: boolean }[] = []
-    const running = [worker(1), worker(2)].map(
-        (instance) =>
-            new Promise<void>((resolve, reject) => {
-                instance.on('message', (message: { ok: boolean }) => results.push(message))
-                instance.on('error', reject)
-                instance.on('exit', () => resolve())
-            }),
+    const reports: WriterReport[] = []
+    await Promise.all(
+        values.map(
+            (value) =>
+                new Promise<void>((resolve, reject) => {
+                    const index = value - 1
+                    const instance = new Worker(writerSource(), {
+                        eval: true,
+                        type: 'module',
+                        workerData: {
+                            file,
+                            modulePath,
+                            value,
+                            barrier: barrier.buffer,
+                            failWith: launch.failWith,
+                            exitSilently: launch.exitSilently,
+                        },
+                    })
+                    let reported = false
+                    instance.on('message', (message: WriterReport) => {
+                        reported = true
+                        reports.push(message)
+                        resolve()
+                    })
+                    instance.on('error', reject)
+                    instance.on('exit', (code, signal) => {
+                        if (reported) return
+                        // The report may still be queued behind this event: give the
+                        // port one turn before calling the worker silent.
+                        setImmediate(() => {
+                            if (reported) return
+                            reject(
+                                new Error(
+                                    `worker ${index} 没有上报任何结果就退出了（exit code=${code}, signal=${signal ?? 'none'}）：` +
+                                        '它自己的错误没有被上报，所以这次并发的结论不可信（这不是屏障超时）',
+                                ),
+                            )
+                        })
+                    })
+                }),
+        ),
     )
-    await Promise.all(running)
-    assert.equal(Atomics.load(barrier, 0), 1, 'writer 1 reached the barrier')
-    assert.equal(Atomics.load(barrier, 1), 1, 'writer 2 reached the barrier')
-    assert.equal(results.length, 2, 'both writers finished')
-    const entries = readBaseline(file, 'b').entries
-    assert.deepEqual(
-        entries.map((entry) => entry.value).sort((left, right) => left - right),
-        [1, 2],
-        'both measurements are in the append-only history: one was not overwritten by the other',
-    )
-})
+    return { barrier, reports }
+}
+
+test(
+    'budgets: two concurrent writers both end up in the history (an append is never lost)',
+    // Serially: the rendezvous only proves something if both writers really get a
+    // core at the same time, so this pair must not compete with another test's work.
+    { concurrency: false },
+    async () => {
+        const cwd = tempWorkspace('budget-lock-race-')
+        const file = path.join(cwd, 'budgets.json')
+        fs.writeFileSync(file, `${JSON.stringify({ version: 1, budgets: {} }, null, 2)}\n`)
+        // The compiled module, so a REAL second process does the writing: this test's
+        // claim is about concurrency, and an interleaved stub cannot make it.
+        const modulePath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../dist/budget.js')
+        const { barrier, reports } = await spawnWriters(file, modulePath, [1, 2])
+        assert.equal(Atomics.load(barrier, 0), 1, 'writer 1 reached the barrier')
+        assert.equal(Atomics.load(barrier, 1), 1, 'writer 2 reached the barrier')
+        assert.equal(reports.length, 2, 'both writers finished')
+        assert.deepEqual(
+            reports.map((report) => report.ok),
+            [true, true],
+            `both writers must succeed, and a failure carries its own stack: ${JSON.stringify(reports)}`,
+        )
+        const entries = readBaseline(file, 'b').entries
+        assert.deepEqual(
+            entries.map((entry) => entry.value).sort((left, right) => left - right),
+            [1, 2],
+            'both measurements are in the append-only history: one was not overwritten by the other',
+        )
+    },
+)
+
+test(
+    'budgets: a worker that throws reports ITS OWN error, never a barrier timeout (the diagnosis path)',
+    { concurrency: false },
+    async () => {
+        const cwd = tempWorkspace('budget-lock-race-diagnosis-')
+        const file = path.join(cwd, 'budgets.json')
+        fs.writeFileSync(file, `${JSON.stringify({ version: 1, budgets: {} }, null, 2)}\n`)
+        const modulePath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../dist/budget.js')
+
+        // 1. ONE worker, and it throws before the barrier: the only two outcomes are
+        // its own report (item 2 holds) or a silently dead worker whose failure the
+        // main thread would misread. A failed writer must never be reported as "the
+        // other one was slow to reach the barrier".
+        const { reports } = await spawnWriters(file, modulePath, [1], { failWith: INJECTED_WORKER_FAILURE })
+        assert.equal(reports.length, 1, 'the worker posted its own report instead of dying silently')
+        assert.equal(reports[0]?.ok, false, 'the report says the worker failed')
+        assert.ok(
+            String(reports[0]?.error).includes(INJECTED_WORKER_FAILURE),
+            `the worker's own error reaches the main thread verbatim: ${String(reports[0]?.error)}`,
+        )
+        assert.doesNotMatch(
+            String(reports[0]?.error),
+            /屏障未会合|barrier timeout/,
+            'the failure is not disguised as a rendezvous timeout',
+        )
+
+        // 2. A worker that dies WITHOUT posting: the run must fail naming the exit
+        // facts and the worker index, never resolve into "both writers finished".
+        await assert.rejects(
+            () => spawnWriters(file, modulePath, [1], { exitSilently: 7 }),
+            (error: unknown) => {
+                const message = String((error as Error).message)
+                assert.match(message, /worker 0 没有上报任何结果就退出了/)
+                assert.match(message, /exit code=7/)
+                assert.match(message, /signal=none/)
+                assert.doesNotMatch(message, /屏障未会合|barrier timeout/, 'a silent death is not a rendezvous timeout either')
+                return true
+            },
+        )
+        assert.deepEqual(readBaseline(file, 'b').entries, [], 'neither failed worker wrote anything')
+
+        // Verified by temporarily reverting each item in this file and watching this
+        // test go red, then restoring it byte-for-byte from a copy in /tmp:
+        //  - item 2 reverted (no try/catch around the worker body): the throwing
+        //    worker dies as an uncaught 'error', `spawnWriters` rejects and no report
+        //    ever arrives — the `await` above throws, RED.
+        //  - item 4 reverted (`exit` resolves regardless of a report): the silent
+        //    worker resolves, so `assert.rejects` fails with "Missing expected
+        //    rejection", RED.
+    },
+)
 
 test('budgets: a stale lock file is reported with its path and age, and refused (never waited out)', () => {
     const cwd = tempWorkspace('budget-lock-stale-')
@@ -705,7 +871,10 @@ test('budgets: a live lock makes the second writer wait, then refuses loudly (no
     const rootDir = path.join(cwd, '.dsh')
     const defaultFile = path.join(rootDir, 'budgets.json')
     fs.mkdirSync(rootDir, { recursive: true })
-    fs.writeFileSync(`${defaultFile}.lock`, `${JSON.stringify({ pid: process.pid, at: Date.now() - 2_000, file: defaultFile })}\n`)
+    // On the INJECTED clock, like every other age in this file: `at: Date.now() - 2000`
+    // would be 2s old only against the real clock, and a 28s stall would turn it into
+    // a stale lock (30s default) and route the run down a different refusal path.
+    fs.writeFileSync(`${defaultFile}.lock`, `${JSON.stringify({ pid: process.pid, at: CLOCK - 2_000, file: defaultFile })}\n`)
     const run = await runBudgets({
         cwd,
         config: resolveConfig(budget()),
