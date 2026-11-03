@@ -90,8 +90,13 @@ function safeRealpath(target: string): string {
     }
 }
 
-/** The path a `git status --porcelain` line refers to (handles renames). */
-function porcelainPath(line: string): string | undefined {
+/**
+ * The path a `git status --porcelain` line refers to (handles renames).
+ *
+ * Exported for the exclusion-aware fingerprinter, so both readers parse git's
+ * porcelain format the same way instead of growing two subtly different ones.
+ */
+export function porcelainPath(line: string): string | undefined {
     const body = line.slice(3).trim()
     if (body === '') return undefined
     const arrow = body.lastIndexOf(' -> ')

@@ -1,37 +1,24 @@
 /**
- * The git fingerprint the index is BUILT at and COMPARED against.
+ * The knowledge-base fingerprint: the index directory as a declared exclusion.
  *
- * Why this module exists (a real bug, found in a live repository): `kb_index`
- * wrote `.dsh/kb/`, and the very next `kb_search` reported the index as stale.
- * The artifact had changed the workspace's fingerprint between the build and
- * the comparison — a build product invalidating itself. The report even said
- * `工作区改动数从 0 变成 0`: the excluded files were not counted, but the
- * repository still counted as dirty, and `stalenessOf` compares both.
+ * The mechanism itself lives in `dsh-eng-core` (`fingerprintWithExcludes`), so a
+ * READER can reproduce it from the artifact instead of reimplementing this
+ * module's rules. This file keeps only what is specific to the knowledge base:
  *
- * The rule this module enforces, in one place, for both sides of the
- * comparison: **the effective index directory never appears in the
- * fingerprint.** Concretely, `.dsh/kb` is excluded from the status entries
- * (so a fresh, un-ignored artifact is not a change), from the diff digest (so
- * a repository that COMMITS its index — the README allows it — does not go
- * stale the moment `manifest.json`'s `builtAt` moves), and from the dirty flag
- * (which must mean what it says next to `changedFiles`).
+ *  - the effective index directory, named as a repository-root-relative path
+ *    (`indexSpecPath`), including the symlink/realpath normalisation git
+ *    requires (`/var` vs `/private/var` on macOS);
+ *  - the two pieces of metadata the manifest stores NEXT TO the fingerprint
+ *    (`algorithm`, `excludes`) so a later comparison does not have to guess;
+ *  - the public `indexFingerprint`, kept as a thin wrapper so every existing
+ *    surface (`kb_index`, `kb_search`, `kb_status`, `/kb`, `scripts/kb.mjs`)
+ *    imports the same function it always did.
  *
- * The exclusion is expressed ONCE, by git itself, as a pathspec
- * (`:(top,exclude,literal)<indexDir>`) rather than by filtering the output
- * here: git then decides what counts, including the case where an untracked
- * directory would otherwise be collapsed into a single `?? .dsh/` line that
- * carries the artifact back in through its parent.
- *
- * Why here and not in `dsh-eng-core`'s `gitFingerprint`: that function's
- * `excludePaths` option already filters `changedFiles`, but its `dirty` flag
- * still counts every status entry, and its diff digest has no pathspec at all.
- * Fixing that in `dsh-eng-core` would change the recorded fingerprint of seven
- * other plugins (quality/coverage/deploy/evidence/supply-chain/impact gates and
- * the release ledger), which is not an additive change. The suite's rule is
- * "narrow fixes stay narrow", so the knowledge base keeps its own fingerprint —
- * and exports it (see `index-store.ts`) so sibling surfaces such as
- * `scripts/kb.mjs` compare against the SAME function instead of raw
- * `gitFingerprint`, which is how the false "stale" reaches a human.
+ * Why the manifest must carry the exclusions: `dsh-eng-core` cannot import this
+ * package (that would be a dependency cycle), and a reader comparing with its
+ * own idea of what to exclude would either produce a permanent false "stale"
+ * (excluding too little) or hide real changes (excluding too much). The artifact
+ * declaring its own rule is the only shape both sides can honour.
  *
  * @module dsh-knowledge-base/fingerprint
  */
@@ -39,7 +26,27 @@
 import { execFileSync } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
-import { gitFingerprint, sha256, type GitFingerprint } from 'dsh-eng-core'
+import { FINGERPRINT_ALGORITHM, fingerprintWithExcludes, type GitFingerprint } from 'dsh-eng-core'
+
+/**
+ * A fingerprint as the knowledge-base manifest records it: the six compared
+ * fields plus the metadata that makes the comparison reproducible.
+ *
+ * `algorithm`/`excludes` are OPTIONAL on read on purpose: manifests written
+ * before they existed must still load here (this package knows its own index
+ * directory, so its own freshness comparison keeps working), while the
+ * cross-package freshness view — which does not — reports them as unknown
+ * instead of guessing.
+ */
+export interface KbFingerprint extends GitFingerprint {
+    /** `git-status-v1`; absent in manifests written by older versions. */
+    algorithm?: string
+    /** Repository-root-relative POSIX paths excluded when computing the fields. */
+    excludes?: string[]
+}
+
+/** The algorithm token this package now writes into every manifest. */
+export const KB_FINGERPRINT_ALGORITHM = FINGERPRINT_ALGORITHM
 
 /** One git call; never throws (a missing binary is a verdict, not a crash). */
 function git(cwd: string, args: readonly string[]): { ok: boolean; out: string } {
@@ -67,14 +74,41 @@ function realpathOf(target: string): string {
 }
 
 /**
- * The index directory as a repository-root-relative path, or `undefined` when it
- * cannot be named that way (the workspace is not inside a repository, or the
- * configured directory lies outside it).
+ * Canonicalise a path even when its leaf does not exist yet.
  *
- * Both the literal and the realpath'd candidate are tried, mirroring the
- * normalisation `gitFingerprint` applies to its own `excludePaths`: git reports
- * realpath'd directories while a caller may hold a symlinked one (`/var` vs
- * `/private/var` on macOS).
+ * `fs.realpathSync` fails on a missing leaf, which is exactly the first build:
+ * git reports realpath'd directories (`/private/var/…` on macOS) while the
+ * configured index directory is still `/var/…/.dsh/kb`. Failing to canonicalise
+ * it would make `indexSpecPath` return `undefined` on the first build and a real
+ * path on the second — the manifest would then declare a DIFFERENT exclusion set
+ * on every other build, which is the permanent-false-stale trap this whole
+ * mechanism exists to remove. The deepest existing ancestor is canonicalised and
+ * the missing tail is appended verbatim.
+ */
+function canonicalPath(target: string): string {
+    let current = path.resolve(target)
+    const tail: string[] = []
+    for (;;) {
+        try {
+            const real = fs.realpathSync(current)
+            return tail.length === 0 ? real : path.join(real, ...[...tail].reverse())
+        } catch {
+            const parent = path.dirname(current)
+            if (parent === current) return path.resolve(target)
+            tail.push(path.basename(current))
+            current = parent
+        }
+    }
+}
+
+/**
+ * The index directory as a repository-root-relative POSIX path, or `undefined`
+ * when it cannot be named that way (the workspace is not inside a repository, or
+ * the configured directory lies outside it).
+ *
+ * Both the literal and the canonical candidate are tried, mirroring git's own
+ * normalisation: git reports realpath'd directories while a caller may hold a
+ * symlinked one.
  * @param cwd - workspace directory.
  * @param indexDir - absolute (or cwd-relative) index directory.
  * @returns the root-relative path, or `undefined`.
@@ -84,8 +118,12 @@ export function indexSpecPath(cwd: string, indexDir: string): string | undefined
     if (!toplevel.ok) return undefined
     const root = realpathOf(toplevel.out.trim())
     if (root === '') return undefined
-    for (const candidate of [indexDir, realpathOf(indexDir)]) {
-        const relative = path.relative(root, path.resolve(cwd, candidate)).replace(/\/+$/, '')
+    for (const candidate of [indexDir, canonicalPath(indexDir)]) {
+        const relative = path
+            .relative(root, path.resolve(cwd, candidate))
+            .split(path.sep)
+            .join('/')
+            .replace(/\/+$/, '')
         // '' means the index directory IS the repository: excluding it would
         // exclude everything, which is not an exclusion but a blindfold.
         if (relative === '') return undefined
@@ -98,32 +136,19 @@ export function indexSpecPath(cwd: string, indexDir: string): string | undefined
 /**
  * The workspace fingerprint used by `kb_index`, `kb_search` and `kb_status`.
  *
- * `head`/`branch`/`isRepo` come from `gitFingerprint` unchanged (a stored
- * manifest must stay comparable across builds and with the other plugins'
- * fingerprints); `changedFiles`, `dirty` and `diffDigest` are recomputed with
- * the index directory excluded.
+ * Thin wrapper over the core mechanism: the effective index directory becomes
+ * the ONE declared exclusion, and the result records that fact so a reader can
+ * recompute it without this package's code.
  * @param cwd - workspace directory.
  * @param indexDir - the effective index directory (`indexDirOf(cwd, config)`).
- * @returns the fingerprint; `isRepo: false` when git cannot answer.
+ * @returns the fingerprint plus its `algorithm`/`excludes` declaration.
  */
-export function indexFingerprint(cwd: string, indexDir: string): GitFingerprint {
-    // The exclusion, in case the repository has other callers of it: a file
-    // inside `.dsh/kb/` is never a workspace change, whatever this module's own
-    // status call below reports.
-    const base = gitFingerprint(cwd, { excludePaths: [indexDir] })
-    if (!base.isRepo) return base
+export function indexFingerprint(cwd: string, indexDir: string): KbFingerprint {
     const relative = indexSpecPath(cwd, indexDir)
-    if (relative === undefined) return { ...base, dirty: base.changedFiles > 0 }
-    const pathspec = `:(top,exclude,literal)${relative}`
-    // `-uall` is load-bearing. Without it git collapses an untracked directory
-    // into ONE `?? .dsh/` line, and a repository whose trail is untracked would
-    // put the artifact back into the count through its parent directory.
-    const status = git(cwd, ['status', '--porcelain', '-uall', '--', pathspec])
-    const diff = git(cwd, ['diff', 'HEAD', '--', pathspec])
-    const entries = status.ok ? status.out.split('\n').filter((line) => line.trim() !== '') : undefined
+    const excludes = relative === undefined ? [] : [relative]
     return {
-        ...base,
-        ...(entries === undefined ? { dirty: base.changedFiles > 0 } : { dirty: entries.length > 0, changedFiles: entries.length }),
-        ...(diff.ok ? { diffDigest: sha256(diff.out) } : {}),
+        ...fingerprintWithExcludes(cwd, { paths: excludes }),
+        algorithm: FINGERPRINT_ALGORITHM,
+        excludes,
     }
 }

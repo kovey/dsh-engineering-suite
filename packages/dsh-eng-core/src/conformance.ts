@@ -30,6 +30,13 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { formatTime } from './digest.js'
+import {
+    FINGERPRINT_ALGORITHM,
+    changedPathsWithExcludes,
+    fingerprintWithExcludes,
+    sameFingerprint,
+    usableFingerprintExcludes,
+} from './fingerprint.js'
 import { gitFingerprint } from './git.js'
 import { readJson, readText } from './io.js'
 import { mandateState, policyDifferences, policyFingerprint, readPolicySnapshot } from './mandate.js'
@@ -895,13 +902,81 @@ function standardsFreshness(layout: Layout): { facts: string[]; reasons: string[
     return { facts, reasons, blind }
 }
 
-/** 知识库索引的新鲜度：读取索引构建时自己记录的局限，不重复实现它的指纹规则。 */
+/** The manifest fields this module reads (never trusted as a whole). */
+interface KnowledgeManifestFacts {
+    builtAt?: unknown
+    staleness?: { reason?: unknown }
+    fingerprint?: unknown
+}
+
+/**
+ * The fingerprint a manifest recorded, or `undefined` when the shape is not one
+ * this module can compare.
+ *
+ * The manifest comes back through `JSON.parse`, so an unreadable or foreign
+ * shape must not be coerced into "looks the same" — that is exactly how a
+ * freshness check reports `fresh` with nothing behind it.
+ */
+function recordedKnowledgeFingerprint(value: unknown): GitFingerprint | undefined {
+    if (typeof value !== 'object' || value === null) return undefined
+    const record = value as Record<string, unknown>
+    if (
+        typeof record['isRepo'] !== 'boolean' ||
+        typeof record['dirty'] !== 'boolean' ||
+        typeof record['changedFiles'] !== 'number' ||
+        !Number.isFinite(record['changedFiles']) ||
+        typeof record['diffDigest'] !== 'string'
+    ) {
+        return undefined
+    }
+    if (record['head'] !== undefined && typeof record['head'] !== 'string') return undefined
+    if (record['branch'] !== undefined && typeof record['branch'] !== 'string') return undefined
+    return {
+        isRepo: record['isRepo'],
+        dirty: record['dirty'],
+        changedFiles: record['changedFiles'],
+        diffDigest: record['diffDigest'],
+        ...(typeof record['head'] === 'string' ? { head: record['head'] } : {}),
+        ...(typeof record['branch'] === 'string' ? { branch: record['branch'] } : {}),
+    }
+}
+
+/** The declared exclusions as the core fingerprinter will consume them. */
+function declaredKnowledgeExcludes(value: unknown): { paths: string[] } | { problem: string } {
+    if (!Array.isArray(value) || !value.every((entry) => typeof entry === 'string')) {
+        return { problem: '知识库索引声明的排除集不是字符串数组：按不可复算处理' }
+    }
+    for (const entry of value as string[]) {
+        // One entry at a time: `usableFingerprintExcludes` dedupes, so a repeated
+        // path is not a problem, while an absolute/escaping/empty one is.
+        if (usableFingerprintExcludes([entry]).length !== 1) {
+            return { problem: `知识库索引声明的排除集含无法复算的路径 ${JSON.stringify(entry)}：按不可复算处理` }
+        }
+    }
+    return { paths: usableFingerprintExcludes(value as string[]) }
+}
+
+/** One readable list of the exclusions a comparison used (empty is named). */
+function formatExcludes(paths: readonly string[]): string {
+    return paths.length === 0 ? '（未排除任何路径）' : paths.join('、')
+}
+
+/**
+ * 知识库索引的新鲜度：**从数据复算**，不重复实现写方的规则。
+ *
+ * The manifest declares how it may be compared (`fingerprint.algorithm` +
+ * `fingerprint.excludes`); this function honours that declaration through the
+ * same core function the writer used. A manifest that does not declare the rule
+ * (written by an older version) is `unknown` with a blind line — never `fresh`,
+ * because "cannot recompute" is not "up to date". An artifact that declared a
+ * rule this module does not know is also unknown, for the same reason.
+ */
 function knowledgeIndexFreshness(layout: Layout): { facts: string[]; reasons: string[]; blind: string[] } {
     const manifestFile = path.join(layout.rootDir, 'kb', 'manifest.json')
     if (!exists(manifestFile)) {
         return { facts: [`没有知识库索引（${rel(layout, manifestFile)} 不存在）：索引这项不适用`], reasons: [], blind: [] }
     }
-    const manifest = readJson<{ builtAt?: unknown; staleness?: { reason?: unknown } }>(manifestFile)
+    const manifest = readJson<KnowledgeManifestFacts>(manifestFile)
     if (manifest === undefined) {
         return {
             facts: [],
@@ -913,14 +988,64 @@ function knowledgeIndexFreshness(layout: Layout): { facts: string[]; reasons: st
         `知识库索引构建于 ${typeof manifest.builtAt === 'string' ? manifest.builtAt : '(未记录)'}（${rel(layout, manifestFile)}）`,
     ]
     const selfDeclared =
-        manifest.staleness !== undefined && typeof manifest.staleness.reason === 'string' ? manifest.staleness.reason : undefined
+        typeof manifest.staleness === 'object' &&
+        manifest.staleness !== null &&
+        typeof manifest.staleness.reason === 'string'
+            ? manifest.staleness.reason
+            : undefined
     if (selfDeclared !== undefined) {
         return { facts, reasons: [`知识库索引自述不完整：${selfDeclared}`], blind: [] }
     }
+    const recorded = recordedKnowledgeFingerprint(manifest.fingerprint)
+    if (recorded === undefined) {
+        return { facts, reasons: [], blind: [`知识库索引的 manifest 没有可比较的 git 指纹：索引新旧无从核对`] }
+    }
+    const fingerprintRecord =
+        typeof manifest.fingerprint === 'object' && manifest.fingerprint !== null
+            ? (manifest.fingerprint as Record<string, unknown>)
+            : undefined
+    const algorithm = fingerprintRecord?.['algorithm']
+    const excludesValue = fingerprintRecord?.['excludes']
+    if (algorithm === undefined || excludesValue === undefined) {
+        // An index written before the declaration existed. `dsh-knowledge-base`
+        // itself can still compare it (it knows its own index directory); this
+        // view cannot, and saying `fresh` here would be a guess.
+        return { facts, reasons: [], blind: ['旧索引未声明算法与排除集，无法复算'] }
+    }
+    if (typeof algorithm !== 'string') {
+        return { facts, reasons: [], blind: ['知识库索引声明的指纹算法不可读：按不可复算处理'] }
+    }
+    if (algorithm !== FINGERPRINT_ALGORITHM) {
+        return {
+            facts,
+            reasons: [],
+            blind: [`知识库索引声明的指纹算法 ${shortText(algorithm)} 不是 ${FINGERPRINT_ALGORITHM}：按不可复算处理`],
+        }
+    }
+    const declared = declaredKnowledgeExcludes(excludesValue)
+    if ('problem' in declared) return { facts, reasons: [], blind: [declared.problem] }
+    if (!recorded.isRepo) {
+        return { facts, reasons: [], blind: ['知识库索引构建时工作区不是 git 仓库：索引新旧无从复算'] }
+    }
+    const current = fingerprintWithExcludes(layout.cwd, { paths: declared.paths })
+    if (!current.isRepo) {
+        return { facts, reasons: [], blind: ['当前工作区不是 git 仓库：知识库索引新旧无从复算'] }
+    }
+    const scope = `（按 manifest 声明的 ${algorithm}、排除集 ${formatExcludes(declared.paths)} 复算）`
+    if (sameFingerprint(recorded, current)) {
+        facts.push(`知识库索引的指纹与当前工作区一致${scope}`)
+        return { facts, reasons: [], blind: [] }
+    }
+    const differences = fingerprintDifferences(recorded, current)
+    const changed = changedPathsWithExcludes(layout.cwd, { paths: declared.paths })
+    const named =
+        changed.length === 0
+            ? ''
+            : `；改动的文件：${changed.slice(0, 8).join('、')}${changed.length > 8 ? ` 等 ${changed.length} 个` : ''}`
     return {
         facts,
-        reasons: [],
-        blind: ['知识库索引是否落后于当前工作区要按 dsh-knowledge-base 的指纹规则比较：eng-core 不重复实现（避免误报）'],
+        reasons: [`知识库索引落后于工作区${scope}：${differences.join('，') || '指纹字段有差异'}${named}`],
+        blind: [],
     }
 }
 

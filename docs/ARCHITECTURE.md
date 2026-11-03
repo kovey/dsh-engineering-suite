@@ -763,7 +763,7 @@ IM 侧的职责（不在本仓库）：卡片按钮不可伪造且一次性、�
 | 授权 | mandate 的强度/范围/策略版本是否仍成立、是否撤回、`legacy`/缺失 |
 | 证据 | 最新回执 → 它引用的门禁：来源是否必需、`scope.full`、结果非空且 PASS、证据 id 是否覆盖必填种类 |
 | 门禁 | 每个来源的最新记录（BLOCK > WARN）；`observations`（影子）**在明细里可见但不计入裁决** |
-| 新鲜度 | 策略版本、门禁指纹 vs 当前工作区指纹（排除 `.dsh`）、基线、知识库 manifest 自述的陈旧 |
+| 新鲜度 | 策略版本、门禁指纹 vs 当前工作区指纹（排除 `.dsh`）、基线，以及**知识库索引**：按 manifest 声明的 `algorithm` + `excludes` 复算（见 §5.26） |
 | 一致性 | `evidence.jsonl` 可解析、回执/证据引用的工件存在、`mandate.at` 与 `spec.approvedAt` 一致、部署门禁 ↔ `deployments.jsonl` |
 
 **头行状态 = 最差维度**，且 **`unknown` 与 `partial` 同档**（`unknown` + `conformant` ⇒ `partial`，只有五维全未知才是 `unknown`）——
@@ -771,6 +771,28 @@ IM 侧的职责（不在本仓库）：卡片按钮不可伪造且一次性、�
 **任何门禁都不读**，`mission_complete` 仍然直接读门禁记录与回执；有一个测试用 grep 保证没有任何门禁包引用它。
 **它是只读、派生、可复现的**：不写任何文件，同一棵台账两次运行输出逐字节相同；**不做加权分数**（分数会掩盖"哪个维度坏了"，
 也会诱导优化分数本身），比较用同一组维度的分布，趋势用已有的 `metrics`。
+
+### 5.26 让产物声明"怎么比较它"：知识库索引新鲜度的可复现化
+
+一致性总览最初把"知识库索引是否陈旧"列为**盲区**，原因有两层：计算函数在 `dsh-knowledge-base`（`eng-core` 不能依赖它，会成环），
+而更本质的一层是——索引指纹是在**排除了 `.dsh/kb`** 之后算的，这个"排除集"只存在于写者的代码里。读者若用自己的排除集
+（例如排除整个 `.dsh`）去比，**永远不会相等**，结果是**永久假 stale**，比"不知道"更糟。
+
+修法不是加依赖，而是**让产物声明它自己是怎么被比较的**：
+
+- `dsh-eng-core/src/fingerprint.ts`（新增、纯加法，`gitFingerprint` 一字未改）：
+  `fingerprintWithExcludes(cwd, { paths })` 用 git 的 pathspec 表达排除（`:(top,exclude,literal)<p>`，且 `-uall` 载重——
+  否则未跟踪目录被折叠成一行 `?? .dsh/`，产物又通过父目录溜回来），`sameFingerprint(a, b)` 只比那六个字段；
+  另有 `changedPathsWithExcludes()` 用来**点名**到底是哪些文件变了。
+- 知识库的 manifest 现在写清楚：`fingerprint: { …六个字段, algorithm: 'git-status-v1', excludes: ['.dsh/kb'] }`。
+  `indexFingerprint` 与 `stalenessOf` 仍从 `dist/index-store.js` 导出（`scripts/kb.mjs` 与包内测试都从那里取），
+  但它们**只是 core 实现的薄转发**——全仓只有**一份**比较逻辑。
+- 一致性总览据此复算：声明齐全 → `fresh` 或 `stale`（**并列出改动的文件**）；缺 `algorithm`/`excludes`（旧版本写的索引）
+  → **`unknown` + 盲区行"旧索引未声明算法与排除集，无法复算"**，**绝不输出 `fresh`**；算法未知、排除集不可用、非 git 仓库同样 `unknown`。
+
+有一条测试专门钉住这件事：**把 manifest 的 `excludes` 手改成 `[]`，结论必须随之改变**——它证明读者真的按产物声明在算，
+而不是偷偷用自己的排除集（这正是在这之前会产生的"永久假 stale"）。另有测试断言 `kb_status`、`scripts/kb.mjs`、
+一致性总览三处对同一状态给出一致结论，防止三个界面各说各话。
 
 ## 6. 为什么这样切分
 

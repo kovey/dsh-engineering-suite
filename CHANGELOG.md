@@ -1,5 +1,26 @@
 ## [未发布]
 
+### 修复 · 知识库索引新鲜度可复现（一致性总览的最后一个盲区）
+
+一致性总览此前只能读索引 manifest **自述**的陈旧标记，因为真正的计算在 `dsh-knowledge-base`（`eng-core` 不能依赖它，会成环），
+而索引指纹是在**排除 `.dsh/kb`** 之后算的——读者用自己的排除集去比会**永久假 stale**，比"不知道"更糟。
+
+- 新增 `dsh-eng-core/src/fingerprint.ts`：`fingerprintWithExcludes(cwd, {paths})`（git pathspec + `-uall`）、
+  `sameFingerprint(a,b)`（只比六个字段）、`changedPathsWithExcludes()`（**点名**哪些文件变了）。`gitFingerprint` 一字未改。
+- **产物声明怎么比较它**：`.dsh/kb/manifest.json` 的 `fingerprint` 增加 `algorithm: 'git-status-v1'` 与 `excludes: ['.dsh/kb']`；
+  `indexFingerprint`/`stalenessOf` 仍从 `dist/index-store.js` 导出（`scripts/kb.mjs` 不变），但**只是 core 的薄转发**——全仓一份比较逻辑。
+- **总览据此复算**：声明齐全 → `fresh` / `stale`（并列出改动的文件）；缺声明（旧索引）→ **`unknown` + 盲区行"旧索引未声明算法与排除集，无法复算"**，
+  **绝不 `fresh`**；算法未知 / 排除集不可用 / 非 git 仓库同样 `unknown`。
+- 一条测试专门证明读者**按声明在算**：把 `excludes` 手改成 `[]`，结论必须随之改变（这正是之前会产生"永久假 stale"的地方）；
+  另有测试断言 `kb_status`、`scripts/kb.mjs`、一致性总览三处结论一致。
+
+### 验证
+
+- `bash scripts/verify.sh`：**1082 测试 / 1081 通过 / 0 失败 / 1 如实跳过**（含 OPS SELFTEST GREEN）。
+- 包内计数：eng-core 173→179、knowledge-base 52→59。
+
+## [未发布]
+
 ### 新增 · 影子模式推广到 `standards-gate`（含一条硬规矩），`impact-gate` 明确不适用
 
 - **`dsh-standards-gate`**：规则级 `mode: observe|enforce` 放在仓库自己的 `.dsh/standards.json` 的 `rules` 映射里

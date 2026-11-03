@@ -46,6 +46,7 @@ import {
     nowIso,
     readText,
     resolvePath,
+    sameFingerprint,
     sha256,
     writeTextAtomic,
     type GitFingerprint,
@@ -53,7 +54,7 @@ import {
     type Logger,
 } from 'dsh-eng-core'
 import type { KbKind, KnowledgeBaseConfig } from './config.js'
-import { indexFingerprint, indexSpecPath } from './fingerprint.js'
+import { indexFingerprint, indexSpecPath, type KbFingerprint } from './fingerprint.js'
 import { collectDocuments, type KbDocument, type KbSkipped, type KbSymbol, type SourceReport } from './sources.js'
 import { BM25_B, BM25_K1, tokenCounts, tokenize, type TokenizerOptions } from './search.js'
 
@@ -62,6 +63,7 @@ import { BM25_B, BM25_K1, tokenCounts, tokenize, type TokenizerOptions } from '.
 // computed differently from the one stored in the manifest is exactly how a
 // false "过期" appears (see fingerprint.ts).
 export { indexFingerprint, indexSpecPath }
+export type { KbFingerprint }
 
 /** Index format version; a mismatch is reported, never silently tolerated. */
 export const KB_INDEX_VERSION = 1
@@ -110,7 +112,13 @@ export interface KbManifestSource {
 export interface KbManifest {
     version: number
     builtAt: string
-    fingerprint: GitFingerprint
+    /**
+     * The workspace state the index was built at, plus the rule that produced it
+     * (`algorithm`/`excludes`, optional only so manifests written before this
+     * declaration still load). A reader that does not have this package's code
+     * recomputes with exactly these exclusions instead of guessing.
+     */
+    fingerprint: KbFingerprint
     sources: KbManifestSource[]
     totals: {
         documents: number
@@ -213,7 +221,8 @@ export interface BuildResult {
     artifactsWritten: boolean
     /** Set when `changeKind` is `'coverage'`: the recorded and requested source ids. */
     coverageChange?: CoverageChange
-    fingerprint: GitFingerprint
+    /** The recorded fingerprint, including its algorithm/excludes declaration. */
+    fingerprint: KbFingerprint
     /** Structural problems (a duplicate document id, a version bump…). */
     problems: string[]
     files: { manifest: string; chunks: string; postings: string }
@@ -434,22 +443,15 @@ function recordedFingerprint(manifestText: string | undefined): GitFingerprint |
  * by exactly the fields `stalenessOf` compares (isRepo, HEAD, branch, dirty,
  * changedFiles, the diff digest).
  *
- * Comparing the same field set is the point: the build refreshes the recorded
- * fingerprint precisely when the freshness comparison would otherwise call the
- * index 陈旧, so the two can no longer disagree. A `JSON.stringify` comparison
- * would be wrong here — the recorded value has been through `JSON.parse`, and
- * the same facts in a different key order are not a change.
+ * The comparison itself lives in `dsh-eng-core`'s `sameFingerprint` and is used
+ * here, by `stalenessOf`, and by the cross-package freshness view — one field
+ * set, one answer. A `JSON.stringify` comparison would be wrong: the recorded
+ * value has been through `JSON.parse`, and the same facts in a different key
+ * order are not a change. The artifact's `algorithm`/`excludes` metadata is deliberately not
+ * compared either (see `sameFingerprint`).
  */
-function sameFingerprint(recorded: GitFingerprint | undefined, current: GitFingerprint): boolean {
-    if (recorded === undefined) return false
-    return (
-        recorded.isRepo === current.isRepo &&
-        recorded.head === current.head &&
-        recorded.branch === current.branch &&
-        recorded.dirty === current.dirty &&
-        recorded.changedFiles === current.changedFiles &&
-        recorded.diffDigest === current.diffDigest
-    )
+function fingerprintMoved(recorded: GitFingerprint | undefined, current: GitFingerprint): boolean {
+    return recorded === undefined || !sameFingerprint(recorded, current)
 }
 
 /**
@@ -721,7 +723,7 @@ export function buildIndex(input: BuildInput): BuildResult {
     // reported 陈旧 — and the warning's own advice (`kb_index`) never cleared
     // it. So a moved fingerprint is a change of its own kind, and only the
     // manifest is rewritten for it.
-    const fingerprintMoved = !created && !sameFingerprint(recordedFingerprint(previousManifest), fingerprint)
+    const fingerprintMovedNow = !created && fingerprintMoved(recordedFingerprint(previousManifest), fingerprint)
     // The third judgement of the same family: what the caller ASKED this build to
     // cover versus what the manifest records. Bytes alone cannot see it — a
     // partial build whose excluded sources happen to contribute no document
@@ -740,7 +742,7 @@ export function buildIndex(input: BuildInput): BuildResult {
     else if (contentChanged) changeKind = 'content'
     else if (postingsChanged) changeKind = 'postings'
     else if (input.force === true) changeKind = 'forced'
-    else if (fingerprintMoved) changeKind = 'fingerprint'
+    else if (fingerprintMovedNow) changeKind = 'fingerprint'
     const changed = changeKind !== 'unchanged'
     // Which files this build rewrites. The manifest always is (that is what makes
     // the recorded coverage and fingerprint true again); the two content artifacts
@@ -838,6 +840,10 @@ export function stalenessOf(indexed: GitFingerprint, current: GitFingerprint): S
     if (!indexed.isRepo || !current.isRepo) {
         return { stale: false, unknown: true, reason: '工作区不是 git 仓库，无法用指纹判断索引新旧' }
     }
+    // The equality decision itself is `dsh-eng-core`'s `sameFingerprint`: the
+    // cross-package freshness view compares with the same field set, so the two
+    // surfaces cannot answer differently about the same two fingerprints.
+    if (sameFingerprint(indexed, current)) return { stale: false }
     const head = (value: string | undefined): string => (value === undefined ? 'no-commit' : value.slice(0, 8))
     if (indexed.head !== current.head) return { stale: true, reason: `HEAD 从 ${head(indexed.head)} 变成 ${head(current.head)}` }
     if (indexed.branch !== current.branch) return { stale: true, reason: `分支从 ${indexed.branch ?? 'detached'} 变成 ${current.branch ?? 'detached'}` }
@@ -853,7 +859,9 @@ export function stalenessOf(indexed: GitFingerprint, current: GitFingerprint): S
             reason: `工作区改动数从 ${indexed.changedFiles} 变成 ${current.changedFiles}（可能是新增/删除的未跟踪文件）`,
         }
     }
-    return { stale: false }
+    // Unreachable through `sameFingerprint`: every compared field is named above.
+    // Kept as a truthful degenerate verdict rather than pretending "fresh".
+    return { stale: true, reason: '工作区指纹已变化（差异不在已命名的字段里）' }
 }
 
 /** One-line reminder of the id bonus, reused by the status report. */
