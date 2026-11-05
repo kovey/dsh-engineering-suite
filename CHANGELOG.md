@@ -1,3 +1,40 @@
+## [未发布]
+
+### 新增 · 测试命令识别覆盖主流语言（表驱动），脚手架同步
+
+`doctor` 的"质量门禁里有没有测试类命令"此前是一段手写正则，**PHP 整块被漏掉**（`phpunit`/`vendor/bin/phpunit`/`pest`/
+`php artisan test`/`composer test` 全不识别），于是健康的 PHP 仓库会被提示"没有一条能认出是测试"。
+
+- 改成**冻结的表**（`dsh-eng-core/src/test-commands.ts`，52 行 / 127 个示例）：JS/TS、Python、Go、Rust、JVM、.NET、
+  C/C++、**PHP**、Ruby、Elixir/Erlang、Swift/Apple、Zig/Nim/Lua/Perl/Shell、Haskell、以及 `make test|check|verify` 与
+  `bash|sh *test*.sh` 这类包装器。
+- 匹配规则写在模块注释里：按**命令词边界**锚定（`^(?:pattern)(?=\s|$)`）、大小写不敏感；跳过 `NAME=value`、`env/sudo/time/command/exec/nohup`、
+  `npx/pnpx/bunx`、`pnpm|yarn exec|dlx`、`bun x`、`bundle exec`、`poetry|pipenv run` 等前缀；路径归约为 basename
+  （`./`、`vendor/bin/`、`bin/`、`node_modules/.bin`、绝对路径）；工具名之后的参数忽略；`echo pytest`、`grep phpunit`、
+  `cat jest.config.js` 这类**含词但不执行**的命令不识别；首行命中即止。
+- `doctor` 的 detail 现在**点名生态与工具**（`识别为 PHP / phpunit、Rust / cargo…`），比"1 条测试命令"有用得多；
+  严重度语义不变：命令列表为空才是 `required`，"有命令但认不出"仍是建议级。
+- **脚手架同步**：`scripts/project-config.sh` 的 `detect()` 按清单文件给出建议命令，覆盖 composer.json→`vendor/bin/phpunit`、
+  Gemfile→`bundle exec rspec`、mix.exs→`mix test`、Package.swift→`swift test`、gradle→`./gradlew test`、pom.xml→`mvn test`、
+  Cargo.toml→`cargo test`、go.mod→`go test ./...`、pyproject/tox→`pytest`、package.json→`npm test`、CMakeLists→`ctest`、
+  `*.csproj/*.sln`→`dotnet test`、Makefile→`make test`；`--test/--lint` 仍优先。新增 **`--print`**：只打印
+  `kind=/test=/lint=`、**不写任何文件**（检测不出时返回 3）。
+- **防漂移**：新测试用 16 个清单夹具跑 `--print`，断言脚手架给出的命令**恰好被识别器认出、且生态/工具一致**，
+  同时断言没有写 `.dsh/`、重复运行结果相同。两个列表从此不能各自漂移。
+
+### 已知未覆盖（明确报告）
+
+- `scan.ts` 的 `suggestCommands`（**第三份**清单→命令列表，用于 `spec_bootstrap` 的建议）尚未同步这批清单文件——
+  它有自己的测试钉着，本轮未动；
+- 纯文本匹配无法区分 `phpunit --version` 与真正跑测试（参数被忽略）；
+- `sudo -u deploy phpunit`、带引号的 `xcodebuild` destination、`make -C dir test` **刻意不匹配**（保守：宁可漏认，不可误认）。
+
+### 验证
+
+- `bash scripts/verify.sh`：**1090 测试 / 1089 通过 / 0 失败 / 1 如实跳过**（含 OPS SELFTEST GREEN）。
+- 手工抽检：`vendor/bin/phpunit` → `PHP / phpunit`、`php artisan test` → `PHP / artisan`、`pest` → `PHP / pest`、
+  `composer test` → `PHP / composer`；而 `php -l`、`echo pytest`、`grep phpunit` **不识别** ✓。
+
 ## [0.6.0] — 2026-11-03
 
 ### 修复 · 知识库索引新鲜度可复现（一致性总览的最后一个盲区）

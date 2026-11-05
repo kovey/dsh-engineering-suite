@@ -197,6 +197,27 @@ test('a spec without the budget section contributes no rows (regression)', () =>
     assert.match(check?.detail ?? '', /未声明非功能预算/)
 })
 
+test('the test-command detail names ecosystem and tool for three ecosystems (feedback)', () => {
+    // The operator complaint behind the table-driven recogniser: "有 N 条命令但
+    // 没有一条能认出是测试" on a healthy PHP repository. The detail must now say
+    // WHAT was recognised, not just that something was.
+    const cwd = repo({ ignoreTrail: true })
+    fs.writeFileSync(path.join(cwd, '.dsh', 'quality-gate.json'), JSON.stringify({
+        commands: [
+            { id: 'php', name: '单元测试', command: 'vendor/bin/phpunit -q', required: true, phase: 'gate' },
+            { id: 'rust', name: '单元测试', command: 'cargo test --all-features', required: true, phase: 'gate' },
+            { id: 'js', name: '单元测试', command: 'vitest run', required: false, phase: 'gate' },
+        ],
+    }))
+    const check = checkWorkspace({ cwd, now: 0 }).checks.find((item) => item.id === 'test.command')
+    assert.equal(check?.state, 'ok')
+    assert.equal(check?.severity, 'recommended')
+    assert.match(check?.detail ?? '', /^3 条测试命令：识别为 /)
+    for (const label of ['PHP / phpunit', 'Rust / cargo', 'JavaScript/TypeScript / vitest']) {
+        assert.ok((check?.detail ?? '').includes(label), `the detail must name "${label}": ${check?.detail}`)
+    }
+})
+
 test('a wrapper test command counts, and "commands but no recognisable test" is advice (regression)', () => {
     const cwd = repo({ ignoreTrail: true })
     // `make test` is a test command: the first version of this check only knew
@@ -210,6 +231,7 @@ test('a wrapper test command counts, and "commands but no recognisable test" is 
     const recognised = checkWorkspace({ cwd, now: 0 }).checks.find((item) => item.id === 'test.command')
     assert.equal(recognised?.state, 'ok')
     assert.match(recognised?.detail ?? '', /1 条测试命令/)
+    assert.match(recognised?.detail ?? '', /识别为 通用包装器 \/ make/, 'the detail names the ecosystem and the tool')
 
     // An unusual runner is not a missing test: partial + advice, never a blocker.
     fs.writeFileSync(path.join(cwd, '.dsh', 'quality-gate.json'), JSON.stringify({

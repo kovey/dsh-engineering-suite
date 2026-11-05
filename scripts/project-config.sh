@@ -21,6 +21,8 @@
 #   --deploy on|skip       → 写 .dsh/deploy-gate.json（环境清单骨架，默认空 = 拒绝部署）
 #   --no-gitignore        不自动补 .dsh 运行时忽略规则（见下）
 #   --json       只打印将写入的内容
+#   --print      只打印检测结果（kind=/test=/lint= 三行，不写任何文件），
+#                供脚本和测试断言；检测不到测试命令时仍以 3 退出
 #
 # 写入时会顺带保证 `.gitignore` 忽略**运行时台账**（.dsh/missions/、audit/、state/、
 # specs/ 以及已存在的根级 *.jsonl）：不忽略的话，每次门禁运行都会改动工作区，
@@ -32,6 +34,7 @@ WS="$PWD"
 WRITE=0
 FORCE=0
 JSON_ONLY=0
+PRINT_ONLY=0
 SPEC="skip"
 STANDARDS="skip"
 INTERACTION="skip"
@@ -46,6 +49,7 @@ while [ $# -gt 0 ]; do
     --write) WRITE=1; shift ;;
     --force) FORCE=1; shift ;;
     --json) JSON_ONLY=1; shift ;;
+    --print) PRINT_ONLY=1; shift ;;
     --spec) SPEC="${2:-skip}"; shift 2 ;;
     --standards) STANDARDS="${2:-skip}"; shift 2 ;;
     --interaction) INTERACTION="${2:-skip}"; shift 2 ;;
@@ -53,7 +57,7 @@ while [ $# -gt 0 ]; do
     --no-gitignore) GITIGNORE=0; shift ;;
     --test) TEST_CMD="${2:-}"; shift 2 ;;
     --lint) LINT_CMD="${2:-}"; shift 2 ;;
-    -h|--help) sed -n '3,29p' "$0"; exit 0 ;;
+    -h|--help) sed -n '3,31p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -62,16 +66,59 @@ done
 WS="$(cd "$WS" && pwd)"
 
 # --- detect the project type ------------------------------------------------
+# One precedence list, one place: `DETECTED_TEST` and `DETECTED_KIND` are set
+# together so the `project :` line can never disagree with the command written.
+# Precedence = "the manifest that names its own runner wins"; package manifests
+# come before the generic build files, and the Makefile is the LAST resort (it
+# is a convenience wrapper, not a toolchain). Keep this list in step with
+# `recognizeTestCommand` (packages/dsh-eng-core/src/test-commands.ts): the
+# cross-side test in packages/dsh-eng-core/test/test-commands.test.ts runs this
+# script per manifest and feeds the output to the recogniser.
+DETECTED_KIND="unknown"
+DETECTED_TEST=""
+
 detect() {
-  if [ -n "$TEST_CMD" ]; then echo "$TEST_CMD"; return; fi
-  if [ -f "$WS/Cargo.toml" ]; then echo "cargo test"; return; fi
-  if [ -f "$WS/go.mod" ]; then echo "go test ./..."; return; fi
-  if [ -f "$WS/pyproject.toml" ] || [ -f "$WS/pytest.ini" ] || [ -d "$WS/tests" ]; then echo "pytest -q"; return; fi
-  if [ -f "$WS/pnpm-lock.yaml" ]; then echo "pnpm test"; return; fi
-  if [ -f "$WS/yarn.lock" ]; then echo "yarn test"; return; fi
-  if [ -f "$WS/package.json" ]; then echo "npm test"; return; fi
-  if [ -f "$WS/Makefile" ] && grep -qE '^test:' "$WS/Makefile"; then echo "make test"; return; fi
-  echo ""
+  if [ -f "$WS/composer.json" ]; then
+    DETECTED_KIND="php"; DETECTED_TEST="vendor/bin/phpunit"
+  elif [ -f "$WS/Gemfile" ]; then
+    DETECTED_KIND="ruby"; DETECTED_TEST="bundle exec rspec"
+  elif [ -f "$WS/mix.exs" ]; then
+    DETECTED_KIND="elixir"; DETECTED_TEST="mix test"
+  elif [ -f "$WS/Package.swift" ]; then
+    DETECTED_KIND="swift"; DETECTED_TEST="swift test"
+  elif [ -f "$WS/build.gradle" ] || [ -f "$WS/build.gradle.kts" ]; then
+    DETECTED_KIND="jvm"; DETECTED_TEST="./gradlew test"
+  elif [ -f "$WS/pom.xml" ]; then
+    DETECTED_KIND="jvm"; DETECTED_TEST="mvn test"
+  elif [ -f "$WS/Cargo.toml" ]; then
+    DETECTED_KIND="rust"; DETECTED_TEST="cargo test"
+  elif [ -f "$WS/go.mod" ]; then
+    DETECTED_KIND="go"; DETECTED_TEST="go test ./..."
+  elif [ -f "$WS/pyproject.toml" ] || [ -f "$WS/pytest.ini" ] || [ -f "$WS/tox.ini" ] || [ -d "$WS/tests" ]; then
+    DETECTED_KIND="python"; DETECTED_TEST="pytest -q"
+  elif [ -f "$WS/pnpm-lock.yaml" ]; then
+    DETECTED_KIND="node"; DETECTED_TEST="pnpm test"
+  elif [ -f "$WS/yarn.lock" ]; then
+    DETECTED_KIND="node"; DETECTED_TEST="yarn test"
+  elif [ -f "$WS/package.json" ]; then
+    DETECTED_KIND="node"; DETECTED_TEST="npm test"
+  elif [ -f "$WS/CMakeLists.txt" ]; then
+    DETECTED_KIND="cpp"; DETECTED_TEST="ctest"
+  else
+    # .NET has no single manifest name; check the project/solution files. An
+    # unmatched glob stays literal, so `[ -f ]` is false and nothing is claimed.
+    for dotnet_project in "$WS"/*.csproj "$WS"/*.sln; do
+      if [ -f "$dotnet_project" ]; then
+        DETECTED_KIND="dotnet"; DETECTED_TEST="dotnet test"; break
+      fi
+    done
+    if [ -z "$DETECTED_TEST" ] && [ -f "$WS/Makefile" ] && grep -qE '^test:' "$WS/Makefile"; then
+      DETECTED_KIND="make"; DETECTED_TEST="make test"
+    fi
+  fi
+  # An explicit --test wins over detection; the kind still reports what the
+  # repository is (same as before this list grew).
+  if [ -n "$TEST_CMD" ]; then DETECTED_TEST="$TEST_CMD"; fi
 }
 
 detect_lint() {
@@ -83,20 +130,23 @@ detect_lint() {
   echo ""
 }
 
-TEST="$(detect)"
+detect
+TEST="$DETECTED_TEST"
+KIND="$DETECTED_KIND"
 LINT="$(detect_lint)"
 
-if [ -z "$TEST" ]; then
-  echo "无法识别项目类型（${WS}）：没有 Cargo.toml / go.mod / pyproject.toml / package.json / Makefile:test。" >&2
-  echo "请显式指定：--test \"<命令>\" [--lint \"<命令>\"]" >&2
-  exit 3
+# Machine-readable detection for scripts (and the cross-side agreement test):
+# three lines, no headers, nothing written.
+if [ "$PRINT_ONLY" = "1" ]; then
+  printf 'kind=%s\ntest=%s\nlint=%s\n' "$KIND" "$TEST" "$LINT"
+  [ -n "$TEST" ] || exit 3
+  exit 0
 fi
 
-KIND="unknown"
-if [ -f "$WS/Cargo.toml" ]; then KIND="rust"
-elif [ -f "$WS/go.mod" ]; then KIND="go"
-elif [ -f "$WS/pyproject.toml" ] || [ -d "$WS/tests" ]; then KIND="python"
-elif [ -f "$WS/package.json" ]; then KIND="node"
+if [ -z "$TEST" ]; then
+  echo "无法识别项目类型（${WS}）：没有 composer.json / Gemfile / mix.exs / Package.swift / build.gradle(.kts) / pom.xml / Cargo.toml / go.mod / pyproject.toml / tox.ini / package.json / CMakeLists.txt / *.csproj / *.sln / Makefile:test。" >&2
+  echo "请显式指定：--test \"<命令>\" [--lint \"<命令>\"]" >&2
+  exit 3
 fi
 
 # --- build the JSON ---------------------------------------------------------

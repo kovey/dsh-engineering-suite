@@ -35,6 +35,7 @@ import { archiveFootprint } from './archive.js'
 import { mandateState, policyDifferences, policyFingerprint, readPolicySnapshot, type PolicyChange } from './mandate.js'
 import { MissionStore } from './mission.js'
 import { projectConfigFile } from './project-config.js'
+import { recognizeTestCommand, testCommandLabel } from './test-commands.js'
 import { resolveLayout, type Layout } from './paths.js'
 import type { MissionRecord } from './types.js'
 import { MAX_DETAIL_FINDINGS, describeFinding, writersCheck } from './writer-check.js'
@@ -671,13 +672,19 @@ export function checkWorkspace(options: DoctorOptions): DoctorReport {
 
     // ---- test -------------------------------------------------------------
     // Recognise "this command runs tests" across the toolchains people actually
-    // use — including the make/gradle/script wrappers that a plain "go test"
-    // pattern misses (a repo whose only command is `make test` was reported as
-    // having NO test command, which is a false alarm on a healthy repository).
-    const testLike = commands.filter((entry) => {
-        const command = typeof entry === 'object' && entry !== null ? String((entry as { command?: unknown }).command ?? '') : ''
-        return /(^|\s)(go\s+test|gotestsum|npm\s+(run\s+)?test|pnpm\s+(run\s+)?test|yarn\s+(run\s+)?test|bun\s+test|pytest|python\s+-m\s+pytest|vitest|jest|mocha|node\s+--test|deno\s+test|cargo\s+test|mvn\s+(test|verify)|gradle(w)?\s+test|\.\/gradlew\s+test|dotnet\s+test|rake\s+test|make\s+(test|check|verify)|bash\s+\S*test\S*\.sh|sh\s+\S*test\S*\.sh)/i.test(command)
-    })
+    // use. The recogniser is table-driven (`test-commands.ts`): the hand-written
+    // regex this check started with knew Go/Node/Python/Cargo and reported a
+    // healthy PHP repository as having no test command — `vendor/bin/phpunit`,
+    // `php artisan test` and `pest` were all invisible. The detail now names the
+    // ecosystem and tool, which is what tells the operator the recognition was
+    // the intended one and not a coincidence.
+    const testLike = commands
+        .map((entry) => {
+            const command = typeof entry === 'object' && entry !== null ? String((entry as { command?: unknown }).command ?? '') : ''
+            return recognizeTestCommand(command)
+        })
+        .filter((recognition) => recognition.matched)
+    const testLabels = [...new Set(testLike.map((recognition) => testCommandLabel(recognition)).filter((label): label is string => label !== undefined))]
     add({
         id: 'test.command',
         area: 'test',
@@ -689,7 +696,7 @@ export function checkWorkspace(options: DoctorOptions): DoctorReport {
         label: '质量门禁里有测试类命令',
         detail:
             testLike.length > 0
-                ? `${testLike.length} 条测试命令`
+                ? `${testLike.length} 条测试命令：识别为 ${testLabels.join('、')}`
                 : commands.length === 0
                   ? '命令列表为空：交付证据不会有任何确定性裁决'
                   : `有 ${commands.length} 条命令但没有一条能认出是测试（可能是包装脚本或特殊 runner）：请人工确认其中至少一条真的跑测试`,
