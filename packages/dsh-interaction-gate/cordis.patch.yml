@@ -24,4 +24,9 @@
         preferredChannels: []
         maxPayloadChars: 4000
         redactPatterns: []
+        # The optional IM channel (see README「可选 IM 通道」). `auto` is the
+        # default: a `chatInteraction` service that appears at ANY time (bundle
+        # order does not decide apply order) is used. `required` waits the
+        # bounded `requiredWaitMs` before refusing; `off` never touches it.
+        im: { channel: auto, requiredWaitMs: 5000 }
         prompt: { enabled: true, order: 600 }

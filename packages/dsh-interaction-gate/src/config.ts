@@ -69,15 +69,34 @@ export const MAX_REDACT_PATTERNS = 64
 /** Every accepted value of `im.channel` (the IM routing mode). */
 export const IM_CHANNEL_MODES: readonly ImChannelMode[] = ['auto', 'off', 'required']
 
+/**
+ * How long `im.channel=required` waits for the `chatInteraction` service to
+ * appear before refusing (default 5 s).
+ *
+ * The window exists because bundle order does not decide apply order: the IM
+ * plugin may be applied AFTER this one and provides its service at the end of
+ * its own `apply`. Refusing at our `apply` would therefore reject a correctly
+ * configured deployment. The bound keeps "required" honest: after it, a
+ * missing service is a fact, not a hope.
+ */
+export const DEFAULT_IM_REQUIRED_WAIT_MS = 5_000
+
+/** `required` may refuse immediately (`0`): useful for deterministic tests/CI. */
+export const MIN_IM_REQUIRED_WAIT_MS = 0
+
+/** Upper bound for the `required` window (a minute: a turn must eventually fail closed). */
+export const MAX_IM_REQUIRED_WAIT_MS = 60_000
+
 /** The host-owned `im` block. */
 export interface ImConfig {
     /**
-     * `auto` (default): route questions through the installed IM plugin when
-     * its `chatInteraction` service exposes `api.apiVersion >= 1`, else keep
-     * today's local-only behaviour and log which path is active.
+     * `auto` (default): use the IM channel whenever the `chatInteraction`
+     * service exposes `api.apiVersion >= 1` — at `apply` or whenever it
+     * appears later — and keep today's local-only behaviour otherwise.
      * `off`: never touch the service at all (byte-for-byte today's behaviour).
-     * `required`: refuse to apply when the service is absent/too old instead of
-     * running silently without it.
+     * `required`: the service must end up present; a bounded wait covers the
+     * "not yet applied" ordering, and after it the plugin refuses loudly
+     * (`problems()` + `interaction_ask`) instead of running silently without it.
      */
     channel: ImChannelMode
     /**
@@ -85,6 +104,11 @@ export interface ImConfig {
      * IM plugin resolves its own active chat across channels.
      */
     channelId?: string
+    /**
+     * How long `im.channel=required` waits for the service (ms). `0` refuses
+     * immediately. Host-owned: a repository cannot widen or shorten it.
+     */
+    requiredWaitMs: number
 }
 
 /** Resolved plugin configuration. */
@@ -273,6 +297,22 @@ export function resolveConfig(input: unknown, warn?: (message: string) => void):
         if (typeof rawChannelId === 'string' && rawChannelId.trim() !== '') imChannelId = rawChannelId.trim()
         else warn?.(`profile 配置: im.channelId 必须是非空字符串（IM 渠道名，如 "feishu"），收到 ${JSON.stringify(rawChannelId)}，已忽略（改由 IM 插件解析 active chat）`)
     }
+    // The bounded window is what makes `required` compatible with the actual
+    // apply order (the IM plugin may provide its service after us). An
+    // unusable value keeps the documented DEFAULT and says so, like every other
+    // value in this suite.
+    const rawWait = imBlock['requiredWaitMs']
+    let imRequiredWaitMs = DEFAULT_IM_REQUIRED_WAIT_MS
+    if (rawWait !== undefined) {
+        const usable = typeof rawWait === 'number' && Number.isFinite(rawWait) && rawWait >= MIN_IM_REQUIRED_WAIT_MS && rawWait <= MAX_IM_REQUIRED_WAIT_MS
+        if (usable) imRequiredWaitMs = Math.floor(rawWait as number)
+        else {
+            warn?.(
+                `profile 配置: im.requiredWaitMs 必须是 ${MIN_IM_REQUIRED_WAIT_MS}…${MAX_IM_REQUIRED_WAIT_MS} 的毫秒数（收到 ${JSON.stringify(rawWait)}），` +
+                    `已按默认值 ${DEFAULT_IM_REQUIRED_WAIT_MS} 处理`,
+            )
+        }
+    }
 
     return {
         enabled: bool(raw['enabled'], true),
@@ -301,7 +341,7 @@ export function resolveConfig(input: unknown, warn?: (message: string) => void):
         preferredChannels: preferred ?? [],
         maxPayloadChars: payload < MIN_MAX_PAYLOAD_CHARS || payload > MAX_MAX_PAYLOAD_CHARS ? DEFAULT_MAX_PAYLOAD_CHARS : payload,
         redactPatterns: (redact ?? []).slice(0, MAX_REDACT_PATTERNS),
-        im: { channel: imMode, ...(imChannelId === undefined ? {} : { channelId: imChannelId }) },
+        im: { channel: imMode, requiredWaitMs: imRequiredWaitMs, ...(imChannelId === undefined ? {} : { channelId: imChannelId }) },
     }
 }
 

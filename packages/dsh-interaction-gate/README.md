@@ -76,13 +76,24 @@ ctx.get('interaction').register(channel)                       // 返回 dispose
 im:
   channel: auto        # auto（默认）| off | required
   channelId: feishu    # 可选：固定用哪个 IM 渠道（feishu/wecom…）；省略 = 由 IM 插件解析 active chat
+  requiredWaitMs: 5000 # required 的有界等待（毫秒；0 = 立即拒绝；上限 60000）
 ```
+
+**为什么是"反应式"而不是启动时探一次**：bundle 顺序**不决定** apply 顺序，而 `dsh-chat-interaction` 在它自己 `apply` 的
+**末尾**才 `provide('chatInteraction')`。如果本插件先装配、只探测一次并把结论固化，这个完全正确的部署会**永远**丢掉 IM 通道
+——这是确定性的，不是偶发。所以：
+
+- 启动探测只是**快路径**（服务已在 → 立即注册，与今天一致）；
+- 权威是 cordis 的反应式依赖：`ctx.inject(['chatInteraction'], cb)`。服务在**任何时刻**出现都会触发 `cb` 注册
+  `chat-interaction` 通道；服务消失（提供者卸载/重启）时回调的 disposer 注销通道、回退本地，并让在途提问失败关闭；
+- 服务被替换成另一个实现时，旧通道先摘掉、新通道再注册；`apiVersion < 1` 或形状不完整的服务按"缺席"处理并记录，
+  之后被合法 v1 替换时会升级注册。
 
 | 模式 | 行为 |
 |---|---|
-| `auto`（默认） | 服务存在且 `api.apiVersion >= 1` → 注册 `chat-interaction`，日志写 `interaction channel: chat-interaction(api v1)`；否则**完全保持今天的行为**，日志写 `interaction channel: local only (chat-interaction absent: <原因>)` |
-| `off` | **一次都不碰**这个服务（不查找、不读属性、不调用任何方法）——与没有集成时逐字一致 |
-| `required` | 服务缺失/过旧/坏掉 → `apply` 直接**拒绝装配**，日志写明装什么、怎么装（`npm i -g dsh-chat-interaction@>=0.3.0` + 宿主装配它 + 它的 `apiVersion` 版本策略），**不会**静默降级成"没有 IM" |
+| `auto`（默认） | 服务一旦可用就用（装配时或之后任意时刻出现都算），否则本地。切换记一行日志（`interaction channel: 等待 chatInteraction 提供…` → `interaction channel: chat-interaction(api v1)`） |
+| `off` | **一次都不碰**这个服务：不查找、不读属性、也**不订阅**（`ctx.inject` 都不调用）——即使服务在之后出现也不注册。与没有集成时逐字一致 |
+| `required` | 服务必须最终可用。**不**在 apply 时因"还没出现"拒绝（那会拒绝正确部署）：用有界等待 `im.requiredWaitMs`（默认 5000ms，0 = 立即拒绝）。窗口内出现 → 注册；窗口结束仍未出现 → `problems()` 写明原因、日志给出安装提示、`interaction_ask` 以 `refused:im-required` 拒绝（**不会**静默走本地）；**迟到出现仍会自愈**：注册并清除拒绝 |
 
 映射与规则：
 
@@ -104,16 +115,22 @@ im:
   `redactPatterns` 由工具在调用通道前应用（与宿主规则取并集），通道层是第二道网。
 - **并发**：同一 IM 渠道同时只允许一次待回答的提问（并发提问的答案无法区分归属）；第二次 `send`
   如实拒绝并说明原因，而不是把两张卡的答案搅在一起。
-- **可见性**：`interaction_status` 多一行 `IM 通道：…`；服务上的 `registry.im()` 给出
-  `{mode, registered, apiVersion, pluginVersion, channelId, reason}`。注册成功时 `chat-interaction`
-  也自然出现在 `describeAll()` / 通道列表里。"没配置 / 没装 / 版本旧 / 服务坏了"都是**写明的事实**，
-  不是缺席。
+- **可见性**：`interaction_status` 的 `IM 通道：` 行用字面 `phase=absent|waiting|registered|refused`
+  （`off` 模式为 `phase=off`）区分：**absent**（从未出现）/ **waiting**（required 窗口内等待）/
+  **registered**（api v1 已注册）/ **refused**（required 窗口超时，提问会拒绝）。服务上的 `registry.im()` 给出
+  `{mode, phase, registered, appeared, requiredWaitMs, apiVersion, pluginVersion, channelId, reason}`；
+  `problems()` 在 required 拒绝或服务不可用时写明原因。注册成功时 `chat-interaction` 也自然出现在
+  `describeAll()` / 通道列表里。"没配置 / 没装 / 版本旧 / 服务坏了 / 已撤销 / 等待中 / 已拒绝"都是
+  **写明的事实**，不是缺席。
 - **通知与进度不走这里**：本通道 `canNotify: false`。渠道连接、去重、卡片样式、等待、`/命令`、入站观察
   都归 IM 插件——本插件不 `onInbound`、不 `registerCommand`、不 `connect`/`disconnect`，也不碰
   `permission.bridgeHarnessApproval`。
 
 诚实的边界：**`auto` 且宿主没装 `dsh-chat-interaction` 时，什么都不变**——这是有意的（升级不该悄悄改变
-"谁能批准什么"）。另外 IM 的 `ask` 有自己的截止上限（见它的 `API.md`：1s…10min，由它实现决定）；若宿主
+"谁能批准什么"）。`required` 的"拒绝"发生在**有界等待之后**，而不是 apply 当时：这是为了兼容"本插件先装配、
+IM 插件后装配"的合法顺序；窗口长度是宿主配置（`im.requiredWaitMs`），仓库不能改。服务在注册后消失时，`auto`
+回退本地、`required` 让后续提问拒绝；在途提问以台账 `refused:*` 行失败关闭（卡片可能已经发出，人仍可能点它，
+但那个迟到的答案不再属于任何等待者）。另外 IM 的 `ask` 有自己的截止上限（见它的 `API.md`：1s…10min，由它实现决定）；若宿主
 `askTimeoutMs` 更大，IM 会先在它自己的上限处返回 `timeout`，本插件照样按"没有答案"拒绝并把原因记下来。
 
 ## 投票给谁：令牌、名单、选项
@@ -148,7 +165,7 @@ profile（宿主上限）与 `<repo>/.dsh/interaction-gate.json`（项目只能�
     preferredChannels: []                # 空 = 全部已注册通道（注册顺序）
     maxPayloadChars: 4000
     redactPatterns: []                   # 额外拒绝规则（命中即拒绝发送）
-    im: { channel: auto, channelId: feishu }   # 可选 IM 通道（见「可选 IM 通道」）；默认 auto
+    im: { channel: auto, channelId: feishu, requiredWaitMs: 5000 }   # 可选 IM 通道（见「可选 IM 通道」）；默认 auto
     prompt: { enabled: true, order: 600 }
 ```
 
@@ -191,7 +208,7 @@ profile（宿主上限）与 `<repo>/.dsh/interaction-gate.json`（项目只能�
 - `decision` 是封闭词汇：套件四词之一 / 声明的选项 / 自由文本答案（限量） / `refused:<原因>` /
   `notified` / `notify-failed` / `progress` / `filtered`。`refused:` 的原因有：
   `no-channel`、`channel-unusable`、`approvers-missing`、`timeout`、`cancelled`、`unauthorized`、
-  `unknown-answer`、`secret`、`send-failed`、`token-lost`、`ledger-unwritable`、`bad-request`、
+  `unknown-answer`、`secret`、`send-failed`、`token-lost`、`ledger-unwritable`、`bad-request`、`im-required`、
   `superseded`（提问已作废，迟到的答案被拒绝）、`withdrawn`（提问已被撤回）。
 - 读取**容忍截断的尾行**（崩溃不是台账损坏），并且**计数**跳过了几行：`interaction_status` 会写
   "行数 N，可用行 M，跳过 K"——"0 行"和"解析不了"绝不长得一样。
@@ -259,8 +276,9 @@ profile（宿主上限）与 `<repo>/.dsh/interaction-gate.json`（项目只能�
   但"这张卡是不是本人点的"仍然是通道的责任（`docs/KNOWN-LIMITS.md` 附一之九）。
 - **超时既不是拒绝也不是同意**；推送失败既不是通过也不是失败。台账里没有任何一行能被当成"门禁通过"。
 - **IM 通道是可选层**：`auto` 且没装 `dsh-chat-interaction` 时行为与集成前逐字一致（有意如此）；`required`
-  时缺了它就不装配（拒绝静默降级）；`off` 时连服务都不查找。IM 侧的连接状态、群成员身份、平台去重
-  都不由本插件保证——它只保证"发出去的提问带回一个对得上令牌、且只对这一次有效的答案"。
+  时有界等待后仍缺它就拒绝提问（拒绝静默降级），迟到出现会自愈；`off` 时连服务都不查找、也不订阅。
+  IM 侧的连接状态、群成员身份、平台去重都不由本插件保证——它只保证"发出去的提问带回一个对得上令牌、
+  且只对这一次有效的答案"。
 - **进程重启后等不到答案**：pending 行还在（这是它存在的意义），但没有任何 waiter 会醒来——需要人处理，
   `interaction_status` 会把年龄摆出来。
 - **中途被注销的通道**：已发出的卡片仍然可以被回答（令牌还装着）；注销不会作废别人手里的卡。

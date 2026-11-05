@@ -15,13 +15,19 @@ import fs from 'node:fs'
 import path from 'node:path'
 import test from 'node:test'
 import { createFakeHost, runText, tempWorkspace, type FakeHost } from 'dsh-eng-core/testing'
-import { apply } from '../dist/index.js'
+import { apply, createInteractionRegistry, installImChannel, resolveConfig } from '../dist/index.js'
 import { imRequiredHint } from '../dist/chat-channel.js'
 import { refusalOf } from '../dist/ledger.js'
 
 const LEDGER = '.dsh/interaction/decisions.jsonl'
 const LOG = 'interaction-gate.log'
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
+
+/** Hosts assembled by this file: their effects (timers/subscriptions) are torn down after the run. */
+const hosts: FakeHost[] = []
+test.after(() => {
+    for (const host of hosts) host.dispose()
+})
 
 /** Poll until a predicate holds (the tools run on real timers). */
 async function waitFor(predicate: () => boolean, message: string): Promise<void> {
@@ -88,6 +94,7 @@ interface Assembly {
 
 function assemble(cwd: string, config: Record<string, unknown> = {}, services?: Record<string, unknown>): Assembly {
     const fake = createFakeHost({ cwd, ...(services === undefined ? {} : { services: { ...services } }) })
+    hosts.push(fake)
     const getCalls = { chat: 0 }
     const original = (fake.ctx as { get: (name: string) => unknown }).get.bind(fake.ctx)
     ;(fake.ctx as { get: (name: string) => unknown }).get = (service: string) => {
@@ -97,6 +104,18 @@ function assemble(cwd: string, config: Record<string, unknown> = {}, services?: 
     apply(fake.ctx as never, { logFile: path.join(cwd, LOG), ...config })
     const registry = (fake.ctx as { get: (name: string) => unknown }).get('interaction')
     return { fake, registry, getCalls }
+}
+
+/**
+ * Provide a service on the FAKE host after `apply` (the ordering bug) and
+ * return its withdrawal disposer — the fake mirrors cordis: a disposer removes
+ * the service and unloads every reactive dependent.
+ */
+function provide(fake: FakeHost, name: string, value: unknown): () => void {
+    const ctx = fake.ctx as { provide: (service: string, value: unknown) => unknown }
+    const dispose = ctx.provide(name, value)
+    assert.equal(typeof dispose, 'function', 'fake host 的 provide 必须返回 disposer（与 cordis 一致）')
+    return dispose as () => void
 }
 
 /** A local (non-IM) scripted channel, the shape the existing suite tests use. */
@@ -148,10 +167,12 @@ test('IM 通道：chatInteraction(api v1) 存在 → 注册 chat-interaction，�
     assert.equal(info.canAsk, true)
     assert.equal(info.canNotify, false, '本通道只转发提问，不接管通知')
     assert.equal(registry.describeAll().some((entry: { name: string }) => entry.name === 'chat-interaction'), true)
-    assert.deepEqual([registry.im().mode, registry.im().registered, registry.im().apiVersion, registry.im().channelId], ['auto', true, 1, 'feishu'])
+    assert.deepEqual([registry.im().mode, registry.im().phase, registry.im().registered, registry.im().apiVersion, registry.im().channelId], ['auto', 'registered', true, 1, 'feishu'])
     assert.ok(registry.im().reason.includes('api v1'), registry.im().reason)
     assert.deepEqual(registry.problems(), [])
-    assert.equal(getCalls.chat, 1, '每次 apply 只探测一次服务')
+    assert.equal(getCalls.chat, 1, 'apply 的快路径只探测一次服务（反应式回调走注入上下文）')
+    assert.deepEqual(fake.injections(), [['chatInteraction']], '反序（服务先存在）也必须建立反应式订阅')
+    assert.equal(registry.list().filter((entry: { name: string }) => entry.name === 'chat-interaction').length, 1, '反序不得重复注册')
 
     const running = fake.runTool('interaction_ask', { question: '这条交付可以放出去吗？', options: ['allowed-once', 'rejected'] })
     await waitFor(() => chat.asks.length === 1, 'interaction_ask 没有把提问交给 chatInteraction')
@@ -269,9 +290,19 @@ test('IM 通道：im.channel=off → 即使服务存在也一次都不碰（0 �
     assert.equal(registry.im().registered, false)
     assert.ok(registry.im().reason.includes('off'), registry.im().reason)
     assert.equal(registry.problems().some((problem: string) => problem.includes('IM 通道')), false, 'off 不是缺陷，不写进问题清单')
+    assert.deepEqual(fake.injections(), [], 'off 模式不得订阅 chatInteraction（连 ctx.inject 都不调用）')
+
+    // The service appears AFTER our apply: `off` must not notice it at all.
+    provide(fake, 'chatInteraction', tripwire)
+    assert.equal(getCalls.chat, 0, 'off 模式整个生命周期都不得查找 IM 服务')
+    assert.equal(touched, 0, 'off 模式不得读取事后提供服务的任何属性')
+    assert.deepEqual(fake.injections(), [], 'off 模式事后也不得订阅')
+    assert.equal(registry.list().some((entry: { name: string }) => entry.name === 'chat-interaction'), false, 'off 模式事后也不得注册')
+    assert.equal(registry.im().phase, 'off')
 
     const status = runText(await fake.runTool('interaction_status', {}))
     assert.ok(status.includes('IM 通道：未注册（im.channel=off'), status)
+    assert.ok(status.includes('phase=off'), status)
     assert.ok(status.includes('仅本地通道'), status)
     assert.ok(status.trimEnd().split('\n').at(-1)!.startsWith('下一步：'))
 
@@ -284,7 +315,7 @@ test('IM 通道：im.channel=off → 即使服务存在也一次都不碰（0 �
     assert.equal(getCalls.chat, 0, '整个提问过程也不得查找 IM 服务')
 })
 
-test('IM 通道：im.channel=required + 缺失/过旧 → apply 拒绝（写明装什么、怎么装），不装配任何工具与服务', async () => {
+test('IM 通道：required + 缺失/过旧 → 窗口后拒绝（安装提示），提问 refused:im-required 且不走本地；合法服务正常装配', async () => {
     const variants: { label: string; services?: Record<string, unknown> }[] = [
         { label: '缺失' },
         { label: '过旧', services: { chatInteraction: makeChat({ apiVersion: 0 }).layer } },
@@ -292,9 +323,39 @@ test('IM 通道：im.channel=required + 缺失/过旧 → apply 拒绝（写明�
     for (const variant of variants) {
         const cwd = tempWorkspace('interaction-chat-')
         const fake = createFakeHost({ cwd, ...(variant.services === undefined ? {} : { services: variant.services }) })
-        apply(fake.ctx as never, { logFile: path.join(cwd, LOG), im: { channel: 'required' } })
-        assert.equal(fake.tools.size, 0, `${variant.label}：required 不允许静默降级运行`)
-        assert.equal((fake.ctx as { get: (name: string) => unknown }).get('interaction'), undefined, variant.label)
+        hosts.push(fake)
+        apply(fake.ctx as never, {
+            logFile: path.join(cwd, LOG),
+            im: { channel: 'required', requiredWaitMs: 30 },
+            preferredChannels: ['chat-interaction'],
+        })
+        const registry = (fake.ctx as { get: (name: string) => unknown }).get('interaction') as any
+        // The ordering fix: the plugin IS applied (tools + service exist). A
+        // missing service is a BOUNDED WAIT, not a refusal to boot.
+        assert.equal(fake.tools.size, 4, `${variant.label}：required 仍要装配（否则没人能报告等待/拒绝）`)
+        assert.notEqual(registry, undefined, variant.label)
+        assert.equal(registry.im().phase, 'waiting', `${variant.label}：窗口内应先等待：${JSON.stringify(registry.im())}`)
+        await waitFor(() => registry.im().phase === 'refused', `${variant.label}：窗口结束后必须拒绝`)
+        assert.equal(registry.im().registered, false, variant.label)
+        const problems = registry.problems().join('\n')
+        assert.ok(problems.includes('im.channel=required'), problems)
+        assert.ok(problems.includes('dsh-chat-interaction@>=0.3.0'), `${variant.label}：problems() 要写明装什么版本`)
+        assert.ok(problems.includes('apiVersion'), `${variant.label}：problems() 要写明契约版本`)
+        const status = runText(await fake.runTool('interaction_status', {}))
+        assert.ok(status.includes('phase=refused'), `${variant.label}：status 必须区分 refused：\\n${status}`)
+        assert.ok(status.includes('等待窗口 30ms'), `${variant.label}：status 要写明窗口：\\n${status}`)
+
+        // A local channel exists, but `required` must never silently use it.
+        const local = localChannel()
+        registry.register(local.channel)
+        const refused = await fake.runTool('interaction_ask', { question: '放行吗？', options: ['yes', 'no'] })
+        assert.equal(refused.isError, true, variant.label)
+        const text = runText(refused)
+        assert.ok(text.includes('refused:im-required'), text)
+        assert.ok(text.includes('dsh-chat-interaction@>=0.3.0'), `${variant.label}：拒绝要带安装提示`)
+        assert.ok(text.includes('apiVersion'), `${variant.label}：拒绝要带契约版本`)
+        assert.equal(local.sent.length, 0, `${variant.label}：required 拒绝时不得静默走本地`)
+        assert.equal(rowsOf(cwd).at(-1).decision, refusalOf('im-required'), variant.label)
         const log = fs.readFileSync(path.join(cwd, LOG), 'utf8')
         assert.ok(log.includes('im.channel=required'), log)
         assert.ok(log.includes('dsh-chat-interaction@>=0.3.0'), `${variant.label}：提示必须写明装什么版本`)
@@ -305,12 +366,13 @@ test('IM 通道：im.channel=required + 缺失/过旧 → apply 拒绝（写明�
     assert.ok(hint.includes('dsh-chat-interaction@>=0.3.0'))
     assert.ok(hint.includes('拒绝'))
 
-    // required + a usable service applies normally.
+    // required + a usable service applies normally (the fast path).
     const cwd = tempWorkspace('interaction-chat-')
     const chat = makeChat()
     const { fake, registry } = assemble(cwd, { im: { channel: 'required' } }, { chatInteraction: chat.layer })
     assert.equal(fake.tools.size, 4)
     assert.equal(registry.im().registered, true)
+    assert.equal(registry.im().phase, 'registered')
 })
 
 test('IM 通道：超时与通道级失败 → 台账记拒绝并写明原因，任何门禁都不能读成 allowed-once', async () => {

@@ -61,6 +61,7 @@ import {
     type InteractionRegistry,
 } from './channels.js'
 import { DEFAULT_MAX_PAYLOAD_CHARS, describeSource, NOTIFY_LEVELS, type EffectiveConfig, type InteractionGateConfig, type NotifyLevel } from './config.js'
+import { imRequiredHint } from './chat-channel.js'
 import {
     appendLedgerRow,
     newRowId,
@@ -790,6 +791,33 @@ export function registerTools(
                         durationMs: deps.now() - startedAt,
                         extraLines: [`- 名单文件：${approvers.file}（存在=${approvers.present}，有效 id=${approvers.ids.length}）`],
                         next: `由人写 ${config.approversFile}（一行一个 id，# 开头为注释）；名单为空时问出去也没人能合法回答，所以这里不发卡片。`,
+                        ...(missionId === undefined ? {} : { missionId }),
+                    })
+                }
+
+                // --- im.channel=required: a missing IM service is a REFUSAL -----
+                // The bounded window already passed (im-binding.ts) and the
+                // service never appeared. Falling back to whatever local channel
+                // happens to be registered would be exactly the silent downgrade
+                // `required` exists to prevent, so this ask is refused instead —
+                // naming the install/upgrade step. A late service appearance
+                // clears the phase, so a later ask works.
+                const imReport = deps.registry.im()
+                if (imReport.mode === 'required' && imReport.phase === 'refused') {
+                    refuseAsk({
+                        ledgerFile,
+                        reason: 'im-required',
+                        detail: `im.channel=required，但 IM 通道不可用：${imReport.reason}`,
+                        title: titleOut.text,
+                        questionId,
+                        durationMs: deps.now() - startedAt,
+                        extraLines: [
+                            `- 有界等待：${imReport.requiredWaitMs ?? '?'}ms（profile 配置 im.requiredWaitMs）内 chatInteraction 没有出现`,
+                            `- ${imRequiredHint(imReport.reason)}`,
+                        ],
+                        next:
+                            '安装/升级 `dsh-chat-interaction@>=0.3.0` 并让宿主装配它（提供 chatInteraction 服务，apiVersion>=1）后重新提问；' +
+                            '在此之前这道提问不会被本地通道静默回答。',
                         ...(missionId === undefined ? {} : { missionId }),
                     })
                 }

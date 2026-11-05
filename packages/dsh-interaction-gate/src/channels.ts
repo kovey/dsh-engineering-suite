@@ -138,18 +138,57 @@ export interface ChannelInfo {
 export type ImChannelMode = 'auto' | 'off' | 'required'
 
 /**
+ * The lifecycle phase of the optional IM channel.
+ *
+ * The startup probe is only a FAST PATH. The authority is the reactive binding
+ * on the `chatInteraction` service (`ctx.inject`, see `im-binding.ts`): bundle
+ * order does not decide apply order, and `dsh-chat-interaction` provides its
+ * service at the END of its own `apply`, so "absent at startup" is not a
+ * verdict — it is a state that a later appearance upgrades.
+ *
+ *  - `off`: the host disabled the integration; the service is never touched.
+ *  - `absent`: no USABLE service has appeared (yet). An old/invalid service is
+ *    treated as absent and logged; when it is replaced by a valid one the phase
+ *    moves to `registered`.
+ *  - `waiting`: `im.channel=required`, the service has not appeared and the
+ *    configured bounded window is still open.
+ *  - `registered`: a `chatInteraction` service with `apiVersion >= 1` is
+ *    registered as the `chat-interaction` channel.
+ *  - `refused`: `im.channel=required` and the bounded window closed without the
+ *    service. `interaction_ask` refuses from here on (it never silently falls
+ *    back to a local channel) until a late arrival clears the refusal.
+ */
+export type ImPhase = 'off' | 'absent' | 'waiting' | 'registered' | 'refused'
+
+/**
  * The optional IM channel's verdict: registered or not, and WHY.
  *
  * This exists so "the IM channel is not registered" is a STATED fact on the
  * doctor instead of an absence a reader has to interpret: `off` means the host
- * disabled it, `auto` + absent means the IM plugin is not installed (and the
- * suite behaves exactly as it did before the integration), and a broken/old
- * service says which part was missing. `reason` is never empty.
+ * disabled it, `auto` + absent means no usable IM plugin has appeared (yet),
+ * `waiting`/`refused` say how a `required` deployment is doing inside its
+ * bounded window, and a broken/old service says which part was missing.
+ * `reason` is never empty.
  */
 export interface ImChannelReport {
     /** The configured mode this report is about. */
     mode: ImChannelMode
+    /**
+     * The lifecycle phase (see {@link ImPhase}). `registered` is the only phase
+     * in which the channel exists; `refused` is the only phase that makes
+     * `interaction_ask` refuse for a missing IM channel.
+     */
+    phase: ImPhase
     registered: boolean
+    /**
+     * Whether a `chatInteraction` service has EVER been observed, even when it
+     * was unusable (older/invalid api, throwing accessor). `phase=absent` +
+     * `appeared=true` says "it is there but not usable", which is a different
+     * fact from "it never showed up".
+     */
+    appeared?: boolean
+    /** How long `im.channel=required` waits for the service (ms). */
+    requiredWaitMs?: number
     /** The registered channel name (present when `registered`). */
     name?: string
     /** `chatInteraction.api.apiVersion` that was accepted. */
@@ -164,6 +203,10 @@ export interface ImChannelReport {
 
 /**
  * One line the doctor shows for the IM channel.
+ *
+ * The phase is named literally (`phase=absent|waiting|registered|refused`) so a
+ * reader never has to infer from prose whether the IM plugin never appeared, is
+ * still being waited for, or has been given up on.
  * @param report - the current verdict.
  */
 export function describeIm(report: ImChannelReport): string {
@@ -171,25 +214,53 @@ export function describeIm(report: ImChannelReport): string {
         const version = report.apiVersion === undefined ? 'api v?' : `api v${report.apiVersion}`
         const plugin = report.pluginVersion === undefined ? '' : `，插件 v${report.pluginVersion}`
         const target = report.channelId === undefined ? '' : `，渠道 ${report.channelId}`
-        return `${report.name ?? 'chat-interaction'}（${version}${plugin}${target}）：需要人决定的提问走 IM，通知/进度仍走本进程通道`
+        return `${report.name ?? 'chat-interaction'}（${version}${plugin}${target}）：需要人决定的提问走 IM，通知/进度仍走本进程通道（phase=registered）`
     }
-    if (report.mode === 'off') {
-        return `未注册（im.channel=off：宿主未启用）：仅本地通道，行为与未集成时一致`
+    if (report.mode === 'off' || report.phase === 'off') {
+        return '未注册（im.channel=off：宿主未启用）：仅本地通道，行为与未集成时一致（phase=off）'
     }
-    return `未注册（im.channel=${report.mode}：${report.reason}）：仅本地通道，行为与未集成时一致`
+    const window = report.requiredWaitMs === undefined ? '' : `，等待窗口 ${report.requiredWaitMs}ms`
+    if (report.phase === 'waiting') {
+        return (
+            `未注册（phase=waiting：im.channel=required${window}，正在等 chatInteraction 提供：${report.reason}）：` +
+            '窗口内提问仍走本地通道；窗口结束仍未出现则 `interaction_ask` **拒绝**（不会静默走本地）'
+        )
+    }
+    if (report.phase === 'refused') {
+        return (
+            `未注册（phase=refused：im.channel=required${window}：${report.reason}）：` +
+            '`interaction_ask` 会**拒绝**（不会静默走本地通道）；服务迟到出现会自动恢复'
+        )
+    }
+    const appeared = report.appeared === true ? '服务已出现但不可用' : '从未出现'
+    return `未注册（phase=absent：${appeared}；im.channel=${report.mode}：${report.reason}）：仅本地通道，行为与未集成时一致`
 }
 
 /**
- * The log line that states which path is active.
+ * The log line that states which path is active, and every transition into it.
  *
- * Exactly one of these is logged on every `apply`, so "did questions go to IM
- * or not" is answerable from the log without inspecting the host.
+ * Exactly one of these is logged on every `apply` and again at every phase
+ * change (the service appears, is replaced, goes away, or a `required` window
+ * closes), so "did questions go to IM or not" is answerable from the log
+ * without inspecting the host.
  * @param report - the current verdict.
  */
 export function imLogLine(report: ImChannelReport): string {
     if (report.registered) return `interaction channel: chat-interaction(api v${report.apiVersion ?? '?'})`
-    if (report.mode === 'off') return 'interaction channel: local only (im.channel=off)'
-    return `interaction channel: local only (chat-interaction absent: ${report.reason})`
+    if (report.mode === 'off' || report.phase === 'off') return 'interaction channel: local only (im.channel=off)'
+    if (report.phase === 'refused') {
+        // The reason says WHICH refusal it is (bounded window expired, or the
+        // service was withdrawn after it had been registered) — never a generic
+        // "unavailable" that hides the difference.
+        return `interaction channel: 不可用（im.channel=required：${report.reason}；interaction_ask 将拒绝）`
+    }
+    if (report.phase === 'waiting') {
+        return `interaction channel: 等待 chatInteraction 提供（当前进程内尚未出现；im.channel=required，窗口 ${report.requiredWaitMs ?? '?'}ms）`
+    }
+    if (report.appeared === true) {
+        return `interaction channel: local only (chat-interaction 出现但不可用：${report.reason}；可用后会自动注册)`
+    }
+    return 'interaction channel: 等待 chatInteraction 提供（当前进程内尚未出现；出现后自动注册）'
 }
 
 /** How an ask ended. */
@@ -446,7 +517,7 @@ export function createInteractionRegistry(options: {
     // The IM channel's verdict starts as "not probed yet" rather than as an
     // absence: a doctor that runs before/without the probe still states that
     // fact, and the plugin replaces it in `apply`.
-    let imReport: ImChannelReport = { mode: 'auto', registered: false, reason: '尚未探测：插件还没有执行 IM 通道探测' }
+    let imReport: ImChannelReport = { mode: 'auto', phase: 'absent', registered: false, reason: '尚未探测：插件还没有执行 IM 通道探测' }
 
     const note = (message: string): void => {
         problems.push(message)

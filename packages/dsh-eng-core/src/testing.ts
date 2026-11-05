@@ -78,6 +78,19 @@ export interface FakeHost {
     toolRuns: ToolRun[]
     subagentStarts: unknown[]
     approvalRequests: unknown[]
+    /**
+     * Register a reactive dependency (the fake of cordis's `ctx.inject`).
+     *
+     * The callback runs when EVERY named service is available — immediately when
+     * it already is (the fake is synchronous on purpose, so a test needs no
+     * sleep), and again after the service is provided later or replaced. Its
+     * returned disposer runs when the service is withdrawn or the host is
+     * disposed. `off`-style plugins that must never touch a service simply do
+     * not call it.
+     */
+    inject: (deps: string[] | Record<string, unknown>, callback: (ctx: { get: (name: string) => unknown }) => unknown) => () => void
+    /** The dependency declarations currently subscribed (one name list per `inject`). */
+    injections: () => string[][]
     /** Dispatch an emit-mode event to every listener. */
     emit: (event: string, payload: unknown) => void
     /** Run a waterfall event: listeners in order, then `base`. */
@@ -183,6 +196,66 @@ export function createFakeHost(options: FakeHostOptions = {}): FakeHost {
         services['subprocess'] = service
     }
 
+    // --- reactive dependencies (the fake of cordis's `ctx.inject`) ------------
+    // A plugin that consumes an OPTIONAL service must not freeze the startup
+    // observation: the real host runs the callback when the service is provided
+    // later (and its disposer when the service goes away). The fake does the
+    // same synchronously — a test needs no sleep to see the transition.
+    interface FakeInjector {
+        names: string[]
+        callback: (ctx: { get: (name: string) => unknown }) => unknown
+        active: boolean
+        disposers: (() => void)[]
+    }
+    const injectors: FakeInjector[] = []
+    const hasService = (name: string): boolean => services[name] !== undefined
+    const injectedContext = { get: (name: string): unknown => services[name] }
+
+    const activate = (injector: FakeInjector): void => {
+        if (injector.active || !injector.names.every(hasService)) return
+        injector.active = true
+        const result = injector.callback(injectedContext)
+        if (typeof result === 'function') injector.disposers.push(result as () => void)
+    }
+
+    const deactivate = (injector: FakeInjector): void => {
+        injector.active = false
+        // Reverse order, like a fiber unloading its effects: the last cleanup
+        // registered runs first.
+        for (const dispose of injector.disposers.splice(0).reverse()) {
+            try {
+                dispose()
+            } catch {
+                // A test's own cleanup; never let it hide the transition.
+            }
+        }
+    }
+
+    const notifyInjectors = (name: string): void => {
+        for (const injector of injectors) {
+            if (!injector.names.includes(name)) continue
+            // A replaced service reloads its dependents: the old instance is
+            // unloaded (disposer runs) before the callback runs against the new one.
+            if (injector.active) deactivate(injector)
+            activate(injector)
+        }
+    }
+
+    const inject = (
+        deps: string[] | Record<string, unknown>,
+        callback: (ctx: { get: (name: string) => unknown }) => unknown,
+    ): (() => void) => {
+        const names = Array.isArray(deps) ? [...deps] : Object.keys(deps)
+        const injector: FakeInjector = { names, callback, active: false, disposers: [] }
+        injectors.push(injector)
+        activate(injector)
+        return () => {
+            const index = injectors.indexOf(injector)
+            if (index >= 0) injectors.splice(index, 1)
+            deactivate(injector)
+        }
+    }
+
     const ctx = {
         tools: {
             register(definition: FakeTool) {
@@ -226,7 +299,16 @@ export function createFakeHost(options: FakeHostOptions = {}): FakeHost {
         },
         provide(name: string, value: unknown) {
             services[name] = value
+            notifyInjectors(name)
+            return () => {
+                // Only the provider of the CURRENT value may withdraw it (a
+                // stale disposer must not delete a service that replaced it).
+                if (services[name] !== value) return
+                delete services[name]
+                notifyInjectors(name)
+            }
         },
+        inject,
     }
 
     const emit = (event: string, payload: unknown): void => {
@@ -298,6 +380,8 @@ export function createFakeHost(options: FakeHostOptions = {}): FakeHost {
         approvalRequests,
         emit,
         waterfall,
+        inject,
+        injections: () => injectors.map((injector) => [...injector.names]),
         runTool,
         guardReason: (exec: unknown) => {
             for (const guard of guards) {
@@ -313,6 +397,8 @@ export function createFakeHost(options: FakeHostOptions = {}): FakeHost {
         },
         dispose: () => {
             for (const disposer of effects.splice(0)) disposer()
+            // The host is going away: every dependency callback is unloaded.
+            for (const injector of injectors.splice(0)) deactivate(injector)
         },
     }
 }

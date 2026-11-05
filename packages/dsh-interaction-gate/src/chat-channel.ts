@@ -100,7 +100,16 @@ export interface ChatApiLike {
 /** A usable service, or the reason there is none (never both). */
 export type ChatProbe =
     | { ok: true; api: ChatApiLike; apiVersion: number; pluginVersion?: string }
-    | { ok: false; reason: string }
+    | {
+          ok: false
+          reason: string
+          /**
+           * `true` when a `chatInteraction` service EXISTS but is not usable
+           * (older/invalid api, throwing accessor, partial object). The doctor
+           * distinguishes "it never showed up" from "it showed up broken".
+           */
+          appeared?: boolean
+      }
 
 /** Render any thrown value as one short Chinese report line. */
 function reasonOf(error: unknown): string {
@@ -137,43 +146,43 @@ export function probeChatInteraction(get: (name: string) => unknown): ChatProbe 
         return { ok: false, reason: 'chat-interaction 未安装（服务 chatInteraction 不存在）' }
     }
     if (typeof layer !== 'object') {
-        return { ok: false, reason: `chatInteraction 服务不是对象（收到 ${typeof layer}）` }
+        return { ok: false, reason: `chatInteraction 服务不是对象（收到 ${typeof layer}）`, appeared: true }
     }
 
     let api: unknown
     try {
         api = (layer as { api?: unknown }).api
     } catch (error) {
-        return { ok: false, reason: `chatInteraction.api 的访问器抛错：${reasonOf(error)}` }
+        return { ok: false, reason: `chatInteraction.api 的访问器抛错：${reasonOf(error)}`, appeared: true }
     }
     if (api === undefined || api === null) {
-        return { ok: false, reason: 'chat-interaction 没有暴露 api（需要 0.3.0+：服务形状是 { api: { apiVersion, ask, … } }）' }
+        return { ok: false, reason: 'chat-interaction 没有暴露 api（需要 0.3.0+：服务形状是 { api: { apiVersion, ask, … } }）', appeared: true }
     }
     if (typeof api !== 'object') {
-        return { ok: false, reason: `chatInteraction.api 不是对象（收到 ${typeof api}）` }
+        return { ok: false, reason: `chatInteraction.api 不是对象（收到 ${typeof api}）`, appeared: true }
     }
 
     let version: unknown
     try {
         version = (api as { apiVersion?: unknown }).apiVersion
     } catch (error) {
-        return { ok: false, reason: `api.apiVersion 的访问器抛错：${reasonOf(error)}` }
+        return { ok: false, reason: `api.apiVersion 的访问器抛错：${reasonOf(error)}`, appeared: true }
     }
     if (typeof version !== 'number' || !Number.isFinite(version)) {
-        return { ok: false, reason: `api.apiVersion 不是数字（收到 ${JSON.stringify(version)}），无法判断契约版本` }
+        return { ok: false, reason: `api.apiVersion 不是数字（收到 ${JSON.stringify(version)}），无法判断契约版本`, appeared: true }
     }
     if (version < CHAT_API_MIN_VERSION) {
-        return { ok: false, reason: `chat-interaction 的 apiVersion=${version} 低于 ${CHAT_API_MIN_VERSION}（旧版本没有给其他插件用的问答 API）` }
+        return { ok: false, reason: `chat-interaction 的 apiVersion=${version} 低于 ${CHAT_API_MIN_VERSION}（旧版本没有给其他插件用的问答 API）`, appeared: true }
     }
 
     let ask: unknown
     try {
         ask = (api as { ask?: unknown }).ask
     } catch (error) {
-        return { ok: false, reason: `api.ask 的访问器抛错：${reasonOf(error)}` }
+        return { ok: false, reason: `api.ask 的访问器抛错：${reasonOf(error)}`, appeared: true }
     }
     if (typeof ask !== 'function') {
-        return { ok: false, reason: 'api 不完整：缺少 ask()（无法把提问发出去并等一个对得上令牌的回答）' }
+        return { ok: false, reason: 'api 不完整：缺少 ask()（无法把提问发出去并等一个对得上令牌的回答）', appeared: true }
     }
 
     let pluginVersion: string | undefined
