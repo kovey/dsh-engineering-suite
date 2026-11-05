@@ -122,20 +122,57 @@ function withoutQuotedSpans(command: string): string {
     return out
 }
 
+/** `<<EOF`, `<<-'EOF'`, `<< "EOF"`: the marker that opens a heredoc. */
+const HEREDOC_START = /<<-?\s*(?:['"]?)([A-Za-z_][A-Za-z0-9_]*)/
+
+/**
+ * Drop heredoc BODIES, keeping the line that opens each one.
+ *
+ * A heredoc body is DATA, never shell syntax: a commit message, a markdown snippet
+ * or a code sample that happens to contain `>=` or `> out.txt` is not a
+ * redirection. Reading it as shell produced two false positives in the wild — a
+ * `git commit -F -` whose message said `apiVersion >= 1` was refused for "writing
+ * `=`". The opening line IS kept, because a real redirect may precede the marker
+ * (`cat > notes.md <<'EOF'`). An unterminated heredoc removes the rest of the
+ * command: nothing after it could be trusted as shell syntax either.
+ * @param command - the raw command string.
+ * @returns the command with every heredoc body removed.
+ */
+function stripHeredocs(command: string): string {
+    const lines = command.split('\n')
+    const kept: string[] = []
+    for (let index = 0; index < lines.length; index += 1) {
+        const line = lines[index] ?? ''
+        kept.push(line)
+        const delimiter = HEREDOC_START.exec(line)?.[1]
+        if (delimiter === undefined) continue
+        // Skip the body, stopping ON the delimiter line so the loop's increment
+        // consumes it and whatever follows the heredoc survives.
+        index += 1
+        while (index < lines.length && (lines[index] ?? '').trim() !== delimiter) index += 1
+    }
+    return kept.join('\n')
+}
+
 /** Split `a >b` / `a >> b` / `a 2> b` into segments and record the targets. */
 function redirectTargets(command: string): { targets: string[]; segments: string[] } {
     const targets: string[] = []
+    // Heredoc bodies are data (see `stripHeredocs`): both passes must read the
+    // stripped text, or one of them still scans the body as shell.
+    const stripped = stripHeredocs(command)
     // Operators inside quotes are text, not redirections (`echo "> not a file"`).
-    const unquoted = withoutQuotedSpans(command)
-    // A target ends at whitespace or a shell separator.
-    const pattern = /(\d?|&)>>?\s*([^\s;&|<>]+)/g
+    const unquoted = withoutQuotedSpans(stripped)
+    // A target ends at whitespace or a shell separator, and never STARTS with `=`:
+    // the `=` in `apiVersion >= 1` is the tail of the comparison operator, not a
+    // file name.
+    const pattern = /(\d?|&)>>?\s*([^=\s;&|<>][^\s;&|<>]*)/g
     let match: RegExpExecArray | null
     while ((match = pattern.exec(unquoted)) !== null) {
         const target = (match[2] ?? '').trim()
         if (target !== '') targets.push(target)
     }
     // Token-level pass catches `>` written as its own token.
-    const tokens = tokenize(command)
+    const tokens = tokenize(stripped)
     const segments: string[] = []
     let current: string[] = []
     for (let index = 0; index < tokens.length; index += 1) {
