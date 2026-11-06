@@ -5,9 +5,13 @@
 ## 职责
 
 - 角色文件 = persona + 模型路由 + 工具白名单 + 技能白名单（YAML frontmatter + 正文）。
-- `team_delegate`：主 Agent 通过它派活；每个子 Agent 按角色创建，携带
-  `toolFilter`（**白名单外的工具在子 Agent 的工具列表里根本不存在**，不是“调用后被拒绝”）、
-  `persona`（影子 persona 段）、`agentOptions`（provider/model/reasoningEffort/maxTokens）。
+- `team_delegate`：主 Agent 通过它派活；每个子 Agent 按角色创建，宿主在**子作用域**强制
+  `ctx.tools.restrict({allow, deny})`（**白名单外的工具在子 Agent 的工具列表里根本不存在**，不是"调用后被拒绝"），
+  并写入角色的 persona section 与 `agentOptions`（provider/model/reasoningEffort/maxTokens）。
+  机制落在 **Agent Preset** 上（harness 0.2.2-rc.1）：本插件为每个角色注册 `role:<roleId>`，它的行挂载本包的
+  `dsh-role-guard/scope` 插件，插件在子作用域里施加限制与 persona；启动请求只带 `agentPreset` ——
+  `SubagentStartRequest` 已经没有 `persona` / `toolFilter` 字段。旧宿主（只有 `start(provider, request)`）
+  退回旧路径，工具输出会写明"旧宿主 / persona、toolFilter 随启动请求传递"。
   `agentOptions` 默认取角色文件的模型路由，也可以**按调用覆盖**（见下文「按调用覆盖模型」）。
 - 严格的写/只读分离：`mode: read` 的角色无论文件怎么写，都会被剥掉 `readonlyDeny` 里的写工具。
 - 技能白名单在调用时强制：子会话 id → 角色的绑定落盘，`ctx.tools.guard` 拒绝加载白名单外的技能
@@ -118,18 +122,18 @@ harness 0.2.0 带来官方 **Agent Teams**：`@deepseek-ai/dsh-experimental-agen
 **合成规则：Agent Teams 是协作面，不是权限面。**
 
 `SpawnTeammateRequest` 只有 `{ name, description, prompt, context: 'fresh' | 'fork', provider, signal }`
-——**没有** persona / toolFilter / agentOptions / maxDepth，也没有权限参数。服务把它转成
-`ctx.subagents.startContinuable({ provider, request: { prompt, parent } })`，于是 teammate 按
-`resolveChildAgentOptions(parent, undefined, depth)` 与 `{ persona: undefined, toolFilter: undefined }` 组装：
-**继承 Lead 的 provider/model 和全部工具，跑在部署 persona 下**。而 `startContinuable` 本身是接受
-`persona` / `toolFilter` / `agentOptions` / `maxDepth` 的——缺口就在官方这一层请求类型上。
+——**没有** persona / toolFilter / agentOptions / maxDepth，也没有权限参数。服务把它转成一次子代理启动，
+于是 teammate 按 `resolveChildAgentOptions(parent, undefined, depth)` 与"没有任何组合"来组装：
+**继承 Lead 的 provider/model 和全部工具，跑在部署 persona 下**。0.2.2-rc.1 的
+`startActivation` 只多出一个 `agentPreset` 入口（persona 与工具白名单必须由 preset 的行插件在子作用域里
+强制），而 `SpawnTeammateRequest` 连 preset id 都没有——缺口就在官方这一层请求类型上。
 
 因此本插件的做法是：
 
-1. **`team_delegate` 的 `dispatch: 'team'` 一律被按名字拒绝**，改用本插件自己的 `ctx.subagents.start()`
+1. **`team_delegate` 的 `dispatch: 'team'` 一律被按名字拒绝**，改用本插件自己的 `startActivation + Agent Preset`
    路径（`dispatch path: subagents（请求 team：拒绝 agentTeams.spawnTeammate——它无法表达：…）`）。
    拒绝不是笼统的"不支持"，而是逐条点名：`persona 影子段`（官方请求没有 persona 字段，而每个角色都必须有
-   persona——这条是**结构性**的，所以今天**任何**角色都走不了官方路径）、`工具白名单`（没有 toolFilter，
+   persona——这条是**结构性**的，所以今天**任何**角色都走不了官方路径）、`工具白名单`（官方请求没有工具白名单入口，
    只读模式的降权也靠它）、`模型路由`（没有 agentOptions）、`技能白名单`（绑定必须早于 teammate 第一轮，
    而官方 spawn 只在创建完成后才给出会话 id）。报告里同时写明官方 API 需要怎么改才可用。
    **本插件从不调用 `spawnTeammate`**：它只探测这个方法在不在（`auto` 模式），不在就说明"官方服务只是模型
@@ -159,9 +163,9 @@ harness 0.2.0 带来官方 **Agent Teams**：`@deepseek-ai/dsh-experimental-agen
    持久事实（官方名册事件），不是 teammate 的自我声明。
 
 **配置开关 `composeWithAgentTeams`（默认 `'auto'`）**：`'off'` 时完全不读 `agentTeams`、不装名册观察者、
-提示词也不加那一段，行为与引入本能力之前**逐字段一致**（回归测试断言：`off` 与 `auto` 下同一次派发给
-`ctx.subagents.start` 的请求完全相同、工具输出逐字节相同）。装配日志会打印
-`agentTeams=off(config)` / `absent` / `on(availability=programmatic-spawn|no-programmatic-spawn)`。
+提示词也不加那一段，行为与引入本能力之前**逐字段一致**（回归测试断言：`off` 与 `auto` 下同一次派发的
+启动请求完全相同、工具输出逐字节相同；该用例跑在 legacy 宿主上，因为两条路径的差别只在启动请求里）。
+装配日志会打印 `agentTeams=off(config)` / `absent` / `on(availability=programmatic-spawn|no-programmatic-spawn)`。
 
 ## 配置
 
@@ -236,10 +240,13 @@ harness 0.2.0 带来官方 **Agent Teams**：`@deepseek-ai/dsh-experimental-agen
 
 ## 已知边界（诚实说明）
 
-- 角色工具白名单通过 `toolFilter` 生效，需要 provider 支持 `toolFilter` 能力
-  （`@deepseek-ai/dsh-subagent-spawn-in-process` 支持）；不支持的 provider 会在 `start` 时报错，
-  本插件会把错误原样返回给模型。
-- 角色文件里的工具名如果在当前部署不存在，会被**从白名单里剔除**并在结果里 warning
+- 角色工具白名单通过 **Agent Preset 的行插件** 在子作用域 `ctx.tools.restrict` 生效：需要宿主装配
+  `agentPresets`（`@deepseek-ai/dsh-agent-preset-registry`），且 provider 支持独立预设
+  （`capabilities.agentPreset`，`@deepseek-ai/dsh-subagent-spawn-in-process` 支持）——任一不成立都**拒绝派发**，
+  不会降级成"只写提示词"。旧宿主（只有 legacy `start`）仍按 `toolFilter` 传递，工具输出会写明。
+  角色文件的 `tools`/`persona` 在**注册时**固化：改了要重启宿主，否则该角色的派发会被按 `stale` 拒绝
+  （宁可拒绝，也不用旧的、可能更宽的白名单派发）。
+- 角色文件里的工具名如果在当前部署不存在，会被**从 preset 的白名单里剔除**并在结果里 warning
   （宿主对未知工具名是硬失败，剔除比整次派发失败更可取；剔除只会减少权限，不会增加）。
 - 技能继承只走**一跳**（自己的绑定 → 直接父会话的绑定）：子会话头里只有 `parentSession`，
   再往上的链在持久事实里无法重建。因此"孙子由通用 `subagent` 直接派生、父级不是 `team_delegate` 子代理"

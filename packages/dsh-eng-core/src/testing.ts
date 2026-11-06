@@ -5,12 +5,20 @@
  * need a context that behaves like the harness for exactly the extension
  * points the suite uses: `tools.register` / `tools.guard` / `tools.get`,
  * `on(event, listener)`, `effect`, `systemPrompt.section`, `approval.request`,
- * `subagents.start`, `subprocess.spawn` and `get(service)`.
+ * `subagents.start` / `subagents.startActivation`, `agentPresets.register`,
+ * `subprocess.spawn` and `get(service)`.
  *
  * The fake is deliberately small and honest: it stores definitions, dispatches
  * emit-mode events, and runs waterfall listeners in registration order with a
  * caller-supplied base decision. It performs no schema validation — a test that
  * cares about argument shape should assert on what the tool received.
+ *
+ * The subagent surface is **opt-in per API**, because the two are a version
+ * boundary rather than a detail: `withSubagents` gives the legacy
+ * `start(provider, request)` seam (an old host), `withActivation` adds the
+ * 0.2.2-rc.1 `startActivation(spec)` seam on top, and `withAgentPresets` adds
+ * the `agentPresets` registry. A test can therefore assemble an old host and a
+ * new one from the same fake instead of mocking the difference by hand.
  *
  * @module dsh-eng-core/testing
  */
@@ -51,6 +59,20 @@ export interface FakeHostOptions {
     withApproval?: boolean
     /** Recorded subagent starts; supply to enable `ctx.subagents`. */
     withSubagents?: boolean
+    /**
+     * Add the 0.2.2-rc.1 `startActivation(spec)` seam to `ctx.subagents`
+     * (requires {@link withSubagents}). Default false = an old host that only
+     * has the legacy `start(provider, request)`.
+     */
+    withActivation?: boolean
+    /** Add an `agentPresets` registry service (the Agent Preset seam). */
+    withAgentPresets?: boolean
+    /** Provider names `subagents.list()` reports (default `['spawn']`). */
+    providers?: string[]
+    /** Child session id `startActivation` returns (default `'activation-1'`). */
+    activationChildId?: string
+    /** The result `startActivation` returns, so a test seeds the child's output. */
+    activationResult?: { stopReason?: string; diagnostic?: string; output?: { type: string; text?: string }[] }
     /** Enable `ctx.subprocess` backed by the real child-process runner. */
     withSubprocess?: boolean
     /** The agent every tool call runs as (defaults to a root agent in `cwd`). */
@@ -65,6 +87,15 @@ export interface FakeAgent {
     session: { id: string; header: { id: string; cwd: string; origin?: string } }
 }
 
+/** One preset definition registered through the fake `agentPresets` service. */
+export interface FakePresetDefinition {
+    id: string
+    name?: string
+    description?: string
+    order?: number
+    plugins: readonly unknown[]
+}
+
 /** The fake host surface. */
 export interface FakeHost {
     ctx: unknown
@@ -77,6 +108,14 @@ export interface FakeHost {
     sections: { name: string; order?: number; text?: (context?: unknown) => string }[]
     toolRuns: ToolRun[]
     subagentStarts: unknown[]
+    /** Every `startActivation(spec)` the fake accepted (the 0.2.2-rc.1 seam). */
+    activationSpecs: unknown[]
+    /** How many activations the caller disposed. */
+    activationDisposals: () => number
+    /** Definitions handed to the fake `agentPresets.register` (id → definition). */
+    presetDefinitions: Map<string, FakePresetDefinition>
+    /** Every `register` call, in order (including a rejected duplicate). */
+    presetRegistrations: unknown[]
     approvalRequests: unknown[]
     /**
      * Register a reactive dependency (the fake of cordis's `ctx.inject`).
@@ -129,6 +168,10 @@ export function createFakeHost(options: FakeHostOptions = {}): FakeHost {
     const sections: FakeHost['sections'] = []
     const toolRuns: ToolRun[] = []
     const subagentStarts: unknown[] = []
+    const activationSpecs: unknown[] = []
+    const presetDefinitions = new Map<string, FakePresetDefinition>()
+    const presetRegistrations: unknown[] = []
+    let activationDisposals = 0
     const approvalRequests: unknown[] = []
 
     const on = (event: string, listener: (...args: never[]) => unknown): (() => void) => {
@@ -154,7 +197,10 @@ export function createFakeHost(options: FakeHostOptions = {}): FakeHost {
         }
     }
     if (options.withSubagents === true) {
-        services['subagents'] = {
+        const providers = [...(options.providers ?? ['spawn'])]
+        // The legacy seam: every fake host with a subagent service keeps it, so a
+        // test can still model an old host (`withActivation` off).
+        const service: Record<string, unknown> = {
             start: async (provider: string, request: unknown) => {
                 subagentStarts.push({ provider, request })
                 return {
@@ -162,7 +208,51 @@ export function createFakeHost(options: FakeHostOptions = {}): FakeHost {
                     result: Promise.resolve({ stopReason: 'completed', output: [{ type: 'text', text: 'child output' }] }),
                 }
             },
-            list: () => ['spawn'],
+            list: () => [...providers],
+            getProvider: (name: string) =>
+                providers.includes(name)
+                    ? { name, capabilities: { agentOptions: true, agentPreset: true, outputSchema: true, depthLimit: true } }
+                    : undefined,
+        }
+        if (options.withActivation === true) {
+            // The 0.2.2-rc.1 seam: `startActivation(spec)` → activation whose
+            // `childId`/`result`/`dispose` the caller must honour. The seeded
+            // result is what a test asserts flows back into the tool output.
+            service['startActivation'] = async (spec: unknown) => {
+                activationSpecs.push(spec)
+                const seeded = options.activationResult ?? {}
+                return {
+                    childId: options.activationChildId ?? 'activation-1',
+                    result: Promise.resolve({
+                        stopReason: seeded.stopReason ?? 'completed',
+                        output: seeded.output ?? [{ type: 'text', text: 'child output' }],
+                        ...(seeded.diagnostic === undefined ? {} : { diagnostic: seeded.diagnostic }),
+                    }),
+                    dispose: async () => {
+                        activationDisposals += 1
+                    },
+                }
+            }
+        }
+        services['subagents'] = service
+    }
+    if (options.withAgentPresets === true) {
+        services['agentPresets'] = {
+            // Deliberately NOT async: a duplicate id fails synchronously, which
+            // is the stricter of the two shapes a caller must survive (the real
+            // `register` rejects instead — both paths are exercised by tests).
+            register(definition: unknown) {
+                presetRegistrations.push(definition)
+                const id = definition !== null && typeof definition === 'object' ? (definition as { id?: unknown }).id : undefined
+                if (typeof id !== 'string' || id === '') throw new Error('agent preset id must be a non-empty string')
+                if (presetDefinitions.has(id)) throw new Error(`Duplicate agent preset: ${id}`)
+                presetDefinitions.set(id, definition as FakePresetDefinition)
+                // The real one resolves to a disposer that unregisters.
+                return Promise.resolve(async () => {
+                    presetDefinitions.delete(id)
+                })
+            },
+            has: (id: string) => presetDefinitions.has(id),
         }
     }
     if (options.withSubprocess === true) {
@@ -377,6 +467,10 @@ export function createFakeHost(options: FakeHostOptions = {}): FakeHost {
         sections,
         toolRuns,
         subagentStarts,
+        activationSpecs,
+        activationDisposals: () => activationDisposals,
+        presetDefinitions,
+        presetRegistrations,
         approvalRequests,
         emit,
         waterfall,

@@ -1,5 +1,37 @@
 ## [未发布]
 
+### 修复 · `team_delegate` 改接 `startActivation` + Agent Preset（0.2.2-rc.1 的真实 API）
+
+`packages/dsh-role-guard/src/tools.ts` 里的 `subagents.start(provider, request)` **在 0.2.2-rc.1 已不存在**：
+`SubagentRuntime` 只暴露 `startActivation(spec)` / `registerProvider` / `getProvider` / `list` / `prompt` /
+`sendMessage` / `interrupt` 与 catalog 一族。此前手写的 `SubagentsLike` 类型说了谎，真机上 `team_delegate`
+死于 `subagents.start is not a function`。同一个版本还删掉了 `SubagentStartRequest` 的 `persona` 与
+`toolFilter` 两个字段——角色策略不能再"随请求带过去"。
+
+- **persona / 工具白名单改由 Agent Preset 承载**：新增 `presets.ts`，为每个角色注册
+  `{ id: 'role:<roleId>', order: 100+i, plugins: [{ id: 'role-guard-scope', name: 'dsh-role-guard/scope' }] }`；
+  新增 `scope.ts`（新增子路径导出 `dsh-role-guard/scope`），它是那一行的插件，**运行在子作用域**，在那里
+  `ctx.tools.restrict({allow, deny})`（宿主强制）并写入 `role-guard:persona` section。限制**先于** persona 应用；
+  `restrict` 被拒绝时**抛出**（子代理启动失败），绝不吞掉错误让子代理带着父 Agent 的全部工具跑起来。
+- **派发路径**：`startActivation({ provider, label, request: { prompt, parent, signal, agentOptions, agentPreset }, signal, delivery: 'caller' })`，
+  并把 activation 归一为 `{ id: childId, result, dispose }`。**`agentPreset` 必须随请求传**——不传时子代理加入
+  父 Agent 的 composition，角色的 preset 根本不会挂载（"看起来派发了，其实没强制"）。
+- **旧路径保留但不是默认**：只有当宿主没有 `startActivation`、仍有 `start(provider, request)` 时才走旧路径，
+  且工具输出里如实写「旧宿主 / persona、toolFilter 随启动请求传递」，不假装用了 preset。
+  两条路径的产物、绑定记录与提示词完全一致，差别只在工具输出里那一行 `派发:`。
+- **四种缺失前提一律 fail closed**（不会再出现裸 TypeError）：既无 `startActivation` 也无 `start`；有
+  `startActivation` 但无 `agentPresets` 服务；角色 preset 不是本插件注册的（被他人注册 / 注册失败 / 注册时的
+  工具过滤与当前角色文件不一致）；provider 未注册（列出 `service.list()`）或 `capabilities.agentPreset === false`。
+  报文点名**缺什么**、**该挂哪些包**（`@deepseek-ai/dsh-subagent` + 一个 provider +
+  `@deepseek-ai/dsh-agent-preset-registry`），以及闭包过期时的 `bash scripts/repair-profile-closure.sh --apply`。
+- **假宿主**（`dsh-eng-core/testing`）补上 `startActivation` 与 `agentPresets`：`withActivation` / `withAgentPresets` /
+  `providers` / `activationChildId` / `activationResult` 全部可选，旧的 `start` 保持原样——同一个 fake 既能装旧宿主
+  也能装新宿主；新增 `activationSpecs` / `activationDisposals()` / `presetDefinitions` / `presetRegistrations`。
+- **测试**：`dsh-role-guard` 42 → **53**（11 条新增：两条派发路径、四种拒绝、preset 被他人注册 / 注册被拒 /
+  过滤过期，以及 scope 插件的 restrict+persona 与"能力缺失不抛错、restrict 被拒必须抛"）。
+- **文档**：`docs/ARCHITECTURE.md` §5.6 里"派发时把 persona/toolFilter 传进启动请求"的说法已被替换；
+  `docs/KNOWN-LIMITS.md` 附一之十八 补上"闭包过期时 preset 行根本加载不了"与 id 按角色（而非工作区）固化的代价。
+
 ### 新增 · `scripts/repair-profile-closure.sh`：修掉 profile 共享闭包的过期软链
 
 多个 profile 通过**一份共享闭包**（`~/.dsh/profiles/node_modules/@deepseek-ai`）解析 `@deepseek-ai/*`，而那是一堆指进

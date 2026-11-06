@@ -19,7 +19,8 @@
  * Extension points used here (verified against the installed packages):
  *  - ctx.tools.register(defineTool(...))        @deepseek-ai/dsh-tools
  *  - ctx.tools.guard((exec) => reason|undefined) @deepseek-ai/dsh-tools
- *  - ctx.get('subagents').start(provider, req)  @deepseek-ai/dsh-subagent
+ *  - ctx.get('subagents').startActivation(spec)  @deepseek-ai/dsh-subagent (0.2.2-rc.1)
+ *  - ctx.get('agentPresets').register(def)      @deepseek-ai/dsh-agent-preset-registry
  *  - ctx.tools.get(name, agent)                 visibility used to prune whitelists
  *  - ctx.on('agent/disposed' | 'session/disposed')  cache cleanup only
  *  - ctx.systemPrompt.section({...})            @deepseek-ai/dsh-system-prompt
@@ -35,10 +36,11 @@ import { agentTeamsAvailability } from './agent-teams.js'
 import { RoleBindingStore } from './bindings.js'
 import { resolveConfig } from './config.js'
 import { RoleRegistryCache } from './loader.js'
+import { RolePresetRegistry, type AgentPresetsLike } from './presets.js'
 import { PROMPT_SECTION, sectionText } from './prompt.js'
 import { createSkillGuard } from './skill-gate.js'
 import { TeammateAuditStore, teammateObservation } from './teammates.js'
-import { registerTools, type SubagentsLike } from './tools.js'
+import { planToolFilter, registerTools, type SubagentsLike } from './tools.js'
 import { createRolePlanner } from './service.js'
 
 export const name = 'dsh-role-guard'
@@ -112,12 +114,58 @@ export function apply(ctx: Context, config: unknown = {}): void {
             resolveLayout(sessionCwd(agent), resolved.layout)
         const bindings = new RoleBindingStore(layoutFor, logger)
 
+        // --- Agent Presets: how a role travels into a 0.2.2-rc.1 child ---------
+        // The start request no longer has `persona`/`toolFilter`, so each role is
+        // declared as a preset whose row mounts our `scope` plugin in the CHILD's
+        // scope (host-enforced `tools.restrict`). Registration is best effort:
+        // without `ctx.agentPresets` the state is reported and `team_delegate`
+        // refuses the modern path instead of degrading to prompt text.
+        const presets = new RolePresetRegistry({
+            presets: () => safeGet(context, 'agentPresets') as AgentPresetsLike | undefined,
+            // Pruned against the GLOBAL tool view on purpose: `tools.restrict`
+            // validates names against the global set, so this is the same view it
+            // will accept — and it does not vary per delegating agent.
+            filterFor: (role) => {
+                try {
+                    return planToolFilter(role, resolved, (toolName) => {
+                        try {
+                            return context.tools.get(toolName, undefined) !== undefined
+                        } catch {
+                            return false
+                        }
+                    }).filter
+                } catch {
+                    // Planning a filter cannot fail in practice; if it ever does,
+                    // an EMPTY whitelist is the fail-closed answer (the scope
+                    // plugin refuses to mount it) — never "no filter at all".
+                    return { allow: [] }
+                }
+            },
+            logger,
+        })
+        let presetsState: string
+        try {
+            if (presets.service() === undefined) {
+                presetsState = 'absent(no ctx.agentPresets)'
+            } else {
+                // Register for the workspace this host assembles in (the same one
+                // the prompt section reads). A workspace-local role is registered
+                // lazily on its first delegation; the two are idempotent by id.
+                const summary = presets.ensureAll(roles.for(resolveLayout(process.cwd(), resolved.layout)).list())
+                presetsState = `on(${summary.registered} registered${summary.refused === 0 ? '' : `, ${summary.refused} refused`})`
+            }
+        } catch (error) {
+            presetsState = 'failed'
+            logger.error('cannot register agent presets:', error)
+        }
+
         const tools = registerTools(context as never, {
             config: resolved,
             roles,
             stores,
             layoutFor,
             bindings,
+            presets,
             subagents: () => context.get('subagents') as SubagentsLike | undefined,
             agentTeams: () => safeGet(context, 'agentTeams'),
             visibleTool: (toolName, agent) => {
@@ -287,10 +335,11 @@ export function apply(ctx: Context, config: unknown = {}): void {
             }
             roles.clear()
             bindings.clear()
+            presets.clear()
         })
 
         logger.info(
-            `applied (tools: ${tools.registered.join(', ') || 'none'}; provider=${resolved.provider}; defaultRole=${resolved.defaultRole}; skillGate=${skillGate}; service=${serviceState}; agentTeams=${teamsState})`,
+            `applied (tools: ${tools.registered.join(', ') || 'none'}; provider=${resolved.provider}; defaultRole=${resolved.defaultRole}; skillGate=${skillGate}; service=${serviceState}; agentTeams=${teamsState}; presets=${presetsState})`,
         )
     } catch (error) {
         logger.error('apply failed:', error)

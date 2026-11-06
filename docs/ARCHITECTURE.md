@@ -259,10 +259,23 @@ autoDispatch 判定      阶段 autoDispatch:true/false 优先；否则看配置
         ↓
 权限与路由            阶段有 role 且 role-guard 提供 service → 角色的 persona/工具白名单/模型路由
         ↓             否则退回落配置 toolFilter + routing（并说明"角色服务不可用"）
-subagents.start(...)  prompt = 阶段任务 + mission 上下文 + 规则（只做本阶段、不要调 orchestrate、如实汇报）
+startActivation(...)  prompt = 阶段任务 + mission 上下文 + 规则（只做本阶段、不要调 orchestrate、如实汇报）
+        ↓             角色的 persona/工具白名单经 `role:<id>` preset 在子作用域强制（见下方 0.2.2-rc.1 的接法）
         ↓ 等待（受 timeoutMs 约束，失败/超时都只记录）
 产物 + 报告            .dsh/missions/<id>/stages/<stage>-dispatch.md；工具结果里给出运行 id/stopReason/权限来源
 ```
+
+> **0.2.2-rc.1 的接法（2026-11 修正）**：上面那行旧写法 `subagents.start(provider, request)` **已经不存在**，
+> 而且 `SubagentStartRequest` 删掉了 `persona` 与 `toolFilter` 两个字段——**角色的 persona / 工具白名单不再随启动
+> 请求传递**。现在的接法是 `startActivation({ provider, label, request: { prompt, parent, signal, agentOptions, agentPreset }, signal, delivery: 'caller' })`
+> 加一个 **Agent Preset**：`dsh-role-guard` 为每个角色注册 `id: role:<roleId>`（`presets.ts`），它的行挂载本包的
+> `dsh-role-guard/scope` 插件；插件**运行在子作用域**，在那里 `ctx.tools.restrict({allow, deny})` 并写入
+> `role-guard:persona` section。工具白名单因此仍是**宿主强制**（白名单外的工具对子代理不可见，而不是"被提示词劝阻"），
+> 并且限制先于 persona 应用：`restrict` 被拒绝时子代理**启动失败**，绝不吞掉错误让它带着父 Agent 的全部工具跑起来。
+> 旧宿主（只有 `start(provider, request)`）仍走旧路径，工具输出会如实写明"旧宿主 / persona、toolFilter 随启动请求传递"。
+> 四个前提（`startActivation`、`agentPresets` 服务、本插件注册的角色 preset、已注册的 provider）任一不成立都 **fail closed**，
+> 报错点名缺什么、该挂哪个包。**`agentPreset` 必须随请求传**：不传时子代理加入父 Agent 的 composition，角色的 preset
+> 根本不会挂载（"看起来派发了，其实没强制"）。
 
 四条不变量：
 
@@ -496,7 +509,7 @@ IM 侧的职责（不在本仓库）：卡片按钮不可伪造且一次性、�
 
 | 官方能力 | 性质 | 判定 | 理由 |
 |---|---|---|---|
-| `dsh-experimental-agent-team`（`agentTeams` 服务 + `spawn_teammate`/`send_message`/`team_task_*`） | **协作面**（roster + 持久邮箱 + 共享任务 DAG） | 互补，但**官方 spawn 对我们不可用**（实测） | `SpawnTeammateRequest` 只有 `{name,description,prompt,context,provider,signal}`，**无法表达** persona 影子段 / 工具白名单 / 模型路由 / 深度上限（缺口在官方请求类型这一层，而 `startContinuable` 本身接受这些参数）；每个可加载角色又都必须有 persona ⇒ 任何角色的策略都表达不了。因此 `role-guard` **点名拒绝**官方路径、回落到自研 `subagents` 路径，并把官方创建出的 teammate 记为 **ungoverned**（不是"已阻止"：工具守卫只覆盖模型面的 `spawn_teammate`，插件直接调服务即可绕过——声称阻止就是假保证） |
+| `dsh-experimental-agent-team`（`agentTeams` 服务 + `spawn_teammate`/`send_message`/`team_task_*`） | **协作面**（roster + 持久邮箱 + 共享任务 DAG） | 互补，但**官方 spawn 对我们不可用**（实测） | `SpawnTeammateRequest` 只有 `{name,description,prompt,context,provider,signal}`，**无法表达** persona / 工具白名单 / 模型路由 / 深度上限（缺口在官方请求类型这一层：0.2.2-rc.1 的 `startActivation` 只接受 `agentPreset` 这一个策略入口，persona 与工具白名单必须由 preset 的行插件在子作用域里强制，官方请求连 preset id 都没有）；每个可加载角色又都必须有 persona ⇒ 任何角色的策略都表达不了。因此 `role-guard` **点名拒绝**官方路径、回落到自研 `subagents` 路径，并把官方创建出的 teammate 记为 **ungoverned**（不是"已阻止"：工具守卫只覆盖模型面的 `spawn_teammate`，插件直接调服务即可绕过——声称阻止就是假保证） |
 | `dsh-experimental-auto-review`（按工具调用的 LLM 授权判断） | **概率判断**，挂在 `tools/pre-execute` **瀑布**上 | **不接管授权**（但它只收紧） | 代码级核实：它只返回 `deny` / `ask` / `cancel`，**从不返回 `allow`**——因此它能加限制、能把调用升级成"问人"，却不能放行任何东西 |
 | `dsh-workspace-changes`（`workspaceChanges` 服务） | **事实源**（宿主视角的变更） | **已采纳**（`impact-gate` 的 `changeSource`，默认 `auto`） | 语义是**按轮**：turn 起止快照、靠 `workspace/changes` 事件的 `seq` 定位、无变更的轮不产生事件、记录随会话消失。采纳后处处标注来源（`workspaceChanges（会话 … 第 N 轮）` / `git` / `git（回退：<原因>）`），不可用一律回退 git 并说明原因；与 `git diff <base>` 不一致时打印 ⚠️ 交叉核对（**报告，不作为裁决**） |
 | `dsh-plugin-manager` / `dsh-config-editor` | 安装与编辑 | 各司其职 | 它们负责"装上"；**"装上之后真的工作吗"**由本套件的自检与验证脚本回答 |
