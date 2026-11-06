@@ -260,22 +260,31 @@ autoDispatch 判定      阶段 autoDispatch:true/false 优先；否则看配置
 权限与路由            阶段有 role 且 role-guard 提供 service → 角色的 persona/工具白名单/模型路由
         ↓             否则退回落配置 toolFilter + routing（并说明"角色服务不可用"）
 startActivation(...)  prompt = 阶段任务 + mission 上下文 + 规则（只做本阶段、不要调 orchestrate、如实汇报）
-        ↓             角色的 persona/工具白名单经 `role:<id>` preset 在子作用域强制（见下方 0.2.2-rc.1 的接法）
+        ↓             阶段的 persona/工具限制经 `orchestrator:<role>` preset 在子作用域强制（见下方 0.2.2-rc.1 的接法）
         ↓ 等待（受 timeoutMs 约束，失败/超时都只记录）
 产物 + 报告            .dsh/missions/<id>/stages/<stage>-dispatch.md；工具结果里给出运行 id/stopReason/权限来源
 ```
 
 > **0.2.2-rc.1 的接法（2026-11 修正）**：上面那行旧写法 `subagents.start(provider, request)` **已经不存在**，
-> 而且 `SubagentStartRequest` 删掉了 `persona` 与 `toolFilter` 两个字段——**角色的 persona / 工具白名单不再随启动
+> 而且 `SubagentStartRequest` 删掉了 `persona` 与 `toolFilter` 两个字段——**persona / 工具白名单不再随启动
 > 请求传递**。现在的接法是 `startActivation({ provider, label, request: { prompt, parent, signal, agentOptions, agentPreset }, signal, delivery: 'caller' })`
-> 加一个 **Agent Preset**：`dsh-role-guard` 为每个角色注册 `id: role:<roleId>`（`presets.ts`），它的行挂载本包的
-> `dsh-role-guard/scope` 插件；插件**运行在子作用域**，在那里 `ctx.tools.restrict({allow, deny})` 并写入
+> 加一个 **Agent Preset**：`dsh-role-guard` 为每个角色注册 `id: role:<roleId>`（`presets.ts`），`dsh-orchestrator`
+> 为每个被派发的阶段角色注册 `id: orchestrator:<role>`（`presets.ts`）。两者的行**都挂同一个插件**
+> `dsh-eng-core/scope`；插件**运行在子作用域**，在那里 `ctx.tools.restrict({allow, deny})` 并写入
 > `role-guard:persona` section。工具白名单因此仍是**宿主强制**（白名单外的工具对子代理不可见，而不是"被提示词劝阻"），
 > 并且限制先于 persona 应用：`restrict` 被拒绝时子代理**启动失败**，绝不吞掉错误让它带着父 Agent 的全部工具跑起来。
 > 旧宿主（只有 `start(provider, request)`）仍走旧路径，工具输出会如实写明"旧宿主 / persona、toolFilter 随启动请求传递"。
 > 四个前提（`startActivation`、`agentPresets` 服务、本插件注册的角色 preset、已注册的 provider）任一不成立都 **fail closed**，
 > 报错点名缺什么、该挂哪个包。**`agentPreset` 必须随请求传**：不传时子代理加入父 Agent 的 composition，角色的 preset
 > 根本不会挂载（"看起来派发了，其实没强制"）。
+>
+> **scope 插件为什么上移到 eng-core（而不是各留一份）**：这个插件是"子作用域里到底强制了什么"的唯一实现点。
+> 两处用法（角色的 `role:<roleId>`、派发阶段的 `orchestrator:<role>`）需要的语义完全相同——
+> 先 `restrict` 再 persona、缺能力只告警、空白名单直接拒绝挂载。复制一份的代价不是几十行代码，而是**两处可以各自漂移**：
+> 一边修好了拒绝空白名单、另一边没有，就会有一个子代理带着父 Agent 的全部工具在跑，而测试只覆盖了修好的那一边。
+> 放在 eng-core 还有一个结构上的好处：eng-core **不依赖任何插件**，所以共享它不会让任何一个插件依赖另一个插件；
+> preset 行里的名字是从实现里 `import` 的常量（`dsh-eng-core/scope`），而不是手写字符串——改名不会留下"指向旧名字的行"
+> （那样的行加载失败，子代理就没有限制）。
 
 四条不变量：
 

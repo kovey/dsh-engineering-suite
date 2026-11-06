@@ -29,6 +29,7 @@ import type { AgentLike } from 'dsh-eng-core'
 import { resolveConfig } from './config.js'
 import { AutoAdvanceSessions, autoAdvanceStages, createAutoAdvanceHook } from './hooks.js'
 import { createProbes, mergeProbes } from './probes.js'
+import { DispatchPresetRegistry } from './presets.js'
 import { PROMPT_SECTION, sectionText } from './prompt.js'
 import { registerTools } from './sequence.js'
 
@@ -92,10 +93,27 @@ export function apply(ctx: Context, config: unknown = {}): void {
         // Autonomous dispatch: entering a stage can hand the work to a child
         // agent instead of waiting for the model to call team_delegate.
         // Off unless config.autoDispatch.enabled; never settles a stage.
+        //
+        // The dispatch presets are registered lazily on the first dispatch (the
+        // stage role's persona/filter is only known then). `agentPresets` is read
+        // per call, so a service that appears after assembly still works; the
+        // registry itself never throws into `apply` — a missing service becomes a
+        // refusal at dispatch time, which is where the model can act on it.
+        const dispatchPresets = new DispatchPresetRegistry({
+            presets: () => {
+                try {
+                    return context.get('agentPresets') as never
+                } catch {
+                    return undefined
+                }
+            },
+            logger,
+        })
         const dispatchDeps = {
             config: resolved,
             subagents: () => context.get('subagents') as never,
             roleGuard: () => context.get('role-guard') as never,
+            presets: dispatchPresets,
             stagesDir: (cwd: string, missionId: string) => {
                 try {
                     return path.join(stores.for(cwd).layout.missionsDir, missionId, 'stages')
@@ -175,6 +193,9 @@ export function apply(ctx: Context, config: unknown = {}): void {
                     logger.warn('disposer failed:', error)
                 }
             }
+            // Release the presets this plugin registered: a reloaded plugin must
+            // not find its own ids taken by the previous instance.
+            dispatchPresets.clear()
             sessions.clearAll()
         })
 

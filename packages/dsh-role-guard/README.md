@@ -8,8 +8,9 @@
 - `team_delegate`：主 Agent 通过它派活；每个子 Agent 按角色创建，宿主在**子作用域**强制
   `ctx.tools.restrict({allow, deny})`（**白名单外的工具在子 Agent 的工具列表里根本不存在**，不是"调用后被拒绝"），
   并写入角色的 persona section 与 `agentOptions`（provider/model/reasoningEffort/maxTokens）。
-  机制落在 **Agent Preset** 上（harness 0.2.2-rc.1）：本插件为每个角色注册 `role:<roleId>`，它的行挂载本包的
-  `dsh-role-guard/scope` 插件，插件在子作用域里施加限制与 persona；启动请求只带 `agentPreset` ——
+  机制落在 **Agent Preset** 上（harness 0.2.2-rc.1）：本插件为每个角色注册 `role:<roleId>`，它的行挂载
+  **共享的** `dsh-eng-core/scope` 插件（同一个实现也被 `dsh-orchestrator` 的派发 preset 挂载；本包不再自带一份），
+  插件在子作用域里施加限制与 persona；启动请求只带 `agentPreset` ——
   `SubagentStartRequest` 已经没有 `persona` / `toolFilter` 字段。旧宿主（只有 `start(provider, request)`）
   退回旧路径，工具输出会写明"旧宿主 / persona、toolFilter 随启动请求传递"。
   `agentOptions` 默认取角色文件的模型路由，也可以**按调用覆盖**（见下文「按调用覆盖模型」）。

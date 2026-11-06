@@ -11,6 +11,7 @@ import path from 'node:path'
 import test from 'node:test'
 import { MissionStoreRegistry, type GateState, type MissionRecord, type MissionStore } from 'dsh-eng-core'
 import { createFakeHost, runText, tempWorkspace, type FakeHost } from 'dsh-eng-core/testing'
+import { name as scopePluginName } from 'dsh-eng-core/scope'
 import { apply, inject, name } from '../dist/index.js'
 import { resolveConfig } from '../dist/config.js'
 import { dispatchStage } from '../dist/dispatch.js'
@@ -62,6 +63,12 @@ function host(
         withPlugins?: boolean
         config?: Record<string, unknown>
         withSubagents?: boolean
+        /** Add the 0.2.2-rc.1 `startActivation(spec)` seam (a modern host). */
+        withActivation?: boolean
+        /** Add the `agentPresets` registry (the only way a restriction travels). */
+        withAgentPresets?: boolean
+        /** Provider names the fake `subagents.list()` reports. */
+        providers?: string[]
         services?: Record<string, unknown>
     } = {},
 ): FakeHost & { steers: Steered[] } {
@@ -69,6 +76,9 @@ function host(
     const fake = createFakeHost({
         cwd,
         ...(options.withSubagents === true ? { withSubagents: true } : {}),
+        ...(options.withActivation === true ? { withActivation: true } : {}),
+        ...(options.withAgentPresets === true ? { withAgentPresets: true } : {}),
+        ...(options.providers === undefined ? {} : { providers: options.providers }),
         ...(options.services === undefined ? {} : { services: options.services }),
     })
     hosts.push(fake)
@@ -1661,6 +1671,251 @@ test('a role whitelist keeps its tools but loses orchestrate (regression)', asyn
         .toolFilter
     assert.deepEqual(filter?.allow, ['read', 'grep', 'glob'], 'the role keeps its tools, minus the pipeline one')
     assert.ok(filter?.deny?.includes('orchestrate'))
+})
+
+// ---------------------------------------------------------------------------
+// dispatch on harness 0.2.2-rc.1: startActivation + an Agent Preset whose row
+// mounts the scope plugin shared from eng-core (the two-arg start is gone)
+// ---------------------------------------------------------------------------
+
+/** The one activation spec a test expects (with its request). */
+function activationSpec(fake: FakeHost): { provider: string; label: string; delivery: string; request: Record<string, unknown> } {
+    const spec = fake.activationSpecs[0] as { provider: string; label: string; delivery: string; request: Record<string, unknown> } | undefined
+    assert.ok(spec !== undefined, 'expected one startActivation call')
+    return spec
+}
+
+/** The single plugin row of a registered dispatch preset. */
+function presetRow(fake: FakeHost, presetId: string): { id: string; name: string; config: Record<string, unknown> } {
+    const definition = fake.presetDefinitions.get(presetId)
+    assert.ok(definition !== undefined, `expected preset ${presetId}, got ${[...fake.presetDefinitions.keys()].join(', ')}`)
+    assert.equal(definition.plugins.length, 1)
+    return definition.plugins[0] as { id: string; name: string; config: Record<string, unknown> }
+}
+
+/** A modern host with one dispatched stage, plus a role-guard stub. */
+function modernDispatchHost(cwd: string, extra: { config?: Record<string, unknown>; services?: Record<string, unknown>; providers?: string[] } = {}): FakeHost {
+    return host({
+        cwd,
+        withSubagents: true,
+        withActivation: true,
+        withAgentPresets: true,
+        ...(extra.providers === undefined ? {} : { providers: extra.providers }),
+        config: {
+            autoDispatch: { enabled: true, stages: ['impl'] },
+            stages: [
+                { id: 'impl', prompt: '实现这个需求', requiredPlugins: [], role: 'developer', next: 'done' },
+                { id: 'done', prompt: '收尾', requiredPlugins: [] },
+            ],
+            ...(extra.config ?? {}),
+        },
+        ...(extra.services === undefined
+            ? {
+                  services: {
+                      'role-guard': {
+                          plan: () => ({
+                              persona: '你是开发者：只改规格允许的文件。',
+                              toolFilter: { allow: ['read', 'grep', 'orchestrate'] },
+                              dropped: [],
+                              skills: [],
+                              route: {},
+                          }),
+                      },
+                  },
+              }
+            : { services: extra.services }),
+    })
+}
+
+test('a modern host dispatches through startActivation and a preset that has no orchestrate (TC-901)', async () => {
+    disposeHosts()
+    const cwd = tempWorkspace('orchestrator-activation-')
+    const fake = modernDispatchHost(cwd)
+    const report = await orchestrate(fake, { action: 'start', summary: '新路径派发' })
+
+    // The modern seam was used, and ONLY it: the deleted two-arg start must not run.
+    assert.equal(fake.activationSpecs.length, 1)
+    assert.equal(fake.subagentStarts.length, 0, 'the legacy seam must not be used when startActivation exists')
+    const spec = activationSpec(fake)
+    assert.equal(spec.provider, 'spawn')
+    assert.equal(spec.delivery, 'caller', 'a stage dispatch returns its product to the caller, not as a second parent turn')
+    assert.equal(spec.request['agentPreset'], 'orchestrator:developer')
+    assert.equal(spec.request['maxDepth'], 1, 'a stage worker must not fan out further')
+    // 0.2.2-rc.1 has no persona/toolFilter in the start request: sending them
+    // would be a lie about where the restriction is enforced.
+    assert.equal('toolFilter' in spec.request, false)
+    assert.equal('persona' in spec.request, false)
+    assert.equal('signal' in spec.request, false, 'the signal rides on the activation spec, not inside the request')
+    assert.match((spec.request['prompt'] as { text: string }[])[0]?.text ?? '', /实现这个需求/)
+
+    // THE anti-recursion guard: it lives in the preset's row, not in the prompt.
+    // Found live once as ~800 child sessions from a single stage entry.
+    const row = presetRow(fake, 'orchestrator:developer')
+    assert.equal(row.id, 'orchestrator-scope')
+    assert.equal(row.name, 'dsh-eng-core/scope', 'the row must name the plugin eng-core actually exports')
+    assert.equal(row.name, scopePluginName, 'a stale specifier here is a child with NO restriction (the row cannot load)')
+    assert.deepEqual(row.config['allow'], ['read', 'grep'], 'the role keeps its tools, minus the pipeline one')
+    assert.match(String(row.config['deny']), /orchestrate/, 'orchestrate must be denied structurally')
+    assert.match(String(row.config['persona']), /只改规格允许的文件/)
+
+    // The report says how the child was created and that the guard is structural.
+    assert.match(report, /派发: startActivation \+ Agent Preset（orchestrator:developer/)
+    assert.match(report, /orchestrate 已剔除/)
+    assert.match(report, /子代理运行：activation-1/)
+    assert.equal(fake.activationDisposals(), 1, 'the activation is disposed after the stage entry')
+
+    // INVARIANT: dispatch is not settlement; the stage is still entered.
+    assert.equal(stageFile(cwd, missionIdOf(cwd), 'impl').state, 'entered')
+    assert.equal(stageFile(cwd, missionIdOf(cwd), 'impl').dispatch?.runId, 'activation-1')
+})
+
+test('a role-less stage gets its own preset, and the guard is deny-only (TC-901)', async () => {
+    disposeHosts()
+    const cwd = tempWorkspace('orchestrator-activation-roleless-')
+    const fake = host({
+        cwd,
+        withSubagents: true,
+        withActivation: true,
+        withAgentPresets: true,
+        config: {
+            autoDispatch: { enabled: true, stages: ['impl'], toolFilter: { allow: ['read'] } },
+            stages: [{ id: 'impl', prompt: '计划', requiredPlugins: [], next: 'done' }, { id: 'done', prompt: 'x', requiredPlugins: [] }],
+        },
+    })
+    await orchestrate(fake, { action: 'start' })
+    assert.equal(activationSpec(fake).request['agentPreset'], 'orchestrator:stage')
+    const row = presetRow(fake, 'orchestrator:stage')
+    // The deployment's filter is the fallback, and it is narrowed — never dropped.
+    assert.deepEqual(row.config['allow'], ['read'])
+    assert.deepEqual(row.config['deny'], ['orchestrate'])
+    assert.equal('persona' in row.config, false, 'a role-less stage has no persona to install')
+})
+
+test('an old host still dispatches through the legacy start, and says so (TC-903)', async () => {
+    disposeHosts()
+    const cwd = tempWorkspace('orchestrator-legacy-dispatch-')
+    const fake = host({
+        cwd,
+        withSubagents: true, // no startActivation, no agentPresets: a pre-0.2.2 host
+        config: {
+            autoDispatch: { enabled: true, stages: ['impl'] },
+            stages: [{ id: 'impl', prompt: '实现', requiredPlugins: [], next: 'done' }, { id: 'done', prompt: 'x', requiredPlugins: [] }],
+        },
+    })
+    const report = await orchestrate(fake, { action: 'start' })
+    assert.equal(fake.activationSpecs.length, 0, 'no activation exists on an old host')
+    assert.equal(fake.subagentStarts.length, 1)
+    const start = fake.subagentStarts[0] as { request: { toolFilter?: { allow?: readonly string[]; deny?: readonly string[] }; maxDepth?: number } }
+    // Recursion protection survives the fallback: same filter, same depth cap.
+    assert.equal(start.request.maxDepth, 1)
+    assert.ok(start.request.toolFilter?.deny?.includes('orchestrate'), `orchestrate must be denied: ${JSON.stringify(start.request.toolFilter)}`)
+    // …and the report never pretends a preset enforced it.
+    assert.match(report, /legacy start\(provider, request\)/)
+    assert.match(report, /旧宿主/)
+    assert.match(report, /orchestrate 已在过滤里剔除/)
+    assert.doesNotMatch(report, /Agent Preset/, 'an old host must never be described as preset-enforced')
+})
+
+test('a host with neither dispatch API is refused by name, never by a TypeError (TC-903)', async () => {
+    disposeHosts()
+    const cwd = tempWorkspace('orchestrator-no-dispatch-api-')
+    const fake = host({
+        cwd,
+        services: { subagents: { list: () => ['spawn'] } },
+        config: {
+            autoDispatch: { enabled: true, stages: ['impl'] },
+            stages: [{ id: 'impl', prompt: '实现', requiredPlugins: [], next: 'done' }, { id: 'done', prompt: 'x', requiredPlugins: [] }],
+        },
+    })
+    const report = await orchestrate(fake, { action: 'start' })
+    assert.match(report, /startActivation/)
+    assert.match(report, /start\(provider, request\)/)
+    assert.match(report, /fail closed/)
+    assert.match(report, /@deepseek-ai\/dsh-agent-preset-registry/)
+    assert.doesNotMatch(report, /is not a function/)
+    assert.doesNotMatch(report, /TypeError/)
+    assert.equal(stageFile(cwd, missionIdOf(cwd), 'impl').state, 'entered', 'a refusal leaves the stage entered for the model')
+})
+
+test('startActivation without an agentPresets registry is refused, naming the repair (TC-904)', async () => {
+    disposeHosts()
+    const cwd = tempWorkspace('orchestrator-no-presets-')
+    const fake = host({
+        cwd,
+        withSubagents: true,
+        withActivation: true, // the preset registry is missing
+        config: {
+            autoDispatch: { enabled: true, stages: ['impl'] },
+            stages: [{ id: 'impl', prompt: '实现', requiredPlugins: [], next: 'done' }, { id: 'done', prompt: 'x', requiredPlugins: [] }],
+        },
+    })
+    const report = await orchestrate(fake, { action: 'start' })
+    assert.match(report, /agentPresets/)
+    assert.match(report, /@deepseek-ai\/dsh-agent-preset-registry/)
+    assert.match(report, /repair-profile-closure\.sh --apply/)
+    assert.match(report, /拒绝派发/)
+    assert.equal(fake.activationSpecs.length, 0, 'nothing may start without a way to carry the restriction')
+})
+
+test('a preset id registered by somebody else is refused, never trusted (TC-902)', async () => {
+    disposeHosts()
+    const cwd = tempWorkspace('orchestrator-foreign-preset-')
+    const fake = modernDispatchHost(cwd)
+    const service = (fake.ctx as { get: (name: string) => unknown }).get('agentPresets') as { register: (definition: unknown) => unknown }
+    service.register({ id: 'orchestrator:developer', plugins: [] })
+    const report = await orchestrate(fake, { action: 'start' })
+    assert.match(report, /orchestrator:developer/)
+    assert.match(report, /其他插件注册/)
+    assert.equal(fake.activationSpecs.length, 0, 'a preset we cannot vouch for is never used')
+
+    // A rejected registration is a refusal too — never a silent "registered".
+    disposeHosts()
+    const other = modernDispatchHost(tempWorkspace('orchestrator-register-fail-'))
+    const failing = (other.ctx as { get: (name: string) => unknown }).get('agentPresets') as { register: (definition: unknown) => unknown }
+    failing.register = () => Promise.reject(new Error('激活失败：订阅不到 tools 服务'))
+    const failed = await orchestrate(other, { action: 'start' })
+    assert.match(failed, /不可用（注册失败）/)
+    assert.match(failed, /激活失败：订阅不到 tools 服务/)
+    assert.equal(other.activationSpecs.length, 0)
+})
+
+test('an unknown provider is refused with the registered providers listed (TC-905)', async () => {
+    disposeHosts()
+    const cwd = tempWorkspace('orchestrator-unknown-provider-')
+    const fake = modernDispatchHost(cwd, {
+        providers: ['spawn', 'fork-in-process'],
+        config: { autoDispatch: { enabled: true, stages: ['impl'], provider: 'nope' } },
+    })
+    const report = await orchestrate(fake, { action: 'start' })
+    assert.match(report, /provider "nope" 没有注册/)
+    assert.match(report, /已注册的 provider（service\.list\(\)）：spawn, fork-in-process/)
+    assert.equal(fake.activationSpecs.length, 0, 'no silent fallback to the first registered provider')
+})
+
+test('a provider without the agentPreset capability is refused, not silently widened (TC-905)', async () => {
+    disposeHosts()
+    const cwd = tempWorkspace('orchestrator-no-preset-capability-')
+    const fake = host({
+        cwd,
+        withAgentPresets: true,
+        services: {
+            subagents: {
+                list: () => ['spawn'],
+                getProvider: () => ({ name: 'spawn', capabilities: { agentOptions: true, outputSchema: true, depthLimit: true, agentPreset: false } }),
+                startActivation: async () => {
+                    throw new Error('must never be called')
+                },
+            },
+        },
+        config: {
+            autoDispatch: { enabled: true, stages: ['impl'] },
+            stages: [{ id: 'impl', prompt: '实现', requiredPlugins: [], next: 'done' }, { id: 'done', prompt: 'x', requiredPlugins: [] }],
+        },
+    })
+    const report = await orchestrate(fake, { action: 'start' })
+    assert.match(report, /capabilities\.agentPreset = false/)
+    assert.match(report, /无法由宿主强制/)
+    assert.equal(fake.activationSpecs.length, 0, 'without the capability orchestrate cannot be removed, so nothing starts')
 })
 
 test('the standards gate requires a PASS from this round (regression)', async () => {

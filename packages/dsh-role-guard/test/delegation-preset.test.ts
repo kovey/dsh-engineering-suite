@@ -13,8 +13,9 @@ import fs from 'node:fs'
 import path from 'node:path'
 import test from 'node:test'
 import { createFakeHost, runText, tempWorkspace, type FakeHost, type FakeHostOptions } from 'dsh-eng-core/testing'
+import { name as scopePluginName } from 'dsh-eng-core/scope'
 import { apply as applyRoleGuard } from '../dist/index.js'
-import { apply as applyScope, name as scopeName, PERSONA_SECTION } from '../dist/scope.js'
+import { SCOPE_PLUGIN_NAME } from '../dist/presets.js'
 
 const HOST_TOOLS = ['read', 'write', 'edit', 'bash', 'glob', 'grep', 'todo_write', 'read_image', 'subagent', 'skill']
 
@@ -83,7 +84,12 @@ test('a modern host dispatches through startActivation and mounts the role prese
     // The identity/whitelist the HOST will enforce in the child scope.
     const row = presetRow(fake, 'role:reviewer')
     assert.equal(row.id, 'role-guard-scope')
-    assert.equal(row.name, 'dsh-role-guard/scope')
+    // The specifier names the plugin eng-core actually exports (TC-902): a row
+    // left behind by a move is a row the host cannot load, and a preset whose row
+    // fails to mount is a child running with NO restriction.
+    assert.equal(row.name, 'dsh-eng-core/scope')
+    assert.equal(row.name, scopePluginName)
+    assert.equal(row.name, SCOPE_PLUGIN_NAME)
     assert.deepEqual(row.config['allow'], ['read', 'glob', 'grep'])
     assert.match(String(row.config['persona']), /审查者/)
     const definition = fake.presetDefinitions.get('role:reviewer')
@@ -236,89 +242,5 @@ test('a tool list edited after registration is refused instead of enforced stale
     assert.equal(fake.activationSpecs.length, 1, 'the stale preset is never used for a second child')
 })
 
-// --- the scope plugin (what the preset row mounts in the child) -------------
-
-test('the scope plugin enforces the filter and installs the persona in the child scope (TC-803)', () => {
-    assert.equal(scopeName, 'dsh-role-guard/scope')
-    const filters: unknown[] = []
-    const sections: { name: string; order: number; text: string | (() => string) }[] = []
-    const effects: (() => void)[] = []
-    let released = 0
-    const ctx = {
-        tools: {
-            restrict: (filter: unknown) => {
-                filters.push(filter)
-                return () => {
-                    released += 1
-                }
-            },
-        },
-        systemPrompt: {
-            section: (section: { name: string; order: number; text: string | (() => string) }) => {
-                sections.push(section)
-                return () => {
-                    released += 1
-                }
-            },
-        },
-        effect: (execute: () => (() => void) | void) => {
-            const disposer = execute()
-            if (typeof disposer === 'function') effects.push(disposer)
-        },
-    }
-
-    applyScope(ctx, { persona: '你是审查者，只读。', allow: ['read', 'grep'] })
-    assert.deepEqual(filters, [{ allow: ['read', 'grep'] }], 'the host-enforced restriction is applied exactly once')
-    assert.equal(sections.length, 1)
-    assert.equal(sections[0]?.name, PERSONA_SECTION)
-    assert.equal(sections[0]?.order, 0)
-    assert.equal(typeof sections[0]?.text, 'function')
-    assert.equal((sections[0]?.text as () => string)(), '你是审查者，只读。')
-
-    // Teardown releases both registrations (the scope's effect owns them).
-    for (const dispose of effects) dispose()
-    assert.equal(released, 2)
-})
-
-test('the scope plugin never throws on an absent capability, and never half-enforces silently (TC-803)', () => {
-    // Nothing to enforce and nothing to crash: a bare composition is legal.
-    assert.doesNotThrow(() => applyScope({}, { persona: '只读角色', allow: ['read'] }))
-    assert.doesNotThrow(() => applyScope({ tools: {}, systemPrompt: {} }, { persona: '只读角色', allow: ['read'] }))
-    assert.doesNotThrow(() => applyScope({}, 'not even an object'))
-
-    // No filter, no section when nothing is declared.
-    const filters: unknown[] = []
-    const sections: unknown[] = []
-    applyScope(
-        { tools: { restrict: (filter: unknown) => (filters.push(filter), () => undefined) }, systemPrompt: { section: (s: unknown) => (sections.push(s), () => undefined) } },
-        { persona: '   ', deny: [] },
-    )
-    assert.deepEqual(filters, [])
-    assert.deepEqual(sections, [])
-
-    // A declared-but-EMPTY whitelist is not "no whitelist": the child must not
-    // mount at all rather than run with everything the role excluded.
-    assert.throws(() => applyScope({ tools: { restrict: () => () => undefined } }, { allow: [] }), /empty tool whitelist/)
-
-    // A deny-only role leans on the deny half (read-only roles do exactly this).
-    const denyFilters: unknown[] = []
-    applyScope({ tools: { restrict: (filter: unknown) => (denyFilters.push(filter), () => undefined) } }, { deny: ['write', 'edit'] })
-    assert.deepEqual(denyFilters, [{ deny: ['write', 'edit'] }])
-
-    // A filter the host REJECTS must fail the child's start: swallowing it would
-    // hand the child every tool the role excluded.
-    assert.throws(
-        () =>
-            applyScope(
-                {
-                    tools: {
-                        restrict: () => {
-                            throw new Error('unknown tool "nope"')
-                        },
-                    },
-                },
-                { allow: ['nope'] },
-            ),
-        /unknown tool "nope"/,
-    )
-})
+// The scope plugin itself (restrict-then-persona, absent capabilities, empty
+// allow) is tested beside its implementation: `packages/dsh-eng-core/test/scope.test.ts`.

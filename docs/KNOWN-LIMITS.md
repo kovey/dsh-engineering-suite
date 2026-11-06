@@ -410,13 +410,15 @@ bash scripts/e2e-mission.sh          # 建立隔离 profile、起 stub、跑一�
 已知影响：`agentPresets` 服务缺席 → 子会话无法通过预设获得 `persona` / `toolFilter`；`team_delegate` 这类依赖它的路径
 只能 fail-closed。处置：`bash scripts/repair-profile-closure.sh`（dry-run）→ `--apply`；升级宿主后应例行跑一次。
 
-**一条 preset 行能不能加载，取决于闭包，而不取决于我们的代码**：`role:<roleId>` 的行是
-`name: dsh-role-guard/scope`，由 loader 在声明方的解析基上 `import`。闭包悬空时它 import 不到，
+**一条 preset 行能不能加载，取决于闭包，而不取决于我们的代码**：`role:<roleId>`（role-guard）与
+`orchestrator:<role>`（orchestrator）的行都是 `name: dsh-eng-core/scope`——scope 插件已上移到 eng-core，
+两个插件各挂同一个实现，不再各带一份。它由 loader 在**声明方**的解析基上 `import`：对 orchestrator 来说就是
+"它自己解析到的 eng-core 必须带 `./scope` 子路径"。闭包悬空时它 import 不到，
 `mountPreset` 就把这一行算作 failed，并把理由**并进 preset 的 `broken` 诊断**（宿主 preset 列表里能看到，
-`team_delegate` 的工具输出里看不到——它只能看到"启动失败"）。所以"角色 preset 注册成功"≠"preset 里的行能加载"：
+`team_delegate` 的工具输出里看不到——它只能看到"启动失败"）。所以"preset 注册成功"≠"preset 里的行能加载"：
 注册只证明定义进了 registry，行的可用性要等第一次 `mount`。复现与处置都只有一条路：`--apply` 修闭包 → 重启宿主。
 
-另有一处结构性代价：`register()` 是**按 preset id** 的，而 id 由角色 id 决定（`role:developer`），与工作区无关；
-工具过滤在注册时被固化。**同一个进程里两个工作区的同名角色如果声明了不同的白名单**，第二个会拿到 `stale` 拒绝，
-而不是被静默按第一个工作区的权限派发；改角色文件的 `tools` 也需要重启宿主才好使（`persona` 只影响文案，
-同样要重启才生效）。
+另一处结构性代价（两个插件同形）：`register()` 是**按 preset id** 的，而 id 由角色 id 决定（`role:developer` /
+`orchestrator:developer`），与工作区无关；工具过滤在注册时被固化。**同一个进程里两个工作区的同名角色如果声明了
+不同的白名单**，第二个会拿到 `stale` 拒绝，而不是被静默按第一个工作区的权限派发；改角色文件的 `tools` 或
+`autoDispatch.toolFilter` 也需要重启宿主才好使（`persona` 只影响文案，同样要重启才生效）。

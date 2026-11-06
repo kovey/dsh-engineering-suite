@@ -1,7 +1,11 @@
 # dsh-eng-core
 
-工程套件的共享运行时（**库，不是 Cordis 插件**：没有 `apply()`，profile 的
-`dsh.profile.bundles` 里也不该出现它）。
+工程套件的共享运行时（**库，不是 Cordis 插件**：profile 的 `dsh.profile.bundles` 里不该出现它）。
+
+唯一的例外是 `scope.ts`：它是一个**子作用域插件模块**（子路径导出 `dsh-eng-core/scope`，有 `apply()`），
+由 preset 行在**子代理的 scope 里**挂载，所以它不是一个 bundle，也不是本包的入口。放在这里是因为
+`dsh-role-guard`（`role:<roleId>` preset）与 `dsh-orchestrator`（`orchestrator:<role>` preset）挂的是**同一个实现**：
+复制一份会让两处可以各自漂移，而漂移的后果是某个子代理带着父 Agent 的全部工具在跑。
 
 设计约束：**运行时不 import 任何 `@deepseek-ai/*`**，所以它可以在任意 harness 构建上加载；
 harness 相关的东西一律走结构化类型（`AgentLike`、`SubprocessLike`）或由插件自己 `import`。
@@ -27,6 +31,7 @@ harness 相关的东西一律走结构化类型（`AgentLike`、`SubprocessLike`
 | `metrics.ts` | `measureWorkspace`、`parseBaseline`、`compareToBaseline` | 代码度量的确定性一半：文件/函数规模、嵌套深度、`if`/`else` 块行数、参数个数、导出面、模块依赖方向与导入环；输出违规清单与基线对比（详见下文） |
 | `conformance.ts` | `missionConformance`、`conformanceRollup`、`conformanceOverview`、`buildConformanceContext`、`conformanceHeadline`、`HEADLINE_RANK`、`CONFORMANCE_DIMENSIONS` | **一致性总览**：一个 mission 的五个维度（授权/证据/门禁/新鲜度/一致性）+ 仓库级分布；头行 = 最差维度，`unknown` 不优于 `partial`；只读、派生、零权力（详见下文） |
 | `testing.ts` | `createFakeHost`、`tempWorkspace`、`fakeAgent`、`runText` | 单元测试用的假宿主：`tools.register/guard/get`、`on`、`effect`、`systemPrompt.section`、`get()`、`approval.request`、`subagents.start`、`subprocess.spawn`，外加 `emit` / `waterfall`（数组 payload 会展开成多参）/ `runTool` / `sectionText` / `dispose` |
+| `scope.ts`（子路径 `dsh-eng-core/scope`） | `apply`、`name`、`resolveScopeConfig`、`PERSONA_SECTION`、`PERSONA_ORDER`、`ScopeContextLike` | 子代理 scope 里的唯一强制点：先 `ctx.tools.restrict({allow, deny})`（宿主强制，白名单外的工具对子代理不可见）再写 persona section；能力缺失只告警、`restrict` 被拒必须抛（子代理启动失败），空白名单 `allow: []` 拒绝挂载。被 role-guard 与 orchestrator 的 preset 行**按同名挂载** |
 
 ## 用法
 

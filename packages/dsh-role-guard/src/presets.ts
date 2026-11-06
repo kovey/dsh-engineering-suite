@@ -10,12 +10,19 @@
  * ```
  * id: role:<roleId>            order: 100 + index
  * plugins:
- *   - id: role-guard-scope     name: dsh-role-guard/scope
+ *   - id: role-guard-scope     name: dsh-eng-core/scope
  *     config: { persona, allow?, deny? }
  * ```
  *
- * The row's plugin is `scope.js`, which runs in the child's scope and calls
- * `ctx.tools.restrict(...)` there — host-enforced, not prompt text.
+ * The row's plugin is the scope plugin shared from `dsh-eng-core/scope`
+ * (`packages/dsh-eng-core/src/scope.ts`), which runs in the child's scope and
+ * calls `ctx.tools.restrict(...)` there — host-enforced, not prompt text. It is
+ * shared rather than copied because `dsh-orchestrator` mounts the same row for
+ * an auto-dispatched stage; one implementation, one place to fix.
+ *
+ * The specifier is IMPORTED, not spelled out: a rename that leaves a stale
+ * string in a row is exactly the failure this suite keeps hitting (the preset
+ * then fails to mount and the child starts with no restriction at all).
  *
  * Registration is deliberately defensive: `apply()` must never fail because the
  * preset service is absent, slow, or rejects one definition. Failures are
@@ -26,10 +33,15 @@
  * @module dsh-role-guard/presets
  */
 
+import { name as SCOPE_NAME } from 'dsh-eng-core/scope'
 import type { Role } from './roles.js'
 
-/** The scope plugin a preset row mounts (this package's `./scope` subpath). */
-export const SCOPE_PLUGIN_NAME = 'dsh-role-guard/scope'
+/**
+ * The scope plugin a preset row mounts (`dsh-eng-core/scope`).
+ *
+ * Imported from the implementation so the two can never drift.
+ */
+export const SCOPE_PLUGIN_NAME = SCOPE_NAME
 
 /** Row id inside one preset; stable so a roster is readable in a diff. */
 export const SCOPE_ROW_ID = 'role-guard-scope'

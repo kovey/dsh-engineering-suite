@@ -10,10 +10,6 @@
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
     },
-    "./scope": {
-      "types": "./dist/scope.d.ts",
-      "default": "./dist/scope.js"
-    },
     "./package.json": "./package.json"
   },
   "files": [

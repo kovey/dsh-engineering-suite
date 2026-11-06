@@ -14,6 +14,10 @@
       "types": "./dist/testing.d.ts",
       "default": "./dist/testing.js"
     },
+    "./scope": {
+      "types": "./dist/scope.d.ts",
+      "default": "./dist/scope.js"
+    },
     "./package.json": "./package.json"
   },
   "files": [

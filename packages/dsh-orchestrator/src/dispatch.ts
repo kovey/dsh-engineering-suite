@@ -19,13 +19,27 @@
  *    cancelled leaves the stage entered with the reason recorded in the artifact
  *    and in the tool result; the model can still do the work itself.
  *
+ * How the child is STARTED changed with harness 0.2.2-rc.1: the two-argument
+ * `subagents.start(provider, request)` no longer exists, and the start request
+ * carries neither `persona` nor `toolFilter`. Every dispatch therefore goes
+ * through `startActivation` with an Agent Preset this plugin registers (see
+ * `presets.ts` / `dispatch-plan.ts`); the preset's row mounts the scope plugin
+ * shared from `dsh-eng-core/scope`, which applies the tool restriction inside
+ * the CHILD's scope. The legacy two-arg `start` is used ONLY for a host that has
+ * no `startActivation`, and the dispatch note says which path ran — an old host
+ * must never be described as preset-enforced.
+ *
  * @module dsh-orchestrator/dispatch
  */
 
 import path from 'node:path'
 import { formatTime, writeTextAtomic, type AgentLike, type MissionRecord } from 'dsh-eng-core'
 import type { OrchestratorConfig } from './config.js'
+import { dispatchLine, planDispatch, startChild, type SubagentsLike } from './dispatch-plan.js'
 import { describeStageRoute, resolveStageRoute, type StageConfig, type StageRoute } from './pipeline.js'
+import { withoutOrchestrate, type DispatchPresetRegistry } from './presets.js'
+
+export type { SubagentsLike } from './dispatch-plan.js'
 
 /** The role-guard service, as much of it as this module uses. */
 export interface RoleGuardLike {
@@ -54,6 +68,14 @@ export interface DispatchDeps {
     config: OrchestratorConfig
     subagents: () => SubagentsLike | undefined
     roleGuard: () => RoleGuardLike | undefined
+    /**
+     * The Agent Preset seam: the presets THIS plugin registered (see `presets.ts`).
+     *
+     * Optional so a hand-wired deps (a unit test, an older embedding) keeps
+     * compiling; the dispatch then refuses the activation path by name instead of
+     * dispatching without a way to carry the restriction.
+     */
+    presets?: DispatchPresetRegistry
     /** Where a stage artifact lives, for the child's transcript file. */
     stagesDir: (cwd: string, missionId: string) => string
 }
@@ -191,21 +213,6 @@ export async function dispatchStage(
     // The role decides rights; the config is the fallback for role-less setups.
     let persona: string | undefined
     let toolFilter = dispatchFilter
-    /**
-     * The child must not be able to re-enter the pipeline.
-     *
-     * `orchestrate` in a child's hands means recursion: the child calls
-     * `orchestrate start`, that re-enters the stage, and my own auto-dispatch
-     * spawns a grandchild — measured live as ~800 sessions from ONE entry. The
-     * stage prompt says "don't call orchestrate", but prose is not a permission
-     * model, so the tool is removed structurally.
-     */
-    const withoutOrchestrate = (filter: { allow?: readonly string[]; deny?: readonly string[] } | undefined) => {
-        if (filter?.allow !== undefined) {
-            return { allow: filter.allow.filter((name) => name !== 'orchestrate'), deny: [...(filter.deny ?? []), 'orchestrate'] }
-        }
-        return { deny: [...new Set([...(filter?.deny ?? []), 'orchestrate'])] }
-    }
     let route = resolveStageRoute(stage, deps.config.routing)
     // Never empty: "who decided the child's rights" must be answerable from the
     // report alone, including on the role-less path.
@@ -275,20 +282,62 @@ export async function dispatchStage(
         }
     }
 
+    // The anti-recursion guard is computed ONCE and used by both paths: on a
+    // modern host it becomes the preset row's `deny`, on an old host the request's
+    // `toolFilter`. Prose in the prompt is not a permission model.
+    const guarded = withoutOrchestrate(toolFilter)
+    // BUG-5 again, one step later: a role whose whitelist held nothing but
+    // `orchestrate` would otherwise become an EMPTY allow-list, which the scope
+    // plugin refuses to mount (correctly) — refuse here instead, where the reason
+    // can name the role and the fix.
+    if (guarded.allow !== undefined && guarded.allow.length === 0) {
+        return {
+            dispatched: false,
+            note: `自动派发未执行：${stage.role === undefined ? '工具白名单' : `角色 ${stage.role} 的工具白名单`}在剔除 orchestrate 后为空（等于"不给任何工具"）。请给角色补一个工具，或删掉 allow（用 deny 表达减法）。`,
+        }
+    }
+
+    let plan: Awaited<ReturnType<typeof planDispatch>>
+    try {
+        plan = await planDispatch({
+            subagents,
+            provider: deps.config.autoDispatch.provider,
+            presets: deps.presets,
+            role: stage.role,
+            persona,
+            filter: guarded,
+        })
+    } catch (error) {
+        // Decision-making must never take stage entry down with it: a hostile or
+        // half-mounted service becomes one reported refusal, not a failed tool.
+        return { dispatched: false, note: `自动派发未执行：派发准备失败（${(error as Error).message}）` }
+    }
+    if (plan.kind === 'refused') {
+        // Fail closed and name the premise. A degraded dispatch would either lose
+        // the role's restriction or lose the anti-recursion guard — both worse
+        // than one stage done by hand.
+        return { dispatched: false, note: `自动派发未执行：${plan.reason}` }
+    }
+    // "How was this child created" is part of who decided its rights, so it rides
+    // in the same line the report and the transcript already show.
+    roleNote = `${roleNote}；${dispatchLine(plan)}`
+
     const prompt = dispatchPrompt(stage, mission, {
         ...(mission.specPath === undefined ? {} : { specPath: path.isAbsolute(mission.specPath) ? mission.specPath : path.join(cwd, mission.specPath) }),
         gate: describeGateText(stage),
         ...(input.extra === undefined ? {} : { extra: input.extra }),
     })
 
-    let child: Awaited<ReturnType<SubagentsLike['start']>>
+    let child: Awaited<ReturnType<typeof startChild>>
     try {
-        child = await subagents.start(deps.config.autoDispatch.provider, {
+        child = await startChild(subagents, {
+            provider: deps.config.autoDispatch.provider,
+            plan,
             label: `${stage.id} · ${mission.title}`,
-            prompt: [{ type: 'text', text: prompt }],
+            prompt,
             parent: input.agent as never,
             signal: input.signal ?? new AbortController().signal,
-            toolFilter: withoutOrchestrate(toolFilter),
+            toolFilter: guarded,
             ...(persona === undefined ? {} : { persona }),
             maxDepth: deps.config.autoDispatch.maxDepth,
             ...(route.model === undefined && route.provider === undefined
@@ -308,12 +357,9 @@ export async function dispatchStage(
             error: `派发失败（provider ${deps.config.autoDispatch.provider}）：${(error as Error).message}`,
         }
     }
-    // A provider that resolves to nothing usable must not take the tool call
-    // down with a TypeError (BUG-6).
-    const runId = typeof (child as { id?: unknown } | null)?.id === 'string' ? (child as { id: string }).id : undefined
-    if (runId === undefined || child === null || child === undefined) {
-        return { dispatched: true, error: '派发失败：provider 返回了不可用的运行句柄（没有 id）' }
-    }
+    // `startChild` already refused a handle without an id; the binding below needs
+    // the id itself (BUG-6 was a host returning nothing usable).
+    const runId = child.id
 
     // The child exists now: bind its role BEFORE it can load a skill. Without
     // this record the skill gate has no oracle and the child's skill whitelist
@@ -418,25 +464,4 @@ export async function dispatchStage(
 function describeGateText(stage: StageConfig): string {
     const phase = stage.gate.phase === 'entry' ? '进入时' : '离开时'
     return `${phase}要求：${stage.gate.label}${stage.gate.verdict === 'pass-or-warn' ? '（软门禁：警告也放行）' : ''}`
-}
-
-/** Minimal structural view of `ctx.subagents` (mirrors role-guard's). */
-export interface SubagentsLike {
-    start: (
-        provider: string,
-        request: {
-            label?: string
-            prompt: { type: 'text'; text: string }[]
-            parent: never
-            signal: AbortSignal
-            toolFilter?: { allow?: readonly string[]; deny?: readonly string[] }
-            persona?: string
-            agentOptions?: { provider?: string; model?: string; reasoningEffort?: string; maxTokens?: number }
-            maxDepth?: number
-        },
-    ) => Promise<{
-        id: string
-        result: Promise<{ stopReason?: string; output?: { type?: string; text?: string }[]; diagnostic?: string }>
-        dispose?: () => Promise<void>
-    }>
 }

@@ -1,5 +1,42 @@
 ## [未发布]
 
+### 重构 · scope 插件上移到 `dsh-eng-core`，`autoDispatch` 改走 `startActivation` + Agent Preset
+
+两件事一起做，因为它们共享同一个前提：**子作用域里"到底强制了什么"只有一个实现点**。
+
+- **scope 插件搬家**：`packages/dsh-role-guard/src/scope.ts` → `packages/dsh-eng-core/src/scope.ts`，行为不变
+  （先 `ctx.tools.restrict` 再 persona；能力缺失只告警；空白名单 `allow: []` 直接拒绝挂载）。eng-core 新增子路径导出
+  `dsh-eng-core/scope`，role-guard **删掉自己的 `./scope` 导出与源码**。两个插件不再各带一份：复制一份的代价不是几十行，
+  而是两处可以各自漂移——一边修好"空白名单必须拒绝挂载"、另一边没修，就有一个子代理带着父 Agent 的全部工具在跑，
+  而测试只覆盖修好的那一边。方向规则不变：eng-core 不 import role-guard / orchestrator。
+  preset 行里的插件名现在是**从实现 import 的常量**（`SCOPE_PLUGIN_NAME = name`），不是手写字符串——
+  改名不会留下"指向旧名字的行"（那样的行加载失败，子代理就**没有限制**）。
+- **orchestrator 的第二处 `subagents.start` 修掉了**：`autoDispatch` 之前还在调 0.2.2-rc.1 已删除的两参
+  `start(provider, request)`（真机上就是 `start is not a function`），并靠请求里的 `toolFilter`/`persona` 传限制
+  ——新宿主没有这两个字段。现在：每个被派发的阶段角色注册一个 preset
+  `{ id: 'orchestrator:<role>'（无角色阶段是 'orchestrator:stage'）, order: 200+i, plugins: [{ id: 'orchestrator-scope', name: 'dsh-eng-core/scope', config: { persona?, allow?, deny } }] }`，
+  派发走 `startActivation({ ..., request: { prompt, parent, agentPreset, maxDepth, agentOptions }, delivery: 'caller' })`。
+- **防递归没有被顺手丢掉**：`withoutOrchestrate(toolFilter)` 现在是 preset 行 config 里的一行（`deny` 必含
+  `orchestrate`，有 `allow` 时同时把它从 `allow` 里剔掉），`maxDepth` 仍然随请求传。两条路径共用同一个守卫函数：
+  旧宿主上它落在请求的 `toolFilter` 里。真机事故（~800 个子会话）的修法因此是**结构性**的，不是提示词。
+- **旧路径保留但不是默认**：只有宿主没有 `startActivation`、仍有 `start(provider, request)` 时才走旧路径，
+  且派发记录里如实写「旧宿主 / persona、toolFilter 随启动请求传递 / orchestrate 已在过滤里剔除」，
+  绝不把旧宿主描述成 preset 强制。
+- **五种缺失前提 fail closed**（不会再出现裸 TypeError）：无 `startActivation` 也无 `start`；有 `startActivation`
+  但无 `agentPresets` 服务；preset 不是本插件注册的（被他人注册 / 注册失败 / 注册时的限制与本次要用的不一致）；
+  provider 未注册（列出 `service.list()`）；provider 的 `capabilities.agentPreset === false`（限制无法强制，等于剔不掉
+  `orchestrate`）。报文点名缺什么、该挂哪些包，以及闭包过期时的 `bash scripts/repair-profile-closure.sh --apply`。
+  另加一条同类的 fail-closed：角色白名单在剔除 `orchestrate` 后为空时拒绝派发，而不是把 `allow: []` 交给宿主。
+- **测试**：`dsh-eng-core` 186 → **190**（scope 插件的用例随代码搬过来，并补上"先 restrict 后 persona"的顺序断言、
+  section 身份稳定、非数组 `allow` 不算声明）；`dsh-role-guard` 53 → **51**（2 条 scope 用例搬走），但新增一行断言：
+  preset 行的 `name` 必须等于 `dsh-eng-core/scope` 这个实现导出的常量；`dsh-orchestrator` 92 → **100**
+  （新路径带 `agentPreset`+`maxDepth` 且 preset 里没有 `orchestrate`、无角色阶段的自有 preset、旧宿主回退且如实说明、
+  五种拒绝）。`bash scripts/verify.sh --quiet` 全绿。
+- **文档**：`docs/ARCHITECTURE.md` §5.6 改为"两处 preset 都挂 `dsh-eng-core/scope`"并写明为什么共享而不是复制；
+  `docs/KNOWN-LIMITS.md` 附一之十八跟着改名，并补上 orchestrator preset 同样"注册时固化、按 id 与工作区无关"的代价。
+  上一条 `[未发布]` 里写的 `dsh-role-guard/scope` 由本次上移取代（同一个未发布版本，不另留旧名）。
+
+
 ### 修复 · `orchestrate metrics` 的偶发不确定（0.1 天取整 × 实时钟）
 
 门禁里偶发失败：`metrics distribution is deterministic: two runs on the same tree are
@@ -28,8 +65,9 @@ orchestrator 91 → 92 测试；`scripts/verify.sh --quiet` 连跑 3 次全绿�
 `toolFilter` 两个字段——角色策略不能再"随请求带过去"。
 
 - **persona / 工具白名单改由 Agent Preset 承载**：新增 `presets.ts`，为每个角色注册
-  `{ id: 'role:<roleId>', order: 100+i, plugins: [{ id: 'role-guard-scope', name: 'dsh-role-guard/scope' }] }`；
-  新增 `scope.ts`（新增子路径导出 `dsh-role-guard/scope`），它是那一行的插件，**运行在子作用域**，在那里
+  `{ id: 'role:<roleId>', order: 100+i, plugins: [{ id: 'role-guard-scope', name: 'dsh-eng-core/scope' }] }`
+  （该行的插件在同一个未发布版本里已上移到 eng-core，见文件顶部条目：`dsh-role-guard/scope` 不再存在）；
+  新增 `scope.ts`，它是那一行的插件，**运行在子作用域**，在那里
   `ctx.tools.restrict({allow, deny})`（宿主强制）并写入 `role-guard:persona` section。限制**先于** persona 应用；
   `restrict` 被拒绝时**抛出**（子代理启动失败），绝不吞掉错误让子代理带着父 Agent 的全部工具跑起来。
 - **派发路径**：`startActivation({ provider, label, request: { prompt, parent, signal, agentOptions, agentPreset }, signal, delivery: 'caller' })`，

@@ -1,19 +1,28 @@
 /**
- * The scope plugin a role's Agent Preset row mounts **inside the child scope**.
+ * The scope plugin an Agent Preset row mounts **inside the child scope**.
  *
  * Why this exists: on harness 0.2.2-rc.1 a subagent start request no longer
  * carries `persona` or `toolFilter` (`SubagentStartRequest` has neither), so a
- * role's identity and its tool whitelist can only travel as a *composition*.
+ * child's identity and its tool whitelist can only travel as a *composition*.
  * The host mounts the selected preset into the child's scope and this plugin
  * runs there, where `ctx.tools.restrict(...)` and
  * `ctx.systemPrompt.section(...)` act on the child's own scope. That is what
  * makes the whitelist **host-enforced**: a tool outside it is not visible to
  * the child at all, rather than merely discouraged by prompt text.
  *
- * Mounted as `dsh-role-guard/scope` (see `presets.ts`), so it must stay a
- * plain cordis plugin: `name` + `apply(ctx, config)`, no `inject` (a required
- * service that the composition does not supply would leave the row pending
- * forever), and no runtime dependency outside this file.
+ * Why it lives HERE (dsh-eng-core) rather than in one plugin: more than one
+ * plugin needs the same child-scope enforcement — `dsh-role-guard` for a role's
+ * preset (`role:<roleId>`) and `dsh-orchestrator` for an auto-dispatched
+ * stage's preset (`orchestrator:<role>`). A preset row is resolved by *name*
+ * against the declaring plugin's packaging root, so a copy per plugin would be
+ * two implementations of the same enforcement (and two places to fix when the
+ * restriction semantics change). dsh-eng-core imports nothing from the suite,
+ * so sharing it here keeps the dependency direction pointing down.
+ *
+ * Mounted as `dsh-eng-core/scope` (see each plugin's preset declaration), so it
+ * must stay a plain cordis plugin: `name` + `apply(ctx, config)`, no `inject`
+ * (a required service that the composition does not supply would leave the row
+ * pending forever), and no runtime dependency outside this file.
  *
  * Enforcement order matters: the tool restriction is applied FIRST. If it is
  * rejected (an unknown tool name, an empty filter), this plugin throws — the
@@ -22,11 +31,11 @@
  * `systemPrompt` service) are logged and skipped: nothing can be enforced
  * there, and refusing to load would only hide the persona.
  *
- * @module dsh-role-guard/scope
+ * @module dsh-eng-core/scope
  */
 
-/** The plugin name a preset row references (`name: dsh-role-guard/scope`). */
-export const name = 'dsh-role-guard/scope'
+/** The plugin name a preset row references (`name: dsh-eng-core/scope`). */
+export const name = 'dsh-eng-core/scope'
 
 /**
  * Stable persona section name.
@@ -34,9 +43,14 @@ export const name = 'dsh-role-guard/scope'
  * Deliberately NOT `deployment:persona-prefix` (the name the old host used for
  * a request `persona`): a scoped section shadows the global one of the same
  * name, and silently replacing the deployment's persona for every delegated
- * child is a bigger change than adding the role's own line. With
+ * child is a bigger change than adding the child's own line. With
  * `DEPLOYMENT_PERSONA_PREFIX` at order 0 and ties broken by name, ours reads
  * directly after it.
+ *
+ * The `role-guard:` prefix is retained now that the module is shared: the
+ * section NAME decides what shadows what inside a child scope, so renaming it
+ * is a behaviour change (a different shadow target), not a rename of a private
+ * constant. Both plugins that mount this row keep the same identity on purpose.
  */
 export const PERSONA_SECTION = 'role-guard:persona'
 
@@ -45,7 +59,7 @@ export const PERSONA_ORDER = 0
 
 /** Preset-row configuration (untrusted: a row is YAML someone else wrote). */
 export interface ScopeConfig {
-    /** The role's persona; empty/absent means "no section". */
+    /** The persona text; empty/absent means "no section". */
     persona?: string
     /** Global tool names that stay visible to the child. */
     allow?: readonly string[]
@@ -97,7 +111,7 @@ export function resolveScopeConfig(input: unknown): ResolvedScope {
     const deny = stringList(raw['deny'])
     const emptyAllow = Array.isArray(raw['allow']) && allow.length === 0
     // A filter needs at least one entry: `tools.restrict` rejects an empty one,
-    // and "no entries" is exactly the case where the role declared no list.
+    // and "no entries" is exactly the case where the child declared no list.
     const filter: ScopeFilter | undefined = allow.length === 0 && deny.length === 0 ? undefined : {
         ...(allow.length === 0 ? {} : { allow }),
         ...(deny.length === 0 ? {} : { deny }),
@@ -116,7 +130,7 @@ function warn(message: string): void {
 }
 
 /**
- * Apply one role's persona and tool whitelist in the calling (child) scope.
+ * Apply one child's persona and tool whitelist in the calling (child) scope.
  * @param ctx - the child scope the preset is mounted into.
  * @param config - the preset row's config (untrusted).
  */
@@ -124,8 +138,8 @@ export function apply(ctx: ScopeContextLike, config: unknown = {}): void {
     const resolved = resolveScopeConfig(config)
     const disposers: (() => void)[] = []
 
-    // 0. A declared-but-empty whitelist is a broken role, not an unrestricted
-    //    one: mounting it would hand the child everything the role excluded.
+    // 0. A declared-but-empty whitelist is a broken child, not an unrestricted
+    //    one: mounting it would hand the child everything the rule excluded.
     if (resolved.emptyAllow) {
         throw new Error(`[${name}] the role declared an empty tool whitelist (allow: []): refusing to mount a child without its restriction`)
     }
@@ -139,7 +153,7 @@ export function apply(ctx: ScopeContextLike, config: unknown = {}): void {
         } else {
             // Deliberately NOT caught: `restrict` rejects unknown tool names and
             // empty filters, and swallowing that would grant the child every
-            // tool the role excluded — the exact widening this plugin exists to
+            // tool the rule excluded — the exact widening this plugin exists to
             // prevent.
             disposers.push(restrict.call(ctx.tools, resolved.filter))
         }
