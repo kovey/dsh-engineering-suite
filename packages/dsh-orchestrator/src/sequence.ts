@@ -116,6 +116,18 @@ export interface SequenceDeps {
      * once at assembly.
      */
     probesFor: (agent: AgentLike | undefined) => Record<string, PluginProbe>
+    /**
+     * The clock for wall-clock-derived numbers (delivery metrics).
+     *
+     * Injected rather than read from `Date.now()` at the call site because the
+     * report contains rounded durations: two calls a few milliseconds apart agree
+     * only until one of them crosses a rounding boundary, which is exactly how
+     * "two runs on the same tree are byte-identical" became a flaky assertion
+     * under load. A caller that wants determinism passes a fixed clock; the
+     * default keeps the tool's behaviour unchanged.
+     * @returns milliseconds since the epoch.
+     */
+    now?: () => number
 }
 
 /** The resolved call context (mission, store, workspace). */
@@ -1406,11 +1418,22 @@ export async function runOrchestrate(deps: SequenceDeps, args: OrchestrateArgs, 
  * （每条指标说"没有数据"），不是错误。它同时**不写任何文件**：`metrics.ts` 没有写
  * 路径，测试用 `.dsh` 前后快照断言。
  */
+/** The injected clock, or the real one. Never throws: a broken clock falls back. */
+function clock(deps: SequenceDeps): number {
+    if (deps.now === undefined) return Date.now()
+    try {
+        const value = deps.now()
+        return Number.isFinite(value) ? value : Date.now()
+    } catch {
+        return Date.now()
+    }
+}
+
 function metricsAction(deps: SequenceDeps, ctx: CallContext, args: OrchestrateArgs): string {
     const window = resolveWindowDays(args.windowDays, deps.config.metrics.windowDays)
     const maxInFlight = resolveMaxInFlight(args.maxInFlight, deps.config.metrics.maxInFlight)
     const notes = [...window.notes, ...maxInFlight.notes]
-    const metrics = collectMetrics({ store: ctx.store, now: Date.now(), windowDays: window.days })
+    const metrics = collectMetrics({ store: ctx.store, now: clock(deps), windowDays: window.days })
     return renderMetrics(metrics, {
         cwd: ctx.cwd,
         maxInFlight: maxInFlight.value,

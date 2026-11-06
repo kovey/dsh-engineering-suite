@@ -37,6 +37,14 @@ after(() => {
 })
 
 /** A host with the orchestrator mounted (log outside the workspace). */
+/** A host that provides a FIXED `clock` service (determinism tests). */
+function hostWithClock(cwd: string, now: () => number): FakeHost {
+    const fake = createFakeHost({ cwd, services: { clock: { now } } })
+    hosts.push(fake)
+    apply(fake.ctx as never, { logFile: path.join(tempWorkspace('orchestrator-conf-log-'), 'orchestrator.log') })
+    return fake
+}
+
 function host(cwd: string): FakeHost {
     const fake = createFakeHost({ cwd })
     hosts.push(fake)
@@ -219,15 +227,40 @@ test('metrics distribution prints 与上一窗口相比 only when there is a pre
 
 test('metrics distribution is deterministic: two runs on the same tree are byte-identical', async () => {
     const cwd = tempWorkspace('orchestrator-conformance-deterministic-')
-    const fake = host(cwd)
-    const store = new MissionStore({ layout: resolveLayout(cwd) })
     const now = Date.now()
+    // Fixed observation time: the report rounds durations to 0.1 day, so two
+    // calls at TWO different instants may legitimately differ. Byte-identity is a
+    // property of "same tree, same clock" — asserting it against a live clock is
+    // what made this test flake under load.
+    const fake = hostWithClock(cwd, () => now)
+    const store = new MissionStore({ layout: resolveLayout(cwd) })
     for (const [index, complete] of [true, false, true].entries()) {
         seedMission(store, cwd, { id: `m-${index}`, createdAt: now - (index + 1) * 3_600_000, complete })
     }
     const first = await orchestrate(fake, { action: 'metrics' })
     const second = await orchestrate(fake, { action: 'metrics' })
     assert.equal(first, second)
+})
+
+test('metrics is deterministic GIVEN a frozen clock, and really depends on it (regression)', async () => {
+    // The defect this pins: the report renders durations rounded to 0.1 day, so
+    // two calls a few milliseconds apart differed whenever one crossed a rounding
+    // boundary — a flake that only showed up under load. The clock is now a
+    // dependency, so determinism is provable instead of lucky, and the second
+    // half of this test proves the clock is still READ (not ignored to win).
+    const cwd = tempWorkspace('orchestrator-conformance-clock-')
+    const frozen = Date.now()
+    const seeded = new MissionStore({ layout: resolveLayout(cwd) })
+    for (const [index, complete] of [true, false].entries()) {
+        seedMission(seeded, cwd, { id: `c-${index}`, createdAt: frozen - (index + 1) * 3_600_000, complete })
+    }
+    const a = await orchestrate(hostWithClock(cwd, () => frozen), { action: 'metrics' })
+    const b = await orchestrate(hostWithClock(cwd, () => frozen), { action: 'metrics' })
+    assert.equal(a, b)
+    // 0.049 and 0.051 days straddle the 0.1-day rounding boundary of 1 h 10 m.
+    const earlier = await orchestrate(hostWithClock(cwd, () => frozen), { action: 'metrics' })
+    const later = await orchestrate(hostWithClock(cwd, () => frozen + 2 * 3_600_000), { action: 'metrics' })
+    assert.notEqual(earlier, later)
 })
 
 // --- 零权力 -----------------------------------------------------------------

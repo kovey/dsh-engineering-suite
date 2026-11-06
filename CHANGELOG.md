@@ -1,5 +1,24 @@
 ## [未发布]
 
+### 修复 · `orchestrate metrics` 的偶发不确定（0.1 天取整 × 实时钟）
+
+门禁里偶发失败：`metrics distribution is deterministic: two runs on the same tree are
+byte-identical`。**不是测试太严**——报告把时长按 **0.1 天**取整渲染，而采集用的是
+`Date.now()`：两次调用相隔几毫秒，只要其中一次跨过取整边界（例如 0.049 → 0.051 天），
+中位数就从 `0.0 天` 变 `0.1 天`。全量并发时间隔更大，所以只在门禁里出现。
+
+修法是把**观察时刻变成依赖**，而不是放宽断言：
+
+- `SequenceDeps` 增加可选 `now()`；`metricsAction` 通过它取时间（**默认仍是 `Date.now`**，
+  生产行为不变，异常/非有限值回落到真实钟）；
+- 宿主可以提供 `clock` 服务（cordis 的注入方式）；真实部署不提供，测试提供冻结时钟；
+- 两条确定性用例都改用冻结时钟，**断言 `assert.equal(first, second)` 一字未改**；
+- 新增反向用例：跨时钟（+2 小时）时报告**必须不同**——证明时钟仍被读取，不是靠忽略时间赢的确定性。
+
+orchestrator 91 → 92 测试；`scripts/verify.sh --quiet` 连跑 3 次全绿。
+
+## [未发布]
+
 ### 修复 · `team_delegate` 改接 `startActivation` + Agent Preset（0.2.2-rc.1 的真实 API）
 
 `packages/dsh-role-guard/src/tools.ts` 里的 `subagents.start(provider, request)` **在 0.2.2-rc.1 已不存在**：

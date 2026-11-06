@@ -105,6 +105,14 @@ export function apply(ctx: Context, config: unknown = {}): void {
             },
         }
 
+        const clockFromHost = (context as unknown as { get?: (name: string) => unknown }).get?.('clock') as
+            | { now?: () => number }
+            | undefined
+        const clockService =
+            clockFromHost !== undefined && typeof clockFromHost.now === 'function'
+                ? (): number => (clockFromHost.now as () => number).call(clockFromHost)
+                : undefined
+
         const tools = registerTools(context as never, {
             config: resolved,
             stores,
@@ -112,6 +120,11 @@ export function apply(ctx: Context, config: unknown = {}): void {
             // view of a delegated child may differ from the root's.
             probesFor: (agent) => createProbes(context, resolved.probes, agent),
             dispatch: dispatchDeps,
+            // A host MAY provide a `clock` service; a real deployment does not, so
+            // metrics keep using the wall clock. Tests provide a frozen one, which
+            // is what makes "two runs are byte-identical" a provable property
+            // rather than a lucky one (the report rounds durations to 0.1 day).
+            ...(clockService === undefined ? {} : { now: clockService }),
         })
 
         const disposers: (() => void)[] = [...tools.disposers]
