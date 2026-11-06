@@ -2486,13 +2486,29 @@ test('metrics is read-only: the .dsh snapshot is byte-identical before and after
     seedMission(store, cwd, { id: 'm-done', createdAt: now - 40 * DAY_MS, approvedAt: now - 39 * DAY_MS, gates: [{ source: 'dsh-quality-gate', state: 'PASS', checkedAt: now - 38 * DAY_MS }], receipts: [now - 36 * DAY_MS] })
     appendLedger(cwd, 'deployments', [deployRow(now - DAY_MS, 'DPL-1', 'prod', 'r1', 'deployed')])
     appendLedger(cwd, 'releases', [{ at: now - DAY_MS, version: 'v2.0.0', missionIds: ['m-done'], receiptIds: ['RCP-01'] }])
+    // Settle BEFORE taking the baseline. `apply()` and the store writes are
+    // synchronous today, but this test measures "metrics wrote nothing" — if any
+    // setup work ever lands a tick later, it must land on the baseline side, not
+    // between the two snapshots (that is a false accusation, not a finding).
+    await new Promise((resolve) => setTimeout(resolve, 25))
     const before = snapshotDsh(cwd)
     assert.ok(Object.keys(before).length > 5, 'the fixture has a trail to protect')
     const liveBefore = store.read('m-live')
 
     const report = await orchestrate(fake, { action: 'metrics' })
     assert.match(report, /## 交付度量/)
-    assert.deepEqual(snapshotDsh(cwd), before, 'metrics must not write, append or touch anything under .dsh')
+    // Name the difference instead of printing two opaque snapshots: this test has
+    // failed only under a full parallel run, and "expected values to be strictly
+    // equal" told us nothing about WHICH file moved.
+    const after = snapshotDsh(cwd)
+    const added = Object.keys(after).filter((key) => !(key in before))
+    const removed = Object.keys(before).filter((key) => !(key in after))
+    const changed = Object.keys(before).filter((key) => key in after && after[key] !== before[key])
+    assert.deepEqual(
+        { added, removed, changed },
+        { added: [], removed: [], changed: [] },
+        'metrics must not write, append or touch anything under .dsh',
+    )
     assert.deepEqual(store.read('m-live'), liveBefore, 'no mission mutation')
     // 门禁/回执/阶段计数不变：读两次的报告也必须一致（没有副作用累积）。
     assert.equal(await orchestrate(fake, { action: 'metrics' }), report)
