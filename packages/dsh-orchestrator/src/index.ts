@@ -24,12 +24,11 @@
 
 import path from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
-import { MissionStoreRegistry, createLogger, expandHome, sessionIdOf } from 'dsh-eng-core'
+import { MissionStoreRegistry, createDelegationPresets, createLogger, expandHome, sessionIdOf } from 'dsh-eng-core'
 import type { AgentLike } from 'dsh-eng-core'
 import { resolveConfig } from './config.js'
 import { AutoAdvanceSessions, autoAdvanceStages, createAutoAdvanceHook } from './hooks.js'
 import { createProbes, mergeProbes } from './probes.js'
-import { DispatchPresetRegistry } from './presets.js'
 import { PROMPT_SECTION, sectionText } from './prompt.js'
 import { registerTools } from './sequence.js'
 
@@ -99,7 +98,10 @@ export function apply(ctx: Context, config: unknown = {}): void {
         // per call, so a service that appears after assembly still works; the
         // registry itself never throws into `apply` — a missing service becomes a
         // refusal at dispatch time, which is where the model can act on it.
-        const dispatchPresets = new DispatchPresetRegistry({
+        // The seam is dsh-eng-core's (`delegation.ts`); this registry remembers
+        // only which preset ids THIS plugin registered, so a preset somebody else
+        // declared under `orchestrator:<role>` is refused instead of trusted.
+        const dispatchPresets = createDelegationPresets({
             presets: () => {
                 try {
                     return context.get('agentPresets') as never

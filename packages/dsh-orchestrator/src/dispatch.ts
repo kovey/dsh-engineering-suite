@@ -23,7 +23,7 @@
  * `subagents.start(provider, request)` no longer exists, and the start request
  * carries neither `persona` nor `toolFilter`. Every dispatch therefore goes
  * through `startActivation` with an Agent Preset this plugin registers (see
- * `presets.ts` / `dispatch-plan.ts`); the preset's row mounts the scope plugin
+ * `presets.ts`; the seam itself is dsh-eng-core's `delegation.ts`); the preset's row mounts the scope plugin
  * shared from `dsh-eng-core/scope`, which applies the tool restriction inside
  * the CHILD's scope. The legacy two-arg `start` is used ONLY for a host that has
  * no `startActivation`, and the dispatch note says which path ran — an old host
@@ -33,13 +33,35 @@
  */
 
 import path from 'node:path'
-import { formatTime, writeTextAtomic, type AgentLike, type MissionRecord } from 'dsh-eng-core'
+import {
+    dispatchLine,
+    formatTime,
+    planDelegation,
+    startDelegation,
+    writeTextAtomic,
+    type AgentLike,
+    type DelegationOwner,
+    type DelegationPresets,
+    type DelegationServices,
+    type MissionRecord,
+} from 'dsh-eng-core'
 import type { OrchestratorConfig } from './config.js'
-import { dispatchLine, planDispatch, startChild, type SubagentsLike } from './dispatch-plan.js'
 import { describeStageRoute, resolveStageRoute, type StageConfig, type StageRoute } from './pipeline.js'
-import { withoutOrchestrate, type DispatchPresetRegistry } from './presets.js'
+import { dispatchPresetInput, withoutOrchestrate } from './presets.js'
 
-export type { SubagentsLike } from './dispatch-plan.js'
+/**
+ * The refusal subject for one stage.
+ *
+ * The seam's texts are shared; the subject is what the human can go and fix. A
+ * stage is named by its role when it declares one, and by "this stage" when it
+ * does not — "the child" would name nothing.
+ */
+export function stageOwner(stage: StageConfig): DelegationOwner {
+    return {
+        plugin: 'dsh-orchestrator',
+        subject: stage.role === undefined ? '本阶段（未声明角色）' : `阶段角色 "${stage.role}"`,
+    }
+}
 
 /** The role-guard service, as much of it as this module uses. */
 export interface RoleGuardLike {
@@ -66,7 +88,7 @@ export interface RoleGuardLike {
 /** Everything the dispatcher needs from the plugin. */
 export interface DispatchDeps {
     config: OrchestratorConfig
-    subagents: () => SubagentsLike | undefined
+    subagents: () => DelegationServices | undefined
     roleGuard: () => RoleGuardLike | undefined
     /**
      * The Agent Preset seam: the presets THIS plugin registered (see `presets.ts`).
@@ -75,7 +97,7 @@ export interface DispatchDeps {
      * compiling; the dispatch then refuses the activation path by name instead of
      * dispatching without a way to carry the restriction.
      */
-    presets?: DispatchPresetRegistry
+    presets?: DelegationPresets
     /** Where a stage artifact lives, for the child's transcript file. */
     stagesDir: (cwd: string, missionId: string) => string
 }
@@ -297,15 +319,15 @@ export async function dispatchStage(
         }
     }
 
-    let plan: Awaited<ReturnType<typeof planDispatch>>
+    const owner = stageOwner(stage)
+    let plan: Awaited<ReturnType<typeof planDelegation>>
     try {
-        plan = await planDispatch({
-            subagents,
+        plan = await planDelegation({
+            owner,
             provider: deps.config.autoDispatch.provider,
-            presets: deps.presets,
-            role: stage.role,
-            persona,
-            filter: guarded,
+            subagents,
+            ...(deps.presets === undefined ? {} : { presets: deps.presets }),
+            preset: dispatchPresetInput({ role: stage.role, ...(persona === undefined ? {} : { persona }), filter: guarded }),
         })
     } catch (error) {
         // Decision-making must never take stage entry down with it: a hostile or
@@ -320,7 +342,10 @@ export async function dispatchStage(
     }
     // "How was this child created" is part of who decided its rights, so it rides
     // in the same line the report and the transcript already show.
-    roleNote = `${roleNote}；${dispatchLine(plan)}`
+    // The note is the guarantee THIS caller adds on top of the seam's: the
+    // recursion guard is structural on both paths, so the report says where it
+    // lives instead of leaving a reader to assume prompt text.
+    roleNote = `${roleNote}；${dispatchLine(plan, plan.kind === 'legacy' ? 'orchestrate 已在过滤里剔除' : 'orchestrate 已剔除')}`
 
     const prompt = dispatchPrompt(stage, mission, {
         ...(mission.specPath === undefined ? {} : { specPath: path.isAbsolute(mission.specPath) ? mission.specPath : path.join(cwd, mission.specPath) }),
@@ -328,17 +353,19 @@ export async function dispatchStage(
         ...(input.extra === undefined ? {} : { extra: input.extra }),
     })
 
-    let child: Awaited<ReturnType<typeof startChild>>
+    let child: Awaited<ReturnType<typeof startDelegation>>
     try {
-        child = await startChild(subagents, {
+        child = await startDelegation(subagents, {
+            owner,
             provider: deps.config.autoDispatch.provider,
             plan,
             label: `${stage.id} · ${mission.title}`,
             prompt,
             parent: input.agent as never,
             signal: input.signal ?? new AbortController().signal,
-            toolFilter: guarded,
-            ...(persona === undefined ? {} : { persona }),
+            // The legacy request carries the guarded filter and the persona; the
+            // activation path carries the preset instead (which holds both).
+            legacy: { filter: guarded, ...(persona === undefined ? {} : { persona }) },
             maxDepth: deps.config.autoDispatch.maxDepth,
             ...(route.model === undefined && route.provider === undefined
                 ? {}
@@ -357,7 +384,7 @@ export async function dispatchStage(
             error: `派发失败（provider ${deps.config.autoDispatch.provider}）：${(error as Error).message}`,
         }
     }
-    // `startChild` already refused a handle without an id; the binding below needs
+    // `startDelegation` already refused a handle without an id; the binding below needs
     // the id itself (BUG-6 was a host returning nothing usable).
     const runId = child.id
 
@@ -418,7 +445,7 @@ export async function dispatchStage(
         error = (cause as Error).message
     } finally {
         try {
-            await child.dispose?.()
+            await child.dispose()
         } catch {
             // disposal must never mask the dispatch outcome
         }

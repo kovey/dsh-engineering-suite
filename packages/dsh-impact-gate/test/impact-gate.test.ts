@@ -12,6 +12,7 @@ import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 import { MissionStoreRegistry, clearProjectConfigCache } from 'dsh-eng-core'
+import { name as scopePluginName } from 'dsh-eng-core/scope'
 import { createFakeHost, runText, tempWorkspace, type FakeHost } from 'dsh-eng-core/testing'
 import { apply, inject, name } from '../dist/index.js'
 import { PROJECT_OVERRIDABLE_KEYS, resolveConfig, resolveEffectiveConfig } from '../dist/config.js'
@@ -526,6 +527,91 @@ test('reviewDispatch adds a read-only opinion and never a verdict', async () => 
     const plainRun = runText(await plain.runTool('impact_analyze', {}))
     assert.doesNotMatch(plainRun, /复核意见/)
     assert.equal(reviewers.calls.length, 1)
+})
+
+test('the reviewer keeps EXACTLY its old confinement, now carried by the preset (TC-905)', async () => {
+    // The regression this test exists for: on harness 0.2.1+ the two-argument
+    // `subagents.start(provider, request)` does not exist, so the old dispatch
+    // here did not merely lose the restriction — it could not start a child at
+    // all. The confinement (allow read/glob/grep, deny orchestrate, same
+    // persona, maxDepth 1) must survive the move into a preset row, and the
+    // request must carry `agentPreset` or the host mounts nothing.
+    const cwd = fixture()
+    touchStore(cwd)
+    const fake = createFakeHost({
+        cwd,
+        withSubagents: true,
+        withActivation: true,
+        withAgentPresets: true,
+        activationChildId: 'review-modern',
+        activationResult: { output: [{ type: 'text', text: '## 图外引用\n\n没有发现图外耦合。' }] },
+    })
+    hosts.push(fake)
+    apply(fake.ctx as never, {
+        logFile: path.join(LOG_DIR, `modern-review-${hosts.length}.log`),
+        testCommandTemplate: 'go test {files}',
+        reviewDispatch: { enabled: true, targets: 3, timeoutMs: 30_000 },
+    })
+    const run = await fake.runTool('impact_analyze', {})
+    assert.equal(run.isError, false, runText(run))
+
+    // The modern seam was used, and ONLY it.
+    assert.equal(fake.activationSpecs.length, 1)
+    assert.equal(fake.subagentStarts.length, 0, 'the deleted two-arg start must never run on a 0.2.1+ host')
+    const spec = fake.activationSpecs[0] as { provider: string; delivery: string; request: Record<string, unknown> }
+    assert.equal(spec.provider, 'spawn')
+    assert.equal(spec.delivery, 'caller')
+    assert.equal(spec.request['agentPreset'], 'impact-gate:review', 'without agentPreset the host mounts no preset')
+    assert.equal(spec.request['maxDepth'], 1)
+    // 0.2.1's request has neither field: sending them would claim an enforcement
+    // the host does not perform.
+    assert.equal('toolFilter' in spec.request, false)
+    assert.equal('persona' in spec.request, false)
+    assert.equal('signal' in spec.request, false, 'the signal rides on the activation spec')
+
+    // The row is the shared scope plugin, and its config is byte-for-byte the
+    // filter the old request carried: identical allow set, identical deny set.
+    const definition = fake.presetDefinitions.get('impact-gate:review')
+    assert.ok(definition !== undefined, `expected preset impact-gate:review, got ${[...fake.presetDefinitions.keys()].join(', ')}`)
+    assert.equal(definition.plugins.length, 1)
+    const row = definition.plugins[0] as { id: string; name: string; config: Record<string, unknown> }
+    assert.equal(row.id, 'impact-gate-scope')
+    assert.equal(row.name, 'dsh-eng-core/scope')
+    assert.equal(row.name, scopePluginName)
+    assert.deepEqual(row.config['allow'], ['read', 'glob', 'grep'], 'the reviewer must not gain a tool')
+    assert.deepEqual(row.config['deny'], ['orchestrate'], 'a reviewer that can re-enter the pipeline can advance a stage')
+    assert.match(String(row.config['persona']), /只读，只判断，不改代码/)
+    assert.match(String(row.config['persona']), /没有发现图外耦合/)
+
+    // The activation is disposed, and the opinion is still an opinion.
+    assert.equal(fake.activationDisposals(), 1)
+    const text = runText(run)
+    assert.match(text, /### 复核意见（reviewDispatch，只读子代理）/)
+    assert.match(text, /没有发现图外耦合/)
+    assert.match(text, /这是\*\*意见\*\*，不是门禁裁决/)
+})
+
+test('a modern host without agentPresets refuses the review instead of widening it (TC-905)', async () => {
+    // No registry means no way to carry the reviewer's confinement: the review
+    // is reported as unavailable, and NOTHING is started (the analysis itself
+    // does not depend on the opinion layer, so it still succeeds).
+    const cwd = fixture()
+    touchStore(cwd)
+    const fake = createFakeHost({ cwd, withSubagents: true, withActivation: true })
+    hosts.push(fake)
+    apply(fake.ctx as never, {
+        logFile: path.join(LOG_DIR, `nopresets-review-${hosts.length}.log`),
+        testCommandTemplate: 'go test {files}',
+        reviewDispatch: { enabled: true, targets: 3, timeoutMs: 30_000 },
+    })
+    const run = await fake.runTool('impact_analyze', {})
+    assert.equal(run.isError, false, 'a missing opinion layer never loses the analysis')
+    assert.equal(fake.activationSpecs.length, 0, 'no child may start without a way to restrict it')
+    const text = runText(run)
+    assert.match(text, /未产出复核/)
+    assert.match(text, /agentPresets/)
+    assert.match(text, /拒绝派发/)
+    assert.match(text, /repair-profile-closure\.sh --apply/)
 })
 
 // --- pure helpers ----------------------------------------------------------

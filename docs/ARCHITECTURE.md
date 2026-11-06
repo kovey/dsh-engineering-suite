@@ -269,7 +269,8 @@ startActivation(...)  prompt = 阶段任务 + mission 上下文 + 规则（只�
 > 而且 `SubagentStartRequest` 删掉了 `persona` 与 `toolFilter` 两个字段——**persona / 工具白名单不再随启动
 > 请求传递**。现在的接法是 `startActivation({ provider, label, request: { prompt, parent, signal, agentOptions, agentPreset }, signal, delivery: 'caller' })`
 > 加一个 **Agent Preset**：`dsh-role-guard` 为每个角色注册 `id: role:<roleId>`（`presets.ts`），`dsh-orchestrator`
-> 为每个被派发的阶段角色注册 `id: orchestrator:<role>`（`presets.ts`）。两者的行**都挂同一个插件**
+> 为每个被派发的阶段角色注册 `id: orchestrator:<role>`（`presets.ts`），`dsh-impact-gate` 为它那次可选的复核子会话注册
+> `id: impact-gate:review`（`review.ts`）。三者的行**都挂同一个插件**
 > `dsh-eng-core/scope`；插件**运行在子作用域**，在那里 `ctx.tools.restrict({allow, deny})` 并写入
 > `role-guard:persona` section。工具白名单因此仍是**宿主强制**（白名单外的工具对子代理不可见，而不是"被提示词劝阻"），
 > 并且限制先于 persona 应用：`restrict` 被拒绝时子代理**启动失败**，绝不吞掉错误让它带着父 Agent 的全部工具跑起来。
@@ -277,6 +278,13 @@ startActivation(...)  prompt = 阶段任务 + mission 上下文 + 规则（只�
 > 四个前提（`startActivation`、`agentPresets` 服务、本插件注册的角色 preset、已注册的 provider）任一不成立都 **fail closed**，
 > 报错点名缺什么、该挂哪个包。**`agentPreset` 必须随请求传**：不传时子代理加入父 Agent 的 composition，角色的 preset
 > 根本不会挂载（"看起来派发了，其实没强制"）。
+>
+> **委派只有一份实现**：`planDelegation` / `startDelegation` / `registerDelegationPreset` 都在
+> `packages/dsh-eng-core/src/delegation.ts`，三个调用点只提供自己的**领域**输入（哪个 preset、什么 persona/过滤、
+> 旧宿主请求里带什么）。这不是"为了少写几行"：同一个接缝被手写过三次，第三次（impact-gate 的复核子会话）在 0.2.2-rc.1
+> 上直接起不来，而它的限制在新宿主没有任何字段可放——复制一份的代价是**每一份都能各自漂移，而测试只覆盖迁走的那一份**。
+> `packages/dsh-eng-core/test/delegation-seam.test.ts` 因此扫 `packages/*/src/**`：除该模块外再出现
+> `subagents.start(` 调用即失败（注释除外；`startActivation(` 不算）。
 >
 > **scope 插件为什么上移到 eng-core（而不是各留一份）**：这个插件是"子作用域里到底强制了什么"的唯一实现点。
 > 两处用法（角色的 `role:<roleId>`、派发阶段的 `orchestrator:<role>`）需要的语义完全相同——

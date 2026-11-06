@@ -33,12 +33,19 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis'
-import { MissionStoreRegistry, createLogger, expandHome, type AgentLike, type Logger } from 'dsh-eng-core'
+import {
+    MissionStoreRegistry,
+    createDelegationPresets,
+    createLogger,
+    expandHome,
+    type AgentLike,
+    type DelegationServices,
+    type Logger,
+} from 'dsh-eng-core'
 import { ChangeLedger, type WorkspaceChangesLike } from './changes.js'
 import { resolveConfig, resolveEffectiveConfig } from './config.js'
 import { PROMPT_SECTION, sectionText } from './prompt.js'
 import { registerTools, type ToolDeps } from './tools.js'
-import type { SubagentsLike } from './review.js'
 
 export const name = 'dsh-impact-gate'
 
@@ -93,6 +100,14 @@ export function apply(ctx: Context, config: unknown = {}): void {
         // is keyed by `(sessionId, seq)`, and the seq is not discoverable from
         // the service itself.
         const changes = new ChangeLedger()
+        // The presets THIS plugin registers (the seam itself is dsh-eng-core's
+        // `delegation.ts`): the reviewer's persona and allow/deny set travel
+        // through a preset mounted into the child scope, because the 0.2.2-rc.1 start
+        // request has no `toolFilter` field to carry them.
+        const reviewPresets = createDelegationPresets({
+            presets: () => context.get('agentPresets') as never,
+            logger: log,
+        })
         const serviceOf = (): unknown => context.get('workspaceChanges')
         const deps: ToolDeps = {
             config: resolved,
@@ -106,7 +121,10 @@ export function apply(ctx: Context, config: unknown = {}): void {
                 logger: log,
             },
             stores,
-            subagents: () => context.get('subagents') as SubagentsLike | undefined,
+            subagents: () => context.get('subagents') as DelegationServices | undefined,
+            // The reviewer's confinement is registered as a preset on its first
+            // dispatch (the seam decides whether the host can carry one at all).
+            presets: reviewPresets,
             // `flaky_plan`'s repeated-run mode uses the host's managed process
             // seam when it exists (sandboxing, teardown) and the node transport
             // otherwise — the same rule as every other command in the suite.

@@ -38,6 +38,8 @@ import {
     stamp,
     type AgentLike,
     type ChangedFile,
+    type DelegationPresets,
+    type DelegationServices,
     type ImpactReport,
     type ImpactedFile,
     type Logger,
@@ -70,7 +72,7 @@ import {
     tallyRuns,
     type FlakyPlan,
 } from './flaky.js'
-import { runImpactReview, selectReviewTargets, type ReviewOutcome, type SubagentsLike } from './review.js'
+import { runImpactReview, selectReviewTargets, type ReviewOutcome } from './review.js'
 
 const TEXT_OUTPUT = { type: 'string' } as const
 
@@ -115,7 +117,12 @@ export interface ToolDeps {
     changes: ChangeProviderDeps
     stores: MissionStoreRegistry
     /** `ctx.get('subagents')`, used only when `reviewDispatch.enabled`. */
-    subagents: () => SubagentsLike | undefined
+    subagents: () => DelegationServices | undefined
+    /**
+     * The presets THIS plugin registered; the reviewer's confinement travels
+     * through them (dsh-eng-core's delegation seam), never through the request.
+     */
+    presets: DelegationPresets
     /** `ctx.get('subprocess')`, used by `flaky_plan`'s repeated-run mode. */
     subprocess: () => unknown
     logger?: Logger
@@ -1157,6 +1164,7 @@ export function registerTools(
                     review = await runImpactReview(
                         {
                             subagents: () => deps.subagents(),
+                            presets: deps.presets,
                             reportDir:
                                 mission === undefined
                                     ? path.join(cwd, '.dsh', 'impact-reviews')

@@ -30,17 +30,27 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis'
-import { MissionStoreRegistry, createLogger, expandHome, resolveLayout, sessionCwd, sessionIdOf } from 'dsh-eng-core'
-import type { AgentLike, Layout } from 'dsh-eng-core'
+import {
+    MissionStoreRegistry,
+    createDelegationPresets,
+    createLogger,
+    expandHome,
+    registerDelegationPreset,
+    resolveLayout,
+    sessionCwd,
+    sessionIdOf,
+} from 'dsh-eng-core'
+import type { AgentLike, AgentPresetsLike, DelegationFilter, DelegationServices, Layout } from 'dsh-eng-core'
 import { agentTeamsAvailability } from './agent-teams.js'
 import { RoleBindingStore } from './bindings.js'
 import { resolveConfig } from './config.js'
 import { RoleRegistryCache } from './loader.js'
-import { RolePresetRegistry, type AgentPresetsLike } from './presets.js'
+import { rolePresetInput } from './presets.js'
 import { PROMPT_SECTION, sectionText } from './prompt.js'
+import type { Role } from './roles.js'
 import { createSkillGuard } from './skill-gate.js'
 import { TeammateAuditStore, teammateObservation } from './teammates.js'
-import { planToolFilter, registerTools, type SubagentsLike } from './tools.js'
+import { planToolFilter, registerTools } from './tools.js'
 import { createRolePlanner } from './service.js'
 
 export const name = 'dsh-role-guard'
@@ -120,27 +130,30 @@ export function apply(ctx: Context, config: unknown = {}): void {
         // scope (host-enforced `tools.restrict`). Registration is best effort:
         // without `ctx.agentPresets` the state is reported and `team_delegate`
         // refuses the modern path instead of degrading to prompt text.
-        const presets = new RolePresetRegistry({
+        // The filter a role's preset carries, pruned against the GLOBAL tool view
+        // on purpose: `tools.restrict` validates names against the global set, so
+        // this is the same view it will accept — and it does not vary per
+        // delegating agent, which is what makes the registration fingerprint
+        // (assembly time) and the delegation-time one agree.
+        const presetFilter = (role: Role): DelegationFilter | undefined => {
+            try {
+                return planToolFilter(role, resolved, (toolName) => {
+                    try {
+                        return context.tools.get(toolName, undefined) !== undefined
+                    } catch {
+                        return false
+                    }
+                }).filter
+            } catch {
+                // Planning a filter cannot fail in practice; if it ever does, an
+                // EMPTY whitelist is the fail-closed answer (the scope plugin
+                // refuses to mount it) — never "no filter at all".
+                return { allow: [] }
+            }
+        }
+        // The presets THIS plugin registers (the seam itself is dsh-eng-core's).
+        const presets = createDelegationPresets({
             presets: () => safeGet(context, 'agentPresets') as AgentPresetsLike | undefined,
-            // Pruned against the GLOBAL tool view on purpose: `tools.restrict`
-            // validates names against the global set, so this is the same view it
-            // will accept — and it does not vary per delegating agent.
-            filterFor: (role) => {
-                try {
-                    return planToolFilter(role, resolved, (toolName) => {
-                        try {
-                            return context.tools.get(toolName, undefined) !== undefined
-                        } catch {
-                            return false
-                        }
-                    }).filter
-                } catch {
-                    // Planning a filter cannot fail in practice; if it ever does,
-                    // an EMPTY whitelist is the fail-closed answer (the scope
-                    // plugin refuses to mount it) — never "no filter at all".
-                    return { allow: [] }
-                }
-            },
             logger,
         })
         let presetsState: string
@@ -150,10 +163,20 @@ export function apply(ctx: Context, config: unknown = {}): void {
             } else {
                 // Register for the workspace this host assembles in (the same one
                 // the prompt section reads). A workspace-local role is registered
-                // lazily on its first delegation; the two are idempotent by id.
-                const summary = presets.ensureAll(roles.for(resolveLayout(process.cwd(), resolved.layout)).list())
-                presetsState = `on(${summary.registered} registered${summary.refused === 0 ? '' : `, ${summary.refused} refused`})`
-                logger.debug(`agent presets registered by this plugin: ${presets.registeredIds().join(', ') || '(none)'}`)
+                // lazily on its first delegation; the two are idempotent by id —
+                // including while this first batch is still in flight.
+                const list = roles.for(resolveLayout(process.cwd(), resolved.layout)).list()
+                const registrations = list.map((role) => registerDelegationPreset(presets, rolePresetInput(role, presetFilter(role))))
+                presetsState = `on(${list.length} presets)`
+                // `apply()` must not block on the host: the settlement is reported
+                // when it lands, and a failure still surfaces as a refusal on the
+                // next delegation (the id is never claimed by a failed register).
+                void Promise.all(registrations).then((statuses) => {
+                    logger.debug(
+                        `agent presets registered by this plugin: ${presets.registeredIds().join(', ') || '(none)'}` +
+                            `${statuses.filter((status) => !status.ok).length === 0 ? '' : `；被拒绝：${statuses.filter((status) => !status.ok).map((status) => status.id).join(', ')}`}`,
+                    )
+                })
             }
         } catch (error) {
             presetsState = 'failed'
@@ -167,7 +190,8 @@ export function apply(ctx: Context, config: unknown = {}): void {
             layoutFor,
             bindings,
             presets,
-            subagents: () => context.get('subagents') as SubagentsLike | undefined,
+            presetFilter,
+            subagents: () => context.get('subagents') as DelegationServices | undefined,
             agentTeams: () => safeGet(context, 'agentTeams'),
             visibleTool: (toolName, agent) => {
                 try {

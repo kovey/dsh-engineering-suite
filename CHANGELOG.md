@@ -1,5 +1,41 @@
 ## [未发布]
 
+### 重构 · 子代理委派收敛成一份实现：`dsh-eng-core/delegation`
+
+三个包各自手写过同一段"怎么派子代理"的接缝（角色的 persona/白名单、被派发阶段的工具限制、复核子会话的只读收紧），
+迁移进度各不相同：role-guard 与 orchestrator 早已改到 0.2.2-rc.1 的 `startActivation`，**impact-gate 的复核子会话还在调
+0.2.2-rc.1 已删除的两参 `subagents.start(provider, request)`**——真机上它根本起不来；而它的 `toolFilter`/`persona` 在新宿主
+也没有字段可放（`SubagentStartRequest` 两者都没有，身份与白名单只能作为 Agent Preset 交给子作用域）。同一个缺陷
+第三次出现，说明"每个包自己实现一遍"本身才是缺陷。
+
+- **一份实现**：新增 `packages/dsh-eng-core/src/delegation.ts`（随主入口导出，不新增子路径——`./scope` 是子路径是因为
+  preset 行要按名字解析它，这里不需要）。导出面：
+  `planDelegation`（纯决策 → `activation{presetId}` / `legacy` / `refused{reason}`）、
+  `startDelegation`（两条路径归一到同一个 `{ id, result, dispose }`，`dispose` 一定有值）、
+  `registerDelegationPreset`（幂等注册：单个行挂 `dsh-eng-core/scope`，按 id 记住**本插件**注册过什么、按过滤指纹识别
+  "注册后被改"，并发调用只注册一次，`register` 的 rejection 如实变成失败状态而不是"注册成功"），以及五种拒绝文案
+  （无 `startActivation` 也无 `start`；无 `agentPresets` 服务；preset 不是本插件注册的/注册失败/已过期；provider 未注册；
+  `capabilities.agentPreset === false`）。文案共用、主语由调用方给（`角色 "x"` / `阶段角色 "y"` / `复核子会话`）。
+- **三个调用点只剩领域逻辑**：role-guard 的 `role:<roleId>`（id 方案不变）与 `role-guard-scope` 行、orchestrator 的
+  `orchestrator:<role>`（防递归 `withoutOrchestrate` 仍进 preset 行的 `deny`，`maxDepth` 仍随请求，旧宿主仍落在请求的
+  `toolFilter` 里）、impact-gate 新增的 `impact-gate:review`（`allow: read/glob/grep`、`deny: orchestrate`、同一条只读
+  persona、`maxDepth: max(1, reviewDispatch.maxDepth)`）。**收紧范围逐字保持不变**，只是从请求搬进 preset 行；
+  迁移前请求里那份 `toolFilter`/`persona` 在 0.2.2-rc.1 上并不生效。
+- **源码回归（AC-002）**：`packages/dsh-eng-core/test/delegation-seam.test.ts` 扫 `packages/*/src/**`，除
+  `delegation.ts` 外再出现 `subagents.start(` 调用即失败（注释不计；`startActivation(` 不匹配；只看 `src/`，
+  因为测试可以合法地调 fake 的 `start`）。扫描本身自检"该命中的段落能命中、不该命中的不命中"，并且**空目录/文件数
+  过少算失败**——一个什么都没扫到的检查器最容易报绿。**首次运行的收获**：它立刻扫出两个本任务文件边界外的同类缺陷
+  （`dsh-spec-gate` 的 `spec_bootstrap draft`、`dsh-standards-gate` 的结构评审，见 `docs/KNOWN-LIMITS.md` 附一之十九）。
+  这两个文件被列进扫描的**棘轮基线**：新出现的调用一律失败，而基线里的文件一旦迁走还留在名单上同样失败，名单不能
+  变成永久豁免。
+- **测试**：`dsh-eng-core` 190 → **212**（`delegation.test.ts` 20 条：决策、五种拒绝、preset 归属/过期/并发/注册失败、
+  归一化、两条路径的请求形状；`delegation-seam.test.ts` 2 条：源码扫描 + 扫描自检）；`dsh-impact-gate` 62 → **64**
+  （新宿主上复核子会话走 `startActivation` 且 preset 行**逐字**等于旧的 allow/deny/persona；新宿主缺 `agentPresets` 时
+  复核**拒绝**而不是放宽）。role-guard 51、orchestrator 100 不变（用例随代码迁移，没有删覆盖）。
+- **文档**：`docs/ARCHITECTURE.md` §5.6 写明委派只有一份实现、三个 preset 前缀（`role:`/`orchestrator:`/`impact-gate:`）
+  与"复查子会话与工具体系同一个缝"；`docs/KNOWN-LIMITS.md` 附一之十八更新为三处同形，新增附一之十九记下仍用已删除
+  两参 `start` 的两个包（本版本文件边界外）与处置。
+
 ### 重构 · scope 插件上移到 `dsh-eng-core`，`autoDispatch` 改走 `startActivation` + Agent Preset
 
 两件事一起做，因为它们共享同一个前提：**子作用域里"到底强制了什么"只有一个实现点**。

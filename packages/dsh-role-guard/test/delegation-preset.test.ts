@@ -12,10 +12,10 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import path from 'node:path'
 import test from 'node:test'
+import { SCOPE_PLUGIN_NAME } from 'dsh-eng-core'
 import { createFakeHost, runText, tempWorkspace, type FakeHost, type FakeHostOptions } from 'dsh-eng-core/testing'
 import { name as scopePluginName } from 'dsh-eng-core/scope'
 import { apply as applyRoleGuard } from '../dist/index.js'
-import { SCOPE_PLUGIN_NAME } from '../dist/presets.js'
 
 const HOST_TOOLS = ['read', 'write', 'edit', 'bash', 'glob', 'grep', 'todo_write', 'read_image', 'subagent', 'skill']
 
