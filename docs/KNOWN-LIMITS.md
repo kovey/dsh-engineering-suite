@@ -401,3 +401,11 @@ bash scripts/e2e-mission.sh          # 建立隔离 profile、起 stub、跑一�
   代价是"历史授权"没有强度依据。
 - **策略漂移后只能新开 mission**：mandate 不可变是刻意设计（否则"已批准的"可以被悄悄放宽），代价是纠正成本比"改一个字段"高。
 
+### 附一之十八：profile 共享闭包会随宿主升级**静默**失配
+
+多个 profile 共用一份 `~/.dsh/profiles/node_modules/@deepseek-ai` 软链农场，指向全局 dsh 安装树。宿主升级时包会
+**改名/拆分**（0.2.2-rc.1：`dsh-agent-presets` → `dsh-agent-preset` + `dsh-agent-preset-registry`），旧软链**悬空**，
+而 Node 的解析失败只会以"某个插件 import 不到"的形式出现，不会有任何"你的闭包过期了"的提示。
+
+已知影响：`agentPresets` 服务缺席 → 子会话无法通过预设获得 `persona` / `toolFilter`；`team_delegate` 这类依赖它的路径
+只能 fail-closed。处置：`bash scripts/repair-profile-closure.sh`（dry-run）→ `--apply`；升级宿主后应例行跑一次。

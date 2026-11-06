@@ -225,6 +225,41 @@ done
 expect_rc 1 "build-all.sh refuses when python3 is missing" env PATH=/usr/bin:/bin bash "$FAKE_ROOT/scripts/build-all.sh"
 
 # ---------------------------------------------------------------------------
+# C11 — repair-profile-closure: the shared profile closure is a farm of symlinks
+# into the installed dsh tree, and upgrading dsh renames packages, so the farm
+# dangles. This script must (a) write NOTHING without --apply, (b) never replace
+# a real directory with a link, (c) converge, and (d) fail when a root is wrong
+# instead of reporting "0 dangling" from a tree it never read.
+section "C11 — repair-profile-closure: dry-run writes nothing, apply converges, real dirs are safe"
+CLOSURE="$TMP/closure"
+TREE="$TMP/tree"
+mkdir -p "$CLOSURE" "$TREE"
+# three real packages in the tree
+for name in alpha beta gamma; do mkdir -p "$TREE/$name"; printf '{"name":"%s"}' "$name" > "$TREE/$name/package.json"; done
+# closure: one good link, one dangling link, one MISSING (no entry), one real dir
+ln -s "$TREE/alpha" "$CLOSURE/alpha"
+ln -s "$TREE/gone" "$CLOSURE/gone"
+mkdir -p "$CLOSURE/beta"   # a real directory where a link belongs: must be left alone
+printf 'keep me' > "$CLOSURE/beta/keep.txt"
+BEFORE="$(ls -a "$CLOSURE" | sort | tr '\n' ' ')"
+run_rc bash "$ROOT/scripts/repair-profile-closure.sh" --closure "$CLOSURE" --dsh-root "$TMP/fake-dsh"
+[ "$LAST_RC" = "2" ] && pass "a tree that is not there is a usage error (exit 2)" || fail "a missing tree must exit 2, got $LAST_RC — $LAST_OUT"
+AFTER="$(ls -a "$CLOSURE" | sort | tr '\n' ' ')"
+[ "$BEFORE" = "$AFTER" ] && pass "the refused run touched nothing" || fail "the refused run changed the closure: $LAST_OUT"
+# Build a fake dsh tree layout so the script can resolve it end to end.
+mkdir -p "$TMP/fake-dsh/dsh/node_modules/@deepseek-ai"
+cp -R "$TREE/." "$TMP/fake-dsh/dsh/node_modules/@deepseek-ai/"
+run_rc bash "$ROOT/scripts/repair-profile-closure.sh" --closure "$CLOSURE" --dsh-root "$TMP/fake-dsh"
+[ "$LAST_RC" = "1" ] && pass "dry-run reports work to do (exit 1)" || fail "dry-run with dangling links must exit 1, got $LAST_RC — $LAST_OUT"
+AFTER="$(ls -a "$CLOSURE" | sort | tr '\n' ' ')"
+[ "$BEFORE" = "$AFTER" ] && pass "dry-run wrote nothing" || fail "dry-run changed the closure: $LAST_OUT"
+expect_rc 0 "apply converges" bash "$ROOT/scripts/repair-profile-closure.sh" --closure "$CLOSURE" --dsh-root "$TMP/fake-dsh" --apply
+[ -d "$CLOSURE/beta" ] && [ -f "$CLOSURE/beta/keep.txt" ] && pass "a real directory is never replaced by a link" || fail "apply destroyed the real beta/ directory"
+[ -e "$CLOSURE/gone" ] && fail "the dangling link was not removed" || pass "the dangling link is gone"
+[ -e "$CLOSURE/gamma" ] && pass "the missing package was linked" || fail "gamma was not linked"
+expect_rc 0 "a second apply is a no-op" bash "$ROOT/scripts/repair-profile-closure.sh" --closure "$CLOSURE" --dsh-root "$TMP/fake-dsh" --apply
+
+# ---------------------------------------------------------------------------
 section "summary"
 if [ "$FAILURES" = "0" ]; then
   printf '  \033[32mOPS SELFTEST GREEN\033[0m — every finding above is still refused.\n'

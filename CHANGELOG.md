@@ -1,3 +1,21 @@
+## [未发布]
+
+### 新增 · `scripts/repair-profile-closure.sh`：修掉 profile 共享闭包的过期软链
+
+多个 profile 通过**一份共享闭包**（`~/.dsh/profiles/node_modules/@deepseek-ai`）解析 `@deepseek-ai/*`，而那是一堆指进
+全局 dsh 安装树的符号链接。升级全局 dsh 会**改名与拆分**包（0.2.2-rc.1 把 `dsh-agent-presets` 拆成 `dsh-agent-preset` +
+`dsh-agent-preset-registry`，把 `dsh-subagent-in-process-driver` 拆成 `-spawn-in-process` / `-fork-in-process`），闭包于是指向
+不存在的路径——**悬空链接不会自己报错，它只是让某个包永远解析不到**。
+
+脚本对账闭包与安装树，报告三类：断链 / 缺失（树里有、闭包没有）/ 冲突（同名但不是符号链接），**默认 dry-run 不写盘**，
+`--apply` 只清断链、补缺失，**真实目录一律不覆盖**（共享闭包，覆盖等于破坏）。收敛结果由**重新读取**判定，不看自己的计划。
+
+本机实测（dry-run）：**断链 23 / 缺失 104 / 冲突 0 / 正常 227**——`dsh-agent-preset` 与 `dsh-agent-preset-registry` 都在
+缺失清单里，这解释了为什么 `agentPresets` 服务在当前 profile 上不可用。
+
+OPS SELFTEST 新增 **C11**（5 项）：tree 不存在时以用法错误退出且不碰闭包、dry-run 零写盘、`--apply` 收敛、
+真实目录不被链接替换、二次 `--apply` 为无操作。
+
 ## [0.6.3] — 2026-11-06
 
 ### 兼容 · harness 0.2.2-rc.1（**两处文档断言此前是错的**）
