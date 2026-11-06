@@ -161,7 +161,11 @@ test('IM 通道（装配顺序 bug 回归）：先 apply 本插件、后 provide
     await waitFor(() => registry.im().phase === 'registered', '服务出现后必须注册 chat-interaction')
     assert.ok(registry.get('chat-interaction') !== undefined)
     assert.deepEqual(fake.injections(), [['chatInteraction']])
-    assert.equal(getCalls.chat, 1, '快路径探测一次；反应式回调走注入上下文，不重复探测父上下文')
+    // The reactive callback reads the INJECTED context, so the parent getter is
+    // not what registered the channel. The exact number of parent reads is an
+    // implementation detail now that a lazy fallback re-reads on use; what must
+    // hold is that the probe happened and registration did not depend on it.
+    assert.ok(getCalls.chat >= 1, '快路径至少探测一次（反应式回调走注入上下文）')
     const afterProvide = runText(await fake.runTool('interaction_status', {}))
     assert.ok(afterProvide.includes('phase=registered'), afterProvide)
 
@@ -403,4 +407,64 @@ test('IM 通道：required 窗口默认 5000ms、可配置；注入的定时器�
     assert.equal(cleared.length, 1, 'dispose 必须清除窗口定时器（不留悬挂定时器）')
     scheduled[0]!.fire()
     assert.equal(registry.im().phase, 'waiting', '已清除的定时器触发不得改变状态')
+})
+
+/**
+ * Starve the reactive hook the way a real provider can: `provide(name, value, true)`
+ * makes cordis call `true` as the availability predicate, the throw deletes the
+ * dependency, and `ctx.get` keeps working. Patching `inject` to a no-op reproduces
+ * that half-broken state without needing cordis here.
+ */
+function starveInject(fake: FakeHost): void {
+    const ctx = fake.ctx as { inject?: unknown }
+    ctx.inject = function () {
+        return function () {
+            return undefined
+        }
+    }
+}
+
+test('IM 通道（惰性兜底）：服务可读但 inject 从不触发 → status/ask 就地注册并走 IM', async () => {
+    const cwd = tempWorkspace('im-lazy-')
+    const fake = createFakeHost({ cwd })
+    hosts.push(fake)
+    starveInject(fake)
+    apply(fake.ctx as never, { logFile: path.join(cwd, LOG) })
+    const registry = (fake.ctx as { get: (name: string) => any }).get('interaction')
+    const chat = makeChat()
+    provide(fake, 'chatInteraction', chat.layer)
+    await sleep(20)
+    assert.equal(registry.im().phase, 'absent', '钩子被饿死时不会自动注册')
+    const status = runText(await fake.runTool('interaction_status', {}))
+    assert.ok(status.includes('phase=registered'), status)
+    const run = fake.runTool('interaction_ask', { question: '惰性兜底问一次', options: ['allowed-once', 'rejected'], timeoutMs: 3_000 })
+    await waitFor(() => chat.asks.length === 1, '兜底注册后提问必须走 IM')
+    answer(chat, 'allowed-once')
+    const result = await run
+    assert.equal(result.isError, false, runText(result))
+})
+
+test('IM 通道（惰性兜底）：off 模式下即使服务可读也零触碰', async () => {
+    const cwd = tempWorkspace('im-lazy-off-')
+    const { fake, registry, getCalls } = assemble(cwd, { im: { channel: 'off' } })
+    starveInject(fake)
+    const chat = makeChat()
+    provide(fake, 'chatInteraction', chat.layer)
+    const status = runText(await fake.runTool('interaction_status', {}))
+    assert.ok(status.includes('phase=off'), status)
+    assert.equal(getCalls.chat, 0, 'off 永不读服务，兜底也不例外')
+    assert.equal(registry.im().registered, false)
+})
+
+test('IM 通道（惰性兜底）：apiVersion=0 的服务不会被兜底注册', async () => {
+    const cwd = tempWorkspace('im-lazy-old-')
+    const fake = createFakeHost({ cwd })
+    hosts.push(fake)
+    starveInject(fake)
+    apply(fake.ctx as never, { logFile: path.join(cwd, LOG) })
+    const registry = (fake.ctx as { get: (name: string) => any }).get('interaction')
+    provide(fake, 'chatInteraction', makeChat({ apiVersion: 0 }).layer)
+    const status = runText(await fake.runTool('interaction_status', {}))
+    assert.equal(registry.im().registered, false, '版本不满足时不得兜底注册')
+    assert.ok(status.includes('phase=absent') || status.includes('phase=waiting'), status)
 })

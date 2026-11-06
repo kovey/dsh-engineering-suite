@@ -1,3 +1,28 @@
+## [未发布]
+
+### 新增 · 门禁 quiet 模式与更可诊断的失败输出
+
+`scripts/verify.sh --quiet` 与 `scripts/test-all.sh --quiet`：每阶段一行、失败时只打失败行（不再打上千行通过用例）。
+门禁命令改为 `bash scripts/verify.sh --quiet`（`lint` 换成 `bash scripts/typecheck-all.sh`——`npm run lint` 在本仓库并不存在）。
+
+顺带修掉三处会让失败**无法诊断**的自伤：
+
+- stage 失败原本打印 `tail -40`，而真正失败的包在**头部**，被后面通过的包挤掉；
+- 诊断代码里的 `printf "$output" | head` 会让 `printf` 收到 SIGPIPE，`pipefail` 把退出码改写成 **141**，把真实失败吃掉；
+- `verify.sh --quiet` 没有把 `--quiet` 传给 `test-all.sh`，后者仍打上千行。
+
+### 修复 · eng-core 的"孙进程不残留"用例只在全量并发时失败
+
+它数的是**全机的 `sleep 60`**，而套件里其它超时用例也会 spawn 同名进程，于是全量跑时数到别人的进程。改为孙进程自带 marker、只数自己，并用有界轮询等待回收；**最终仍要求 0 残留**（不是放宽断言）。
+
+### 新增 · `shellAllow`：strict 下区分受评审脚本与任意代码
+
+`shellPolicy: 'strict'` 原本会连仓库自己的 `bash scripts/verify.sh` 一起拒掉（于是只能把门禁关掉）。新增**宿主键** `shellAllow`（glob 列表）：命中则放行，`python3 -c` / `node -e` 这类内联解释器仍**拒绝**；命令含 `..` 永不匹配。项目级不可覆盖（否则等于自我豁免）。5 条回归测试。
+
+### 验证
+
+- `bash scripts/verify.sh --quiet`：全绿（16 个包 + 跨包集成 + 工具自检）。
+
 ## [0.6.1] — 2026-11-05
 
 ### 修复 · shell 分析器把 heredoc 正文与比较运算符当成重定向

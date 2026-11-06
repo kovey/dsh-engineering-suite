@@ -11,6 +11,7 @@
  * @module dsh-spec-gate/guard
  */
 
+import { matchesShellAllow } from './shell.js'
 import { isInside, isReallyInside, mandateState, pathMatchesAny, pathMatchesPattern, resolvePath, type Mandate, type MissionStore, type MissionStoreRegistry } from 'dsh-eng-core'
 import path from 'node:path'
 import type { AgentLike } from 'dsh-eng-core'
@@ -220,7 +221,12 @@ export function createWriteGuard(deps: WriteGuardDeps): WriteGuard {
                 bump(store.layout.rootDir)
                 return shellUnknownReason(mission?.id ?? '(no mission)', exec.name)
             }
-            if (isShellTool && shell?.undecidable === true && config.shellPolicy === 'strict') {
+            // An unattributable command is refused under `strict`, EXCEPT when it
+            // names a reviewed artifact (`config.shellAllow`, e.g. `bash scripts/**`).
+            // Arbitrary code and a reviewed script are not equally safe just because
+            // neither can be attributed (2026-11: a python heredoc wrote outside the
+            // declared boundaries through exactly this gap).
+            if (isShellTool && shell?.undecidable === true && config.shellPolicy === 'strict' && !matchesShellAllow(command ?? '', config.shellAllow)) {
                 bump(store.layout.rootDir)
                 return shellStrictReason(mission?.id ?? '(no mission)', command ?? '', shell.reasons)
             }

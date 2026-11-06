@@ -234,6 +234,9 @@ export function apply(ctx: Context, config: unknown = {}): void {
             configFor,
             stores,
             registry,
+            // The lazy fallback for a provider that never signals its service
+            // (see `im-binding.ts`'s `refresh`): the tools call this on use.
+            refreshIm: () => imBinding.refresh(),
             outboxFor,
             attentionFor,
             logger,

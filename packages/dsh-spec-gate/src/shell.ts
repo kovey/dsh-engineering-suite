@@ -154,6 +154,50 @@ function stripHeredocs(command: string): string {
     return kept.join('\n')
 }
 
+/**
+ * Does an unattributable command name a reviewed artifact?
+ *
+ * `shellPolicy: 'strict'` refuses shell commands whose write targets cannot be
+ * attributed. That is right for arbitrary code, but it also refuses the
+ * repository's own reviewed scripts (`bash scripts/verify.sh`), which is how a
+ * gate becomes unusable and then gets switched off. `shellAllow` names those
+ * artifacts; a command that matches one of the patterns is allowed and
+ * everything else stays refused. Patterns are globs over the whole normalised
+ * command; a command containing `..` never matches, because the point is "this
+ * file was reviewed", and a traversal is not that file.
+ * @param command - the raw command string.
+ * @param patterns - glob patterns from the host configuration.
+ * @returns whether the command may run despite being unattributable.
+ */
+export function matchesShellAllow(command: string, patterns: readonly string[]): boolean {
+    const normalised = command.trim().replace(/\s+/g, ' ')
+    if (normalised === '') return false
+    if (normalised.indexOf('..') !== -1) return false
+    for (const pattern of patterns) {
+        if (patternMatches(pattern.trim(), normalised)) return true
+    }
+    return false
+}
+
+/** `*` stays inside one path segment, `**` crosses segments. */
+function patternMatches(pattern: string, command: string): boolean {
+    if (pattern === '') return false
+    const halves = pattern.split('**')
+    const parts: string[] = []
+    for (const half of halves) {
+        const pieces = half.split('*')
+        const escaped: string[] = []
+        for (const piece of pieces) escaped.push(escapeRegExp(piece))
+        parts.push(escaped.join('[^/]*'))
+    }
+    const source = parts.join('.*')
+    return new RegExp('^' + source + '(\\s.*)?$').test(command)
+}
+
+function escapeRegExp(text: string): string {
+    return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
 /** Split `a >b` / `a >> b` / `a 2> b` into segments and record the targets. */
 function redirectTargets(command: string): { targets: string[]; segments: string[] } {
     const targets: string[] = []

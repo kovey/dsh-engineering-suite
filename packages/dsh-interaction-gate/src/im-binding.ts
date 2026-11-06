@@ -115,6 +115,13 @@ export interface ImBinding {
     report: () => ImChannelReport
     /** Unregister the channel, clear the window and drop the subscription. */
     dispose: () => void
+    /**
+     * Lazy fallback for a provider whose `provide` never makes the service
+     * available to `inject` (see the implementation comment). Safe to call often;
+     * `interaction_status` and `interaction_ask` call it before deciding.
+     * @returns whether the channel is (now) registered.
+     */
+    refresh: () => boolean
 }
 
 const REAL_TIMERS: ImTimerControl = {
@@ -395,6 +402,50 @@ export function installImChannel(host: ImInjectionHost, options: ImBindingOption
     }
 
     /**
+     * Lazy fallback: register NOW if the service is readable but the reactive
+     * hook never fired.
+     *
+     * `ctx.inject` is the correct mechanism, but it can be starved by the
+     * provider: passing `true` as `ctx.provide`'s third argument makes cordis
+     * treat it as the availability predicate, the call throws, and cordis then
+     * deletes the dependency from the consumer store — so the hook never runs
+     * while `ctx.get` still returns the value (dsh-chat-interaction 0.3.1 does
+     * exactly this, verified against cordis 4.0.5). Reading the same value on
+     * demand turns that half-broken state into a working channel without waiting
+     * for the provider to be fixed.
+     *
+     * Deliberately narrow: it never runs when `im.channel` is `off`, it only
+     * adopts a service that passes the same apiVersion guard, and it registers
+     * nothing when the service is genuinely absent. A fallback, not a
+     * replacement: the reactive hook stays the primary path.
+     * @returns whether the channel is (now) registered.
+     */
+    const refresh = (): boolean => {
+        if (disposed) return false
+        if (mode === 'off') return false
+        if (phase === 'registered') return true
+        function readService(name: string): unknown {
+            return host.get(name)
+        }
+        let probe: ChatProbe
+        try {
+            probe = probeChatInteraction(readService)
+        } catch (error) {
+            probe = { ok: false, reason: `探测 chatInteraction 抛错：${error instanceof Error ? error.message : String(error)}`, appeared: true }
+        }
+        if (probe.ok) {
+            appeared = true
+            attach(probe)
+            // Read through a call: `attach` mutates `phase`, which the compiler
+            // cannot see after the early `return` narrowed the union above.
+            const phaseNow = (): ImPhase => phase
+            return phaseNow() === 'registered'
+        }
+        if (probe.appeared === true) appeared = true
+        return false
+    }
+
+    /**
      * Subscribe to the service. `off` NEVER reaches this function (the caller
      * returns before it), so it neither looks the service up nor subscribes.
      */
@@ -449,6 +500,7 @@ export function installImChannel(host: ImInjectionHost, options: ImBindingOption
 
     return {
         report,
+        refresh,
         dispose: (): void => {
             if (disposed) return
             disposed = true

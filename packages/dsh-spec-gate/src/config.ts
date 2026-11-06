@@ -82,6 +82,14 @@ export interface SpecGateConfig {
      * `strict` denies, `off` skips shell analysis entirely.
      */
     shellPolicy: 'targets' | 'strict' | 'off'
+
+    /**
+     * Reviewed shell artifacts that may run even though their write targets are
+     * unattributable (`bash scripts/**`). Host-only on purpose: a repository that
+     * could widen this list would be excusing itself from the boundary check.
+     * Consulted only under `shellPolicy: 'strict'`.
+     */
+    shellAllow: readonly string[]
     /** Tool names never inspected (escape hatch for host tooling). */
     exemptTools: readonly string[]
     /** `auto` requires a passing test design only when `dsh-test-design-gate` is
@@ -148,7 +156,17 @@ function strList(value: unknown, fallback: readonly string[]): string[] {
  * in the trust root, so the model cannot rewrite it
  * with the write tools (only the derived `specs/*.md` is writable there).
  */
-export const PROJECT_OVERRIDABLE_KEYS: readonly string[] = [
+export /** Host-only glob list; a value of the wrong shape keeps the host's list. */
+function shellAllowOf(raw: unknown, fallback: readonly string[]): readonly string[] {
+    if (!Array.isArray(raw)) return fallback
+    const kept: string[] = []
+    for (const entry of raw) {
+        if (typeof entry === 'string' && entry.trim() !== '') kept.push(entry.trim())
+    }
+    return kept
+}
+
+const PROJECT_OVERRIDABLE_KEYS: readonly string[] = [
     'enforce',
     'enforceBoundaries',
     'writeTools',
@@ -238,6 +256,7 @@ export function resolveEffectiveConfig(host: SpecGateConfig, layout: Layout, log
         writeTools: strList(raw['writeTools'], host.writeTools),
         shellTools: strList(raw['shellTools'], host.shellTools),
         shellPolicy: raw['shellPolicy'] === 'strict' ? 'strict' : raw['shellPolicy'] === 'off' ? 'off' : raw['shellPolicy'] === 'targets' ? 'targets' : host.shellPolicy,
+        shellAllow: shellAllowOf(raw['shellAllow'], host.shellAllow),
         boundaryExemptPaths: strList(raw['boundaryExemptPaths'], host.boundaryExemptPaths ?? []),
         requireTestDesign:
             typeof requireTestDesignRaw === 'boolean' ? requireTestDesignRaw : requireTestDesignRaw === 'auto' ? 'auto' : host.requireTestDesign,
@@ -326,6 +345,7 @@ export function resolveConfig(input: unknown): SpecGateConfig {
         writeTools: strList(raw['writeTools'], DEFAULT_WRITE_TOOLS),
         shellTools: strList(raw['shellTools'], DEFAULT_SHELL_TOOLS),
         shellPolicy: raw['shellPolicy'] === 'strict' ? 'strict' : raw['shellPolicy'] === 'off' ? 'off' : 'targets',
+        shellAllow: shellAllowOf(raw['shellAllow'], []),
         exemptTools: strList(raw['exemptTools'], []),
         requireTestDesign:
             typeof raw['requireTestDesign'] === 'boolean' ? raw['requireTestDesign'] : 'auto',

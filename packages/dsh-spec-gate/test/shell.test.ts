@@ -8,7 +8,7 @@
  */
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { analyzeShellCommand } from '../dist/shell.js'
+import { analyzeShellCommand, matchesShellAllow } from '../dist/shell.js'
 
 const NEWLINE = '\n'
 
@@ -60,4 +60,33 @@ test('an unterminated heredoc hides its body and does not throw (regression)', (
 test('a redirect after the heredoc end line is still detected (regression)', () => {
     const command = lines("cat <<'EOF'", 'hello', 'EOF', 'echo hi > after.txt')
     assert.deepEqual(analyzeShellCommand(command).targets, ['after.txt'])
+})
+
+test('shellAllow: a reviewed script is allowed, arbitrary code is not (regression)', () => {
+    const patterns = ['bash scripts/**']
+    assert.equal(matchesShellAllow('bash scripts/verify.sh --quiet', patterns), true)
+    // The hole this closes: an inline interpreter is not a reviewed artifact.
+    assert.equal(matchesShellAllow('python3 -c "open(\'x\', \'w\')"', patterns), false)
+    assert.equal(matchesShellAllow('node -e "require(\'fs\')"', patterns), false)
+})
+
+test('shellAllow: traversal never matches (regression)', () => {
+    const patterns = ['bash scripts/**']
+    assert.equal(matchesShellAllow('bash ../evil.sh', patterns), false)
+    assert.equal(matchesShellAllow('bash scripts/../../evil.sh', patterns), false)
+})
+
+test('shellAllow: one star stays inside a segment, two stars cross it (regression)', () => {
+    assert.equal(matchesShellAllow('bash scripts/run.sh', ['bash scripts/*']), true)
+    assert.equal(matchesShellAllow('bash scripts/sub/run.sh', ['bash scripts/*']), false)
+    assert.equal(matchesShellAllow('bash scripts/sub/run.sh', ['bash scripts/**']), true)
+})
+
+test('shellAllow: an empty list and empty patterns allow nothing (regression)', () => {
+    assert.equal(matchesShellAllow('bash scripts/verify.sh', []), false)
+    assert.equal(matchesShellAllow('bash scripts/verify.sh', ['']), false)
+})
+
+test('shellAllow: extra spacing is normalised before matching (regression)', () => {
+    assert.equal(matchesShellAllow('bash   scripts/verify.sh', ['bash scripts/**']), true)
 })

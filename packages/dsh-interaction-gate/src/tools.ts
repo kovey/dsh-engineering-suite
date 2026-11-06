@@ -112,6 +112,12 @@ export interface ToolDeps {
     /** The channel registry this plugin provides as `interaction`. */
     registry: InteractionRegistry
     /**
+     * Ask the IM binding to re-check a provider whose service is readable but
+     * never announced itself (see `im-binding.ts`'s `refresh`). Optional — the
+     * tools work without it, and it never touches the service under `off`.
+     */
+    refreshIm?: () => boolean
+    /**
      * The ask outbox of one workspace (one file). The plugin owns the cache, so
      * every tool call of a session sees the same records.
      */
@@ -678,6 +684,10 @@ export function registerTools(
                 const cwd = declaredCwdOf(agent)
                 const effective = deps.configFor(agent)
                 const config = effective.config
+                // A provider whose `provide` never signals leaves the reactive hook
+                // starved; re-check on use so the ask can still go out (no-op when
+                // the service is registered or already absent for real).
+                deps.refreshIm?.()
                 if (!config.enabled) throw new Error('dsh-interaction-gate 已被宿主禁用（enabled=false）')
                 const startedAt = deps.now()
                 const signal = signalOf(exec)
@@ -1594,6 +1604,10 @@ export function registerTools(
                 const cwd = declaredCwdOf(agent)
                 const effective = deps.configFor(agent)
                 const config = effective.config
+                // Read the service on demand: status is where an operator looks
+                // when the channel reports absent, so this is the place a half
+                // broken provider can heal itself.
+                deps.refreshIm?.()
                 const only = args.missionId !== undefined && args.missionId !== '' ? assertSafeId(args.missionId, 'mission id') : undefined
                 const ledgerFile = artifactPathOf(cwd, config.ledgerFile)
                 deps.registry.trackLedger(ledgerFile)

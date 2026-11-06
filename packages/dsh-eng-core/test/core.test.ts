@@ -305,7 +305,11 @@ test('a timed-out command does not leave grandchildren behind', async (t) => {
         argv: [
             'node',
             '-e',
-            `require('node:child_process').spawn('sleep', ['60'], { stdio: 'ignore' }); setTimeout(() => {}, 60000)`,
+            // The GRANDCHILD carries the marker in its own argv: counting a bare
+            // `sleep 60` counts every other timeout test running in the same
+            // verify run, which is why this failed only in a full-suite run and
+            // never alone (2026-11: "grandchildren survived the timeout: 0").
+            `require('node:child_process').spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)', ${JSON.stringify(marker)}], { stdio: 'ignore' }); setTimeout(() => {}, 60000)`,
             marker,
         ],
         cwd,
@@ -313,16 +317,27 @@ test('a timed-out command does not leave grandchildren behind', async (t) => {
         graceMs: 200,
     })
     assert.equal(outcome.timedOut, true)
-    await new Promise((resolve) => setTimeout(resolve, 300))
-    const listing = (() => {
-        try {
-            return execFileSync('ps', ['-eo', 'args'], { encoding: 'utf8' })
-        } catch {
-            return ''
-        }
-    })()
-    const survivors = listing.split('\n').filter((line) => /[s]leep 60/.test(line)).length
-    assert.equal(survivors, '0', `grandchildren survived the timeout: ${survivors}`)
+    // Poll for the marked process to disappear: the kill is immediate but process
+    // reaping under load is not, and a fixed 300 ms sleep asserted on scheduling
+    // luck rather than on the guarantee. The end state is unchanged — zero
+    // survivors, or the test fails.
+    const survivorsNow = (): number => {
+        const listing = (() => {
+            try {
+                return execFileSync('ps', ['-eo', 'args'], { encoding: 'utf8' })
+            } catch {
+                return ''
+            }
+        })()
+        return listing.split('\n').filter((line) => line.includes(marker)).length
+    }
+    const deadline = Date.now() + 5_000
+    let survivors = survivorsNow()
+    while (survivors > 0 && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 100))
+        survivors = survivorsNow()
+    }
+    assert.equal(survivors, 0, `grandchildren survived the timeout: ${survivors}`)
 })
 
 test('two missions created in the same second never share an id (regression)', () => {
