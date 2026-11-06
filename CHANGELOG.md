@@ -1,3 +1,31 @@
+## [未发布]
+
+### 兼容 · harness 0.2.2-rc.1（**两处文档断言此前是错的**）
+
+`rc.2 → rc.1` 不是常规递增：**新增 26 个包、移除 1 个、301 个包版本变化**（cordis 4.0.5 → 4.1.0）。两处变化推翻了我们文档里的旧说法：
+
+- **PTC 的启用方式变了**：`dsh-tools` 删除了 `mode` 配置（`z.never()`："Removed. Mount a native or PTC tool executor instead."），
+  新增 `dsh-tool-executor-native` / `dsh-tool-executor-ptc`；PTC 现在 = **挂载 ptc 执行器**（base patch 里该行默认 `disabled: true`）。
+  旧文档写"`config.mode: 'ptc'`"是**错的**——写下它就是一个硬配置错误。
+- **守卫语义的措辞与实现位置变了**：字面 "no guard can force-allow" 已不存在；契约原文改为
+  "Because guards have no allow result, listener ordering cannot turn a denial back into permission"，方法 `guardReason` → `checkGuards`，
+  位置在 `waterfall('tools/pre-execute')` 之后。**结论不变**（守卫只能加拒绝）。PTC 子调用仍经过
+  `ToolExecutionPipeline.prepare/dispatch/complete`（旧名 `prepareScheduledExecution`/`prepareExecution` 已删）。
+- 其余契约**未变**（逐条复核）：`ApprovalOutcome` 四词、`workspaceChanges` 的 `summary`/`diff` 与事件、
+  `SpawnTeammateRequest` 六字段、`commands` 与 `CommandResult`、cordis 4.1.0 的 `provide(name,value,check)` 语义。
+
+### 修复 · peer 范围的真实缺口（0.2.2 正式版会被拒）
+
+此前只把 `dsh-agent` 扩到 `<0.2.3-0`；`dsh-tools` / `dsh-llm` / `dsh-subagent` / `dsh-subprocess` 仍是 `<0.2.2`——
+它们能接受 `0.2.2-rc.1`（预发布排序在正式版之前），但会在 **0.2.2 正式版**上被宿主门禁拒绝。现已全部改为
+`>=0.2.0-rc.1 <0.2.3-0`；`cordis` 由 `~4.0.4` 改为 `^4.0.4`（rc.1 实际是 4.1.0，旧声明是假的，虽然宿主不强制）。
+
+### 验证
+
+- 在 **0.2.2-rc.1**（隔离安装，581 包）上：build / typecheck / `test-all --quiet` 全部 exit 0（16/16 包）；
+  `E2E GREEN` 且 **15/15 插件挂载**，日志无 `skipping` / `incompatible`。
+- semver 真值表（`includePrerelease`）：`0.2.1-rc.2` ✓、`0.2.2-rc.1` ✓、`0.2.2` ✓、`0.2.3-rc.1` ✗。
+
 ## [0.6.2] — 2026-11-06
 
 ### 新增 · 门禁 quiet 模式与更可诊断的失败输出

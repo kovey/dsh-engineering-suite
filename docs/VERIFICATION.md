@@ -1,7 +1,9 @@
 # 验证记录（2026-09-17）
 
-> **兼容基线（本文件全部结论的宿主版本）**：`@deepseek-ai/dsh-*` **0.2.0-rc.2**（`cordis ~4.0.4`）。
-> 14 个插件的 `peerDependencies` 用**同一 0.2.0 线**的范围 `>=0.2.0-rc.1 <0.2.1-0`。
+> **兼容基线（本文件全部结论的宿主版本）**：`@deepseek-ai/dsh-*` **0.2.2-rc.1**（`cordis ^4.0.4`，rc.1 实际为 4.1.0）。
+> 16 个包的 `peerDependencies` 统一为 **`>=0.2.0-rc.1 <0.2.3-0`**（覆盖 0.2.0/0.2.1/0.2.2 三条线的预发布与正式版；
+> **不含** 0.2.3 的任何预发布）。`dsh-agent` / `dsh-tools` / `dsh-llm` / `dsh-subagent` / `dsh-subprocess` 用同一范围，
+> `cordis` 为 `^4.0.4`（`~4.0.4` 匹配不到 rc.1 的 4.1.0——那条声明是假的，虽然宿主不强制它）。
 >
 > **0.1.7-rc.2 起，宿主在加载时强制校验 peer 版本**（`dsh-app-boot` 的 `evaluatePluginCompatibility`，
 > 判定用 `semver.satisfies(runtime, requirement, { includePrerelease: true })`）：锁 `0.1.7-rc.1` 的插件
@@ -21,7 +23,27 @@
 > `approvalPolicy: 'never'`** 并继承 preset/sandbox（`captureDelegatedPolicyOverrides`），
 > 与我们"派出去的子代理不能自己批准什么"的立场一致，无需插件侧改动。
 >
-> **0.2.1-rc.1 / rc.2 适配记录**（基线现在 = **0.2.1-rc.2**，真机 profile 同版本）：
+> **0.2.2-rc.1 适配记录**（基线现在 = **0.2.2-rc.1**，隔离安装 `/tmp/dsh022`，581 包 / 331 个 `@deepseek-ai`）：
+> `rc.2 → rc.1` 不是常规递增——**新增 26 个包、移除 1 个、301 个包版本变化**，其中两处**改变我们文档里的断言**：
+>
+> - **PTC 的启用方式变了**：`dsh-tools` 删除了 `mode` 配置（`z.never()`："Removed. Mount a native or PTC tool executor
+>   instead."），新增 `dsh-tool-executor-native` / `dsh-tool-executor-ptc` 两个执行器；PTC 现在 = **挂载 ptc 执行器**
+>   （`dsh-base` 的 patch 里该行默认 `disabled: true`）。旧文档里"`config.mode = 'ptc'`"是**错的**，写下它就是一个硬配置错误。
+> - **守卫语义的措辞与实现位置变了**：字面 "no guard can force-allow" 已不存在；契约原文改为
+>   "Because guards have no allow result, listener ordering cannot turn a denial back into permission"，方法
+>   `guardReason` → `checkGuards`，管线内位置在 `waterfall('tools/pre-execute')` 之后。**结论不变**：守卫只能加拒绝。
+>   PTC 子调用仍经过 `ToolExecutionPipeline.prepare/dispatch/complete`（旧名 `prepareScheduledExecution` → `prepareExecution` 已删）。
+> - 其余契约**未变**（逐条复核）：`ApprovalOutcome` 四词、`workspaceChanges` 的 `summary`/`diff` 与 `workspace/changes` 事件、
+>   `SpawnTeammateRequest` 的六个字段（仍无 persona/toolFilter/agentOptions）、`commands` 注册表与 `CommandResult` 形状、
+>   cordis 4.1.0 的 `provide(name, value, check)` 语义（`_checkImpl` 在谓词返回假**或抛错**时删除依赖）。
+> - **peer 缺口（已修）**：此前只把 `dsh-agent` 扩到 `<0.2.3-0`，而 `dsh-tools` / `dsh-llm` 仍是 `<0.2.2`——
+>   它们能接受 `0.2.2-rc.1`（预发布排序在正式版之前），但会在 **0.2.2 正式版**上被宿主门禁拒绝。现已统一为
+>   `>=0.2.0-rc.1 <0.2.3-0`；`cordis` 由 `~4.0.4` 改为 `^4.0.4`（rc.1 实际是 4.1.0，旧声明是假的，虽然宿主不强制）。
+> - **验收**：在 rc.1 上 build / typecheck / `test-all --quiet` 全部 exit 0（16/16 包），`E2E GREEN` 且
+>   **15/15 插件挂载**，日志里没有 `skipping` / `incompatible`。semver 真值表（`includePrerelease`）：
+>   `0.2.1-rc.2` ✓、`0.2.2-rc.1` ✓、`0.2.2` ✓、`0.2.3-rc.1` ✗。
+>
+> **0.2.1-rc.1 / rc.2 适配记录**（基线当时 = **0.2.1-rc.2**，真机 profile 同版本）：
 > `rc.1 → rc.2` 的改动是**常规 rc 递增**——新增 2 个 UI/web 包（`dsh-client-ui-deepseek-model-label-1017`、`dsh-web-deepseek-api`），
 > 295 个包版本号前移，**我们依赖的契约一处未变**（复核：`ApprovalOutcome` 仍四词、单调守卫语义、`run_code` 模式门控、
 > PTC 仍走 `prepareExecution`、`workspaceChanges` 服务、`SpawnTeammateRequest` 字段、`commands` 注册表）。
@@ -37,8 +59,12 @@
 > peer 范围**无需改动**——同一 0.2.0 线的 `>=0.2.0-rc.1 <0.2.1-0` 本来就匹配 rc.2（用宿主自带的 semver 判定：
 > rc.1 ✓、rc.2 ✓、0.2.0 ✓、0.2.1-rc.1 ✗），这正是放弃精确锁版的收益。
 > 契约复核（rc2 上与 rc1 逐条对照）：`ApprovalOutcome` 仍是四个字符串；"每个生产者声明自己的 kind、无 `plugin` 兜底"仍在；
-> 单调守卫语义（"no guard can force-allow"）仍在；`run_code` 仍由 `dsh-tools` 的 `config.mode` 门控（默认 `native`）；
-> PTC 仍走 `prepareScheduledExecution` → `prepareExecution`（我们的守卫仍在链上）。
+> 单调守卫语义仍在（**原文已改**：`0.2.2-rc.1` 起 `dsh-tools` 的契约写的是 "Because guards have no allow result,
+> listener ordering cannot turn a denial back into permission"，方法 `guardReason` 更名为 `checkGuards`）；
+> **`run_code` 的门控方式已变**：`0.2.2-rc.1` 删除了 `dsh-tools` 的 `mode` 配置（`z.never()`，写它就是硬错误），
+> PTC 改由**挂载 `dsh-tool-executor-ptc` 执行器**提供（base patch 里该行默认 `disabled: true`）；
+> PTC 子调用仍走受守卫的管线：`ToolExecutionPipeline.prepare/dispatch/complete`（rc.1 之前叫
+> `prepareScheduledExecution` → `prepareExecution`，命名已不存在，结论不变：我们的守卫仍在链上）。
 >
 > **可选能力缺席时的降级（真机实测）**：真机 profile 是 **250 包的基础安装**，不含
 > `dsh-workspace-changes` / `dsh-experimental-agent-team` / `dsh-experimental-auto-review` / `dsh-ptc-runtime(-node)` / `dsh-workflow-ptc`

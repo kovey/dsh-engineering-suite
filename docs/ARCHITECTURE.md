@@ -512,13 +512,19 @@ IM 侧的职责（不在本仓库）：卡片按钮不可伪造且一次性、�
 
 两个直接推论：
 
-1. **任何插件都无法放行我们拒绝的操作**：我们的强制拦截是单调守卫，官方注释明确"没有任何守卫能强制放行"；
+1. **任何插件都无法放行我们拒绝的操作**：我们的强制拦截是单调守卫，官方契约原文（`dsh-tools` 的 `contracts.d.ts`）写的是
+   "Because guards have no allow result, listener ordering cannot turn a denial back into permission"——
+   `0.2.2-rc.1` 起措辞与实现都有变动（方法 `guardReason` 更名为 `checkGuards`），但**语义未变**：瀑布决定 allow/ask/deny，
+   随后 `checkGuards` 只能加拒绝，不能把拒绝翻回许可；
 2. **自动评审也只会收紧**：`dsh-experimental-auto-review` 的返回值只有 `deny` / `ask` / `cancel`（代码级核实，**从不 `allow`**），
    所以挂上它的后果是"更严 + 更多问人 + 更多 LLM 调用"，而不是"绕过门禁"。它仍然不能成为**授权依据**：一个概率判断
    可以作为附加限制，不能作为放行的理由。
 
-**PTC（`run_code`）的守卫语义——读码 + 真机双重核实**：子派发走 `scheduler.dispatch(prepared.exec)`，其中 `prepared` 来自
-`prepareScheduledExecution` → `prepareExecution`，后者内部才是 `waterfall('tools/pre-execute')` 与随后的单调守卫。
+**PTC（`run_code`）的守卫语义——读码 + 真机双重核实**：`0.2.2-rc.1` 起 PTC 由**工具执行器**提供（`dsh-tool-executor-ptc`），
+不再是 `dsh-tools` 的一个"呈现模式"。子调用仍走同一条受守卫的管线：执行器调用 `executor.prepare(input)`，管线是
+`ToolExecutionPipeline.prepare/dispatch/complete`（`dsh-tool-executor-ptc` 内 `new ToolExecutionPipeline(...)` 后
+`executeToolBatch`），也就是**先过 `waterfall('tools/pre-execute')`，再过只能加拒绝的 `checkGuards`**。
+（`0.2.1` 及更早的实现叫 `prepareScheduledExecution` → `prepareExecution`；那段命名已不存在，结论不变。）
 
 真机实验（0.2.0-rc.1 + 本套件 14 个插件，隔离 `DSH_HOME`）：PTC 程序里执行 `await tools.write({ path: 'src/ptc-before-approval.mjs', … })`，
 审计台账如实记下**子调用自己的两行**（`write` 的 `pre`/`result`），结果是 spec-gate 的拒绝原文：
@@ -531,8 +537,9 @@ IM 侧的职责（不在本仓库）：卡片按钮不可伪造且一次性、�
 2. **代价是调用量**：一次 `run_code` + 一个子调用产生 4 行审计（`run_code` 与子调用各 pre/result）——治理类插件按调用计数的
    预算、门禁计数与 turn 预算都要预期这个放大系数。
 
-**启用方式（不要误解）**：`run_code` 是 PTC **呈现传输**，只在 `dsh-tools` 的 `config.mode = 'ptc'` 时可见（默认 `native`，
-此时调用它会得到 `unknown tool "run_code"`）。也就是说"默认不打扰"；要评估 PTC 的成本，先显式打开这个模式。
+**启用方式（不要误解）**：`0.2.2-rc.1` 起 `dsh-tools` 的 `mode` 配置被**删除**（`z.never()`，写它就是一个硬配置错误：
+"Removed. Mount a native or PTC tool executor instead."）。要用 PTC 就**挂执行器**：`dsh-base` 的 patch 里已有
+`tool-executor-ptc` 这一行，但默认 `disabled: true`，需要显式启用；`run_code` 是否可见由所挂执行器决定，而不是某个 mode 开关。
 
 ### 5.17 项目知识库（`dsh-knowledge-base`）：让"回答项目问题"有据可查
 

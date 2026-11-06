@@ -111,9 +111,11 @@ declare module '@deepseek-ai/dsh-llm' {
 - **不采纳（但它只收紧）**：`auto-review` 不得接管授权。代码级核实：它只返回 `deny` / `ask` / `cancel`，**从不返回 `allow`**；
   我们的强制性拦截又是**单调守卫**（没有守卫能强制放行）。挂上它的后果是"更严 + 更多问人 + 更多 LLM 调用"，不是绕过门禁。
 - **各司其职**：`plugin-manager` / `config-editor` 负责安装与编辑；**验证与自检仍是本套件**。
-- **已核实的边界（真机）**：PTC（`run_code`）的子调用经过 `prepareExecution`，守卫仍生效——实验里 PTC 程序内的 `write`
-  被 spec-gate 拒绝、文件未创建、审计留下子调用自己的两行；代价是调用量（1 次 `run_code` + 1 个子调用 = 4 行审计）。
-  注意 `run_code` 只在 `dsh-tools` 的 `config.mode: ptc` 下可见（默认 `native`）。
+- **已核实的边界（真机）**：PTC（`run_code`）的子调用仍走受守卫的管线（`0.2.2-rc.1` 起是 `ToolExecutionPipeline.prepare/dispatch/complete`），
+  守卫仍生效——实验里 PTC 程序内的 `write` 被 spec-gate 拒绝、文件未创建、审计留下子调用自己的两行；
+  代价是调用量（1 次 `run_code` + 1 个子调用 = 4 行审计）。
+  **启用方式在 `0.2.2-rc.1` 变了**：`dsh-tools` 的 `mode` 配置已被删除（写它就是硬配置错误），
+  要用 PTC 得**挂载 `dsh-tool-executor-ptc`**（`dsh-base` 的 patch 里该行默认 `disabled: true`）。
 
 ### 1.7c 从 v0.2.3 到 v0.3.0（新增一个插件，**不需要改声明**）
 
