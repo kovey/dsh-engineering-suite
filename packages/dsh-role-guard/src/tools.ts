@@ -770,6 +770,9 @@ export function registerTools(
                     )
                 }
                 for (const problem of registry.problems()) warnings.push(`角色文件问题：${problem}`)
+                // A preset that failed to register stays visible on every
+                // delegation: another role's dispatch must not hide it.
+                for (const problem of deps.presets.problems()) warnings.push(`Agent Preset：${problem}`)
                 const header = [
                     `role: ${role.id}（${role.name}，mode=${role.mode}）`,
                     `child session: ${run.id}`,

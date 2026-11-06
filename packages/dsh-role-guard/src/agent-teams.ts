@@ -16,11 +16,13 @@
  *    `{ persona: undefined, toolFilter: undefined }`. The teammate therefore
  *    inherits the Lead's provider/model and its **entire** tool surface, and runs
  *    under the DEPLOYMENT persona.
- *  - `ctx.subagents.startContinuable` itself DOES accept `persona`, `toolFilter`,
- *    `agentOptions` and `maxDepth` — the official spawn simply cannot hand any of
- *    them over. That is the exact gap: the official request type would have to
- *    carry the delegation request (or the service would have to expose an
- *    "adopt this governed child" operation) before a role could survive it.
+ *  - `ctx.subagents.startActivation` (0.2.2-rc.1) carries only `agentPreset` as a
+ *    policy entry: `persona` and `toolFilter` are no longer request fields, they
+ *    are enforced by plugins the selected preset mounts in the child's scope
+ *    (see `presets.ts` / `scope.ts`). The official request names no preset at
+ *    all — that is the exact gap. The official request type would have to carry
+ *    the delegation request (or the service would have to expose an "adopt this
+ *    governed child" operation) before a role could survive it.
  *  - The service emits **no events of its own**. It writes four durable SESSION
  *    events into the Team Lead's log — `team/member`, `team/task`,
  *    `team/message/queued`, `team/message/delivered` — and it *listens* to
@@ -30,8 +32,8 @@
  *
  * Consequence, and why this module exists: the official spawn cannot carry any
  * guarantee `team_delegate` owns, so a team-style dispatch is **refused** and
- * served by our own `ctx.subagents.start()` path, naming the guarantees that
- * could not be expressed. The refusal list is data-driven, so a harness that
+ * served by our own `startActivation + Agent Preset` path, naming the guarantees
+ * that could not be expressed. The refusal list is data-driven, so a harness that
  * grows the fields shrinks it — but the persona entry is structural: both role
  * parsers REJECT a role without a persona (an empty persona is a parse error),
  * and `SpawnTeammateRequest` has no persona field. Today the list is never

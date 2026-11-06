@@ -179,19 +179,14 @@ export class RolePresetRegistry {
         }
     }
 
-    /** Registration problems observed so far (surfaced through the plugin log). */
+    /** Registration problems observed so far (surfaced through `team_delegate`). */
     problems(): readonly string[] {
         return this.issues
     }
 
-    /** Ids this plugin registered (a role id → preset id projection). */
-    ids(): string[] {
+    /** The ids this plugin registered (role id → preset id projection). */
+    registeredIds(): string[] {
         return [...this.tracked.values()].map((entry) => entry.definition.id)
-    }
-
-    /** The definition registered for a role, if any (immutable copy). */
-    definitionFor(roleId: string): PresetDefinitionLike | undefined {
-        return this.tracked.get(roleId)?.definition
     }
 
     /**

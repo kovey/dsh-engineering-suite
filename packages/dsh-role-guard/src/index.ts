@@ -153,6 +153,7 @@ export function apply(ctx: Context, config: unknown = {}): void {
                 // lazily on its first delegation; the two are idempotent by id.
                 const summary = presets.ensureAll(roles.for(resolveLayout(process.cwd(), resolved.layout)).list())
                 presetsState = `on(${summary.registered} registered${summary.refused === 0 ? '' : `, ${summary.refused} refused`})`
+                logger.debug(`agent presets registered by this plugin: ${presets.registeredIds().join(', ') || '(none)'}`)
             }
         } catch (error) {
             presetsState = 'failed'
