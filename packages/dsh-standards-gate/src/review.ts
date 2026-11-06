@@ -18,27 +18,48 @@
  */
 
 import path from 'node:path'
-import { ensureDir, writeTextAtomic, type FileMetrics, type MetricsResult } from 'dsh-eng-core'
+import {
+    ensureDir,
+    planDelegation,
+    startDelegation,
+    writeTextAtomic,
+    type DelegationFilter,
+    type DelegationPresets,
+    type DelegationServices,
+    type FileMetrics,
+    type MetricsResult,
+} from 'dsh-eng-core'
 
-/** Minimal structural view of `ctx.subagents` (same shape the suite uses). */
-export interface SubagentsLike {
-    start: (
-        provider: string,
-        request: {
-            label?: string
-            prompt: { type: 'text'; text: string }[]
-            parent: never
-            signal: AbortSignal
-            toolFilter?: { allow?: readonly string[]; deny?: readonly string[] }
-            persona?: string
-            maxDepth?: number
-        },
-    ) => Promise<{
-        id: string
-        result: Promise<{ stopReason?: string; output?: { type?: string; text?: string }[]; diagnostic?: string }>
-        dispose?: () => Promise<void>
-    }>
-}
+/** The reviewer's preset: namespaced, and sorted after the suite's other three prefixes. */
+export const REVIEW_PRESET_ID = 'standards-gate:review'
+
+/** Row id inside the preset; stable so a roster is readable in a diff. */
+export const REVIEW_SCOPE_ROW_ID = 'standards-gate-scope'
+
+/** Presets sort after role-guard's (100), the orchestrator's (200) and impact-gate's (300). */
+export const REVIEW_PRESET_ORDER = 400
+
+/**
+ * The reviewer's confinement — unchanged from the tool filter this module used
+ * to hand the (now deleted) two-argument `start`.
+ *
+ * `read`/`glob`/`grep` are the whole point (a reviewer reads, it does not
+ * write), and `orchestrate` is denied because a reviewer that can re-enter the
+ * pipeline can advance a stage — and a stage dispatch that re-enters itself
+ * recursed into ~800 child sessions once. Widening either side would change
+ * what the reviewer can DO; this constant is the one place that decision lives.
+ */
+export const REVIEW_TOOL_FILTER: DelegationFilter = { allow: ['read', 'glob', 'grep'], deny: ['orchestrate'] }
+
+/** The reviewer's persona: the same three lines the start request used to carry. */
+export const REVIEW_PERSONA = [
+    '你是结构评审者：只读，只判断，不改代码。',
+    '给可复核的结论（文件:行号），区分"事实"（门禁给的数字）与"方法"（你的判断）。',
+    '允许结论是"没问题"——不要为了产出而编造问题。',
+].join('\n')
+
+/** The refusal subject for the reviewer (the seam's texts name what can be fixed). */
+const REVIEW_OWNER = { plugin: 'dsh-standards-gate', subject: '结构评审子代理（只读，白名单 read/glob/grep）' } as const
 
 /** The reviewer's brief: questions a machine cannot answer, asked concretely. */
 export const REVIEW_RUBRIC = [
@@ -142,7 +163,15 @@ export interface ReviewOutcome {
  */
 export async function runStructuralReview(
     deps: {
-        subagents: () => SubagentsLike | undefined
+        subagents: () => DelegationServices | undefined
+        /**
+         * The presets THIS plugin registered (dsh-eng-core's delegation seam).
+         *
+         * The reviewer's confinement travels in a preset mounted into the child
+         * scope: harness 0.2.2-rc.1's start request has no `toolFilter`, so a
+         * request carrying one would be a claim about an API that cannot keep it.
+         */
+        presets: DelegationPresets
         /** Where the report is written (absolute). */
         reportDir: string
         provider: string
@@ -165,24 +194,46 @@ export async function runStructuralReview(
     if (input.signal?.aborted === true) {
         return { ok: false, report: '', problem: '调用方已取消（signal 已 abort）：未派发评审。' }
     }
-    let child: Awaited<ReturnType<SubagentsLike['start']>>
+    // How the reviewer is started is dsh-eng-core's decision (one seam for
+    // role-guard, the orchestrator, impact-gate and this plugin): `startActivation`
+    // + the preset below on a 0.2.2-rc.1+ host, the legacy request on an older one.
+    // A missing premise is a reported problem, never a widened child.
+    let plan: Awaited<ReturnType<typeof planDelegation>>
     try {
-        child = await subagents.start(deps.provider, {
+        plan = await planDelegation({
+            owner: REVIEW_OWNER,
+            provider: deps.provider,
+            subagents,
+            presets: deps.presets,
+            preset: {
+                id: REVIEW_PRESET_ID,
+                name: '结构评审',
+                description: '只读结构评审子代理的 persona 与工具白名单；orchestrate 已剔除。',
+                order: REVIEW_PRESET_ORDER,
+                rowId: REVIEW_SCOPE_ROW_ID,
+                persona: REVIEW_PERSONA,
+                filter: REVIEW_TOOL_FILTER,
+            },
+        })
+    } catch (error) {
+        return { ok: false, report: '', problem: `派发评审子代理前无法判断可行性（provider ${deps.provider}）：${(error as Error).message}` }
+    }
+    if (plan.kind === 'refused') return { ok: false, report: '', problem: plan.reason }
+
+    let child: Awaited<ReturnType<typeof startDelegation>>
+    try {
+        child = await startDelegation(subagents, {
+            owner: REVIEW_OWNER,
+            provider: deps.provider,
+            plan,
             label: `结构评审 · ${path.basename(input.cwd)}`,
-            prompt: [{ type: 'text', text: reviewPrompt({ cwd: input.cwd, targets: input.targets, ...(input.focus === undefined ? {} : { focus: input.focus }) }) }],
+            prompt: reviewPrompt({ cwd: input.cwd, targets: input.targets, ...(input.focus === undefined ? {} : { focus: input.focus }) }),
             parent: input.agent as never,
             signal: input.signal ?? new AbortController().signal,
-            // Read-only, and the pipeline entry point is removed: a reviewer that
-            // can call `orchestrate` can re-enter the stage (that recursion once
-            // produced ~800 sessions), and a reviewer has no business advancing
-            // anything anyway.
-            toolFilter: { allow: ['read', 'glob', 'grep'], deny: ['orchestrate'] },
             maxDepth: Math.max(1, deps.maxDepth),
-            persona: [
-                '你是结构评审者：只读，只判断，不改代码。',
-                '给可复核的结论（文件:行号），区分"事实"（门禁给的数字）与"方法"（你的判断）。',
-                '允许结论是"没问题"——不要为了产出而编造问题。',
-            ].join('\n'),
+            // An old host still takes the persona and the filter inside the
+            // request; the activation path carries them in the preset instead.
+            legacy: { persona: REVIEW_PERSONA, filter: REVIEW_TOOL_FILTER },
         })
     } catch (error) {
         return { ok: false, report: '', problem: `派发评审子代理失败（provider ${deps.provider}）：${(error as Error).message}` }

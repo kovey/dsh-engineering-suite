@@ -27,16 +27,20 @@ import {
     nextStepsAfter,
     POLICY_SNAPSHOT_ARTIFACT,
     policyFingerprint,
+    planDelegation,
     scanGaps,
     scanWorkspace,
     sessionIdOf,
     scopeWidened,
     sha256,
+    startDelegation,
     specReviewDigest,
     writeJsonAtomic,
     writeTextAtomic,
     type AgentLike,
     type AmendRequest,
+    type DelegationPresets,
+    type DelegationServices,
     type GapReport,
     type Layout,
     type Mandate,
@@ -48,6 +52,12 @@ import {
 } from 'dsh-eng-core'
 import type { Logger } from 'dsh-eng-core'
 import { buildIndex, checkDraft, parseDraftAnswer, renderBrief, renderDraft } from './bootstrap.js'
+import {
+    BOOTSTRAP_OWNER,
+    BOOTSTRAP_PERSONA,
+    bootstrapAgentOptions,
+    bootstrapPresetInput,
+} from './drafting.js'
 import type { SpecGateConfig } from './config.js'
 import type { WriteGuard } from './guard.js'
 import { describeConstraints } from './constraints.js'
@@ -174,7 +184,16 @@ export interface ToolDeps {
      */
     nvimTui: () => NvimTuiLike | undefined
     /** `ctx.get('subagents')`, used to dispatch the READ-ONLY drafting child. */
-    subagents: () => SubagentsLike | undefined
+    subagents: () => DelegationServices | undefined
+    /**
+     * The Agent Presets THIS plugin registered (`dsh-eng-core`'s delegation seam).
+     *
+     * The drafting child's read-only restriction travels in a preset mounted into
+     * the child scope: harness 0.2.2-rc.1's start request has no `toolFilter` and
+     * no `persona`, so a request carrying one would claim a guarantee the host
+     * cannot keep. A host without `ctx.agentPresets` is refused, never downgraded.
+     */
+    presets: DelegationPresets
 }
 
 /** Structural view of `@deepseek-ai/dsh-user-questions`' service. */
@@ -267,26 +286,6 @@ interface BootstrapArgs {
     missionId?: string
     focus?: string
     maxCases?: number
-}
-
-/** Minimal structural view of `ctx.subagents`. */
-interface SubagentsLike {
-    start: (
-        provider: string,
-        request: {
-            label?: string
-            prompt: { type: 'text'; text: string }[]
-            parent: never
-            signal: AbortSignal
-            toolFilter?: { allow?: readonly string[]; deny?: readonly string[] }
-            persona?: string
-            maxDepth?: number
-        },
-    ) => Promise<{
-        id: string
-        result: Promise<{ stopReason?: string; output?: { type?: string; text?: string }[]; diagnostic?: string }>
-        dispose?: () => Promise<void>
-    }>
 }
 
 /** Bound one child-agent run so a stuck draft cannot wedge the tool call. */
@@ -1452,39 +1451,41 @@ export function registerTools(
                     '严格要求：**只读**——你可以读文件、搜索、列目录，但绝不能修改任何文件；',
                     '最终回答只包含 DRAFT 的两段 Markdown（验收标准表 + 测试设计三场景表），不要解释过程。',
                 ].join('\n')
+                // How (and whether) this child may start is dsh-eng-core's decision
+                // — one seam for every delegating plugin. On a 0.2.2-rc.1+ host the
+                // read-only allow-list travels as the preset below (the start
+                // request has no `toolFilter`/`persona` field), so a host that cannot
+                // carry a preset is REFUSED rather than handed a prompt-only child.
+                const preset = bootstrapPresetInput(config.bootstrap.readTools)
+                const plan = await planDelegation({
+                    owner: BOOTSTRAP_OWNER,
+                    provider: config.bootstrap.provider,
+                    subagents,
+                    presets: deps.presets,
+                    preset,
+                })
+                if (plan.kind === 'refused') {
+                    throw new Error(
+                        `${plan.reason}\n\n下一步：改用 \`spec_bootstrap({ action: "brief" })\` 自己读代码写草稿（不依赖子代理）。`,
+                    )
+                }
+                // The host decides which model reads the repository: the bulk
+                // reading is exactly the work a cheap model can do.
+                const agentOptions = bootstrapAgentOptions(config.bootstrap)
                 let child
                 try {
-                    child = await subagents.start(config.bootstrap.provider, {
+                    child = await startDelegation(subagents, {
+                        owner: BOOTSTRAP_OWNER,
+                        provider: config.bootstrap.provider,
+                        plan,
                         label: `规格草稿 · ${path.basename(cwd)}`,
-                        prompt: [{ type: 'text', text: prompt }],
+                        prompt,
                         parent: agent as never,
                         signal: signal ?? new AbortController().signal,
-                        toolFilter: { allow: [...config.bootstrap.readTools] },
-                        // The host decides which model reads the repository: the
-                        // bulk reading is exactly the work a cheap model can do.
-                        ...(config.bootstrap.model === undefined
-                            ? {}
-                            : {
-                                  agentOptions: {
-                                      ...(config.bootstrap.model.includes('/')
-                                          ? { provider: config.bootstrap.model.split('/', 1)[0] as string }
-                                          : {}),
-                                      model: config.bootstrap.model.includes('/')
-                                          ? (config.bootstrap.model.split('/').slice(1).join('/') as string)
-                                          : config.bootstrap.model,
-                                      ...(config.bootstrap.reasoningEffort === undefined
-                                          ? {}
-                                          : { reasoningEffort: config.bootstrap.reasoningEffort }),
-                                      ...(config.bootstrap.maxTokens === undefined
-                                          ? {}
-                                          : { maxTokens: config.bootstrap.maxTokens }),
-                                  },
-                              }),
-                        persona: [
-                            '你是规格草稿员：读代码、写可验证的验收标准与可执行的测试用例步骤。',
-                            '你只有只读工具：绝不修改文件，也不要尝试。',
-                            '证据不足就标注 [推断] 或 [待确认]，禁止发明行为。',
-                        ].join('\n'),
+                        ...(agentOptions === undefined ? {} : { agentOptions }),
+                        // An old host still takes the persona and the filter inside
+                        // the request; the activation path carries the preset instead.
+                        legacy: { persona: BOOTSTRAP_PERSONA, filter: preset.filter },
                     })
                 } catch (error) {
                     throw new Error(

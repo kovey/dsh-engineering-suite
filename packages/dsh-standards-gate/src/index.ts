@@ -28,7 +28,7 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis'
-import { MissionStoreRegistry, createLogger, expandHome, loadProjectConfig, type AgentLike, type Layout } from 'dsh-eng-core'
+import { MissionStoreRegistry, createDelegationPresets, createLogger, expandHome, loadProjectConfig, type AgentLike, type Layout } from 'dsh-eng-core'
 import { resolveConfig, PROJECT_OVERRIDABLE, type StandardsGateConfig } from './config.js'
 import { PROMPT_SECTION, sectionText } from './prompt.js'
 import { registerTools, type ApprovalLike, type ToolDeps } from './tools.js'
@@ -156,6 +156,14 @@ export function apply(ctx: Context, config: unknown = {}): void {
     try {
         const context = ctx as unknown as ContextLike
         const stores = new MissionStoreRegistry({ ...resolved.layout, logger: log })
+        // The presets THIS plugin registers (the seam itself is dsh-eng-core's
+        // `delegation.ts`): the structural reviewer's persona and allow/deny set
+        // travel through a preset mounted into the CHILD scope, because the
+        // 0.2.2-rc.1 start request has no `toolFilter` field to carry them.
+        const reviewPresets = createDelegationPresets({
+            presets: () => context.get('agentPresets') as never,
+            logger: log,
+        })
         const deps: ToolDeps = {
             config: resolved,
             // Profile config is the ceiling; a workspace may refine it through its
@@ -168,6 +176,9 @@ export function apply(ctx: Context, config: unknown = {}): void {
             stores,
             approval: () => context.get('approval') as ApprovalLike | undefined,
             subagents: () => context.get('subagents') as never,
+            // The reviewer's confinement is registered as a preset on its first
+            // dispatch (the seam decides whether the host can carry one at all).
+            presets: reviewPresets,
             logger: log,
         }
 
@@ -196,6 +207,13 @@ export function apply(ctx: Context, config: unknown = {}): void {
         }
 
         ctx.effect(() => () => {
+            // Teardown releases the presets this plugin registered, so a reload does
+            // not leave rows behind that no code enforces any more.
+            try {
+                reviewPresets.clear()
+            } catch (error) {
+                log.warn('agent preset teardown failed:', error)
+            }
             for (const dispose of disposers) {
                 try {
                     dispose()

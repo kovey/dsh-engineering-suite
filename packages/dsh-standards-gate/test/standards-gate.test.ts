@@ -3,7 +3,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import test from 'node:test'
 import { MissionStoreRegistry } from 'dsh-eng-core'
-import { createFakeHost, fakeAgent, runText, tempWorkspace, type FakeHost } from 'dsh-eng-core/testing'
+import { createFakeHost, fakeAgent, runText, tempWorkspace, type FakeHost, type FakeHostOptions } from 'dsh-eng-core/testing'
 import { apply, inject, name, resolveEffectiveConfig } from '../dist/index.js'
 import { resolveConfig } from '../dist/config.js'
 import { compareViolations, freezeBaseline, parseBaselineText } from '../dist/baseline.js'
@@ -51,8 +51,10 @@ function host(
     cwd: string,
     config: Record<string, unknown> = {},
     services: Record<string, unknown> = {},
+    /** The fake host's own seams (subagents/agentPresets): see `createFakeHost`. */
+    hostOptions: Pick<FakeHostOptions, 'withSubagents' | 'withActivation' | 'withAgentPresets' | 'providers' | 'activationResult'> = {},
 ): FakeHost & { approvals: string[] } {
-    const fake = createFakeHost({ cwd, services: { ...services } })
+    const fake = createFakeHost({ cwd, services: { ...services }, ...hostOptions })
     hosts.push(fake)
     const approvals: string[] = []
     const seam = {
@@ -61,8 +63,12 @@ function host(
             return (services['approvalDecision'] as string | undefined) ?? 'allowed-once'
         },
     }
+    const fakeGet = (fake.ctx as unknown as { get: (name: string) => unknown }).get
     ;(fake.ctx as unknown as { get: (name: string) => unknown }).get = ((name: string) =>
-        name === 'approval' ? seam : services[name]) as never
+        // An explicitly passed service wins; otherwise the fake host's own seams
+        // (`withSubagents`/`withAgentPresets`) answer, so a test can assemble a
+        // 0.2.2-rc.1 host instead of hand-writing one.
+        name === 'approval' ? seam : (services[name] ?? fakeGet(name))) as never
     apply(fake.ctx as never, { logFile: path.join(cwd, 'standards-gate.log'), ...config })
     return Object.assign(fake, { approvals })
 }
@@ -360,6 +366,95 @@ test('a structural review dispatches a READ-ONLY reviewer with the rubric (regre
     const files = fs.readdirSync(path.join(cwd, '.dsh', 'standards-reviews'))
     assert.equal(files.length, 1, `expected one report, got ${files.join(', ')}`)
     assert.match(fs.readFileSync(path.join(cwd, '.dsh', 'standards-reviews', files[0]!), 'utf8'), /不是门禁裁决/)
+})
+
+test('a structural review starts its child through the delegation seam + its preset (regression)', async () => {
+    // 0.2.2-rc.1: `start(provider, request)` is deleted and the start request has no
+    // `toolFilter`/`persona`, so the reviewer's confinement can only travel as an
+    // Agent Preset mounted into the CHILD scope. A reviewer started without it would
+    // look identical in the report while holding the parent's whole tool surface.
+    const cwd = longGoRepo()
+    writeStandards(cwd, { languages: { go: { maxFileLines: 400, maxFunctionLines: 80 } } })
+    const fake = host(cwd, {}, {}, {
+        withSubagents: true,
+        withActivation: true,
+        withAgentPresets: true,
+        activationResult: { output: [{ type: 'text', text: '## internal/crawler/big.go\n\n结论：建议拆分（big.go:3）。' }] },
+    })
+    const out = runText(await fake.runTool('standards_review', {}))
+
+    assert.equal(fake.activationSpecs.length, 1, 'the reviewer must start on the API that exists')
+    const spec = fake.activationSpecs[0] as { provider: string; delivery: string; request: Record<string, unknown> }
+    assert.equal(spec.provider, 'spawn')
+    assert.equal(spec.delivery, 'caller')
+    assert.equal(spec.request['agentPreset'], 'standards-gate:review')
+    // The request must not CLAIM a confinement the host has no field for.
+    assert.equal('toolFilter' in spec.request, false)
+    assert.equal('persona' in spec.request, false)
+    assert.equal(spec.request['maxDepth'], 1, 'maxDepth still rides in the request, where it was before')
+
+    // The preset: exactly the old allow/deny set and the same three persona lines.
+    const definition = fake.presetDefinitions.get('standards-gate:review')
+    assert.ok(definition !== undefined, `expected preset standards-gate:review, got ${[...fake.presetDefinitions.keys()].join(', ')}`)
+    assert.deepEqual(
+        definition.plugins.map((row) => (row as { name: string }).name),
+        ['dsh-eng-core/scope'],
+        'one row, mounting the shared scope plugin (a second row could widen the preset)',
+    )
+    const row = definition.plugins[0] as { id: string; config: { allow?: readonly string[]; deny?: readonly string[]; persona?: string } }
+    assert.equal(row.id, 'standards-gate-scope')
+    assert.deepEqual(row.config.allow, ['read', 'glob', 'grep'], 'the same read-only allow list the old request carried')
+    assert.deepEqual(row.config.deny, ['orchestrate'], 'a reviewer must not advance the pipeline')
+    assert.match(row.config.persona ?? '', /你是结构评审者/)
+    assert.match(row.config.persona ?? '', /允许结论是"没问题"/)
+
+    // The findings still flow into the report, and the activation is disposed.
+    assert.match(out, /建议拆分/)
+    assert.equal(fake.activationDisposals(), 1)
+})
+
+test('a structural review refuses a host that cannot carry a preset, and says why (regression)', async () => {
+    // `startActivation` without `ctx.agentPresets`: there is nothing to enforce the
+    // reviewer's confinement with, so the review is refused — never downgraded to a
+    // prompt-only child (the report would still claim "只读").
+    const cwd = longGoRepo()
+    writeStandards(cwd, { languages: { go: { maxFileLines: 400 } } })
+    const fake = host(cwd, {}, {}, { withSubagents: true, withActivation: true })
+    const out = runText(await fake.runTool('standards_review', {}))
+
+    assert.match(out, /未产出评审/)
+    assert.match(out, /没有装配 agentPresets 服务/)
+    assert.match(out, /ctx\.agentPresets/)
+    assert.match(out, /拒绝派发/)
+    assert.match(out, /agent-preset-registry/)
+    assert.equal(fake.activationSpecs.length, 0, 'no child may start without a way to confine it')
+})
+
+test('a structural review refuses a provider that cannot carry a preset (regression)', async () => {
+    // The seam's fourth refusal: a registered provider whose `capabilities.agentPreset`
+    // is false cannot mount the preset, so the restriction would not be enforced.
+    const cwd = longGoRepo()
+    writeStandards(cwd, { languages: { go: { maxFileLines: 400 } } })
+    let started = 0
+    const presetless = {
+        start: async () => {
+            started += 1
+            return { id: 'x', result: Promise.resolve({ stopReason: 'completed', output: [] }) }
+        },
+        startActivation: async () => {
+            started += 1
+            return { childId: 'x', result: Promise.resolve({ stopReason: 'completed', output: [] }), dispose: async () => undefined }
+        },
+        list: () => ['spawn'],
+        getProvider: (provider: string) => ({ name: provider, capabilities: { agentPreset: false } }),
+    }
+    const fake = host(cwd, {}, { subagents: presetless }, { withAgentPresets: true })
+    const out = runText(await fake.runTool('standards_review', {}))
+
+    assert.match(out, /未产出评审/)
+    assert.match(out, /capabilities\.agentPreset = false/)
+    assert.match(out, /拒绝派发/)
+    assert.equal(started, 0, 'a provider that cannot carry the preset must not start the child')
 })
 
 test('a structural review without a subagent service explains itself (regression)', async () => {

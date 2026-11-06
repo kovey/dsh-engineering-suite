@@ -30,6 +30,8 @@ import {
     sessionCwd,
     writeTextAtomic,
     type AgentLike,
+    type DelegationPresets,
+    type DelegationServices,
     type FileMetrics,
     type GateObservation,
     type LayerRule,
@@ -54,7 +56,7 @@ import {
     ruleVerdicts,
     type RuleModeDeclaration,
 } from './rule-modes.js'
-import { runStructuralReview, selectReviewTargets, type SubagentsLike } from './review.js'
+import { runStructuralReview, selectReviewTargets } from './review.js'
 import { trendsOf } from './trends.js'
 import type { StandardsGateConfig } from './config.js'
 
@@ -79,7 +81,13 @@ export interface ToolDeps {
     stores: MissionStoreRegistry
     approval: () => ApprovalLike | undefined
     /** `ctx.get('subagents')`, for the read-only structural reviewer. */
-    subagents: () => SubagentsLike | undefined
+    subagents: () => DelegationServices | undefined
+    /**
+     * The presets THIS plugin registered (`dsh-eng-core`'s delegation seam): the
+     * reviewer's persona and allow/deny set travel through a preset mounted into
+     * the child scope, because 0.2.2-rc.1's start request has no `toolFilter`.
+     */
+    presets: DelegationPresets
     logger?: Logger
 }
 
@@ -1062,6 +1070,7 @@ export function registerTools(
                 const outcome = await runStructuralReview(
                     {
                         subagents: () => deps.subagents() as never,
+                        presets: deps.presets,
                         reportDir,
                         provider: config.reviewProvider,
                         timeoutMs: config.reviewTimeoutMs,

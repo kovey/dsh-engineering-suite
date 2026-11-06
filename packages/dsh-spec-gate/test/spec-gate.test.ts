@@ -1547,6 +1547,110 @@ test('the drafting child can be routed to a cheaper model (regression)', async (
     )
 })
 
+test('spec_bootstrap draft starts its child through the delegation seam + its preset (regression)', async () => {
+    // The 0.2.2-rc.1 host: `start(provider, request)` is gone and the start request
+    // has no `toolFilter`/`persona`, so the read-only confinement can only travel as
+    // an Agent Preset mounted into the CHILD scope. This pins that it does — a draft
+    // that starts a child with no restriction would look identical in the output.
+    const cwd = legacyRepo()
+    const fake = createFakeHost({
+        cwd,
+        withSubagents: true,
+        withActivation: true,
+        withAgentPresets: true,
+        activationResult: { output: [{ type: 'text', text: DRAFT_ANSWER }] },
+    })
+    apply(fake.ctx as never, { logFile: path.join(cwd, 'spec-gate.log') })
+    const out = runText(await fake.runTool('spec_bootstrap', { action: 'draft', focus: '重点补 HTTP 层' }))
+
+    assert.equal(fake.activationSpecs.length, 1, 'the child must start on the API that exists')
+    const spec = fake.activationSpecs[0] as { provider: string; delivery: string; request: Record<string, unknown> }
+    assert.equal(spec.provider, 'spawn')
+    assert.equal(spec.delivery, 'caller')
+    // The request must not CLAIM a confinement the host has no field for.
+    assert.equal('toolFilter' in spec.request, false)
+    assert.equal('persona' in spec.request, false)
+    // The old request carried no depth cap either: this migration adds none.
+    assert.equal('maxDepth' in spec.request, false)
+    const presetId = spec.request['agentPreset']
+    assert.equal(typeof presetId, 'string', 'request.agentPreset is what mounts the preset — without it the child is unrestricted')
+    assert.match(String(presetId), /^spec-gate:bootstrap:[0-9a-f]{8}$/)
+
+    // The preset: exactly the old allow list, the same persona, one row on the
+    // shared scope plugin (the row is the only thing that reaches the child scope).
+    const definition = fake.presetDefinitions.get(String(presetId))
+    assert.ok(definition !== undefined, `expected preset ${String(presetId)}, got ${[...fake.presetDefinitions.keys()].join(', ')}`)
+    assert.deepEqual(
+        definition.plugins.map((row) => (row as { name: string }).name),
+        ['dsh-eng-core/scope'],
+        'one row, mounting the shared scope plugin (a second row could widen the preset)',
+    )
+    const row = definition.plugins[0] as { id: string; config: { allow?: readonly string[]; deny?: readonly string[]; persona?: string } }
+    assert.equal(row.id, 'spec-gate-bootstrap-scope')
+    assert.deepEqual(row.config.allow, ['read', 'grep', 'glob'], 'the same read-only allow list the start request used to carry')
+    assert.equal(row.config.allow?.includes('write'), false)
+    assert.equal(row.config.allow?.includes('bash'), false)
+    assert.equal(row.config.deny, undefined, 'the old request had no deny side')
+    assert.match(row.config.persona ?? '', /你是规格草稿员/)
+    assert.match(row.config.persona ?? '', /只读/)
+
+    // The child's answer still becomes the draft, and the activation is disposed.
+    assert.match(out, /✅ 自查通过/)
+    assert.equal(fake.activationDisposals(), 1)
+})
+
+test('a project bootstrap.readTools gets its own preset instead of a stale refusal (regression)', async () => {
+    // `bootstrap` is project-overridable, so two workspaces of one host may want
+    // different read-only sets. The registry refuses a filter that changed after
+    // registration, so the id carries the list's fingerprint: each workspace gets a
+    // preset that mounts EXACTLY its list, never another workspace's (nor a widened
+    // union of the two).
+    const custom = legacyRepo()
+    const preset = createFakeHost({
+        cwd: custom,
+        withSubagents: true,
+        withActivation: true,
+        withAgentPresets: true,
+        activationResult: { output: [{ type: 'text', text: DRAFT_ANSWER }] },
+    })
+    apply(preset.ctx as never, { logFile: path.join(custom, 'spec-gate.log'), bootstrap: { readTools: ['read'] } })
+    await preset.runTool('spec_bootstrap', { action: 'draft' })
+    const id = (preset.activationSpecs[0] as { request: Record<string, unknown> }).request['agentPreset']
+    const row = (preset.presetDefinitions.get(String(id))?.plugins[0] ?? {}) as { config?: { allow?: readonly string[] } }
+    assert.deepEqual(row.config?.allow, ['read'], 'the configured list, not the default one')
+
+    // The default list is a DIFFERENT preset, so both can be registered side by side.
+    const plain = legacyRepo()
+    const other = createFakeHost({
+        cwd: plain,
+        withSubagents: true,
+        withActivation: true,
+        withAgentPresets: true,
+        activationResult: { output: [{ type: 'text', text: DRAFT_ANSWER }] },
+    })
+    apply(other.ctx as never, { logFile: path.join(plain, 'spec-gate.log') })
+    await other.runTool('spec_bootstrap', { action: 'draft' })
+    const defaultId = (other.activationSpecs[0] as { request: Record<string, unknown> }).request['agentPreset']
+    assert.notEqual(defaultId, id, 'a different allow list is a different preset (the id is the filter identity)')
+})
+
+test('spec_bootstrap draft refuses a host that cannot carry a preset, and says why (regression)', async () => {
+    // No `ctx.agentPresets` on a host that has `startActivation`: the seam's shared
+    // refusal, never a prompt-only child (that would hand the drafting child the
+    // parent's whole tool surface while the output still said "只读").
+    const cwd = legacyRepo()
+    const fake = createFakeHost({ cwd, withSubagents: true, withActivation: true })
+    apply(fake.ctx as never, { logFile: path.join(cwd, 'spec-gate.log') })
+    const refused = await fake.runTool('spec_bootstrap', { action: 'draft' })
+    assert.equal(refused.isError, true)
+    assert.match(String(refused.content), /ctx\.agentPresets/)
+    assert.match(String(refused.content), /没有装配 agentPresets 服务/)
+    assert.match(String(refused.content), /拒绝派发/)
+    // …and the caller is told what still works without a child.
+    assert.match(String(refused.content), /action: "brief"/)
+    assert.equal(fake.activationSpecs.length, 0, 'no child may start without a way to confine it')
+})
+
 test('the trust root survives a symlink (regression: SECURITY)', async () => {
     // Found by an adversarial audit: containment was lexical, so
     // `evil.txt -> .dsh/standards-baseline.json` let a write-class tool land

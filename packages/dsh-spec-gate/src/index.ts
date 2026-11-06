@@ -21,7 +21,7 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis'
-import { MissionStoreRegistry, createLogger, expandHome } from 'dsh-eng-core'
+import { MissionStoreRegistry, createDelegationPresets, createLogger, expandHome } from 'dsh-eng-core'
 import type { AgentLike } from 'dsh-eng-core'
 import { resolveConfig, resolveEffectiveConfig } from './config.js'
 import { createWriteGuard } from './guard.js'
@@ -63,6 +63,14 @@ export function apply(ctx: Context, config: unknown = {}): void {
     try {
         const context = ctx as unknown as ContextLike
         const stores = new MissionStoreRegistry({ ...resolved.layout, logger })
+        // The presets THIS plugin registers (the seam itself is dsh-eng-core's
+        // `delegation.ts`): the drafting child's persona and read-only allow-list
+        // travel through a preset mounted into the CHILD scope, because the
+        // 0.2.2-rc.1 start request has no `toolFilter`/`persona` field to carry them.
+        const draftingPresets = createDelegationPresets({
+            presets: () => context.get('agentPresets') as never,
+            logger,
+        })
         // Profile config is the ceiling; each workspace may refine it through
         // its own .dsh/spec-gate.json (a scratch repo can opt out of `enforce`).
         const configFor = (cwd: string) => resolveEffectiveConfig(resolved, stores.for(cwd).layout, logger)
@@ -85,6 +93,9 @@ export function apply(ctx: Context, config: unknown = {}): void {
             // Drafting dispatches a READ-ONLY child agent (`spec_bootstrap`);
             // every gate decision in this plugin stays deterministic.
             subagents: () => context.get('subagents') as never,
+            // The presets THIS plugin registered; the drafting child's confinement
+            // travels in them (it cannot travel in the start request any more).
+            presets: draftingPresets,
             logger,
         })
 
@@ -114,6 +125,13 @@ export function apply(ctx: Context, config: unknown = {}): void {
         }
 
         ctx.effect(() => () => {
+            // Teardown releases the presets this plugin registered, so a reload does
+            // not leave rows behind that no code enforces any more.
+            try {
+                draftingPresets.clear()
+            } catch (error) {
+                logger.warn('agent preset teardown failed:', error)
+            }
             for (const dispose of disposers) {
                 try {
                     dispose()

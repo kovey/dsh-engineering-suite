@@ -1,5 +1,35 @@
 ## [未发布]
 
+### 重构 · 委派债务清零：五份手写实现收敛成一份
+
+上一版把委派收敛到 `dsh-eng-core/delegation`，但源码扫描当场扫出两个**文件边界外**的同类站点，只能列进棘轮基线。
+这一版把它们也迁走——`packages/*/src` 里除 `delegation.ts` 外已**没有**任何 `subagents.start(` 调用，
+扫描的 `PENDING_MIGRATION` 变成**空集**，并且空集本身是一条断言（想加回一条豁免必须先改测试并被评审看见）。
+同一段"怎么起一个受约束的子代理"从五份手写实现变成一份：role-guard、orchestrator、impact-gate、spec-gate、standards-gate。
+
+- **`spec-gate`：只读草稿子代理**（`spec_bootstrap({ action: "draft" })`）。新宿主上它是
+  `planDelegation` → `startActivation` + preset `spec-gate:bootstrap:<过滤指纹>`，行 `spec-gate-bootstrap-scope`
+  挂 `dsh-eng-core/scope`：`allow` 仍是 `bootstrap.readTools`（默认 `read`/`grep`/`glob`，**没有** `deny` 侧，
+  与迁走的那份请求字段逐字等价），persona 三条逐字不变，模型路由（`agentOptions`）仍随请求。
+  preset id 带 allow 列表的过滤指纹：`bootstrap.readTools` 允许项目级覆盖，而 `register()` 是按 id 的、过滤在注册时被固化，
+  固定 id 会让**第二个工作区**的合法配置变成 `stale` 拒绝，且任何一次重启都只能满足其中一边；id 因此是过滤的身份，
+  一个列表一个 preset。旧宿主（没有 `startActivation`）仍走 legacy 请求，那里的 `toolFilter`/`persona` 照旧。
+- **`standards-gate`：结构评审子代理**（`standards_review`）。preset `standards-gate:review`（行
+  `standards-gate-scope`）：`allow: read/glob/grep`、`deny: orchestrate`、三条只读 persona **逐字不变**，
+  `maxDepth: max(1, reviewMaxDepth)` **仍随请求**（新宿主的请求仍有这个字段）。白名单是代码常量，所以不存在 stale。
+- **不会静默降级**：两项功能现在要求宿主装配 `ctx.agentPresets`（0.2.2-rc.1 把它拆成 agent-preset +
+  agent-preset-registry）且 provider 的 `capabilities.agentPreset` 不为 `false`。缺任一条，草稿功能**报错**并指向
+  `spec_bootstrap({ action: "brief" })`（不依赖子代理的路径），结构评审在报告里写「未产出评审」并列出缺失的包——
+  文案来自 eng-core 的那五种拒绝，与另外三个包同一套措辞。绝不再出现"输出写着只读、子代理其实拿着父 Agent 全部工具"。
+- **测试**：`dsh-spec-gate` 117 → **120**（新宿主上草稿子代理走 `startActivation` 且 `request.agentPreset` 指向
+  已注册的 preset、行 config 的 allow 逐字等于 `readTools`、请求里**没有** `toolFilter`/`persona`；自定义 `readTools`
+  得到自己的 preset 而不是 stale 拒绝；缺 `agentPresets` 时拒绝且不启动子代理）。`dsh-standards-gate` 35 → **38**
+  （同一套断言 + `maxDepth` 仍在请求 + provider `capabilities.agentPreset = false` 的拒绝）。两个包的旧宿主用例
+  一条没删，全部照旧通过（legacy 路径仍把 persona/过滤器放进请求）。`dsh-eng-core` 212 条不变（棘轮基线改空集 +
+  新增一条"名单关闭"的断言）。
+- **文档**：`docs/KNOWN-LIMITS.md` 附一之十九改写为**已关闭**，并保留仍然成立的边界（这两项功能对 `agentPresets`
+  与 provider 能力的硬要求，以及闭包过期时的处置）；附一之十八里"三处委派同形"的计数与 id 清单更新为五处。
+
 ### 重构 · 子代理委派收敛成一份实现：`dsh-eng-core/delegation`
 
 三个包各自手写过同一段"怎么派子代理"的接缝（角色的 persona/白名单、被派发阶段的工具限制、复核子会话的只读收紧），

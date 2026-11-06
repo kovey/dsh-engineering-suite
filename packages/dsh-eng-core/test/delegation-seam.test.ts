@@ -9,12 +9,14 @@
  * noticed was written against an old host. A fourth copy is now a failing test.
  *
  * The rule: `packages/*\/src/**` must not contain a `subagents.start(` CALL
- * outside `packages/dsh-eng-core/src/delegation.ts`, EXCEPT the two sites in
- * {@link PENDING_MIGRATION} — files that are outside this mission's approved
- * file boundary and therefore cannot be migrated here. The exemption list is a
- * RATCHET, not a permission: an entry that is no longer an offence fails the
- * test, so a migrated file must be struck from it, and a new copy anywhere is a
- * failure with no way to be added without editing this test in review.
+ * outside `packages/dsh-eng-core/src/delegation.ts`. {@link PENDING_MIGRATION}
+ * is the ratchet that once listed the sites a mission could not reach; it is now
+ * EMPTY and closed — the last two (`dsh-spec-gate`'s drafting child and
+ * `dsh-standards-gate`'s structural reviewer) were migrated, so the exemption
+ * list has nothing left to exempt. An entry that is no longer an offence fails
+ * the test, and a new copy anywhere is a failure with no way to be added without
+ * editing this test in review: five hand-written copies became one
+ * implementation, and the scan is what keeps it one.
  *
  * Judgement calls, stated so a future reader can argue with them:
  *
@@ -48,29 +50,22 @@ const PACKAGES_DIR = fileURLToPath(new URL('../../', import.meta.url))
 const SEAM = path.join('dsh-eng-core', 'src', 'delegation.ts')
 
 /**
- * Known-unmigrated sites, each with WHY it cannot be fixed in this mission.
+ * Known-unmigrated sites — **empty, and closed for good**.
  *
- * They are the same defect (a call to the seam harness 0.2.2-rc.1 deleted, with the
- * child's restriction riding in a request that no longer has that field), found
- * by this scan after the three packages of this mission were migrated. Their
- * packages are not in this mission's file boundary, so fixing them here is not
- * possible — but leaving the defect unnamed is how it survived two migrations.
+ * The rule: `packages/*\/src/**` must not contain a `subagents.start(` CALL
+ * outside `packages/dsh-eng-core/src/delegation.ts`. This map is the RATCHET
+ * that once listed the sites a previous mission could not reach (its file
+ * boundary excluded their packages): an entry that is no longer an offence
+ * fails the test, so a migrated file had to be struck from it, and a new copy
+ * anywhere fails with no way in without editing this test in review.
+ *
+ * The two remaining sites (`dsh-spec-gate`'s drafting child and
+ * `dsh-standards-gate`'s structural reviewer) are now on the seam, so the list
+ * is EMPTY and must stay empty: delegation has one implementation, and a new
+ * entry here would be a permanent exemption rather than a note. Do not add one
+ * — migrate the call site instead.
  */
-const PENDING_MIGRATION = new Map<string, string>([
-    [
-        path.join('dsh-spec-gate', 'src', 'tools.ts'),
-        'KNOWN-UNMIGRATED：spec_bootstrap({ action: "draft" }) 的只读草稿子代理。0.2.2-rc.1 上 `start` 已不存在，' +
-            '所以这条派发起不到子代理；而它的只读收紧（toolFilter: { allow: readTools }）在新宿主没有载体——' +
-            '`SubagentStartRequest` 没有 toolFilter/persona，只读约束只能作为 preset 行交给子作用域。' +
-            '本任务的文件边界不含 packages/dsh-spec-gate，故未随另外三处一起迁移。',
-    ],
-    [
-        path.join('dsh-standards-gate', 'src', 'review.ts'),
-        'KNOWN-UNMIGRATED：runStructuralReview 的结构评审子代理。同一缺陷：' +
-            'toolFilter/persona/maxDepth 全塞在请求里，0.2.2-rc.1 上这条派发起不到子代理，' +
-            '审查者的只读收紧也就没有载体。本任务的文件边界不含 packages/dsh-standards-gate。',
-    ],
-])
+const PENDING_MIGRATION = new Map<string, string>([])
 
 /**
  * A real call of the deleted two-arg start.
@@ -173,7 +168,8 @@ test('the deleted two-arg subagents.start( call exists in exactly one module (AC
             'subagents.start(provider, request)：请改用那份实现（planDelegation → startDelegation），不要在本包里再写一份。',
             '新出现的调用：',
             ...unexpected.map((entry) => `  packages/${entry.file}:${entry.line} → ${entry.text}`),
-            '若某个包不在本任务的文件边界内，不要把它加进 PENDING_MIGRATION：那需要扩大边界、另开任务由人批准。',
+            '若某个包不在本任务的文件边界内，不要把它加进 PENDING_MIGRATION（名单已关闭、只剩空集）：',
+            '扩大文件边界、另开任务由人批准，然后迁移这个调用点。',
         ].join('\n'),
     )
 
@@ -193,6 +189,15 @@ test('the deleted two-arg subagents.start( call exists in exactly one module (AC
     // And the debt is exactly what is named: a third exempted file cannot appear
     // without a reviewer noticing the count change.
     assert.equal(PENDING_MIGRATION.size, found.length, `PENDING_MIGRATION 有 ${PENDING_MIGRATION.size} 项，实际命中 ${found.length} 个文件`)
+    // The list is CLOSED, stated as its own assertion so a future edit that
+    // re-opens it ("just for this one package") fails here and not in a review
+    // comment: delegation has one implementation, and there is no debt left to
+    // record. Migrating a call site is the only way to add a fourth user.
+    assert.equal(
+        PENDING_MIGRATION.size,
+        0,
+        'the KNOWN-UNMIGRATED ratchet is closed：这份基线必须为空——迁移调用点，不要新增豁免（新增豁免等于永久许可）。',
+    )
 })
 
 test('the scan ignores comments and does not confuse startActivation (self-check)', () => {

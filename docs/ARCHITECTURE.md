@@ -280,14 +280,15 @@ startActivation(...)  prompt = 阶段任务 + mission 上下文 + 规则（只�
 > 根本不会挂载（"看起来派发了，其实没强制"）。
 >
 > **委派只有一份实现**：`planDelegation` / `startDelegation` / `registerDelegationPreset` 都在
-> `packages/dsh-eng-core/src/delegation.ts`，三个调用点只提供自己的**领域**输入（哪个 preset、什么 persona/过滤、
-> 旧宿主请求里带什么）。这不是"为了少写几行"：同一个接缝被手写过三次，第三次（impact-gate 的复核子会话）在 0.2.2-rc.1
-> 上直接起不来，而它的限制在新宿主没有任何字段可放——复制一份的代价是**每一份都能各自漂移，而测试只覆盖迁走的那一份**。
+> `packages/dsh-eng-core/src/delegation.ts`，五个调用点（曾各自手写一份，现已收敛）只提供自己的**领域**输入（哪个 preset、什么 persona/过滤、
+> 旧宿主请求里带什么）。这不是"为了少写几行"：同一个接缝被手写过**五次**（role-guard、orchestrator、impact-gate、spec-gate 的草稿子代理、
+> standards-gate 的结构评审子代理），其中三处在 0.2.2-rc.1
+> 上直接起不来，而它们的限制在新宿主没有任何字段可放——复制一份的代价是**每一份都能各自漂移，而测试只覆盖迁走的那一份**。
 > `packages/dsh-eng-core/test/delegation-seam.test.ts` 因此扫 `packages/*/src/**`：除该模块外再出现
 > `subagents.start(` 调用即失败（注释除外；`startActivation(` 不算）。
 >
 > **scope 插件为什么上移到 eng-core（而不是各留一份）**：这个插件是"子作用域里到底强制了什么"的唯一实现点。
-> 两处用法（角色的 `role:<roleId>`、派发阶段的 `orchestrator:<role>`）需要的语义完全相同——
+> 五处用法（`role:` / `orchestrator:` / `impact-gate:` / `standards-gate:` / `spec-gate:bootstrap:<allow 指纹>`）需要的语义完全相同——
 > 先 `restrict` 再 persona、缺能力只告警、空白名单直接拒绝挂载。复制一份的代价不是几十行代码，而是**两处可以各自漂移**：
 > 一边修好了拒绝空白名单、另一边没有，就会有一个子代理带着父 Agent 的全部工具在跑，而测试只覆盖了修好的那一边。
 > 放在 eng-core 还有一个结构上的好处：eng-core **不依赖任何插件**，所以共享它不会让任何一个插件依赖另一个插件；

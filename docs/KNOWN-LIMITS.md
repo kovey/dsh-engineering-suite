@@ -411,30 +411,39 @@ bash scripts/e2e-mission.sh          # 建立隔离 profile、起 stub、跑一�
 只能 fail-closed。处置：`bash scripts/repair-profile-closure.sh`（dry-run）→ `--apply`；升级宿主后应例行跑一次。
 
 **一条 preset 行能不能加载，取决于闭包，而不取决于我们的代码**：`role:<roleId>`（role-guard）、
-`orchestrator:<role>`（orchestrator）与 `impact-gate:review`（impact-gate 的可选复核子会话）的行都是
-`name: dsh-eng-core/scope`——scope 插件已上移到 eng-core，三个插件各挂同一个实现，不再各带一份。它由 loader 在**声明方**的解析基上 `import`：对 orchestrator 来说就是
+`orchestrator:<role>`（orchestrator）、`impact-gate:review`（impact-gate 的可选复核子会话）、
+`standards-gate:review`（standards-gate 的结构评审）与 `spec-gate:bootstrap:<过滤指纹>`（spec-gate 的只读草稿子代理）
+的行都是 `name: dsh-eng-core/scope`——scope 插件已上移到 eng-core，五个插件各挂同一个实现，不再各带一份。它由 loader 在**声明方**的解析基上 `import`：对 orchestrator 来说就是
 "它自己解析到的 eng-core 必须带 `./scope` 子路径"。闭包悬空时它 import 不到，
 `mountPreset` 就把这一行算作 failed，并把理由**并进 preset 的 `broken` 诊断**（宿主 preset 列表里能看到，
 `team_delegate` 的工具输出里看不到——它只能看到"启动失败"）。所以"preset 注册成功"≠"preset 里的行能加载"：
 注册只证明定义进了 registry，行的可用性要等第一次 `mount`。复现与处置都只有一条路：`--apply` 修闭包 → 重启宿主。
 
-另一处结构性代价（三处委派同形）：`register()` 是**按 preset id** 的，而 id 由角色/阶段决定（`role:developer` /
-`orchestrator:developer` / `impact-gate:review`），与工作区无关；工具过滤在注册时被固化。**同一个进程里两个工作区的
-同名角色如果声明了不同的白名单**，第二个会拿到 `stale` 拒绝，而不是被静默按第一个工作区的权限派发；改角色文件的
-`tools` 或 `autoDispatch.toolFilter` 也需要重启宿主才好使（`persona` 只影响文案，同样要重启才生效）。复核子会话的
-白名单是代码常量（`REVIEW_TOOL_FILTER`），所以它不会 stale——它在三处里唯一没有这个代价。
+另一处结构性代价（五处委派同形）：`register()` 是**按 preset id** 的，工具过滤在注册时被固化。角色与阶段的 id
+（`role:developer` / `orchestrator:developer`）由角色文件/阶段配置决定，**与工作区无关**：同一个进程里两个工作区的
+同名角色如果声明了不同的白名单，第二个会拿到 `stale` 拒绝，而不是被静默按第一个工作区的权限派发；改角色文件的
+`tools` 或 `autoDispatch.toolFilter` 也需要重启宿主才好使（`persona` 只影响文案，同样要重启才生效）。
+另外三处没有这个代价，因为它们的 id 与过滤同源：`impact-gate:review` 与 `standards-gate:review` 的白名单是代码常量
+（`REVIEW_TOOL_FILTER`），而 `spec-gate:bootstrap:<过滤指纹>` 把 `bootstrap.readTools` 的指纹写进 id——列表变了就是
+另一个 preset，两次派发可以并存，不会被判 stale。
 
-### 附一之十九：还有两个包在调 0.2.2-rc.1 已删除的两参 `subagents.start`
+### 附一之十九：已关闭 —— 最后两处手写委派已迁到唯一缝
 
 委派接缝收敛到 `dsh-eng-core/src/delegation.ts` 之后，源码扫描（`packages/dsh-eng-core/test/delegation-seam.test.ts`）
-第一次运行就扫出两个同一缺陷的站点，两者都**不在**那次改动的文件边界内，因此没有和其余三处一起迁移：
+第一次运行就扫出两个同一缺陷的站点；它们当次不在文件边界内，被列进扫描的棘轮基线。**现在两处都已迁移，
+`packages/*/src` 里除 `delegation.ts` 外没有 `subagents.start(` 调用，基线是空集并且关闭**——空集本身是一条断言，
+想加回一条豁免必须先改测试并被评审看见：
 
-- `packages/dsh-spec-gate/src/tools.ts` 的 `spec_bootstrap({ action: "draft" })`：只读草稿子代理仍用
-  `start(provider, request)` 并在请求里传 `toolFilter: { allow: readTools }`；
-- `packages/dsh-standards-gate/src/review.ts` 的 `runStructuralReview`：结构评审子代理同样在请求里传
-  `toolFilter`/`persona`/`maxDepth`。
+- `packages/dsh-spec-gate/src/tools.ts` 的 `spec_bootstrap({ action: "draft" })`：走 `planDelegation`/`startDelegation`，
+  preset id `spec-gate:bootstrap:<过滤指纹>`、行 `spec-gate-bootstrap-scope` 挂 `dsh-eng-core/scope`；`allow` 仍是
+  `bootstrap.readTools`（默认 `read`/`grep`/`glob`，**没有** `deny` 侧），persona 逐字不变。id 带指纹是因为
+  `bootstrap.readTools` 允许项目级覆盖：`register()` 按 id 且过滤在注册时固化，固定 id 会让第二个工作区的合法配置
+  变成 `stale` 拒绝，而任何一次重启都只能满足一边——所以 id 就是过滤的身份，一个列表一个 preset。
+- `packages/dsh-standards-gate/src/review.ts` 的 `runStructuralReview`：preset `standards-gate:review`（行
+  `standards-gate-scope`），`allow`/`deny`/persona 逐字等于迁走的那份请求字段，`maxDepth` **仍随请求**。
+  白名单是代码常量，因此不存在 stale。
 
-后果与第三处（impact-gate 的复核子会话，已修）完全相同：0.2.2-rc.1 上这两条调用**起不到子代理**（`start` 不存在），
-在旧宿主上则"能用但限制只靠请求字段"。两处都已列进扫描的棘轮基线（新出现的调用一律失败，迁移完还留在名单上同样失败），
-所以它不会悄悄变成第四、第五份实现——但**它仍是缺陷**，不是已接受的豁免：修法是各自改走
-`dsh-eng-core` 的 `planDelegation`/`startDelegation` 并注册自己的 preset（一行挂 `dsh-eng-core/scope`）。
+**仍然成立的边界**（这一条还留在这里的原因）：这两项功能现在**要求**宿主装配 `ctx.agentPresets`、且 provider 的
+`capabilities.agentPreset` 不为 `false`。缺任一条就拒绝，不降级成"只把只读写进提示词"的子代理：草稿功能报错并指向
+`spec_bootstrap({ action: "brief" })`（不依赖子代理的路径），结构评审在输出里写「未产出评审」并列出缺失的包。
+profile 共享闭包过期（附一之十八）时正好命中这一条，处置仍是 `bash scripts/repair-profile-closure.sh --apply`。
