@@ -1,4 +1,4 @@
-## [未发布]
+## [0.7.2] — 2026-11-09
 
 ### 新增 · `dependency_audit` 认识 PHP composer / Rust cargo / Ruby bundler / .NET 的报告
 
