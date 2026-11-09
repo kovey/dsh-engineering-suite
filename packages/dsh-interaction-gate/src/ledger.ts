@@ -40,6 +40,13 @@ export const LEDGER_KINDS: readonly LedgerKind[] = ['ask', 'notify', 'progress']
 /** Prefix of a refusal decision. */
 export const REFUSAL_PREFIX = 'refused:'
 
+/**
+ * The `source` of a row that answered the HOST's approval seam
+ * (`approval/request`, stage P1) instead of the model's own `interaction_ask`.
+ * It lives here, with the field, so both writers and readers share one literal.
+ */
+export const APPROVAL_SOURCE = 'approval-request'
+
 /** Decision values that are NOT a refusal and not an answer. */
 export const NOTIFIED = 'notified'
 export const NOTIFY_FAILED = 'notify-failed'
@@ -55,6 +62,23 @@ export interface LedgerRow {
     questionId?: string
     /** The channel that carried it. */
     channel?: string
+    /**
+     * What ASKED, when it was not the model's own `interaction_ask`.
+     *
+     * The only value today is `approval-request`: the host's `approval/request`
+     * waterfall was answered over IM (stage P1). It is a closed, additive field
+     * so an operator can tell "a gate's own question was decided" from "the
+     * model asked something" without a second ledger — and `interaction_status`
+     * counts the two separately.
+     */
+    source?: string
+    /**
+     * The conversation the ANSWER came from (the channel's own report), when it
+     * named one. Recorded next to `userId` so the provenance of a decision
+     * (`answer.chatId` was checked against `im.approvalChatId`) survives in the
+     * audit trail instead of living only in the process that checked it.
+     */
+    chatId?: string
     /** Who answered (the channel's identity claim). */
     userId?: string
     /**
@@ -136,6 +160,8 @@ export function parseLedgerRow(value: unknown): LedgerRow | undefined {
         title,
         ...(optional('questionId') === undefined ? {} : { questionId: optional('questionId') as string }),
         ...(optional('channel') === undefined ? {} : { channel: optional('channel') as string }),
+        ...(optional('source') === undefined ? {} : { source: optional('source') as string }),
+        ...(optional('chatId') === undefined ? {} : { chatId: optional('chatId') as string }),
         ...(optional('userId') === undefined ? {} : { userId: optional('userId') as string }),
         ...(optional('decision') === undefined ? {} : { decision: optional('decision') as string }),
         ...(optional('missionId') === undefined ? {} : { missionId: optional('missionId') as string }),
@@ -235,6 +261,14 @@ export interface LedgerSummary {
     undecided: number
     /** Asks with no decision and no later decision row for the same token. */
     pending: PendingAsk[]
+    /**
+     * Per {@link LedgerRow.source}: how many rows, how many carried a decision
+     * and how many of those were refusals. A row WITHOUT a source was asked by
+     * the model's own `interaction_ask` and is not counted here — the approval
+     * seam's questions (`source: 'approval-request'`) get their own line in the
+     * doctor, because "a gate was decided over IM" is a different fact.
+     */
+    sources: Record<string, { rows: number; decided: number; refused: number }>
     last?: LedgerRow
     /** Rows the reader skipped (truncated tail lines, foreign rows). */
     skipped: number
@@ -250,6 +284,7 @@ export function summarizeLedger(rows: readonly LedgerRow[], now: number, skipped
     const byKind: Record<LedgerKind, number> = { ask: 0, notify: 0, progress: 0 }
     const byDecision: Record<string, number> = {}
     const refusedReasons: Record<string, number> = {}
+    const sources: Record<string, { rows: number; decided: number; refused: number }> = {}
     const decidedTokens = new Set<string>()
     let answered = 0
     let refused = 0
@@ -259,6 +294,12 @@ export function summarizeLedger(rows: readonly LedgerRow[], now: number, skipped
     for (const row of rows) {
         byKind[row.kind] += 1
         if (row.questionId !== undefined && row.decision !== undefined) decidedTokens.add(row.questionId)
+        if (row.source === undefined) continue
+        const bucket = (sources[row.source] ??= { rows: 0, decided: 0, refused: 0 })
+        bucket.rows += 1
+        if (row.decision === undefined) continue
+        if (isRefusal(row.decision)) bucket.refused += 1
+        else bucket.decided += 1
     }
     for (const row of rows) {
         const decision = row.decision
@@ -306,6 +347,7 @@ export function summarizeLedger(rows: readonly LedgerRow[], now: number, skipped
         notifyFailed,
         undecided,
         pending,
+        sources,
         skipped,
         ...(last === undefined ? {} : { last }),
     }

@@ -1,5 +1,33 @@
 ## [未发布]
 
+### 新增 · 宿主的审批接缝可以走 IM 回答了（P1，`im.approvalVia`）
+
+在此之前套件自己的提问能到手机上，而**宿主的**审批接缝（`ctx.approval` / `approval/request`）只有一个终端应答者：
+无头会话与手机都答不了。P1 在那个接缝上注册一个应答者，把它变成**同一条提问路径**——一次性令牌、ask outbox、
+决策台账、P0 的 `from` 白名单与来源校验全部复用（`interaction_ask` 与审批应答者调用同一个 `askThroughChannels`，
+不是两份实现）。
+
+- **配置**：`im.approvalVia: 'off' | 'fallback' | 'only'`，默认 **`off`**。`off` 时**一个监听器都不注册**（不碰通道、不写台账），
+  接缝行为逐字节等同于今天；不可用的值**报告并按 `off` 处理**，绝不升格（这个键决定谁能放行一次权限，打字错误不能把它打开）。
+- **注册**：`ctx.on('approval/request', …, { prepend: true })`。cordis 的 waterfall 是"监听器按序执行、返回值即短路、
+  `next()` 交给下一个、队尾落到宿主自己的 `'unavailable'`"，所以 `prepend` 的真实语义是**我们先问 IM**。
+- **`fallback`**：问不了就 `next()` 交还原通道，判定依据是**"卡片是否可能已经发出"**（`AskRefusal.cardAttempted`）而不是猜原因：
+  没发过卡（无可用通道 / 无审批目标 / 名单为空 / outbox 写不进）才落回；卡片发出之后等不到答案 = `unavailable`，
+  **绝不先发卡再落回**（同一问题不问两遍）。
+- **`only`**：问不了一律 `unavailable` 且**不调 `next()`**——说了"只走 IM"的部署不该在终端里被回答。
+- **四词映射**：`allowed-once` ← 回答 allowed-once；`rejected` ← 回答 rejected；`cancelled` ← 请求信号 abort；
+  其余（无通道 / 超时 / 名单外 / 来源不符 / 会话类型未证明）→ **`unavailable`**。"没有人决定"**绝不**写成 `rejected`。
+- **审批更严，不会更宽**：审批路径额外要求审批人名单（`requireAllowlist`，即使宿主没把名单设为强制），
+  名单为空时**连卡片都不发**（`refused:approvers-missing` / `refused:no-allowlist`）；超时/越权/来源不符都只写 `refused:*`，不写决定行。
+- **落账**：由 IM 回答的审批写 `source: "approval-request"` + `userId` + `chatId`（被校验过的那个会话）+ `messageId`；
+  `interaction_status` 新增「IM 审批应答者」与「审批接缝台账行」两行——`off` 必须读成"没碰过"，不能读成"答了但没发生什么"。
+- **重构（无行为变化）**：`interaction_ask` 的提问主体抽成模块级 `askThroughChannels(deps, request, call)`，
+  `AskRefusal`（含 `reason` 与 `cardAttempted`）取代原来的裸 `throw`；拒绝文案逐字不变，既有 76 个用例全绿。
+- **测试**：`dsh-interaction-gate` 76 → **83**（TC-911…TC-917；含"off 不注册任何监听器"、"fallback 的三种『问不了』都不发卡"、
+  "only 不落回"、"超时是 unavailable 不是 rejected"、"名单外回答只记 refused"、"台账行带 by/chatId/messageId"）。
+  waterfall 由假宿主真实驱动（链路/`next()`/base 都是它的实现），只补回它忽略的 `{ prepend: true }` 顺序。
+- **文档**：`docs/ARCHITECTURE.md` §5.18 补"`prepend` 意味着我们先问 IM，而『终端优先、IM 兜底』在 waterfall 里表达不出来"。
+
 ### 安全 · IM 审批改用显式目标会话 + P2P 白名单（P0）
 
 IM 审批卡的目标会话此前由 `dsh-chat-interaction` 自己决定：不传 `chatId` 时它取 `p2pChat || activeChat`，

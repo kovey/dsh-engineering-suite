@@ -102,6 +102,36 @@ export const DEFAULT_IM_P2P_ONLY = true
 /** Longest `im.approvalChatId` a profile may declare (a platform chat id is short). */
 export const MAX_APPROVAL_CHAT_ID_LENGTH = 512
 
+/**
+ * Whether the plugin answers the HOST's approval seam
+ * (`'approval/request'`) itself, i.e. whether a tool that asks for permission
+ * can be approved from a phone.
+ *
+ *  - `off` (default): nothing is registered — not a listener, not a channel
+ *    lookup. The host keeps answering with whatever answerer it already has, so
+ *    the behaviour is byte for byte what it is today.
+ *  - `fallback`: registered in FRONT of the chain (`{ prepend: true }`); when a
+ *    question cannot even be asked over IM (no usable channel, no approval
+ *    target, no approver list, no workspace) the listener calls `next()` so the
+ *    existing answerer (the TUI) still gets it. It never sends a card and then
+ *    falls back — that would ask the same person twice.
+ *  - `only`: same registration, but "cannot ask" resolves `'unavailable'`
+ *    WITHOUT calling `next()`. The choice is deliberate: a deployment that says
+ *    "only IM" must not silently be answered in a terminal that the person who
+ *    wrote the policy is not looking at.
+ *
+ * An unusable value is reported and treated as `off` (never coerced upward):
+ * `fallback`/`only` change who can grant a permission, so a typo must not be the
+ * thing that turns the seam on.
+ */
+export type ApprovalVia = 'off' | 'fallback' | 'only'
+
+/** Every accepted value of `im.approvalVia`, most conservative first. */
+export const APPROVAL_VIA_MODES: readonly ApprovalVia[] = ['off', 'fallback', 'only']
+
+/** Default for `im.approvalVia`: the approval seam is untouched. */
+export const DEFAULT_APPROVAL_VIA: ApprovalVia = 'off'
+
 /** The host-owned `im` block. */
 export interface ImConfig {
     /**
@@ -162,6 +192,19 @@ export interface ImConfig {
      * so the ask path refuses while this is set.
      */
     approvalChatIdProblem?: string
+    /**
+     * Whether the plugin answers the host's `approval/request` waterfall itself
+     * (see {@link ApprovalVia}). `off` by default: the seam is untouched.
+     */
+    approvalVia: ApprovalVia
+    /**
+     * Why `im.approvalVia` was unusable, when it was configured but invalid.
+     *
+     * The effective value is then `off` — and it is reported, because "the
+     * approval answerer silently did not register" is exactly the kind of quiet
+     * miss this suite refuses to have.
+     */
+    approvalViaProblem?: string
 }
 
 /** Resolved plugin configuration. */
@@ -410,6 +453,24 @@ export function resolveConfig(input: unknown, warn?: (message: string) => void):
         }
     }
 
+    // --- im.approvalVia: who answers the HOST's approval seam ----------------
+    // Never coerced upward. `fallback`/`only` decide who may grant a permission,
+    // so a typo keeps `off` (the seam is untouched) and the problem is reported:
+    // silently turning the answerer on would be a permission decision nobody made.
+    const rawApprovalVia = imBlock['approvalVia']
+    let imApprovalVia: ApprovalVia = DEFAULT_APPROVAL_VIA
+    let imApprovalViaProblem: string | undefined
+    if (rawApprovalVia !== undefined) {
+        if (typeof rawApprovalVia === 'string' && (APPROVAL_VIA_MODES as readonly string[]).includes(rawApprovalVia)) {
+            imApprovalVia = rawApprovalVia as ApprovalVia
+        } else {
+            imApprovalViaProblem =
+                `im.approvalVia 只能是 ${APPROVAL_VIA_MODES.map((mode) => `"${mode}"`).join(' / ')}（收到 ${JSON.stringify(rawApprovalVia)}）：` +
+                `已按 "off" 处理（审批应答者不会注册，审批接缝的行为与今天完全一致）`
+            warn?.(`profile 配置: ${imApprovalViaProblem}`)
+        }
+    }
+
     return {
         enabled: bool(raw['enabled'], true),
         logFile: str(raw['logFile'], '~/.dsh/interaction-gate.log'),
@@ -443,8 +504,10 @@ export function resolveConfig(input: unknown, warn?: (message: string) => void):
             approvalChatId: imApprovalChatId,
             p2pOnly: imP2pOnly,
             p2pOnlyConfigured: imP2pOnlyConfigured,
+            approvalVia: imApprovalVia,
             ...(imChannelId === undefined ? {} : { channelId: imChannelId }),
             ...(imApprovalChatIdProblem === undefined ? {} : { approvalChatIdProblem: imApprovalChatIdProblem }),
+            ...(imApprovalViaProblem === undefined ? {} : { approvalViaProblem: imApprovalViaProblem }),
         },
     }
 }
@@ -488,8 +551,9 @@ export const HOST_OWNED_KEYS: readonly { key: string; why: string }[] = [
     {
         key: 'im',
         why:
-            'IM 通道是否启用、审批卡片发到哪个会话（im.approvalChatId）、答案是否必须来自私聊（im.p2pOnly）都是宿主决定：' +
-            '仓库能选自己的审批会话，就等于绕过审批边界把卡片发给自己',
+            'IM 通道是否启用、审批卡片发到哪个会话（im.approvalChatId）、答案是否必须来自私聊（im.p2pOnly）、' +
+            '是否由本插件回答宿主的审批接缝（im.approvalVia）都是宿主决定：' +
+            '仓库能选自己的审批会话，就等于绕过审批边界把卡片发给自己；而 approvalVia=fallback/only 决定的是"谁能放行一次权限"',
     },
 ]
 

@@ -37,6 +37,7 @@
 import path from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import { MissionStoreRegistry, createLogger, expandHome, type AgentLike } from 'dsh-eng-core'
+import { installApprovalAnswerer } from './approval.js'
 import { createAttentionSource, missionFactsOf, type AttentionSource } from './attention.js'
 import { createInteractionRegistry } from './channels.js'
 import { resolveConfig, resolveEffectiveConfig, type EffectiveConfig, type InteractionGateConfig } from './config.js'
@@ -76,9 +77,11 @@ export { resolveConfig, resolveEffectiveConfig, createInteractionRegistry }
 export { describeIm, imLogLine } from './channels.js'
 export { CHAT_CHANNEL_NAME, CHAT_API_MIN_VERSION, CHAT_SERVICE, createChatChannel, imRequiredHint, probeChatInteraction } from './chat-channel.js'
 export { installImChannel } from './im-binding.js'
+export { APPROVAL_OPTIONS, APPROVAL_OUTCOMES, APPROVAL_SOURCE, agentOfRequest, approvalQuestionOf, installApprovalAnswerer, outcomeOfDecision, reasonTextOf } from './approval.js'
 export type { EffectiveConfig, InteractionGateConfig, InteractionRegistry }
 export type { ImChannelMode, ImChannelReport, ImIgnoredAttempt, ImIgnoredReport, ImPhase } from './channels.js'
 export type { ChatApiLike, ChatChannelHandle, ChatChannelOptions, ChatProbe } from './chat-channel.js'
+export type { ApprovalAnswererHandle, ApprovalAnswererOptions, ApprovalOutcome, ApprovalQuestion, ApprovalRequestLike } from './approval.js'
 export type { ImBinding, ImBindingLogger, ImBindingOptions, ImInjectionContext, ImInjectionHost, ImInject, ImTimerControl } from './im-binding.js'
 export type { ImConfig } from './config.js'
 export type { Attention, AttentionRecord, AttentionSource, AttentionState, WhyYou } from './attention.js'
@@ -252,6 +255,13 @@ export function apply(ctx: Context, config: unknown = {}): void {
         }
 
         const disposers: (() => void)[] = []
+        // P1: the host's approval seam, answered over IM — only when the host
+        // asked for it (`im.approvalVia`; `off` registers NOTHING, so the seam
+        // keeps behaving exactly as it does today). It registers with
+        // `{ prepend: true }` on `approval/request` and drives the SAME ask path
+        // as `interaction_ask` (token, outbox, ledger, P0 whitelist/provenance).
+        const approvalAnswerer = installApprovalAnswerer(context as unknown as { on?: unknown }, deps)
+        if (approvalAnswerer.registered) disposers.push(() => approvalAnswerer.dispose())
         // The reactive binding is torn down with the plugin: the channel is
         // unregistered, the bounded window cleared, the subscription dropped.
         disposers.push(() => imBinding.dispose())
@@ -344,7 +354,7 @@ export function apply(ctx: Context, config: unknown = {}): void {
                 `service=${serviceState}; ledger=${resolved.ledgerFile}; outbox=${resolved.outboxFile}; approvers=${resolved.approversFile}${resolved.requireApproverList ? '(required)' : ''}; ` +
                 `askTimeout=${resolved.askTimeoutMs}ms; notifyLevels=${resolved.notifyLevels.join(',')}; prompt=${resolved.prompt.enabled}; ` +
                 `im=${imFinal.registered ? `chat-interaction(api v${imFinal.apiVersion})` : imFinal.phase}(im.channel=${imMode}${imMode === 'required' ? `; requiredWaitMs=${resolved.im.requiredWaitMs}` : ''}; ` +
-                `approvalChatId=${resolved.im.approvalChatId === '' ? '(未配置)' : resolved.im.approvalChatId}; p2pOnly=${resolved.im.p2pOnly})${resolved.im.approvalChatIdProblem === undefined ? '' : ' ⚠️ im.approvalChatId 不可用（见上）'}))`,
+                `approvalChatId=${resolved.im.approvalChatId === '' ? '(未配置)' : resolved.im.approvalChatId}; p2pOnly=${resolved.im.p2pOnly}; approvalVia=${approvalAnswerer.describe()})${resolved.im.approvalChatIdProblem === undefined ? '' : ' ⚠️ im.approvalChatId 不可用（见上）'}))`,
         )
     } catch (error) {
         log.error('apply failed:', error)

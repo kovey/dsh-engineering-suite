@@ -65,6 +65,7 @@ import { DEFAULT_MAX_PAYLOAD_CHARS, describeSource, NOTIFY_LEVELS, type Effectiv
 import { imRequiredHint } from './chat-channel.js'
 import {
     appendLedgerRow,
+    APPROVAL_SOURCE,
     newRowId,
     readLedger,
     refusalOf,
@@ -134,7 +135,14 @@ export interface ToolDeps {
     now: () => number
 }
 
-/** Arguments of `interaction_ask`. */
+/**
+ * Arguments of `interaction_ask` — the MODEL-facing subset of {@link AskRequest}.
+ *
+ * Deliberately narrower than what `askThroughChannels` accepts: `source` and
+ * `requireAllowlist` are set by the plugin (the approval answerer), never by a
+ * caller. They are not in this type AND not in the tool's `parameters`, so
+ * neither the model nor a schema-validated tool call can reach them.
+ */
 interface AskArgs {
     question?: string
     options?: string[]
@@ -568,6 +576,8 @@ export interface AskDelivererDeps {
     questionId: string
     now: () => number
     missionId?: string
+    /** What asked (see {@link LedgerRow.source}): absent = the model's own `interaction_ask`. */
+    source?: string
     /**
      * The wait window this question is allowed (epoch ms). Recorded on the
      * ledger `ask` row so an attention's reported deadline
@@ -618,6 +628,7 @@ export function createAskDeliverer(deps: AskDelivererDeps): OutboxDeliver {
             title: deps.message.title,
             questionId: deps.questionId,
             channel: record.channel,
+            ...(deps.source === undefined ? {} : { source: deps.source }),
             ...(deps.missionId === undefined ? {} : { missionId: deps.missionId }),
             ...(sent.messageId === undefined ? {} : { messageId: sent.messageId }),
             ...(deps.windowMs === undefined ? {} : { windowMs: Math.max(0, Math.floor(deps.windowMs)) }),
@@ -634,30 +645,112 @@ export function createAskDeliverer(deps: AskDelivererDeps): OutboxDeliver {
     }
 }
 
-/**
- * Register the four tools.
- * @param ctx - the tool runtime (narrow structural view of `ctx.tools`).
- * @param deps - configuration, stores, the channel registry and a clock.
- */
-export function registerTools(
-    ctx: { tools: { register: (definition: never) => () => void } },
-    deps: ToolDeps,
-): { disposers: (() => void)[]; registered: string[]; failed: string[] } {
-    const disposers: (() => void)[] = []
-    const registered: string[] = []
-    const failed: string[] = []
-    const progressGate = new ProgressGate()
-    const register = (definition: unknown, name: string): void => {
-        try {
-            disposers.push(ctx.tools.register(definition as never))
-            registered.push(name)
-        } catch {
-            failed.push(name)
-        }
-    }
+/** One ask, as the caller declares it (the tool's arguments, or a synthesized approval question). */
+export interface AskRequest {
+    question?: string
+    options?: string[]
+    timeoutMs?: number
+    missionId?: string
+    context?: Record<string, unknown>
+    prefer?: string
+    whyYou?: string
+    /**
+     * Who is asking, for the ledger row. Absent = the model-facing tool
+     * (`interaction_ask`); `'approval-request'` = the host's approval seam being
+     * answered over IM (see `approval.ts`). It is what makes a decision that
+     * answered a GATE's own question distinguishable from one the model asked,
+     * without inventing a second ledger.
+     */
+    source?: string
+    /**
+     * Require an APPROVER-LIST answer even when the host did not make the list
+     * mandatory (`requireApproverList=false`).
+     *
+     * Only the approval answerer sets this, and it only ever TIGHTENS: an
+     * approval is a permission, so "anyone on the channel may answer" is not
+     * good enough for it. Absent = today's behaviour, byte for byte.
+     */
+    requireAllowlist?: boolean
+}
 
-    /** Append one row, returning the failure text instead of throwing. */
-    const write = (file: string, row: LedgerRow): { ok: boolean; problem?: string } => appendLedgerRow(file, row)
+/** Who is asking, in whatever transport the ask runs on (the tool's `exec`, the waterfall's request). */
+export interface AskCall {
+    agent?: AgentLike
+    signal?: AbortSignal
+}
+
+/** A decision that HAPPENED: everything a caller needs to route it. */
+export interface AskDecision {
+    /** The rendered report (exactly what `interaction_ask` returns). */
+    text: string
+    /** The decision word as stored in the ledger. */
+    decision: string
+    /** Whether it grants anything (the shared normaliser's verdict). */
+    allowed: boolean
+    /** Who answered (`''` when the channel gave no identity). */
+    by: string
+    channel: string
+    questionId: string
+    /** The ledger row that carries the decision. */
+    rowId: string
+    durationMs: number
+}
+
+/**
+ * A refusal: no decision happened.
+ *
+ * THROWN, not returned: every caller must stop on it, and the message is exactly
+ * the refusal report the model already reads. Two callers need different things
+ * from it, so the shape carries both:
+ *
+ *  - `reason` — the closed refusal id (`timeout`, `unauthorized`, `no-channel`…),
+ *    rendered in the message as `refused:<reason>`;
+ *  - `cardAttempted` — whether a card may already have left the process. The
+ *    approval answerer uses it for the one decision it must not get wrong: a
+ *    request that could not even START may fall through to the host's own
+ *    answerer (`next()`), while one that already asked a human must not —
+ *    asking twice is precisely the double prompt the design forbids.
+ */
+export class AskRefusal extends Error {
+    readonly reason: string
+    readonly cardAttempted: boolean
+
+    constructor(reason: string, cardAttempted: boolean, text: string) {
+        super(text)
+        this.name = 'AskRefusal'
+        this.reason = reason
+        this.cardAttempted = cardAttempted
+    }
+}
+
+/**
+ * The ONE ask path: target → token → outbox → wait → provenance → approver list →
+ * ledger.
+ *
+ * It exists as a module-level function (and not as the body of the tool) because
+ * TWO callers must ask a human through the very same machinery: the
+ * `interaction_ask` tool, and the approval answerer that lets the host's
+ * `approval/request` waterfall be decided over IM (`approval.ts`, stage P1). A
+ * second implementation would be a second place to get the one-shot token, the
+ * outbox ordering, the P0 provenance checks or the ledger row shape wrong — and
+ * the approval path is the one where that would be a real grant of permission.
+ *
+ * @param deps - configuration, stores, the channel registry and a clock.
+ * @param request - what to ask (declared options, deadline, provenance of the ask).
+ * @param call - who is asking and what cancels it.
+ * @returns the decision that happened.
+ * @throws {AskRefusal} when no decision happened (never a default "yes").
+ */
+export async function askThroughChannels(deps: ToolDeps, request: AskRequest, call: AskCall = {}): Promise<AskDecision> {
+    const agent = call.agent
+    const signal = call.signal
+    /**
+     * Whether a card may already have left the process. Set immediately before
+     * the first delivery attempt; it travels on every refusal (see
+     * {@link AskRefusal.cardAttempted}) so "we could not even start" and "we
+     * asked and got no answer" can never be confused by a caller.
+     */
+    let cardAttempted = false
 
     /**
      * Refuse an ask: write the refusal row, then throw with the exact reason.
@@ -700,12 +793,13 @@ export function registerTools(
             questionId: params.questionId,
             decision: refusalOf(params.reason),
             durationMs: Math.max(0, Math.round(params.durationMs)),
+            ...(request.source === undefined ? {} : { source: request.source }),
             ...(params.channel === undefined ? {} : { channel: params.channel }),
             ...(params.userId === undefined ? {} : { userId: params.userId }),
             ...(params.messageId === undefined ? {} : { messageId: params.messageId }),
             ...(params.missionId === undefined ? {} : { missionId: params.missionId }),
         }
-        const appended = write(params.ledgerFile, row)
+        const appended = appendLedgerRow(params.ledgerFile, row)
         const outboxLines: string[] = []
         if (params.outbox !== undefined) {
             if (params.settle !== undefined) {
@@ -713,7 +807,9 @@ export function registerTools(
             }
             outboxLines.push(...params.outbox.linesFor(params.questionId))
         }
-        throw new Error(
+        throw new AskRefusal(
+            params.reason,
+            cardAttempted,
             [
                 `interaction_ask 拒绝（${refusalOf(params.reason)}）：${params.detail}`,
                 ...(params.extraLines ?? []),
@@ -732,12 +828,799 @@ export function registerTools(
      * knows it threw). Exactly two values exist and a third is never invented.
      */
     function refuseBadWhyYou(value: unknown): never {
-        throw new Error(
+        throw new AskRefusal(
+            'bad-request',
+            cardAttempted,
             `interaction_ask 拒绝（refused:bad-request）：whyYou 只能是 ${WHY_YOU_VALUES.map((entry) => `"${entry}"`).join(' 或 ')}` +
                 `（收到 ${JSON.stringify(value)}）。这两个值分别表示"有门禁在等你的决定"和"有一个结果等你去用"——没有第三个。` +
                 '下一步：按这道提问真正需要人做的那一件事选一个（不确定就省略，默认 decision-required）。',
         )
     }
+    const cwd = declaredCwdOf(agent)
+    const effective = deps.configFor(agent)
+    const config = effective.config
+    // A provider whose `provide` never signals leaves the reactive hook
+    // starved; re-check on use so the ask can still go out (no-op when
+    // the service is registered or already absent for real).
+    deps.refreshIm?.()
+    // Every throw in this function is an {@link AskRefusal} on purpose: the
+    // approval answerer distinguishes "no card can have been sent" (delegate to
+    // the next answerer) from "a human may already be looking at a card" (never
+    // ask twice), and that distinction lives on the refusal, not in a message.
+    if (!config.enabled) {
+        throw new AskRefusal('disabled', cardAttempted, 'dsh-interaction-gate 已被宿主禁用（enabled=false）')
+    }
+    const startedAt = deps.now()
+
+    const question = (request.question ?? '').trim()
+    if (question === '') {
+        throw new AskRefusal(
+            'bad-request',
+            cardAttempted,
+            'interaction_ask 拒绝（refused:bad-request）：question 不能为空。下一步：写清楚要人决定什么。',
+        )
+    }
+    const options = normalizeOptions(request.options)
+    if (options.problem !== undefined) {
+        throw new AskRefusal(
+            'bad-request',
+            cardAttempted,
+            `interaction_ask 拒绝（refused:bad-request）：${options.problem}。下一步：把选项写成互不重复的非空字符串（例如 ["deploy","hold"]）。`,
+        )
+    }
+    const declared = options.options
+    const configuredTimeout = config.askTimeoutMs
+    let timeoutMs = configuredTimeout
+    if (request.timeoutMs !== undefined && request.timeoutMs !== null) {
+        const wanted = request.timeoutMs
+        if (typeof wanted !== 'number' || !Number.isFinite(wanted) || wanted <= 0) {
+            throw new AskRefusal(
+                'bad-request',
+                cardAttempted,
+                `interaction_ask 拒绝（refused:bad-request）：timeoutMs 必须是正整数（收到 ${JSON.stringify(wanted)}）。` +
+                    `下一步：省略它使用宿主上限 ${configuredTimeout}ms，或给一个更短的毫秒数。`,
+            )
+        }
+        timeoutMs = Math.min(configuredTimeout, Math.floor(wanted))
+    }
+
+    const ledgerFile = artifactPathOf(cwd, config.ledgerFile)
+    deps.registry.trackLedger(ledgerFile)
+    const outbox = deps.outboxFor(cwd, config)
+    // Replay happens on the next OPPORTUNITY, never on a timer: this
+    // plugin is session-scoped, not a daemon. "Just before a new ask"
+    // is that moment (the other one is `apply`, when a workspace is
+    // knowable). An idle session does not retry — that is the boundary.
+    const replayed = await outbox.replay('ask')
+    if (replayed.considered > 0) deps.logger?.info(describeReplay(replayed))
+    // The attention sidecar of THIS workspace: `whyYou`, the
+    // superseded/withdrawn transitions and the pause interval. The
+    // question itself is derived from the ledger as always.
+    const attention = deps.attentionFor(cwd, config)
+    deps.registry.attachAttention(attention)
+    // A question whose mission ended, was stopped or lost its
+    // mandate is moot; recording that once (not on every read) is
+    // what keeps the operator's queue honest.
+    const swept = attention.sweep()
+    if (swept.superseded > 0) deps.logger?.info(`attention：${swept.superseded} 个提问因 mission 结束/被停止而作废（superseded）`)
+    // `whyYou` is validated before anything is sent: a question that
+    // does not say WHICH of the two things it wants from a person is
+    // not worth sending.
+    const whyYou: WhyYou =
+        request.whyYou === undefined || request.whyYou === null || request.whyYou === ''
+            ? DEFAULT_WHY_YOU
+            : isWhyYou(request.whyYou)
+              ? request.whyYou
+              : refuseBadWhyYou(request.whyYou)
+    const missionId = missionIdOf(deps, cwd, agent, request.missionId)
+    const questionId = newQuestionToken()
+    const contextInput = normalizeApprovalContextInput(request.context)
+    const embedded = parseApprovalContext(question)
+    const context = contextInput.context ?? embedded
+    const prose = proseOf(question)
+    const title = `需要决定：${headline(prose, 64)}`
+    const tokenLine = `一次性令牌：${questionId}（回答必须对得上本次提问；它只对这一次有效）`
+    const optionLines =
+        declared.length === 0
+            ? ['选项：（自由文本回答；请直接回一句话）']
+            : [`选项（必须选一个，大小写不敏感）：${declared.join(' / ')}`]
+    const rawBody =
+        context === undefined
+            ? [prose, '', ...optionLines, tokenLine].join('\n')
+            : [renderApprovalContext(prose, context), ...optionLines, tokenLine].join('\n')
+    const body = truncate(rawBody, config.maxPayloadChars)
+    const titleOut = truncate(title, 200)
+
+    // --- redaction: a payload that would leak a credential is refused ---
+    const compiled = compileRedactPatterns(config.redactPatterns)
+    const verdict = checkOutgoing(
+        [
+            { name: 'title', text: titleOut.text },
+            { name: 'body', text: body.text },
+            ...(declared.length === 0 ? [] : [{ name: 'options', text: declared.join('\n') }]),
+        ],
+        compiled.rules,
+    )
+    const contextVerdict = context === undefined ? { ok: true, hits: [], problems: [] } : scanApprovalContext(context, compiled.rules)
+    const hits = [...verdict.hits, ...contextVerdict.hits]
+    if (hits.length > 0) {
+        refuseAsk({
+            ledgerFile,
+            reason: 'secret',
+            detail: '载荷里检测到疑似凭据，已拒绝发送（绝不"打码后照发"：卡片一旦发出去就收不回来了）',
+            title: titleOut.text,
+            questionId,
+            durationMs: deps.now() - startedAt,
+            extraLines: [`- 命中规则：`, ...describeHits(hits, compiled.rules)],
+            next: '把凭据从问题/上下文里去掉（只描述位置，例如"仓库根的 .env 里那把 key"），需要审批人看凭据就走带权限的通道，不要贴进卡片。',
+            ...(missionId === undefined ? {} : { missionId }),
+        })
+    }
+
+    // --- approver list: refuse BEFORE sending a card nobody may answer ---
+    const approvers = approversOf(cwd, config)
+    // --- the IM approval target (P0): fail closed BEFORE any card ----
+    // A configured target with no usable whitelist (or an unusable
+    // target) must never degrade into "send it and see who answers":
+    // that is precisely the hole this P0 closes.
+    const imPlan = imAskTargetOf(config, approvers)
+    if (!imPlan.ok) {
+        refuseAsk({
+            ledgerFile,
+            reason: imPlan.reason,
+            detail: imPlan.detail,
+            title: titleOut.text,
+            questionId,
+            durationMs: deps.now() - startedAt,
+            extraLines: imPlan.extraLines,
+            next: imPlan.next,
+            ...(missionId === undefined ? {} : { missionId }),
+        })
+    }
+    // The target this ask was SENT with. The post-answer check below
+    // compares the answer's provenance against exactly this value, so
+    // "what we asked for" and "what we accept" cannot drift apart.
+    const imTarget = imPlan.target
+    if ((config.requireApproverList || request.requireAllowlist === true) && approvers.ids.length === 0) {
+        refuseAsk({
+            ledgerFile,
+            reason: 'approvers-missing',
+            detail: `requireApproverList=true，但项目审批人名单不可用：${approvers.problems.join('；') || approvers.file}`,
+            title: titleOut.text,
+            questionId,
+            durationMs: deps.now() - startedAt,
+            extraLines: [`- 名单文件：${approvers.file}（存在=${approvers.present}，有效 id=${approvers.ids.length}）`],
+            next: `由人写 ${config.approversFile}（一行一个 id，# 开头为注释）；名单为空时问出去也没人能合法回答，所以这里不发卡片。`,
+            ...(missionId === undefined ? {} : { missionId }),
+        })
+    }
+
+    // --- im.channel=required: a missing IM service is a REFUSAL -----
+    // The bounded window already passed (im-binding.ts) and the
+    // service never appeared. Falling back to whatever local channel
+    // happens to be registered would be exactly the silent downgrade
+    // `required` exists to prevent, so this ask is refused instead —
+    // naming the install/upgrade step. A late service appearance
+    // clears the phase, so a later ask works.
+    const imReport = deps.registry.im()
+    if (imReport.mode === 'required' && imReport.phase === 'refused') {
+        refuseAsk({
+            ledgerFile,
+            reason: 'im-required',
+            detail: `im.channel=required，但 IM 通道不可用：${imReport.reason}`,
+            title: titleOut.text,
+            questionId,
+            durationMs: deps.now() - startedAt,
+            extraLines: [
+                `- 有界等待：${imReport.requiredWaitMs ?? '?'}ms（profile 配置 im.requiredWaitMs）内 chatInteraction 没有出现`,
+                `- ${imRequiredHint(imReport.reason)}`,
+            ],
+            next:
+                '安装/升级 `dsh-chat-interaction@>=0.3.0` 并让宿主装配它（提供 chatInteraction 服务，apiVersion>=1）后重新提问；' +
+                '在此之前这道提问不会被本地通道静默回答。',
+            ...(missionId === undefined ? {} : { missionId }),
+        })
+    }
+
+    // --- channel selection ---
+    const list = deps.registry.list()
+    const selection = askCandidates(config, list, request.prefer)
+    if (selection.problem !== undefined || selection.candidates.length === 0) {
+        const explicit = request.prefer !== undefined && request.prefer !== ''
+        refuseAsk({
+            ledgerFile,
+            reason: explicit ? 'channel-unusable' : 'no-channel',
+            detail: selection.problem ?? '没有可用的提问通道：注册的通道都不能收答案（没有 wait() 就没人能回答）',
+            title: titleOut.text,
+            questionId,
+            durationMs: deps.now() - startedAt,
+            extraLines: [
+                '- 已注册通道：',
+                ...(list.length === 0
+                    ? ['  （无）']
+                    : list.map((info) => `  ${info.name}：canAsk=${info.canAsk}，canNotify=${info.canNotify}${info.reason === '' ? '' : `（${info.reason}）`}`)),
+            ],
+            next:
+                list.length === 0
+                    ? '让宿主/IM 插件向 `interaction` 服务注册一个通道（register({ name, send, wait, describe })）后重试；需要人决定的事不要自己拍板。'
+                    : '换一个能收答案的通道（`prefer` 或配置 preferredChannels），或让该通道实现 wait()。',
+            ...(missionId === undefined ? {} : { missionId }),
+        })
+    }
+
+    // Recorded BEFORE the card leaves: a crash between "we asked" and
+    // "why we asked" would leave a question nobody can act on.
+    attention.recordWhy(questionId, whyYou)
+    if (!deps.registry.arm(questionId)) {
+        refuseAsk({
+            ledgerFile,
+            reason: 'token-lost',
+            detail: '一次性令牌无法登记（重复或为空）——这次提问没有可归属的令牌',
+            title: titleOut.text,
+            questionId,
+            durationMs: deps.now() - startedAt,
+            next: '重新提问（会生成新令牌）；重复出现说明令牌生成有问题，不要在令牌不可靠时接受任何答案。',
+            ...(missionId === undefined ? {} : { missionId }),
+        })
+    }
+    // One payload for every candidate AND every replay: a re-sent card
+    // is byte-identical to the first attempt, so a human cannot tell
+    // two questions apart that were meant to be one.
+    const askMessage: InteractionMessage = {
+        kind: 'ask',
+        title: titleOut.text,
+        body: body.text,
+        questionId,
+        ...(declared.length === 0 ? {} : { buttons: declared.map((option) => ({ value: option, label: option })) }),
+        // P0: the card's target and its answer whitelist travel WITH
+        // the question, so a replay re-sends it to the same chat and
+        // the post-answer check compares against what was sent.
+        ...(imTarget === undefined ? {} : { im: imTarget }),
+    }
+    const deliverAsk = createAskDeliverer({
+        registry: deps.registry,
+        ledgerFile,
+        message: askMessage,
+        questionId,
+        now: deps.now,
+        ...(missionId === undefined ? {} : { missionId }),
+        ...(request.source === undefined ? {} : { source: request.source }),
+        windowMs: timeoutMs,
+    })
+
+    const failures: string[] = []
+    /** Deferrals and retry facts: stated in the report, never swallowed. */
+    const outboxNotes: string[] = []
+    /** Which kind of obstacle the candidates hit (the refusal names it). */
+    let sawDeferral = false
+    let sendFailed = false
+    for (const candidate of selection.candidates) {
+        const channel = deps.registry.get(candidate.name)
+        if (channel === undefined) {
+            sendFailed = true
+            failures.push(`- ${candidate.name}：通道在发送前被注销`)
+            continue
+        }
+
+        // ① The intent row is on disk BEFORE the channel is touched.
+        const chatId = chatIdOf(channel)
+        const begun = outbox.begin({ questionId, channel: candidate.name, ...(chatId === undefined ? {} : { chatId }) })
+        if (begun.problem !== undefined) {
+            deps.registry.retire(questionId)
+            refuseAsk({
+                ledgerFile,
+                reason: 'outbox-unwritable',
+                detail:
+                    `提问的意图记录写不进 outbox（${outbox.file}），崩溃/重启后就没人能说明"我们问过谁"，所以这里不发卡片：` +
+                    begun.problem,
+                title: titleOut.text,
+                questionId,
+                durationMs: deps.now() - startedAt,
+                extraLines: ['- 说明：意图先落盘、再发卡片——没有那一行就不发。'],
+                next: `修好 ${outbox.file} 的写入（目录存在且可写）后重试；需要人决定的事不要因为写不进记录就自己拍板。`,
+                ...(missionId === undefined ? {} : { missionId }),
+            })
+        }
+        const recordId = begun.record.id
+        if (!begun.created && isOutboxSettled(begun.record.state)) {
+            deps.registry.retire(questionId)
+            refuseAsk({
+                ledgerFile,
+                reason: 'outbox-settled',
+                detail:
+                    `同一个内容寻址的 outbox 记录（${recordId}）已经结案（state=${begun.record.state}）：` +
+                    '一次提问只有一条记录——重放不会再造第二道提问，旧的决定也不会被当成新的决定',
+                title: titleOut.text,
+                questionId,
+                durationMs: deps.now() - startedAt,
+                outbox,
+                next: '重新提问（会生成新令牌与新记录）；重复出现说明调用方在复用同一个令牌，检查调用方。',
+                ...(missionId === undefined ? {} : { missionId }),
+            })
+        }
+
+        // ② Per-conversation order: a later send WAITS while an earlier
+        //    question of the same (channel, chatId) is unsettled. The
+        //    wait is a deferral — it never touches `attempts`.
+        const slot = await outbox.awaitSlot(recordId, startedAt + timeoutMs)
+        if (!slot.ok) {
+            const waiting = slot.blockedBy === undefined ? '更早的提问' : `${slot.blockedBy.id}（已失败 ${slot.blockedBy.attempts} 次）`
+            sawDeferral = true
+            failures.push(`- ${candidate.name}：同会话排队超时（等了 ${Math.round(slot.waitedMs)}ms，${waiting} 仍未落定）`)
+            outboxNotes.push(
+                `- ⚠️ 发送被延后（deferral，不是失败）：${describeConversation(begun.record)} 里 ${waiting} 还没落定，` +
+                    '同一会话按顺序发送、attempts 没有增加；等它落定（或失败 3 次）后重试。',
+            )
+            continue
+        }
+        if (slot.deferrals > 0) {
+            outboxNotes.push(
+                `- 同会话排队：${describeConversation(begun.record)} 里更早的提问还没落定，等 ${Math.round(slot.waitedMs)}ms 才轮到这里` +
+                    '（同一会话按顺序发送；排队不算失败，attempts 不变）',
+            )
+        }
+
+        // ③ The send goes through the outbox: `sent` / `send-failed` /
+        //    `dropped` are appended together with the attempt, never
+        //    inferred afterwards from an absence.
+        outbox.attach(recordId, deliverAsk, { deadlineAt: startedAt + timeoutMs })
+        // From here on a card may have left the process: a refusal after
+        // this point must NOT be handed to another answerer (no double ask).
+        cardAttempted = true
+        const delivered = await outbox.deliver(recordId)
+        outbox.detach(recordId)
+        const sendResult = { messageId: delivered.delivery?.messageId }
+        if (!delivered.ok) {
+            const error = delivered.delivery?.error ?? delivered.problem ?? '发送失败'
+            if (delivered.delivery?.deferred === true) sawDeferral = true
+            else sendFailed = true
+            failures.push(`- ${candidate.name}：${error}`)
+            if (delivered.record?.state === 'send-failed') {
+                outboxNotes.push(
+                    `- outbox ${recordId}：已记 send-failed（第 ${delivered.record.attempts} 次失败，退避到 ` +
+                        `${formatTime(delivered.record.nextAttemptAt ?? deps.now())}）；下一次机会只会重投仍然存活的提问，` +
+                        '令牌失效后按 dropped 结案——不会重新问一次，也不会因此放行任何东西。',
+                )
+            } else if (delivered.record?.state === 'dropped') {
+                outboxNotes.push(`- outbox ${recordId}：已记 dropped（${bounded(error, 160)}）——永久失败，不再重投。`)
+            } else if (delivered.record?.state === 'deferred') {
+                outboxNotes.push(
+                    `- outbox ${recordId}：已记 deferred（${bounded(error, 160)}）——通道暂时不可用，这不是失败，` +
+                        'attempts 没有增加；等通道可用后重新提问即可。',
+                )
+            }
+            continue
+        }
+        if (delivered.delivery?.ledgerProblem !== undefined) {
+            deps.registry.retire(questionId)
+            refuseAsk({
+                ledgerFile,
+                reason: 'ledger-unwritable',
+                detail: `台账写不进去，这张卡片的提问就没有可审计的记录：${delivered.delivery.ledgerProblem}`,
+                title: titleOut.text,
+                questionId,
+                durationMs: deps.now() - startedAt,
+                channel: candidate.name,
+                ...(sendResult.messageId === undefined ? {} : { messageId: sendResult.messageId }),
+                outbox,
+                settle: { state: 'withdrawn', reason: '台账写不进去：这张卡片不算数，也不再等待决定' },
+                next: `修好台账路径（${ledgerFile}）后重试；卡片已发出但这次不算数，请让通道作废它（messageId ${sendResult.messageId ?? '未知'}）。`,
+                ...(missionId === undefined ? {} : { missionId }),
+            })
+        }
+
+        const wait = typeof channel.wait === 'function' ? channel.wait.bind(channel) : undefined
+        // The pause hook: while THIS mission is blocked the waiter
+        // re-reads the recorded pause interval instead of burning its
+        // deadline. Sampling the mission store is what records a pause
+        // that started mid-wait — the orchestrator has no push hook to
+        // this package, so observation is the hook that exists (the
+        // explicit one is `interaction.pauseMission`/`resumeMission`).
+        const sampleMission = (): void => {
+            if (missionId === undefined) return
+            const synced = attention.syncMission(missionId)
+            if (synced.superseded > 0) deps.logger?.info(`attention：mission ${missionId} 已结束，${synced.superseded} 个提问作废（superseded）`)
+        }
+        sampleMission()
+        const outcome: AwaitResult = await deps.registry.awaitAnswer(questionId, timeoutMs, {
+            ...(wait === undefined ? {} : { wait }),
+            ...(signal === undefined ? {} : { signal }),
+            extension: {
+                now: deps.now,
+                pausedMs: () => {
+                    sampleMission()
+                    if (missionId === undefined) return 0
+                    return attention.pausedMsFor({ missionId, questionId, from: startedAt, to: deps.now() })
+                },
+                paused: () => {
+                    sampleMission()
+                    return missionId === undefined ? false : attention.pausedNow({ missionId, questionId, at: deps.now() })
+                },
+            },
+        })
+        const durationMs = deps.now() - startedAt
+        // A question that became moot while we were waiting must not
+        // become an approval: the answer is refused in the SAME
+        // refusal shape, naming the transition.
+        if (outcome.outcome === 'answered' && outcome.answer !== null) {
+            sampleMission()
+            const state = attention.stateOf(questionId)
+            if (state === 'superseded' || state === 'withdrawn') {
+                const closure = attention.records().find((record) => record.questionId === questionId)?.closure
+                const by = (outcome.answer.by ?? '').trim()
+                refuseAsk({
+                    ledgerFile,
+                    reason: state,
+                    detail:
+                        `这道提问已经${state === 'superseded' ? '作废（superseded）' : '被撤回（withdrawn）'}，迟到的回答不算决定：` +
+                        `${closure?.reason ?? (missionId === undefined ? '提问已不再需要回答' : `mission ${missionId} 已结束或被停止`)}`,
+                    title: titleOut.text,
+                    questionId,
+                    durationMs,
+                    channel: candidate.name,
+                    ...(by === '' ? {} : { userId: by }),
+                    ...(outcome.answer.messageId === undefined ? {} : { messageId: outcome.answer.messageId }),
+                    outbox,
+                    settle: { state: 'withdrawn', reason: `refused:${state}：提问已不再等待回答，迟到的答案不算决定` },
+                    next:
+                        '重新提出一个仍然需要的提问（新令牌）；已结束/被停止的 mission 不要再靠旧卡片推进——' +
+                        '如果这件事还要继续，先新建 mission 并重新审批。',
+                    ...(missionId === undefined ? {} : { missionId }),
+                })
+            }
+        }
+
+        if (outcome.outcome !== 'answered' || outcome.answer === null) {
+            if (outcome.outcome === 'cancelled') {
+                refuseAsk({
+                    ledgerFile,
+                    reason: 'cancelled',
+                    detail: `等待被取消（调用方中止，或通道报告中止），没有拿到任何答案`,
+                    title: titleOut.text,
+                    questionId,
+                    durationMs,
+                    channel: candidate.name,
+                    ...(sendResult.messageId === undefined ? {} : { messageId: sendResult.messageId }),
+                    outbox,
+                    settle: { state: 'withdrawn', reason: 'refused:cancelled：等待被取消，这次提问不再等待决定' },
+                    next: '在未被取消的轮次重新提问；不要因为"这次没等到"就自己决定。',
+                    ...(missionId === undefined ? {} : { missionId }),
+                })
+            }
+            if (outcome.outcome === 'unknown-token') {
+                refuseAsk({
+                    ledgerFile,
+                    reason: 'token-lost',
+                    detail: '一次性令牌在等待期间失效（同一令牌只能被回答一次），答案无处归属',
+                    title: titleOut.text,
+                    questionId,
+                    durationMs,
+                    channel: candidate.name,
+                    outbox,
+                    settle: { state: 'withdrawn', reason: 'refused:token-lost：一次性令牌在等待期间失效，答案无处归属' },
+                    next: '重新提问（会生成新令牌）；如果重复出现，说明有通道在替这次提问作答，查通道实现。',
+                    ...(missionId === undefined ? {} : { missionId }),
+                })
+            }
+            const extensionMs = outcome.extensionMs ?? 0
+            refuseAsk({
+                ledgerFile,
+                reason: 'timeout',
+                detail:
+                    `等待超时：通道 "${candidate.name}" 在 ${timeoutMs}ms 内没有返回任何答案` +
+                    `（截止 ${formatTime(startedAt + timeoutMs + extensionMs)}）` +
+                    (extensionMs === 0
+                        ? ''
+                        : `；等待被延长 ${extensionMs}ms——mission ${missionId ?? '(未绑定)'} 在阻塞/暂停期间期限不流逝，恢复后从顺延后的截止时间继续`),
+                title: titleOut.text,
+                questionId,
+                durationMs,
+                channel: candidate.name,
+                ...(sendResult.messageId === undefined ? {} : { messageId: sendResult.messageId }),
+                extraLines: [`- 超时上限：${timeoutMs}ms（配置 askTimeoutMs=${configuredTimeout}ms；调用方只能缩短，不能延长）`],
+                outbox,
+                settle: { state: 'timeout', reason: 'refused:timeout：期限内没有回答（超时不是同意，也不是拒绝）' },
+                next: `确认人真的收到了卡片（messageId ${sendResult.messageId ?? '未知'}）；要么在 ${timeoutMs}ms 内回答重试，要么把问题拆小/换通道。超时**不是**拒绝，也**不是**同意：不要据此继续。`,
+                ...(missionId === undefined ? {} : { missionId }),
+            })
+        }
+
+        const answer = outcome.answer
+        const by = (answer.by ?? '').trim()
+        // --- provenance (P0): is this answer even OURS to accept? ---
+        // Runs BEFORE anything reads the answer's text: an answer from
+        // another conversation is not "a decision with a caveat", it
+        // is somebody else's message. The token is never turned into a
+        // decision (no ledger row with a decision, no outbox
+        // `answered`), and the refusal says exactly which check failed.
+        if (imTarget !== undefined) {
+            const answeredChat = (answer.chatId ?? '').trim()
+            if (answeredChat !== imTarget.chatId) {
+                refuseAsk({
+                    ledgerFile,
+                    reason: 'wrong-chat',
+                    detail:
+                        `答案来自另一个会话（${answeredChat === '' ? '通道没有报告 chatId' : answeredChat}），` +
+                        `不是配置的审批目标（im.approvalChatId=${imTarget.chatId}）：这道回答不是决定，` +
+                        '一次性令牌也不会被换成一次放行',
+                    title: titleOut.text,
+                    questionId,
+                    durationMs,
+                    channel: candidate.name,
+                    ...(by === '' ? {} : { userId: by }),
+                    ...(answer.messageId === undefined ? {} : { messageId: answer.messageId }),
+                    extraLines: [
+                        `- 本次提问的目标：${imTarget.chatId}；回答者：${by === '' ? '通道未提供身份' : by}；回答的会话：${answeredChat === '' ? '通道未报告' : answeredChat}`,
+                        '- 说明：来源不符属于"没有决定"，不是"拒绝"——门禁读不到任何放行。',
+                    ],
+                    outbox,
+                    settle: { state: 'withdrawn', reason: 'refused:wrong-chat：答案来自非审批目标会话，这次提问没有被回答' },
+                    next:
+                        `核对 im.approvalChatId 是否就是你与 bot 私聊的那个会话（interaction_status 里的"IM 审批目标"一行）；` +
+                        '然后重新提问，让目标会话里的人再答一次。不要因为"有人答了"就继续——那张卡可能根本不在审批人手里。',
+                    ...(missionId === undefined ? {} : { missionId }),
+                })
+            }
+            // A missing `chatKind` is NOT proven: the IM plugin reports
+            // the kind only when the platform told it, and accepting an
+            // unproven kind would let a group answer count exactly when
+            // the proof is absent. Fail closed, and say which case it is.
+            if (imTarget.p2pOnly && answer.chatKind !== 'p2p') {
+                refuseAsk({
+                    ledgerFile,
+                    reason: 'not-p2p',
+                    detail:
+                        answer.chatKind === 'group'
+                            ? `答案来自群聊（chatKind=group），而 im.p2pOnly=true：群里任何人按下的按钮都算不到审批人头上，所以它不是决定`
+                            : '答案的会话类型未被证明（IM 插件没有报告 chatKind，无法确认是私聊还是群聊），而 im.p2pOnly=true：' +
+                              '"无法证明"不是"大概没问题"，按未满足处理（fail closed）',
+                    title: titleOut.text,
+                    questionId,
+                    durationMs,
+                    channel: candidate.name,
+                    ...(by === '' ? {} : { userId: by }),
+                    ...(answer.messageId === undefined ? {} : { messageId: answer.messageId }),
+                    extraLines: [
+                        `- 本次提问的目标：${imTarget.chatId}（p2pOnly=true）；回答的会话：${answer.chatId ?? '通道未报告'}；会话类型：${answer.chatKind ?? '未报告'}`,
+                        '- 说明：来源未证明属于"没有决定"，不是"拒绝"——门禁读不到任何放行。',
+                    ],
+                    outbox,
+                    settle: { state: 'withdrawn', reason: 'refused:not-p2p：答案不是已证明的私聊来源，这次提问没有被回答' },
+                    next:
+                        '让审批人在与 bot 的**私聊**里重新回答（新提问）；如果这个部署本来就要在群里审批，' +
+                        '由人把 im.p2pOnly 改成 false，并确认 im.approvalChatId 指向那个群——这两个键是宿主配置，模型改不了。',
+                    ...(missionId === undefined ? {} : { missionId }),
+                })
+            }
+        }
+        const answerVerdict = checkOutgoing([{ name: 'answer', text: answer.value }], compiled.rules)
+        if (!answerVerdict.ok) {
+            refuseAsk({
+                ledgerFile,
+                reason: 'secret',
+                detail: '回答内容里检测到疑似凭据：既不落账也不回显（回答者可能误贴了密钥）',
+                title: titleOut.text,
+                questionId,
+                durationMs,
+                channel: candidate.name,
+                ...(by === '' ? {} : { userId: by }),
+                extraLines: ['- 命中规则：', ...describeHits(answerVerdict.hits, compiled.rules)],
+                outbox,
+                settle: { state: 'withdrawn', reason: 'refused:secret：回答疑似含凭据，未落账（无决定）' },
+                next: '请回答者把凭据从答案里去掉后重新回答（重新提问）；不要把疑似密钥写进台账。',
+                ...(missionId === undefined ? {} : { missionId }),
+            })
+        }
+        const allowed = approveCheck(by, approvers, config.requireApproverList || request.requireAllowlist === true)
+        if (!allowed.ok) {
+            refuseAsk({
+                ledgerFile,
+                reason: 'unauthorized',
+                detail: `回答者未获授权：${allowed.reason}`,
+                title: titleOut.text,
+                questionId,
+                durationMs,
+                channel: candidate.name,
+                ...(by === '' ? {} : { userId: by }),
+                ...(answer.messageId === undefined ? {} : { messageId: answer.messageId }),
+                outbox,
+                settle: { state: 'withdrawn', reason: 'refused:unauthorized：回答者未获授权（无决定）' },
+                next: `让名单里的人回答（由人维护 ${config.approversFile}）；未授权的回答只算"发生了这件事"，不算决定。`,
+                ...(missionId === undefined ? {} : { missionId }),
+            })
+        }
+        const mapped = mapOption(answer.value, declared)
+        if (mapped === undefined) {
+            const bounded = truncate(answer.value, 200)
+            refuseAsk({
+                ledgerFile,
+                reason: 'unknown-answer',
+                detail:
+                    declared.length === 0
+                        ? '答案是空的：没有内容可以当作决定'
+                        : `答案 ${JSON.stringify(bounded.text)} 不是声明选项之一（${declared.join(' / ')}）`,
+                title: titleOut.text,
+                questionId,
+                durationMs,
+                channel: candidate.name,
+                ...(by === '' ? {} : { userId: by }),
+                ...(answer.messageId === undefined ? {} : { messageId: answer.messageId }),
+                outbox,
+                settle: { state: 'withdrawn', reason: 'refused:unknown-answer：答非所问，没有可用的决定' },
+                next: '按声明选项重新问一次（或把选项改成人真正会选的那几个）；答非所问不是"默认通过"。',
+                ...(missionId === undefined ? {} : { missionId }),
+            })
+        }
+        const normalized = normalizeDecision(mapped, by, answer.messageId ?? sendResult.messageId, candidate.name)
+        const carrier = answer.messageId ?? sendResult.messageId
+        // A free-text answer is stored verbatim as the decision, so it
+        // is bounded HERE: an unbounded answer would grow the ledger
+        // (and every report that renders it) without limit. The bound
+        // is the same host-owned `maxPayloadChars` an outgoing payload
+        // gets, and the truncation is stated, never silent.
+        const withinSuiteVocabulary = SUITE_DECISIONS.includes(normalized.decision)
+        const boundedDecision = truncate(normalized.decision, config.maxPayloadChars)
+        const storedDecision = withinSuiteVocabulary ? normalized.decision : boundedDecision.text
+        const decisionTruncated = !withinSuiteVocabulary && boundedDecision.truncated
+        const row: LedgerRow = {
+            at: deps.now(),
+            id: newRowId(),
+            kind: 'ask',
+            title: titleOut.text,
+            questionId,
+            channel: candidate.name,
+            decision: storedDecision,
+        ...(request.source === undefined ? {} : { source: request.source }),
+        ...(answer.chatId === undefined ? {} : { chatId: answer.chatId }),
+            durationMs,
+            ...(normalized.userId === '' ? {} : { userId: normalized.userId }),
+            ...(carrier === undefined ? {} : { messageId: carrier }),
+            ...(missionId === undefined ? {} : { missionId }),
+        }
+        const decided = appendLedgerRow(ledgerFile, row)
+        if (!decided.ok) {
+            outbox.settle(recordId, 'withdrawn', '台账写入失败：回答没有被记录，这次提问没有可审计的决定')
+            // The ledger holds a pending row and will never hold a
+            // decision for it: record the withdrawal (once, with the
+            // reason) so nobody keeps waiting for an answer that the
+            // suite already lost.
+            attention.withdraw(questionId, '台账写入失败：回答没有被记录，这道提问作废（不是答案，也不是批准）')
+            // A refusal that happens AFTER the card went out: it must say so
+            // (`cardAttempted`), because the approval answerer delegates to the
+            // next answerer only when no card can possibly have been sent —
+            // here one was, and a human already answered it.
+            throw new AskRefusal(
+                'ledger-unwritable',
+                cardAttempted,
+                [
+                    `interaction_ask 拒绝（${refusalOf('ledger-unwritable')}）：答案收到了（${JSON.stringify(truncate(answer.value, 200).text)}，回答者 ${by === '' ? '未提供身份' : by}，通道 ${candidate.name}），但台账写不进去，这次决定拿不到可审计的行 id：${decided.problem ?? '未知原因'}`,
+                    `- 一次性令牌：${questionId}`,
+                    `- 台账：${ledgerFile}`,
+                    '下一步：修好台账路径后重新提问（人还得再答一次）；这次回答没有被当作决定，也没有被写进任何地方。',
+                ].join('\n'),
+            )
+        }
+
+        // The ledger decided; the outbox only RECORDS that it did. A
+        // terminal outbox row is never read as a decision anywhere.
+        outbox.settle(recordId, 'answered', `决定 ${bounded(storedDecision, 80)}（回答者 ${by === '' ? '通道未提供身份' : by}，通道 ${candidate.name}）`)
+        outbox.settleQuestion(questionId, 'withdrawn', `同一提问已由 ${candidate.name} 投递并落定：这条候选记录不再重放`)
+
+        const notes: string[] = []
+        if (contextInput.problems.length > 0) notes.push(...contextInput.problems.map((problem) => `- ⚠️ ${problem}`))
+        if (body.truncated) notes.push(`- ⚠️ 正文超过 maxPayloadChars=${config.maxPayloadChars}，已截断后发送`)
+        if (titleOut.truncated) notes.push('- ⚠️ 标题过长，已截断后发送')
+        if (decisionTruncated) {
+            notes.push(
+                `- ⚠️ 回答超过 maxPayloadChars=${config.maxPayloadChars} 字符，落账与回显都已截断（原文 ${answer.value.length} 字符）：` +
+                    '台账是事实记录，不是聊天记录——需要完整内容就让人把长文本写进文件，卡片里只放链接。',
+            )
+        }
+        if (compiled.problems.length > 0) notes.push(...compiled.problems.map((problem) => `- ⚠️ ${problem}`))
+        if (outboxNotes.length > 0) notes.push(...outboxNotes)
+        if (failures.length > 0) notes.push('- 先尝试失败的通道：', ...failures)
+        if (missionId !== undefined) notes.push(`- mission：${missionId}`)
+        const text = [
+            'interaction_ask：已决定',
+            `- 问题：${headline(prose, 120)}`,
+            `- 决定：${storedDecision}${declared.length === 0 ? '（自由文本回答）' : '（声明选项之一）'}`,
+            `- 回答者：${by === '' ? '（通道未提供身份）' : by}${config.requireApproverList ? `（项目审批人名单：${approvers.ids.length} 个 id）` : '（未启用审批人名单：通道内的任何参与者都可回答）'}`,
+            `- 通道：${candidate.name}${(answer.messageId ?? sendResult.messageId) === undefined ? '' : `（消息 ${answer.messageId ?? sendResult.messageId}）`}`,
+            `- 一次性令牌：${questionId}（一次性，已作废）`,
+            `- 台账：${ledgerFile}（行 ${row.id}）`,
+            `- outbox：${recordId}（answered；${describeConversation({ channel: candidate.name, ...(chatId === undefined ? {} : { chatId }) })} 上的下一次提问不会再为它排队）`,
+            `- 耗时：${durationMs}ms（等待上限 ${timeoutMs}ms）`,
+            ...(SUITE_DECISIONS.includes(normalized.decision)
+                ? [
+                      normalized.allowed
+                          ? '- 门禁语义：`allowed-once` 只放行**这一次**——不是长期豁免，也不代表内容被验证过。'
+                          : `- 门禁语义：\`${normalized.decision}\` 没有放行（rejected=人拒绝；cancelled/unavailable=没有人作出决定）。`,
+                  ]
+                : []),
+            ...notes,
+            '下一步：把这个决定用在你问的那一件事上（它只对那件事、那一次有效）；要长期豁免或放宽配置，由人改 `.dsh/**`（模型写不了）。',
+        ].join('\n')
+        return {
+            text,
+            decision: storedDecision,
+            allowed: normalized.allowed,
+            by: normalized.userId === '' ? by : normalized.userId,
+            channel: candidate.name,
+            questionId,
+            rowId: row.id,
+            durationMs,
+        }
+    }
+
+    // Every candidate refused to even deliver the card.
+    deps.registry.retire(questionId)
+    if (sawDeferral && !sendFailed) {
+        // Nothing failed — the question was DEFERRED (a busy chat, a
+        // channel that is temporarily unavailable). Say exactly that,
+        // and point at the fix that actually works.
+        refuseAsk({
+            ledgerFile,
+            reason: 'deferred',
+            detail: '所有候选通道都没有失败，但没有接单：同一会话里更早的提问还没落定，或通道暂时不可用（deferral，不是失败）',
+            title: titleOut.text,
+            questionId,
+            durationMs: deps.now() - startedAt,
+            extraLines: ['- 各通道的情况：', ...failures, ...outboxNotes],
+            outbox,
+            next: '先让同一会话里更早的提问落定（或让它失败 3 次，它就不再挡住后面的提问），或把通道恢复可用（连接/active chat），再重新提问；也可以换一个没人排队的会话（prefer 或项目级 preferredChannels）。排队等待不是失败，也不是同意。',
+            ...(missionId === undefined ? {} : { missionId }),
+        })
+    }
+    if (failures.length === 0) {
+        refuseAsk({
+            ledgerFile,
+            reason: 'no-channel',
+            detail: '没有可用的提问通道（候选通道都没能发出卡片，且没有记录到失败原因）',
+            title: titleOut.text,
+            questionId,
+            durationMs: deps.now() - startedAt,
+            next: '让宿主/IM 插件注册一个实现 wait() 的通道后重试。',
+            ...(missionId === undefined ? {} : { missionId }),
+        })
+    }
+    refuseAsk({
+        ledgerFile,
+        reason: 'send-failed',
+        detail: `所有候选通道都发不出这张卡片（${failures.length} 个）`,
+        title: titleOut.text,
+        questionId,
+        durationMs: deps.now() - startedAt,
+        extraLines: ['- 各通道的失败原因：', ...failures, ...outboxNotes],
+        outbox,
+        next: '修好通道（webhook/网络/凭据）后重试；卡片没发出去 = 没有人被问过，不要自己决定（outbox 里留下的是"没有投递成功"，不是答案）。',
+        ...(missionId === undefined ? {} : { missionId }),
+    })
+}
+
+/**
+ * Register the four tools.
+ * @param ctx - the tool runtime (narrow structural view of `ctx.tools`).
+ * @param deps - configuration, stores, the channel registry and a clock.
+ */
+export function registerTools(
+    ctx: { tools: { register: (definition: never) => () => void } },
+    deps: ToolDeps,
+): { disposers: (() => void)[]; registered: string[]; failed: string[] } {
+    const disposers: (() => void)[] = []
+    const registered: string[] = []
+    const failed: string[] = []
+    const progressGate = new ProgressGate()
+    const register = (definition: unknown, name: string): void => {
+        try {
+            disposers.push(ctx.tools.register(definition as never))
+            registered.push(name)
+        } catch {
+            failed.push(name)
+        }
+    }
+
+    /** Append one row, returning the failure text instead of throwing. */
+    const write = (file: string, row: LedgerRow): { ok: boolean; problem?: string } => appendLedgerRow(file, row)
 
     register(
         defineTool({
@@ -768,731 +1651,12 @@ export function registerTools(
             },
             output: { schema: TEXT_OUTPUT, render: (_args, value) => [{ type: 'text', text: value }] },
             async execute(args: AskArgs = {} as AskArgs, exec) {
-                const agent = agentOf(exec)
-                const cwd = declaredCwdOf(agent)
-                const effective = deps.configFor(agent)
-                const config = effective.config
-                // A provider whose `provide` never signals leaves the reactive hook
-                // starved; re-check on use so the ask can still go out (no-op when
-                // the service is registered or already absent for real).
-                deps.refreshIm?.()
-                if (!config.enabled) throw new Error('dsh-interaction-gate 已被宿主禁用（enabled=false）')
-                const startedAt = deps.now()
-                const signal = signalOf(exec)
-
-                const question = (args.question ?? '').trim()
-                if (question === '') {
-                    throw new Error('interaction_ask 拒绝（refused:bad-request）：question 不能为空。下一步：写清楚要人决定什么。')
-                }
-                const options = normalizeOptions(args.options)
-                if (options.problem !== undefined) {
-                    throw new Error(
-                        `interaction_ask 拒绝（refused:bad-request）：${options.problem}。下一步：把选项写成互不重复的非空字符串（例如 ["deploy","hold"]）。`,
-                    )
-                }
-                const declared = options.options
-                const configuredTimeout = config.askTimeoutMs
-                let timeoutMs = configuredTimeout
-                if (args.timeoutMs !== undefined && args.timeoutMs !== null) {
-                    const wanted = args.timeoutMs
-                    if (typeof wanted !== 'number' || !Number.isFinite(wanted) || wanted <= 0) {
-                        throw new Error(
-                            `interaction_ask 拒绝（refused:bad-request）：timeoutMs 必须是正整数（收到 ${JSON.stringify(wanted)}）。` +
-                                `下一步：省略它使用宿主上限 ${configuredTimeout}ms，或给一个更短的毫秒数。`,
-                        )
-                    }
-                    timeoutMs = Math.min(configuredTimeout, Math.floor(wanted))
-                }
-
-                const ledgerFile = artifactPathOf(cwd, config.ledgerFile)
-                deps.registry.trackLedger(ledgerFile)
-                const outbox = deps.outboxFor(cwd, config)
-                // Replay happens on the next OPPORTUNITY, never on a timer: this
-                // plugin is session-scoped, not a daemon. "Just before a new ask"
-                // is that moment (the other one is `apply`, when a workspace is
-                // knowable). An idle session does not retry — that is the boundary.
-                const replayed = await outbox.replay('ask')
-                if (replayed.considered > 0) deps.logger?.info(describeReplay(replayed))
-                // The attention sidecar of THIS workspace: `whyYou`, the
-                // superseded/withdrawn transitions and the pause interval. The
-                // question itself is derived from the ledger as always.
-                const attention = deps.attentionFor(cwd, config)
-                deps.registry.attachAttention(attention)
-                // A question whose mission ended, was stopped or lost its
-                // mandate is moot; recording that once (not on every read) is
-                // what keeps the operator's queue honest.
-                const swept = attention.sweep()
-                if (swept.superseded > 0) deps.logger?.info(`attention：${swept.superseded} 个提问因 mission 结束/被停止而作废（superseded）`)
-                // `whyYou` is validated before anything is sent: a question that
-                // does not say WHICH of the two things it wants from a person is
-                // not worth sending.
-                const whyYou: WhyYou =
-                    args.whyYou === undefined || args.whyYou === null || args.whyYou === ''
-                        ? DEFAULT_WHY_YOU
-                        : isWhyYou(args.whyYou)
-                          ? args.whyYou
-                          : refuseBadWhyYou(args.whyYou)
-                const missionId = missionIdOf(deps, cwd, agent, args.missionId)
-                const questionId = newQuestionToken()
-                const contextInput = normalizeApprovalContextInput(args.context)
-                const embedded = parseApprovalContext(question)
-                const context = contextInput.context ?? embedded
-                const prose = proseOf(question)
-                const title = `需要决定：${headline(prose, 64)}`
-                const tokenLine = `一次性令牌：${questionId}（回答必须对得上本次提问；它只对这一次有效）`
-                const optionLines =
-                    declared.length === 0
-                        ? ['选项：（自由文本回答；请直接回一句话）']
-                        : [`选项（必须选一个，大小写不敏感）：${declared.join(' / ')}`]
-                const rawBody =
-                    context === undefined
-                        ? [prose, '', ...optionLines, tokenLine].join('\n')
-                        : [renderApprovalContext(prose, context), ...optionLines, tokenLine].join('\n')
-                const body = truncate(rawBody, config.maxPayloadChars)
-                const titleOut = truncate(title, 200)
-
-                // --- redaction: a payload that would leak a credential is refused ---
-                const compiled = compileRedactPatterns(config.redactPatterns)
-                const verdict = checkOutgoing(
-                    [
-                        { name: 'title', text: titleOut.text },
-                        { name: 'body', text: body.text },
-                        ...(declared.length === 0 ? [] : [{ name: 'options', text: declared.join('\n') }]),
-                    ],
-                    compiled.rules,
-                )
-                const contextVerdict = context === undefined ? { ok: true, hits: [], problems: [] } : scanApprovalContext(context, compiled.rules)
-                const hits = [...verdict.hits, ...contextVerdict.hits]
-                if (hits.length > 0) {
-                    refuseAsk({
-                        ledgerFile,
-                        reason: 'secret',
-                        detail: '载荷里检测到疑似凭据，已拒绝发送（绝不"打码后照发"：卡片一旦发出去就收不回来了）',
-                        title: titleOut.text,
-                        questionId,
-                        durationMs: deps.now() - startedAt,
-                        extraLines: [`- 命中规则：`, ...describeHits(hits, compiled.rules)],
-                        next: '把凭据从问题/上下文里去掉（只描述位置，例如"仓库根的 .env 里那把 key"），需要审批人看凭据就走带权限的通道，不要贴进卡片。',
-                        ...(missionId === undefined ? {} : { missionId }),
-                    })
-                }
-
-                // --- approver list: refuse BEFORE sending a card nobody may answer ---
-                const approvers = approversOf(cwd, config)
-                // --- the IM approval target (P0): fail closed BEFORE any card ----
-                // A configured target with no usable whitelist (or an unusable
-                // target) must never degrade into "send it and see who answers":
-                // that is precisely the hole this P0 closes.
-                const imPlan = imAskTargetOf(config, approvers)
-                if (!imPlan.ok) {
-                    refuseAsk({
-                        ledgerFile,
-                        reason: imPlan.reason,
-                        detail: imPlan.detail,
-                        title: titleOut.text,
-                        questionId,
-                        durationMs: deps.now() - startedAt,
-                        extraLines: imPlan.extraLines,
-                        next: imPlan.next,
-                        ...(missionId === undefined ? {} : { missionId }),
-                    })
-                }
-                // The target this ask was SENT with. The post-answer check below
-                // compares the answer's provenance against exactly this value, so
-                // "what we asked for" and "what we accept" cannot drift apart.
-                const imTarget = imPlan.target
-                if (config.requireApproverList && approvers.ids.length === 0) {
-                    refuseAsk({
-                        ledgerFile,
-                        reason: 'approvers-missing',
-                        detail: `requireApproverList=true，但项目审批人名单不可用：${approvers.problems.join('；') || approvers.file}`,
-                        title: titleOut.text,
-                        questionId,
-                        durationMs: deps.now() - startedAt,
-                        extraLines: [`- 名单文件：${approvers.file}（存在=${approvers.present}，有效 id=${approvers.ids.length}）`],
-                        next: `由人写 ${config.approversFile}（一行一个 id，# 开头为注释）；名单为空时问出去也没人能合法回答，所以这里不发卡片。`,
-                        ...(missionId === undefined ? {} : { missionId }),
-                    })
-                }
-
-                // --- im.channel=required: a missing IM service is a REFUSAL -----
-                // The bounded window already passed (im-binding.ts) and the
-                // service never appeared. Falling back to whatever local channel
-                // happens to be registered would be exactly the silent downgrade
-                // `required` exists to prevent, so this ask is refused instead —
-                // naming the install/upgrade step. A late service appearance
-                // clears the phase, so a later ask works.
-                const imReport = deps.registry.im()
-                if (imReport.mode === 'required' && imReport.phase === 'refused') {
-                    refuseAsk({
-                        ledgerFile,
-                        reason: 'im-required',
-                        detail: `im.channel=required，但 IM 通道不可用：${imReport.reason}`,
-                        title: titleOut.text,
-                        questionId,
-                        durationMs: deps.now() - startedAt,
-                        extraLines: [
-                            `- 有界等待：${imReport.requiredWaitMs ?? '?'}ms（profile 配置 im.requiredWaitMs）内 chatInteraction 没有出现`,
-                            `- ${imRequiredHint(imReport.reason)}`,
-                        ],
-                        next:
-                            '安装/升级 `dsh-chat-interaction@>=0.3.0` 并让宿主装配它（提供 chatInteraction 服务，apiVersion>=1）后重新提问；' +
-                            '在此之前这道提问不会被本地通道静默回答。',
-                        ...(missionId === undefined ? {} : { missionId }),
-                    })
-                }
-
-                // --- channel selection ---
-                const list = deps.registry.list()
-                const selection = askCandidates(config, list, args.prefer)
-                if (selection.problem !== undefined || selection.candidates.length === 0) {
-                    const explicit = args.prefer !== undefined && args.prefer !== ''
-                    refuseAsk({
-                        ledgerFile,
-                        reason: explicit ? 'channel-unusable' : 'no-channel',
-                        detail: selection.problem ?? '没有可用的提问通道：注册的通道都不能收答案（没有 wait() 就没人能回答）',
-                        title: titleOut.text,
-                        questionId,
-                        durationMs: deps.now() - startedAt,
-                        extraLines: [
-                            '- 已注册通道：',
-                            ...(list.length === 0
-                                ? ['  （无）']
-                                : list.map((info) => `  ${info.name}：canAsk=${info.canAsk}，canNotify=${info.canNotify}${info.reason === '' ? '' : `（${info.reason}）`}`)),
-                        ],
-                        next:
-                            list.length === 0
-                                ? '让宿主/IM 插件向 `interaction` 服务注册一个通道（register({ name, send, wait, describe })）后重试；需要人决定的事不要自己拍板。'
-                                : '换一个能收答案的通道（`prefer` 或配置 preferredChannels），或让该通道实现 wait()。',
-                        ...(missionId === undefined ? {} : { missionId }),
-                    })
-                }
-
-                // Recorded BEFORE the card leaves: a crash between "we asked" and
-                // "why we asked" would leave a question nobody can act on.
-                attention.recordWhy(questionId, whyYou)
-                if (!deps.registry.arm(questionId)) {
-                    refuseAsk({
-                        ledgerFile,
-                        reason: 'token-lost',
-                        detail: '一次性令牌无法登记（重复或为空）——这次提问没有可归属的令牌',
-                        title: titleOut.text,
-                        questionId,
-                        durationMs: deps.now() - startedAt,
-                        next: '重新提问（会生成新令牌）；重复出现说明令牌生成有问题，不要在令牌不可靠时接受任何答案。',
-                        ...(missionId === undefined ? {} : { missionId }),
-                    })
-                }
-                // One payload for every candidate AND every replay: a re-sent card
-                // is byte-identical to the first attempt, so a human cannot tell
-                // two questions apart that were meant to be one.
-                const askMessage: InteractionMessage = {
-                    kind: 'ask',
-                    title: titleOut.text,
-                    body: body.text,
-                    questionId,
-                    ...(declared.length === 0 ? {} : { buttons: declared.map((option) => ({ value: option, label: option })) }),
-                    // P0: the card's target and its answer whitelist travel WITH
-                    // the question, so a replay re-sends it to the same chat and
-                    // the post-answer check compares against what was sent.
-                    ...(imTarget === undefined ? {} : { im: imTarget }),
-                }
-                const deliverAsk = createAskDeliverer({
-                    registry: deps.registry,
-                    ledgerFile,
-                    message: askMessage,
-                    questionId,
-                    now: deps.now,
-                    ...(missionId === undefined ? {} : { missionId }),
-                    windowMs: timeoutMs,
-                })
-
-                const failures: string[] = []
-                /** Deferrals and retry facts: stated in the report, never swallowed. */
-                const outboxNotes: string[] = []
-                /** Which kind of obstacle the candidates hit (the refusal names it). */
-                let sawDeferral = false
-                let sendFailed = false
-                for (const candidate of selection.candidates) {
-                    const channel = deps.registry.get(candidate.name)
-                    if (channel === undefined) {
-                        sendFailed = true
-                        failures.push(`- ${candidate.name}：通道在发送前被注销`)
-                        continue
-                    }
-
-                    // ① The intent row is on disk BEFORE the channel is touched.
-                    const chatId = chatIdOf(channel)
-                    const begun = outbox.begin({ questionId, channel: candidate.name, ...(chatId === undefined ? {} : { chatId }) })
-                    if (begun.problem !== undefined) {
-                        deps.registry.retire(questionId)
-                        refuseAsk({
-                            ledgerFile,
-                            reason: 'outbox-unwritable',
-                            detail:
-                                `提问的意图记录写不进 outbox（${outbox.file}），崩溃/重启后就没人能说明"我们问过谁"，所以这里不发卡片：` +
-                                begun.problem,
-                            title: titleOut.text,
-                            questionId,
-                            durationMs: deps.now() - startedAt,
-                            extraLines: ['- 说明：意图先落盘、再发卡片——没有那一行就不发。'],
-                            next: `修好 ${outbox.file} 的写入（目录存在且可写）后重试；需要人决定的事不要因为写不进记录就自己拍板。`,
-                            ...(missionId === undefined ? {} : { missionId }),
-                        })
-                    }
-                    const recordId = begun.record.id
-                    if (!begun.created && isOutboxSettled(begun.record.state)) {
-                        deps.registry.retire(questionId)
-                        refuseAsk({
-                            ledgerFile,
-                            reason: 'outbox-settled',
-                            detail:
-                                `同一个内容寻址的 outbox 记录（${recordId}）已经结案（state=${begun.record.state}）：` +
-                                '一次提问只有一条记录——重放不会再造第二道提问，旧的决定也不会被当成新的决定',
-                            title: titleOut.text,
-                            questionId,
-                            durationMs: deps.now() - startedAt,
-                            outbox,
-                            next: '重新提问（会生成新令牌与新记录）；重复出现说明调用方在复用同一个令牌，检查调用方。',
-                            ...(missionId === undefined ? {} : { missionId }),
-                        })
-                    }
-
-                    // ② Per-conversation order: a later send WAITS while an earlier
-                    //    question of the same (channel, chatId) is unsettled. The
-                    //    wait is a deferral — it never touches `attempts`.
-                    const slot = await outbox.awaitSlot(recordId, startedAt + timeoutMs)
-                    if (!slot.ok) {
-                        const waiting = slot.blockedBy === undefined ? '更早的提问' : `${slot.blockedBy.id}（已失败 ${slot.blockedBy.attempts} 次）`
-                        sawDeferral = true
-                        failures.push(`- ${candidate.name}：同会话排队超时（等了 ${Math.round(slot.waitedMs)}ms，${waiting} 仍未落定）`)
-                        outboxNotes.push(
-                            `- ⚠️ 发送被延后（deferral，不是失败）：${describeConversation(begun.record)} 里 ${waiting} 还没落定，` +
-                                '同一会话按顺序发送、attempts 没有增加；等它落定（或失败 3 次）后重试。',
-                        )
-                        continue
-                    }
-                    if (slot.deferrals > 0) {
-                        outboxNotes.push(
-                            `- 同会话排队：${describeConversation(begun.record)} 里更早的提问还没落定，等 ${Math.round(slot.waitedMs)}ms 才轮到这里` +
-                                '（同一会话按顺序发送；排队不算失败，attempts 不变）',
-                        )
-                    }
-
-                    // ③ The send goes through the outbox: `sent` / `send-failed` /
-                    //    `dropped` are appended together with the attempt, never
-                    //    inferred afterwards from an absence.
-                    outbox.attach(recordId, deliverAsk, { deadlineAt: startedAt + timeoutMs })
-                    const delivered = await outbox.deliver(recordId)
-                    outbox.detach(recordId)
-                    const sendResult = { messageId: delivered.delivery?.messageId }
-                    if (!delivered.ok) {
-                        const error = delivered.delivery?.error ?? delivered.problem ?? '发送失败'
-                        if (delivered.delivery?.deferred === true) sawDeferral = true
-                        else sendFailed = true
-                        failures.push(`- ${candidate.name}：${error}`)
-                        if (delivered.record?.state === 'send-failed') {
-                            outboxNotes.push(
-                                `- outbox ${recordId}：已记 send-failed（第 ${delivered.record.attempts} 次失败，退避到 ` +
-                                    `${formatTime(delivered.record.nextAttemptAt ?? deps.now())}）；下一次机会只会重投仍然存活的提问，` +
-                                    '令牌失效后按 dropped 结案——不会重新问一次，也不会因此放行任何东西。',
-                            )
-                        } else if (delivered.record?.state === 'dropped') {
-                            outboxNotes.push(`- outbox ${recordId}：已记 dropped（${bounded(error, 160)}）——永久失败，不再重投。`)
-                        } else if (delivered.record?.state === 'deferred') {
-                            outboxNotes.push(
-                                `- outbox ${recordId}：已记 deferred（${bounded(error, 160)}）——通道暂时不可用，这不是失败，` +
-                                    'attempts 没有增加；等通道可用后重新提问即可。',
-                            )
-                        }
-                        continue
-                    }
-                    if (delivered.delivery?.ledgerProblem !== undefined) {
-                        deps.registry.retire(questionId)
-                        refuseAsk({
-                            ledgerFile,
-                            reason: 'ledger-unwritable',
-                            detail: `台账写不进去，这张卡片的提问就没有可审计的记录：${delivered.delivery.ledgerProblem}`,
-                            title: titleOut.text,
-                            questionId,
-                            durationMs: deps.now() - startedAt,
-                            channel: candidate.name,
-                            ...(sendResult.messageId === undefined ? {} : { messageId: sendResult.messageId }),
-                            outbox,
-                            settle: { state: 'withdrawn', reason: '台账写不进去：这张卡片不算数，也不再等待决定' },
-                            next: `修好台账路径（${ledgerFile}）后重试；卡片已发出但这次不算数，请让通道作废它（messageId ${sendResult.messageId ?? '未知'}）。`,
-                            ...(missionId === undefined ? {} : { missionId }),
-                        })
-                    }
-
-                    const wait = typeof channel.wait === 'function' ? channel.wait.bind(channel) : undefined
-                    // The pause hook: while THIS mission is blocked the waiter
-                    // re-reads the recorded pause interval instead of burning its
-                    // deadline. Sampling the mission store is what records a pause
-                    // that started mid-wait — the orchestrator has no push hook to
-                    // this package, so observation is the hook that exists (the
-                    // explicit one is `interaction.pauseMission`/`resumeMission`).
-                    const sampleMission = (): void => {
-                        if (missionId === undefined) return
-                        const synced = attention.syncMission(missionId)
-                        if (synced.superseded > 0) deps.logger?.info(`attention：mission ${missionId} 已结束，${synced.superseded} 个提问作废（superseded）`)
-                    }
-                    sampleMission()
-                    const outcome: AwaitResult = await deps.registry.awaitAnswer(questionId, timeoutMs, {
-                        ...(wait === undefined ? {} : { wait }),
-                        ...(signal === undefined ? {} : { signal }),
-                        extension: {
-                            now: deps.now,
-                            pausedMs: () => {
-                                sampleMission()
-                                if (missionId === undefined) return 0
-                                return attention.pausedMsFor({ missionId, questionId, from: startedAt, to: deps.now() })
-                            },
-                            paused: () => {
-                                sampleMission()
-                                return missionId === undefined ? false : attention.pausedNow({ missionId, questionId, at: deps.now() })
-                            },
-                        },
-                    })
-                    const durationMs = deps.now() - startedAt
-                    // A question that became moot while we were waiting must not
-                    // become an approval: the answer is refused in the SAME
-                    // refusal shape, naming the transition.
-                    if (outcome.outcome === 'answered' && outcome.answer !== null) {
-                        sampleMission()
-                        const state = attention.stateOf(questionId)
-                        if (state === 'superseded' || state === 'withdrawn') {
-                            const closure = attention.records().find((record) => record.questionId === questionId)?.closure
-                            const by = (outcome.answer.by ?? '').trim()
-                            refuseAsk({
-                                ledgerFile,
-                                reason: state,
-                                detail:
-                                    `这道提问已经${state === 'superseded' ? '作废（superseded）' : '被撤回（withdrawn）'}，迟到的回答不算决定：` +
-                                    `${closure?.reason ?? (missionId === undefined ? '提问已不再需要回答' : `mission ${missionId} 已结束或被停止`)}`,
-                                title: titleOut.text,
-                                questionId,
-                                durationMs,
-                                channel: candidate.name,
-                                ...(by === '' ? {} : { userId: by }),
-                                ...(outcome.answer.messageId === undefined ? {} : { messageId: outcome.answer.messageId }),
-                                outbox,
-                                settle: { state: 'withdrawn', reason: `refused:${state}：提问已不再等待回答，迟到的答案不算决定` },
-                                next:
-                                    '重新提出一个仍然需要的提问（新令牌）；已结束/被停止的 mission 不要再靠旧卡片推进——' +
-                                    '如果这件事还要继续，先新建 mission 并重新审批。',
-                                ...(missionId === undefined ? {} : { missionId }),
-                            })
-                        }
-                    }
-
-                    if (outcome.outcome !== 'answered' || outcome.answer === null) {
-                        if (outcome.outcome === 'cancelled') {
-                            refuseAsk({
-                                ledgerFile,
-                                reason: 'cancelled',
-                                detail: `等待被取消（调用方中止，或通道报告中止），没有拿到任何答案`,
-                                title: titleOut.text,
-                                questionId,
-                                durationMs,
-                                channel: candidate.name,
-                                ...(sendResult.messageId === undefined ? {} : { messageId: sendResult.messageId }),
-                                outbox,
-                                settle: { state: 'withdrawn', reason: 'refused:cancelled：等待被取消，这次提问不再等待决定' },
-                                next: '在未被取消的轮次重新提问；不要因为"这次没等到"就自己决定。',
-                                ...(missionId === undefined ? {} : { missionId }),
-                            })
-                        }
-                        if (outcome.outcome === 'unknown-token') {
-                            refuseAsk({
-                                ledgerFile,
-                                reason: 'token-lost',
-                                detail: '一次性令牌在等待期间失效（同一令牌只能被回答一次），答案无处归属',
-                                title: titleOut.text,
-                                questionId,
-                                durationMs,
-                                channel: candidate.name,
-                                outbox,
-                                settle: { state: 'withdrawn', reason: 'refused:token-lost：一次性令牌在等待期间失效，答案无处归属' },
-                                next: '重新提问（会生成新令牌）；如果重复出现，说明有通道在替这次提问作答，查通道实现。',
-                                ...(missionId === undefined ? {} : { missionId }),
-                            })
-                        }
-                        const extensionMs = outcome.extensionMs ?? 0
-                        refuseAsk({
-                            ledgerFile,
-                            reason: 'timeout',
-                            detail:
-                                `等待超时：通道 "${candidate.name}" 在 ${timeoutMs}ms 内没有返回任何答案` +
-                                `（截止 ${formatTime(startedAt + timeoutMs + extensionMs)}）` +
-                                (extensionMs === 0
-                                    ? ''
-                                    : `；等待被延长 ${extensionMs}ms——mission ${missionId ?? '(未绑定)'} 在阻塞/暂停期间期限不流逝，恢复后从顺延后的截止时间继续`),
-                            title: titleOut.text,
-                            questionId,
-                            durationMs,
-                            channel: candidate.name,
-                            ...(sendResult.messageId === undefined ? {} : { messageId: sendResult.messageId }),
-                            extraLines: [`- 超时上限：${timeoutMs}ms（配置 askTimeoutMs=${configuredTimeout}ms；调用方只能缩短，不能延长）`],
-                            outbox,
-                            settle: { state: 'timeout', reason: 'refused:timeout：期限内没有回答（超时不是同意，也不是拒绝）' },
-                            next: `确认人真的收到了卡片（messageId ${sendResult.messageId ?? '未知'}）；要么在 ${timeoutMs}ms 内回答重试，要么把问题拆小/换通道。超时**不是**拒绝，也**不是**同意：不要据此继续。`,
-                            ...(missionId === undefined ? {} : { missionId }),
-                        })
-                    }
-
-                    const answer = outcome.answer
-                    const by = (answer.by ?? '').trim()
-                    // --- provenance (P0): is this answer even OURS to accept? ---
-                    // Runs BEFORE anything reads the answer's text: an answer from
-                    // another conversation is not "a decision with a caveat", it
-                    // is somebody else's message. The token is never turned into a
-                    // decision (no ledger row with a decision, no outbox
-                    // `answered`), and the refusal says exactly which check failed.
-                    if (imTarget !== undefined) {
-                        const answeredChat = (answer.chatId ?? '').trim()
-                        if (answeredChat !== imTarget.chatId) {
-                            refuseAsk({
-                                ledgerFile,
-                                reason: 'wrong-chat',
-                                detail:
-                                    `答案来自另一个会话（${answeredChat === '' ? '通道没有报告 chatId' : answeredChat}），` +
-                                    `不是配置的审批目标（im.approvalChatId=${imTarget.chatId}）：这道回答不是决定，` +
-                                    '一次性令牌也不会被换成一次放行',
-                                title: titleOut.text,
-                                questionId,
-                                durationMs,
-                                channel: candidate.name,
-                                ...(by === '' ? {} : { userId: by }),
-                                ...(answer.messageId === undefined ? {} : { messageId: answer.messageId }),
-                                extraLines: [
-                                    `- 本次提问的目标：${imTarget.chatId}；回答者：${by === '' ? '通道未提供身份' : by}；回答的会话：${answeredChat === '' ? '通道未报告' : answeredChat}`,
-                                    '- 说明：来源不符属于"没有决定"，不是"拒绝"——门禁读不到任何放行。',
-                                ],
-                                outbox,
-                                settle: { state: 'withdrawn', reason: 'refused:wrong-chat：答案来自非审批目标会话，这次提问没有被回答' },
-                                next:
-                                    `核对 im.approvalChatId 是否就是你与 bot 私聊的那个会话（interaction_status 里的"IM 审批目标"一行）；` +
-                                    '然后重新提问，让目标会话里的人再答一次。不要因为"有人答了"就继续——那张卡可能根本不在审批人手里。',
-                                ...(missionId === undefined ? {} : { missionId }),
-                            })
-                        }
-                        // A missing `chatKind` is NOT proven: the IM plugin reports
-                        // the kind only when the platform told it, and accepting an
-                        // unproven kind would let a group answer count exactly when
-                        // the proof is absent. Fail closed, and say which case it is.
-                        if (imTarget.p2pOnly && answer.chatKind !== 'p2p') {
-                            refuseAsk({
-                                ledgerFile,
-                                reason: 'not-p2p',
-                                detail:
-                                    answer.chatKind === 'group'
-                                        ? `答案来自群聊（chatKind=group），而 im.p2pOnly=true：群里任何人按下的按钮都算不到审批人头上，所以它不是决定`
-                                        : '答案的会话类型未被证明（IM 插件没有报告 chatKind，无法确认是私聊还是群聊），而 im.p2pOnly=true：' +
-                                          '"无法证明"不是"大概没问题"，按未满足处理（fail closed）',
-                                title: titleOut.text,
-                                questionId,
-                                durationMs,
-                                channel: candidate.name,
-                                ...(by === '' ? {} : { userId: by }),
-                                ...(answer.messageId === undefined ? {} : { messageId: answer.messageId }),
-                                extraLines: [
-                                    `- 本次提问的目标：${imTarget.chatId}（p2pOnly=true）；回答的会话：${answer.chatId ?? '通道未报告'}；会话类型：${answer.chatKind ?? '未报告'}`,
-                                    '- 说明：来源未证明属于"没有决定"，不是"拒绝"——门禁读不到任何放行。',
-                                ],
-                                outbox,
-                                settle: { state: 'withdrawn', reason: 'refused:not-p2p：答案不是已证明的私聊来源，这次提问没有被回答' },
-                                next:
-                                    '让审批人在与 bot 的**私聊**里重新回答（新提问）；如果这个部署本来就要在群里审批，' +
-                                    '由人把 im.p2pOnly 改成 false，并确认 im.approvalChatId 指向那个群——这两个键是宿主配置，模型改不了。',
-                                ...(missionId === undefined ? {} : { missionId }),
-                            })
-                        }
-                    }
-                    const answerVerdict = checkOutgoing([{ name: 'answer', text: answer.value }], compiled.rules)
-                    if (!answerVerdict.ok) {
-                        refuseAsk({
-                            ledgerFile,
-                            reason: 'secret',
-                            detail: '回答内容里检测到疑似凭据：既不落账也不回显（回答者可能误贴了密钥）',
-                            title: titleOut.text,
-                            questionId,
-                            durationMs,
-                            channel: candidate.name,
-                            ...(by === '' ? {} : { userId: by }),
-                            extraLines: ['- 命中规则：', ...describeHits(answerVerdict.hits, compiled.rules)],
-                            outbox,
-                            settle: { state: 'withdrawn', reason: 'refused:secret：回答疑似含凭据，未落账（无决定）' },
-                            next: '请回答者把凭据从答案里去掉后重新回答（重新提问）；不要把疑似密钥写进台账。',
-                            ...(missionId === undefined ? {} : { missionId }),
-                        })
-                    }
-                    const allowed = approveCheck(by, approvers, config.requireApproverList)
-                    if (!allowed.ok) {
-                        refuseAsk({
-                            ledgerFile,
-                            reason: 'unauthorized',
-                            detail: `回答者未获授权：${allowed.reason}`,
-                            title: titleOut.text,
-                            questionId,
-                            durationMs,
-                            channel: candidate.name,
-                            ...(by === '' ? {} : { userId: by }),
-                            ...(answer.messageId === undefined ? {} : { messageId: answer.messageId }),
-                            outbox,
-                            settle: { state: 'withdrawn', reason: 'refused:unauthorized：回答者未获授权（无决定）' },
-                            next: `让名单里的人回答（由人维护 ${config.approversFile}）；未授权的回答只算"发生了这件事"，不算决定。`,
-                            ...(missionId === undefined ? {} : { missionId }),
-                        })
-                    }
-                    const mapped = mapOption(answer.value, declared)
-                    if (mapped === undefined) {
-                        const bounded = truncate(answer.value, 200)
-                        refuseAsk({
-                            ledgerFile,
-                            reason: 'unknown-answer',
-                            detail:
-                                declared.length === 0
-                                    ? '答案是空的：没有内容可以当作决定'
-                                    : `答案 ${JSON.stringify(bounded.text)} 不是声明选项之一（${declared.join(' / ')}）`,
-                            title: titleOut.text,
-                            questionId,
-                            durationMs,
-                            channel: candidate.name,
-                            ...(by === '' ? {} : { userId: by }),
-                            ...(answer.messageId === undefined ? {} : { messageId: answer.messageId }),
-                            outbox,
-                            settle: { state: 'withdrawn', reason: 'refused:unknown-answer：答非所问，没有可用的决定' },
-                            next: '按声明选项重新问一次（或把选项改成人真正会选的那几个）；答非所问不是"默认通过"。',
-                            ...(missionId === undefined ? {} : { missionId }),
-                        })
-                    }
-                    const normalized = normalizeDecision(mapped, by, answer.messageId ?? sendResult.messageId, candidate.name)
-                    const carrier = answer.messageId ?? sendResult.messageId
-                    // A free-text answer is stored verbatim as the decision, so it
-                    // is bounded HERE: an unbounded answer would grow the ledger
-                    // (and every report that renders it) without limit. The bound
-                    // is the same host-owned `maxPayloadChars` an outgoing payload
-                    // gets, and the truncation is stated, never silent.
-                    const withinSuiteVocabulary = SUITE_DECISIONS.includes(normalized.decision)
-                    const boundedDecision = truncate(normalized.decision, config.maxPayloadChars)
-                    const storedDecision = withinSuiteVocabulary ? normalized.decision : boundedDecision.text
-                    const decisionTruncated = !withinSuiteVocabulary && boundedDecision.truncated
-                    const row: LedgerRow = {
-                        at: deps.now(),
-                        id: newRowId(),
-                        kind: 'ask',
-                        title: titleOut.text,
-                        questionId,
-                        channel: candidate.name,
-                        decision: storedDecision,
-                        durationMs,
-                        ...(normalized.userId === '' ? {} : { userId: normalized.userId }),
-                        ...(carrier === undefined ? {} : { messageId: carrier }),
-                        ...(missionId === undefined ? {} : { missionId }),
-                    }
-                    const decided = write(ledgerFile, row)
-                    if (!decided.ok) {
-                        outbox.settle(recordId, 'withdrawn', '台账写入失败：回答没有被记录，这次提问没有可审计的决定')
-                        // The ledger holds a pending row and will never hold a
-                        // decision for it: record the withdrawal (once, with the
-                        // reason) so nobody keeps waiting for an answer that the
-                        // suite already lost.
-                        attention.withdraw(questionId, '台账写入失败：回答没有被记录，这道提问作废（不是答案，也不是批准）')
-                        throw new Error(
-                            [
-                                `interaction_ask 拒绝（${refusalOf('ledger-unwritable')}）：答案收到了（${JSON.stringify(truncate(answer.value, 200).text)}，回答者 ${by === '' ? '未提供身份' : by}，通道 ${candidate.name}），但台账写不进去，这次决定拿不到可审计的行 id：${decided.problem ?? '未知原因'}`,
-                                `- 一次性令牌：${questionId}`,
-                                `- 台账：${ledgerFile}`,
-                                '下一步：修好台账路径后重新提问（人还得再答一次）；这次回答没有被当作决定，也没有被写进任何地方。',
-                            ].join('\n'),
-                        )
-                    }
-
-                    // The ledger decided; the outbox only RECORDS that it did. A
-                    // terminal outbox row is never read as a decision anywhere.
-                    outbox.settle(recordId, 'answered', `决定 ${bounded(storedDecision, 80)}（回答者 ${by === '' ? '通道未提供身份' : by}，通道 ${candidate.name}）`)
-                    outbox.settleQuestion(questionId, 'withdrawn', `同一提问已由 ${candidate.name} 投递并落定：这条候选记录不再重放`)
-
-                    const notes: string[] = []
-                    if (contextInput.problems.length > 0) notes.push(...contextInput.problems.map((problem) => `- ⚠️ ${problem}`))
-                    if (body.truncated) notes.push(`- ⚠️ 正文超过 maxPayloadChars=${config.maxPayloadChars}，已截断后发送`)
-                    if (titleOut.truncated) notes.push('- ⚠️ 标题过长，已截断后发送')
-                    if (decisionTruncated) {
-                        notes.push(
-                            `- ⚠️ 回答超过 maxPayloadChars=${config.maxPayloadChars} 字符，落账与回显都已截断（原文 ${answer.value.length} 字符）：` +
-                                '台账是事实记录，不是聊天记录——需要完整内容就让人把长文本写进文件，卡片里只放链接。',
-                        )
-                    }
-                    if (compiled.problems.length > 0) notes.push(...compiled.problems.map((problem) => `- ⚠️ ${problem}`))
-                    if (outboxNotes.length > 0) notes.push(...outboxNotes)
-                    if (failures.length > 0) notes.push('- 先尝试失败的通道：', ...failures)
-                    if (missionId !== undefined) notes.push(`- mission：${missionId}`)
-                    return [
-                        'interaction_ask：已决定',
-                        `- 问题：${headline(prose, 120)}`,
-                        `- 决定：${storedDecision}${declared.length === 0 ? '（自由文本回答）' : '（声明选项之一）'}`,
-                        `- 回答者：${by === '' ? '（通道未提供身份）' : by}${config.requireApproverList ? `（项目审批人名单：${approvers.ids.length} 个 id）` : '（未启用审批人名单：通道内的任何参与者都可回答）'}`,
-                        `- 通道：${candidate.name}${(answer.messageId ?? sendResult.messageId) === undefined ? '' : `（消息 ${answer.messageId ?? sendResult.messageId}）`}`,
-                        `- 一次性令牌：${questionId}（一次性，已作废）`,
-                        `- 台账：${ledgerFile}（行 ${row.id}）`,
-                        `- outbox：${recordId}（answered；${describeConversation({ channel: candidate.name, ...(chatId === undefined ? {} : { chatId }) })} 上的下一次提问不会再为它排队）`,
-                        `- 耗时：${durationMs}ms（等待上限 ${timeoutMs}ms）`,
-                        ...(SUITE_DECISIONS.includes(normalized.decision)
-                            ? [
-                                  normalized.allowed
-                                      ? '- 门禁语义：`allowed-once` 只放行**这一次**——不是长期豁免，也不代表内容被验证过。'
-                                      : `- 门禁语义：\`${normalized.decision}\` 没有放行（rejected=人拒绝；cancelled/unavailable=没有人作出决定）。`,
-                              ]
-                            : []),
-                        ...notes,
-                        '下一步：把这个决定用在你问的那一件事上（它只对那件事、那一次有效）；要长期豁免或放宽配置，由人改 `.dsh/**`（模型写不了）。',
-                    ].join('\n')
-                }
-
-                // Every candidate refused to even deliver the card.
-                deps.registry.retire(questionId)
-                if (sawDeferral && !sendFailed) {
-                    // Nothing failed — the question was DEFERRED (a busy chat, a
-                    // channel that is temporarily unavailable). Say exactly that,
-                    // and point at the fix that actually works.
-                    refuseAsk({
-                        ledgerFile,
-                        reason: 'deferred',
-                        detail: '所有候选通道都没有失败，但没有接单：同一会话里更早的提问还没落定，或通道暂时不可用（deferral，不是失败）',
-                        title: titleOut.text,
-                        questionId,
-                        durationMs: deps.now() - startedAt,
-                        extraLines: ['- 各通道的情况：', ...failures, ...outboxNotes],
-                        outbox,
-                        next: '先让同一会话里更早的提问落定（或让它失败 3 次，它就不再挡住后面的提问），或把通道恢复可用（连接/active chat），再重新提问；也可以换一个没人排队的会话（prefer 或项目级 preferredChannels）。排队等待不是失败，也不是同意。',
-                        ...(missionId === undefined ? {} : { missionId }),
-                    })
-                }
-                if (failures.length === 0) {
-                    refuseAsk({
-                        ledgerFile,
-                        reason: 'no-channel',
-                        detail: '没有可用的提问通道（候选通道都没能发出卡片，且没有记录到失败原因）',
-                        title: titleOut.text,
-                        questionId,
-                        durationMs: deps.now() - startedAt,
-                        next: '让宿主/IM 插件注册一个实现 wait() 的通道后重试。',
-                        ...(missionId === undefined ? {} : { missionId }),
-                    })
-                }
-                refuseAsk({
-                    ledgerFile,
-                    reason: 'send-failed',
-                    detail: `所有候选通道都发不出这张卡片（${failures.length} 个）`,
-                    title: titleOut.text,
-                    questionId,
-                    durationMs: deps.now() - startedAt,
-                    extraLines: ['- 各通道的失败原因：', ...failures, ...outboxNotes],
-                    outbox,
-                    next: '修好通道（webhook/网络/凭据）后重试；卡片没发出去 = 没有人被问过，不要自己决定（outbox 里留下的是"没有投递成功"，不是答案）。',
-                    ...(missionId === undefined ? {} : { missionId }),
-                })
+                // ONE implementation for the model-facing tool AND the approval
+                // answerer (`askThroughChannels`): two ask paths would be two
+                // places to get the token/outbox/provenance checks wrong. A
+                // refusal still THROWS, with exactly the message it always had.
+                const outcome = await askThroughChannels(deps, args, { agent: agentOf(exec), signal: signalOf(exec) })
+                return outcome.text
             },
         }),
         'interaction_ask',
@@ -1839,6 +2003,34 @@ export function registerTools(
                 if (config.im.approvalChatIdProblem !== undefined) lines.push(`  ⚠️ ${config.im.approvalChatIdProblem}`)
                 if (config.im.p2pOnlyConfigured && config.im.approvalChatId === '') {
                     lines.push(`  ⚠️ im.p2pOnly 被显式设为 ${config.im.p2pOnly}，但没有 im.approvalChatId：这个要求无从执行`)
+                }
+                // The host's own approval seam (P1): whether THIS plugin answers
+                // it, and what it has decided so far. `off` must read as "we did
+                // not touch it", never as "we answer it and nothing happened".
+                lines.push(
+                    `- IM 审批应答者（approval/request）：${
+                        config.im.approvalVia === 'off'
+                            ? 'off（本插件未注册监听器：审批接缝由宿主原有的应答者回答）'
+                            : `${config.im.approvalVia}（prepend=true：先问 IM；${
+                                  config.im.approvalVia === 'fallback'
+                                      ? '问不了且没发过卡片 → next() 交还原通道；卡片发出后等不到答案 = unavailable）'
+                                      : '问不了一律 unavailable，绝不落回原通道）'
+                              }`
+                    }`,
+                )
+                if (config.im.approvalViaProblem !== undefined) lines.push(`  ⚠️ ${config.im.approvalViaProblem}`)
+                const approvalRows = summary.sources[APPROVAL_SOURCE]
+                if (approvalRows !== undefined && approvalRows.rows > 0) {
+                    lines.push(
+                        `- 审批接缝台账行（source=${APPROVAL_SOURCE}）：${approvalRows.rows} 行（已决定 ${approvalRows.decided}，` +
+                            `拒答 ${approvalRows.refused}；还没人回答的行不计入这两项）——这些行回答的是门禁自己的提问，不是模型问的`,
+                    )
+                }
+                if (config.im.approvalVia !== 'off' && config.im.approvalViaProblem === undefined && approvers.ids.length === 0) {
+                    lines.push(
+                        `  ⚠️ 审批接缝走 IM（${config.im.approvalVia}）但审批人名单为空：每次审批都会在发卡之前被拒绝（refused:approvers-missing）——` +
+                            `审批是权限，所以它只认名单里的人（由人写 ${config.approversFile}）`,
+                    )
                 }
                 // Refused answer attempts: "someone tried to answer for the
                 // approver" must be visible, and NOT visible must never read as
