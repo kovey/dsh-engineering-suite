@@ -169,7 +169,7 @@ test('TC-924 approvalVia=fallback 而名单为空：必需项失败，点名名�
     assert.match(check?.detail ?? '', /审批人名单为空或不可读/)
     assert.ok((check?.detail ?? '').includes(approvers.file), '必须点名被读的名单文件')
     assert.match(check?.detail ?? '', /refused:approvers-missing/)
-    assert.ok((check?.fix ?? '').includes('名单文件') || (check?.fix ?? '').includes('审批人 id'), '修复要说明怎么补名单')
+    assert.ok((check?.fix ?? '').includes(approvers.file), '修复要点名名单文件')
     assert.match(check?.fix ?? '', /把 im\.approvalVia 设回 off/)
 })
 

@@ -217,9 +217,18 @@ export function imApprovalChecks(fact: ImApprovalFact): DoctorCheck[] {
     }
     const labelWithMode = `${label}（${modeLabel(mode)}）`
     if (problems.length > 0) {
-        const missing: string[] = []
-        if (target === '') missing.push('im.approvalChatId')
-        if (fact.approvers.count === 0) missing.push(`审批人名单 ${fact.approvers.file}`)
+        // The fix names ONLY what is actually missing: a target that is already
+        // configured must not be "fixed" again, and an empty list must point at
+        // its file. The `off` alternative is always the second way out.
+        const repairs: string[] = []
+        if (target === '') {
+            repairs.push(
+                '由宿主在 profile 的 dsh-interaction-gate 配置里补上 im.approvalChatId（你与 bot 私聊的那个会话 id）',
+            )
+        }
+        if (fact.approvers.count === 0) {
+            repairs.push(`由人把审批人的 id 写进 ${fact.approvers.file}（每行一个，# 开头是注释）`)
+        }
         return [
             {
                 id: IM_APPROVAL_CHECK_ID,
@@ -227,10 +236,9 @@ export function imApprovalChecks(fact: ImApprovalFact): DoctorCheck[] {
                 state: 'missing',
                 severity: 'required',
                 label: labelWithMode,
-                detail: `审批接缝配了走 IM（${modeLabel(mode)}），缺 ${missing.length} 项：${problems.join('；')}`,
+                detail: `审批接缝配了走 IM（${modeLabel(mode)}），但还没配齐：${problems.map((problem, index) => `${index + 1}) ${problem}`).join('；')}`,
                 fix:
-                    '两条路，二选一（别停在"配了一半"）：① 由宿主在 profile 的 dsh-interaction-gate 配置里补上 im.approvalChatId' +
-                    '（你与 bot 私聊的那个会话 id），并由人把审批人 id 写进名单文件（每行一个，# 开头是注释）；' +
+                    `两条路，二选一（别停在"配了一半"）：① ${repairs.join('；并')}；` +
                     '② 把 im.approvalVia 设回 off，让审批继续走宿主接缝（TUI）。这些键是宿主/仓库配置，模型改不了；' +
                     'interaction_status 的「IM 审批目标」「审批人名单」两行显示生效值',
             },
