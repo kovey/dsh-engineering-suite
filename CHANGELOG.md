@@ -1,4 +1,17 @@
-## [未发布]
+## [0.7.0] — 2026-11-09
+
+### 修复 · IM 通道在"提供方不发可用信号"时的半坏状态
+
+上游曾把 `ctx.provide('chatInteraction', layer, true)` 的第三参当成 cordis 的可用性谓词，`true.call()` 抛错后依赖被删除——
+于是 `ctx.inject` 回调**永不触发**，而 `ctx.get` 仍能读到值（旧的一次性探测因此看不出问题）。现在
+`interaction_status` / `interaction_ask` 在使用点重探一次（`off` 仍零触碰、真缺失仍不注册），半坏状态可自愈。
+上游 0.3.3 已去掉第三参；本兜底保留作纵深防御。
+
+### 修复 · 调用宿主服务必须保留 `this`
+
+第一次真机 `team_delegate` 才暴露：`const f = subagents.startActivation; f(spec)` 丢了接收者，宿主内部
+`this.expectProvider` 抛 "Cannot read properties of undefined"。所有假宿主都是"函数对象"，脱挂调用照样工作，
+所以单测全绿。改为通过对象调用，并补一条**脱挂就必炸**的回归（`#private` 字段 + 私有助手）。
 
 ### 新增 · IM 审批变成可运维的（P2：自检一项 + 状态一处看完）
 
@@ -103,7 +116,6 @@ OPS SELFTEST 新增 **C12**（4 项）：缺成员失败、全部声明时通过
 ⚠️ 顺带一条工具教训：写这个脚本时两次踩到 **bash 3.2（macOS 自带）** 的同一个坑——`$var（中文）` 会把中文字节
 并入变量名导致 `unbound variable`，必须写 `${var}（`。
 
-## [未发布]
 
 ### 重构 · 委派债务清零：五份手写实现收敛成一份
 
@@ -225,7 +237,6 @@ byte-identical`。**不是测试太严**——报告把时长按 **0.1 天**取�
 
 orchestrator 91 → 92 测试；`scripts/verify.sh --quiet` 连跑 3 次全绿。
 
-## [未发布]
 
 ### 修复 · `team_delegate` 改接 `startActivation` + Agent Preset（0.2.2-rc.1 的真实 API）
 
