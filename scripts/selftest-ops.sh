@@ -260,6 +260,28 @@ expect_rc 0 "apply converges" bash "$ROOT/scripts/repair-profile-closure.sh" --c
 expect_rc 0 "a second apply is a no-op" bash "$ROOT/scripts/repair-profile-closure.sh" --closure "$CLOSURE" --dsh-root "$TMP/fake-dsh" --apply
 
 # ---------------------------------------------------------------------------
+# C12 — check-host-api: an assumption table is only worth having if a missing
+# member FAILS. A wrong tree must be a usage error, never "everything is fine".
+section "C12 — check-host-api: a deleted host member is a failure, not a footnote"
+HOST_TREE="$TMP/host-packages"
+mkdir -p "$HOST_TREE/dsh/lib/types" "$HOST_TREE/dsh-user-approval/lib/types"
+printf '{"version":"9.9.9"}' > "$HOST_TREE/dsh/package.json"
+printf 'export interface S { request(r: R): Promise<O>; }\n' > "$HOST_TREE/dsh-user-approval/lib/types/index.d.ts"
+expect_rc 1 "a member that the host does not declare fails the check" bash "$ROOT/scripts/check-host-api.sh" --harness-root "$HOST_TREE"
+# Same tree, but now the member exists: the required rows we can satisfy must pass.
+for pkg in dsh-subprocess dsh-subagent dsh-agent-preset-registry dsh-user-questions dsh-workspace-changes; do mkdir -p "$HOST_TREE/$pkg/lib/types"; done
+printf 'export declare class R { spawn(s: never): never; }\n' > "$HOST_TREE/dsh-subprocess/lib/types/index.d.ts"
+printf 'export declare class R { startActivation(s: never): never; getProvider(n: string): unknown; list(): string[]; registerProvider(p: never): unknown; prompt(r: never, s: never): never; sendMessage(a: never, b: never, c: never, d: never): never; }\n' > "$HOST_TREE/dsh-subagent/lib/types/index.d.ts"
+printf 'export declare class R { register(d: unknown): unknown; mount(c: never, i: string): never; }\n' > "$HOST_TREE/dsh-agent-preset-registry/lib/types/index.d.ts"
+printf 'export declare class R { ask(r: never): never; askTimed(r: never): never; }\n' > "$HOST_TREE/dsh-user-questions/lib/types/index.d.ts"
+printf 'export interface W { summary: string; diff: string; }\n' > "$HOST_TREE/dsh-workspace-changes/lib/types/index.d.ts"
+run_rc bash "$ROOT/scripts/check-host-api.sh" --harness-root "$HOST_TREE" --quiet
+[ "$LAST_RC" = "0" ] && pass "a fully-declared host passes (exit 0)" || fail "a declared host should pass, got $LAST_RC — $LAST_OUT"
+printf 'export declare class R { startActivation(s: never): never; }\n' > "$HOST_TREE/dsh-subagent/lib/types/index.d.ts"
+expect_rc 1 "one renamed member (the real 0.2.1 incident) fails the whole check" bash "$ROOT/scripts/check-host-api.sh" --harness-root "$HOST_TREE" --quiet
+expect_rc 2 "a tree that does not exist is a usage error (exit 2)" bash "$ROOT/scripts/check-host-api.sh" --harness-root "$TMP/no-such-tree"
+
+# ---------------------------------------------------------------------------
 section "summary"
 if [ "$FAILURES" = "0" ]; then
   printf '  \033[32mOPS SELFTEST GREEN\033[0m — every finding above is still refused.\n'

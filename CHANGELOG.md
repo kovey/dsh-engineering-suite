@@ -1,5 +1,28 @@
 ## [未发布]
 
+### 新增 · `scripts/check-host-api.sh`：把我们对宿主 API 的假设变成可核对的表
+
+我们已经两次被"宿主删了一个方法、我们的结构类型还在编译"击穿（`subagents.start` 在 0.2.1 被删除，
+而它在五个包里各有一份手写副本）。修好调用点是治标；**让下一个人能在升级当天发现问题**才是治本。
+
+脚本内置一张对照表（服务 → 声明它的包 → 我们实际用到的成员），只读本地已安装的 `lib/types/*.d.ts`：
+
+- 必需成员缺失 → **非零退出**并点名服务与成员，提示"先查那个包的 lib/types 再改结构类型"；
+- 读不到包或 d.ts → 同样算失败（**不把"读不到"当通过**）；表里标 `optional` 的才允许缺席；
+- 宿主树定位失败是**用法错误（exit 2）**，绝不打印"全部通过"。
+
+本机 0.2.2-rc.1 实测：**8 条服务假设全部成立**（`approval.request`、`subprocess.spawn`、`subagents.startActivation/
+getProvider/list/registerProvider/prompt/sendMessage`、`agentPresets.register/mount`、`userQuestions.ask/askTimed`、
+`workspaceChanges.summary/diff`、`agentTeams.spawnTeammate`）。
+
+OPS SELFTEST 新增 **C12**（4 项）：缺成员失败、全部声明时通过、**一个成员改名就整体失败**（复刻真实事故）、
+树不存在是用法错误。
+
+⚠️ 顺带一条工具教训：写这个脚本时两次踩到 **bash 3.2（macOS 自带）** 的同一个坑——`$var（中文）` 会把中文字节
+并入变量名导致 `unbound variable`，必须写 `${var}（`。
+
+## [未发布]
+
 ### 重构 · 委派债务清零：五份手写实现收敛成一份
 
 上一版把委派收敛到 `dsh-eng-core/delegation`，但源码扫描当场扫出两个**文件边界外**的同类站点，只能列进棘轮基线。

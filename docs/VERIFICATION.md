@@ -23,6 +23,10 @@
 > `approvalPolicy: 'never'`** 并继承 preset/sandbox（`captureDelegatedPolicyOverrides`），
 > 与我们"派出去的子代理不能自己批准什么"的立场一致，无需插件侧改动。
 >
+> **宿主 API 对照检查（可重复，不再是人工审计）**：`bash scripts/check-host-api.sh` 读取已安装的 `lib/types/*.d.ts`，
+> 逐条核对我们通过 `ctx.get(...)` 使用的服务成员。0.2.2-rc.1 上 8 条全部成立。宿主升级后先跑它：
+> 成员被删除或改名会在升级当天失败，而不是等到某个功能在真机上抛 `TypeError`。
+>
 > **0.2.2-rc.1 适配记录**（基线现在 = **0.2.2-rc.1**，隔离安装 `/tmp/dsh022`，581 包 / 331 个 `@deepseek-ai`）：
 > `rc.2 → rc.1` 不是常规递增——**新增 26 个包、移除 1 个、301 个包版本变化**，其中两处**改变我们文档里的断言**：
 >
