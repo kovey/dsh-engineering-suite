@@ -720,10 +720,15 @@ export async function startDelegation(subagents: DelegationServices, input: Star
         ...(input.maxDepth === undefined ? {} : { maxDepth: input.maxDepth }),
     }
     if (input.plan.kind === 'activation') {
-        const startActivation = subagents.startActivation
-        if (startActivation === undefined) throw new Error('startActivation disappeared between the plan and the call')
+        if (typeof subagents.startActivation !== 'function') throw new Error('startActivation disappeared between the plan and the call')
         try {
-            const activation = await startActivation({
+            // BOUND call, never `const f = service.startActivation; f(...)`:
+            // the host service is a class instance whose methods use `this`
+            // (`expectProvider`, the provider registry). A detached call throws
+            // "Cannot read properties of undefined (reading 'expectProvider')"
+            // — which is exactly how this shipped broken the first time, because
+            // every fake in the tests was a plain function that needed no `this`.
+            const activation = await subagents.startActivation({
                 provider: input.provider,
                 label: input.label,
                 // THE load-bearing field: without it the host mounts no preset and
@@ -740,10 +745,10 @@ export async function startDelegation(subagents: DelegationServices, input: Star
             throw startFailure(input.provider, `startActivation + preset ${input.plan.presetId}`, error, input.detail)
         }
     }
-    const start = subagents.start
-    if (start === undefined) throw new Error('start disappeared between the plan and the call')
+    if (typeof subagents.start !== 'function') throw new Error('start disappeared between the plan and the call')
     try {
-        const run = await start(input.provider, {
+        // Bound, for the same reason as `startActivation` above.
+        const run = await subagents.start(input.provider, {
             ...request,
             label: input.label,
             signal: input.signal,

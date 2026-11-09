@@ -466,3 +466,36 @@ test('the dispatch line names the path, the preset and the guarantee', () => {
     assert.doesNotMatch(legacy, /Agent Preset/, 'an old host must never be described as preset-enforced')
     assert.equal(dispatchLine({ kind: 'refused', reason: 'no' }), '派发: 已拒绝')
 })
+
+test('the service is called BOUND: a method that needs `this` must not be detached (regression)', async () => {
+    // The bug this pins, found by the first real `team_delegate` after a restart:
+    // `const f = service.startActivation; f(spec)` loses the receiver, and the
+    // host's own methods (`expectProvider`, the provider registry) then throw
+    // "Cannot read properties of undefined (reading 'expectProvider')".
+    // Every fake before this one was a plain function object, so nothing noticed.
+    class RealisticService {
+        readonly #providers = new Set(['spawn'])
+        readonly calls: string[] = []
+        /** Private helper, like the host's own `expectProvider`. */
+        #expect(name: string): void {
+            if (!this.#providers.has(name)) throw new Error(`unknown provider ${name}`)
+        }
+        async startActivation(spec: { provider: string }): Promise<{ childId: string; result: Promise<{ stopReason: string; output: unknown[] }>; dispose: () => Promise<void> }> {
+            this.#expect(spec.provider)
+            this.calls.push(spec.provider)
+            return { childId: 'child-1', result: Promise.resolve({ stopReason: 'completed', output: [] }), dispose: async () => undefined }
+        }
+    }
+    const service = new RealisticService()
+    const run = await startDelegation(service as never, {
+        owner: { plugin: 'test', subject: 'qa' },
+        provider: 'spawn',
+        plan: { kind: 'activation', presetId: 'role:qa' },
+        label: 'qa · bound call',
+        prompt: 'hi',
+        parent: {} as never,
+        signal: new AbortController().signal,
+    })
+    assert.equal(run.id, 'child-1')
+    assert.deepEqual(service.calls, ['spawn'], 'the method ran with its receiver')
+})
