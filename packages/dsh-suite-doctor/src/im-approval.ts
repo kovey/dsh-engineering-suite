@@ -74,6 +74,40 @@ export const IM_APPROVAL_P2P_CHECK_ID = 'runtime.im-approval-p2p'
 export const IM_APPROVAL_LEGACY_CHECK_ID = 'runtime.im-approval-legacy-list'
 
 /**
+ * The id of the WORKSPACE-MAPPING check (P3.2): does THIS workspace have an
+ * approval conversation at all?
+ *
+ * A separate id because it is a separate failure with a separate fix: the two
+ * host keys of P1 can be perfect and this workspace still have no entry in
+ * `im.approvals`, in which case every approval raised from here is refused
+ * before a card (`refused:no-workspace-mapping`) — or lands in another
+ * workspace's conversation under the `host-default` policy. Neither is visible
+ * from the mode/target/allowlist facts, which are process-wide.
+ */
+export const IM_APPROVAL_WORKSPACE_CHECK_ID = 'runtime.im-approval-workspace'
+
+/**
+ * The workspace mapping, as the gate reported it for THIS workspace
+ * (`im(workspace).workspaceMapping`, P3.2).
+ *
+ * Absent = the service does not implement the mapping (an older build) or was
+ * not asked about a workspace. That is not a state the check can judge, so the
+ * check stays silent instead of inventing "mapped" or "unmapped".
+ */
+export interface WorkspaceMappingFact {
+    configured?: boolean
+    declared?: number
+    usable?: number
+    policy?: 'refuse' | 'host-default'
+    workspace?: string
+    resolved?: string
+    realpathProblem?: string
+    matched?: { index?: number; workspace?: string; chatId?: string; approvers?: number; approversFallback?: boolean }
+    conflict?: { candidates?: { index?: number; workspace?: string; chatId?: string }[] }
+    problems?: string[]
+}
+
+/**
  * The host-side approver facts, exactly as `dsh-interaction-gate` reports them.
  *
  * Every field is optional: the service is not part of this package and may be an
@@ -126,6 +160,13 @@ export interface ImApprovalFact {
     p2pOnly?: boolean
     /** Why the mode could not be read (a probe failure / an older service), when known. */
     modeProblem?: string
+    /**
+     * The workspace mapping for the workspace this report is about (P3.2), when
+     * the service reports one. Absent = no mapping feature (an older build) or no
+     * workspace was named: the mapping check then stays silent instead of
+     * inventing "mapped"/"unmapped".
+     */
+    mapping?: WorkspaceMappingFact
     /** The HOST-side approver list (`from` whitelist): the only source that decides approvals. */
     approvers: HostApproverFact
     /** The legacy repository list: migration signal only. */
@@ -224,6 +265,135 @@ function legacyCheckOf(legacy: LegacyApproverFact): DoctorCheck | undefined {
 }
 
 /**
+ * The workspace-mapping check: does THIS workspace have an approval conversation?
+ *
+ * Since P3.2 a host may split its approvals per workspace (`im.approvals`). That
+ * makes a new, invisible failure possible: the mode, the target and the allowlist
+ * are all configured correctly, and yet every approval raised in THIS repository
+ * is refused before a card because no entry claims it
+ * (`refused:no-workspace-mapping`) — or, under `host-default`, is sent to a
+ * conversation configured for a different repository. Neither shows up in the
+ * process-wide keys, so it is asked here, per workspace.
+ *
+ * Silent when the mapping is not in force (`configured !== true`) or was not
+ * reported: "no mapping declared" is today's behaviour and must not be nagged,
+ * and "could not read it" is not a state this check may invent.
+ * @param mode - the effective `im.approvalVia` (this check only matters when the seam is on).
+ * @param mapping - the mapping facts for this workspace.
+ * @returns the check, or `undefined` when it does not apply.
+ */
+function workspaceMappingCheckOf(mode: ApprovalVia, mapping: WorkspaceMappingFact): DoctorCheck | undefined {
+    if (mapping.configured !== true) return undefined
+    const label = 'IM 审批的工作区映射'
+    const resolved = mapping.resolved !== undefined && mapping.resolved !== '' ? mapping.resolved : undefined
+    const where = resolved ?? mapping.workspace ?? '(工作区未报告)'
+    const counts = `${mapping.declared ?? 0} 条声明/${mapping.usable ?? 0} 条可用`
+    const problems = mapping.problems ?? []
+    const suffix = problems.length === 0 ? '' : `；映射配置问题：${problems.join('；')}`
+
+    if (mapping.conflict !== undefined) {
+        const candidates = mapping.conflict.candidates ?? []
+        return {
+            id: IM_APPROVAL_WORKSPACE_CHECK_ID,
+            area: 'interact',
+            state: 'missing',
+            severity: 'required',
+            label: `${label}（歧义）`,
+            detail:
+                `im.approvalVia=${mode}，工作区 ${where} 同时命中 ${candidates.length} 条**具体度相同**的 im.approvals 条目` +
+                `（${candidates.map((entry) => `im.approvals[${entry.index ?? '?'}] ${entry.workspace ?? '?'}（会话 ${entry.chatId ?? '?'}）`).join(' / ')}）：` +
+                '具体度相同就无法判断哪一条才是这个工作区的决定，所以每次审批都会在发卡之前被拒绝（refused:ambiguous-workspace-mapping），' +
+                '一次决定也做不出来' +
+                suffix,
+            fix:
+                '由宿主把其中一条写得更具体（更长的路径前缀，例如把 /a 改成 /a/b），或删掉重复的那条；' +
+                '判定规则：先比字面前缀（越长越具体），再比通配符个数（越少越具体，`**` 算两个），同分不裁决。' +
+                '改完用 interaction_status 的「工作区映射」一行核对命中项',
+        }
+    }
+
+    if (mapping.matched !== undefined) {
+        const matched = mapping.matched
+        const approvers = matched.approvers ?? 0
+        if (matched.approversFallback === false && approvers === 0) {
+            // `approvers: []` is a real state and a real trap: the entry says
+            // "nobody may approve here", and the approval path then refuses every
+            // ask with `refused:approvers-missing` (it never falls back to the
+            // host list — a silent fallback would change who may decide).
+            return {
+                id: IM_APPROVAL_WORKSPACE_CHECK_ID,
+                area: 'interact',
+                state: 'missing',
+                severity: 'required',
+                label: `${label}（映射项的空名单）`,
+                detail:
+                    `im.approvalVia=${mode}，工作区 ${where} 命中的 im.approvals[${matched.index ?? '?'}] ${matched.workspace ?? ''} 声明了**空**的 approvers：` +
+                    '这个工作区**谁也不能批准**，每次审批都会在发卡之前被拒绝（refused:approvers-missing）——' +
+                    '空名单不会退回宿主名单（那会让"谁能审批"随配置漂移）' + suffix,
+                fix:
+                    '由宿主给这条映射项写上该工作区的审批人 id，或删掉它的 `approvers` 字段以回落到宿主名单' +
+                    `（im.approvers / im.approversFile，默认 ${HOST_APPROVERS_FILE}）`
+            }
+        }
+        return {
+            id: IM_APPROVAL_WORKSPACE_CHECK_ID,
+            area: 'interact',
+            state: 'ok',
+            severity: 'required',
+            label: `${label}（命中 im.approvals[${matched.index ?? '?'}]）`,
+            detail:
+                `im.approvalVia=${mode}，工作区 ${where} 命中映射项 ${matched.workspace ?? '(未报告)'}` +
+                `（会话 ${matched.chatId ?? '(未报告)'}，${counts}）：` +
+                (matched.approversFallback === true
+                    ? '该条没有声明 approvers，审批人**回落到宿主名单**（由 im.approvers / im.approversFile 决定，denyApprovers 之后再生效）'
+                    : `该条声明了 approvers（${approvers} 个 id），denyApprovers 仍然会先减去被 deny 的人`) +
+                '；审批提问按这条映射发到它的会话' +
+                suffix,
+        }
+    }
+
+    // Unmatched. `host-default` is a policy the host wrote down (allowed, but it
+    // must SAY that the conversation came from the default and not from an entry).
+    const entryHint =
+        `{ "workspace": ${JSON.stringify(where)}, "chatId": "<该工作区与 bot 私聊的会话 id>" }` +
+        '（approvers 省略则回落到宿主名单，写上则替换它）'
+    if ((mapping.policy ?? 'refuse') === 'host-default') {
+        return {
+            id: IM_APPROVAL_WORKSPACE_CHECK_ID,
+            area: 'interact',
+            state: 'partial',
+            severity: 'recommended',
+            label: `${label}（未命中 → host-default）`,
+            detail:
+                `im.approvalVia=${mode}，但工作区 ${where} 不在 im.approvals 的任何条目里（${counts}）：` +
+                'im.unmappedWorkspace=host-default 允许这里回落到 im.approvalChatId + 宿主名单，' +
+                '所以审批会发到**宿主默认会话**，而不是为这个工作区配置的会话——这可能正是你要的，也可能把卡片送进另一个项目的会话里' +
+                suffix,
+            fix:
+                `要给这个工作区自己的审批会话，就由宿主在 im.approvals 里加一条 ${entryHint}；` +
+                '要让"未映射就拒绝"成为硬规矩，把 im.unmappedWorkspace 设为 refuse（默认）。' +
+                '这是**建议**：host-default 是显式策略，不是配置遗漏',
+        }
+    }
+    return {
+        id: IM_APPROVAL_WORKSPACE_CHECK_ID,
+        area: 'interact',
+        state: 'missing',
+        severity: 'required',
+        label: `${label}（未命中 → refuse）`,
+        detail:
+            `im.approvalVia=${mode}（审批走 IM），但工作区 ${where} 不在 im.approvals 的任何条目里（${counts}），` +
+            '而 im.unmappedWorkspace=refuse：这个工作区**每一次**审批都会在发卡之前被拒绝' +
+            '（refused:no-workspace-mapping），一次决定也做不出来' +
+            suffix,
+        fix:
+            `① 由宿主在 profile 的 dsh-interaction-gate 配置里给 im.approvals 加一条 ${entryHint}；` +
+            '② 或把 im.unmappedWorkspace 设为 host-default（明确接受这里使用宿主默认会话 im.approvalChatId）；' +
+            '③ 或把 im.approvalVia 设回 off，让审批继续走宿主接缝（TUI）。这三个键都是宿主配置，模型和仓库都改不了',
+    }
+}
+
+/**
  * Judge the IM approval path and return its checks.
  *
  * Exactly one of these shapes comes back (plus the migration check when a
@@ -296,7 +466,14 @@ export function imApprovalChecks(fact: ImApprovalFact): DoctorCheck[] {
         ]
     }
 
+    const workspaceCheck = workspaceMappingCheckOf(mode, fact.mapping ?? {})
     const target = fact.target ?? ''
+    // P3.2: a matched `im.approvals` entry that DECLARES `approvers` is this
+    // workspace's whitelist, so an empty HOST list is not a failure here — the
+    // gate would not refuse, and reporting it as missing would be a false alarm
+    // that pushes an operator to configure a list nothing reads.
+    const mappedEntry = fact.mapping?.matched
+    const mappedApprovers = mappedEntry !== undefined && mappedEntry.approversFallback === false ? (mappedEntry.approvers ?? 0) : 0
     const problems: string[] = []
     if (target === '') {
         problems.push(
@@ -309,7 +486,7 @@ export function imApprovalChecks(fact: ImApprovalFact): DoctorCheck[] {
             'interaction 服务没有报告宿主审批人名单（im() 里没有 approvers）：**读不到不等于名单为空**，' +
                 '升级 dsh-interaction-gate 后在 interaction_status 的「审批人名单」一行核对生效值',
         )
-    } else if (fact.approvers.count === 0) {
+    } else if (fact.approvers.count === 0 && mappedApprovers === 0) {
         problems.push(
             `宿主审批人名单为空（im.approvers ${fact.approvers.inline ?? 0} 个内联 id + ${
                 fact.approvers.file === undefined || fact.approvers.file === ''
@@ -328,7 +505,7 @@ export function imApprovalChecks(fact: ImApprovalFact): DoctorCheck[] {
         if (target === '') {
             repairs.push('由宿主在 profile 的 dsh-interaction-gate 配置里补上 im.approvalChatId（你与 bot 私聊的那个会话 id）')
         }
-        if (fact.approvers.count === 0) {
+        if (fact.approvers.count === 0 && mappedApprovers === 0) {
             repairs.push(
                 `由宿主配置 im.approvers（内联 id 数组）或 im.approversFile（默认 ${HOST_APPROVERS_FILE}，一行一个 id，# 开头是注释）` +
                     `——仓库里的 ${LEGACY_APPROVERS_FILE} 不再被读取`,
@@ -349,6 +526,7 @@ export function imApprovalChecks(fact: ImApprovalFact): DoctorCheck[] {
                     '② 把 im.approvalVia 设回 off，让审批继续走宿主接缝（TUI）。这些键是宿主配置，模型和仓库都改不了；' +
                     'interaction_status 的「IM 审批目标」「审批人名单」「项目减法」三行显示生效值',
             },
+            ...(workspaceCheck === undefined ? [] : [workspaceCheck]),
             ...(migration === undefined ? [] : [migration]),
         ]
     }
@@ -371,9 +549,14 @@ export function imApprovalChecks(fact: ImApprovalFact): DoctorCheck[] {
                 `宿主审批人名单 ${hostCount} 个 id（${sources.join(' + ') || `im.approversFile=${HOST_APPROVERS_FILE}`}）` +
                 ((fact.approvers.deny ?? 0) > 0
                     ? `；宿主 denyApprovers ${fact.approvers.deny} 个会先减去，项目还能再减（有效名单见 interaction_status 的「项目减法」一行）`
+                    : '') +
+                (mappedApprovers > 0
+                    ? `；这个工作区命中的 im.approvals[${mappedEntry?.index ?? '?'}] 声明了自己的 approvers（${mappedApprovers} 个 id），` +
+                      '宿主名单在该工作区不参与（denyApprovers 仍会先减）'
                     : ''),
         },
     ]
+    if (workspaceCheck !== undefined) checks.push(workspaceCheck)
     if (migration !== undefined) checks.push(migration)
     if (fact.p2pOnly !== false) {
         checks.push({

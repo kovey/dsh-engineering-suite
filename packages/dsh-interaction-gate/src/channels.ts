@@ -35,6 +35,7 @@ import { randomBytes } from 'node:crypto'
 import type { Attention, AttentionSource } from './attention.js'
 import type { ApprovalVia } from './config.js'
 import { readLedger, summarizeLedger } from './ledger.js'
+import type { WorkspaceMappingReport } from './workspace-mapping.js'
 
 /** What the suite is sending. */
 export type InteractionKind = 'ask' | 'notify' | 'progress'
@@ -320,6 +321,17 @@ export interface ImChannelReport {
      */
     approvers?: ImApproverReport
     /**
+     * The WORKSPACE mapping resolved for the workspace the caller asked about
+     * (P3.2), present only when `im(workspace)` was called with one.
+     *
+     * It is the answer to the question `runtime.im-approval` needs and cannot get
+     * anywhere else: "does the workspace I am reporting on have an approval
+     * conversation at all, or would every approval there be refused before a
+     * card?". Chat ids are masked. Absent = not asked about a workspace (or an
+     * older build), which the caller renders as `unknown`, never as "mapped".
+     */
+    workspaceMapping?: WorkspaceMappingReport
+    /**
      * Ignored answer attempts observed through the upstream's
      * `onAnswerIgnored` hook. Absent = nothing was observed (either no ask ran
      * yet or the upstream is too old — see `upstream`).
@@ -594,7 +606,7 @@ export interface InteractionRegistry {
      * Always available — "not registered" is a fact with a reason, not an
      * absence. `setIm()` is the plugin's report; consumers only read.
      */
-    im(): ImChannelReport
+    im(workspace?: string): ImChannelReport
     /** Record the IM channel verdict (the plugin, during/after `apply`). */
     setIm(report: ImChannelReport): void
     /** Record one channel-layer defect in the bounded `problems()` list. */
@@ -675,6 +687,16 @@ function claimedToken(raw: unknown): string | undefined {
 export function createInteractionRegistry(options: {
     now?: () => number
     logger?: { warn: (message: string) => void }
+    /**
+     * P3.2: the workspace mapping of ONE workspace, for the `im()` report.
+     *
+     * The mapping is per workspace while this report is process-wide, so the
+     * consumer (`suite_status`, `interaction_status`) says WHICH workspace it is
+     * asking about and the plugin answers for that one. Absent = this build does
+     * not resolve mappings (an older runtime), which is `unknown` for the caller,
+     * never "no mapping".
+     */
+    workspaceMapping?: (workspace: string) => WorkspaceMappingReport
 } = {}): InteractionRegistry {
     const now = options.now ?? ((): number => Date.now())
     const channels = new Map<string, InteractionChannel>()
@@ -1130,8 +1152,18 @@ export function createInteractionRegistry(options: {
             return [...problems]
         },
 
-        im(): ImChannelReport {
-            return { ...imReport }
+        im(workspace?: string): ImChannelReport {
+            const report = { ...imReport }
+            const resolve = options.workspaceMapping
+            if (resolve === undefined || typeof workspace !== 'string' || workspace === '') return report
+            try {
+                report.workspaceMapping = resolve(workspace)
+            } catch (error) {
+                // A defect in a pure resolver must not turn a report into a throw:
+                // the field is simply absent, which the caller renders as unknown.
+                note(`工作区映射解析失败（${workspace}）：${error instanceof Error ? error.message : String(error)}`)
+            }
+            return report
         },
 
         setIm(report: ImChannelReport): void {

@@ -43,7 +43,11 @@ export function sectionText(
         '- `interaction_status`：只读的体检（通道能力、生效配置、审批人名单、台账里**未决定**的提问、作废/撤回的提问）。',
         `- 生效配置来源：${describeSource(effective)}${problems.length === 0 ? '' : `（${problems.length} 条配置问题，见插件日志）`}；` +
             `提问超时上限 ${effective.config.askTimeoutMs}ms（只能缩短）；审批人名单${effective.config.requireApproverList ? '**必须**' : '不强制'}；` +
-            `IM 审批目标${effective.config.im.approvalChatId === '' ? '未配置（卡片目标由 IM 插件决定）' : `=${effective.config.im.approvalChatId}（p2pOnly=${effective.config.im.p2pOnly}）`}。`,
+            `IM 审批目标${effective.config.im.approvalChatId === '' ? '未配置（卡片目标由 IM 插件决定）' : `=${effective.config.im.approvalChatId}（p2pOnly=${effective.config.im.p2pOnly}）`}` +
+            (effective.config.im.approvalsDeclared === 0
+                ? '。'
+                : `；工作区映射 im.approvals ${effective.config.im.approvalsDeclared} 条（命中的条目会覆盖目标会话与审批人，` +
+                  `未命中的工作区按 im.unmappedWorkspace=${effective.config.im.unmappedWorkspace} 处理）。`),
         channels.length === 0
             ? '- ⚠️ 当前**没有注册任何通道**：`interaction_ask` 会直接拒绝，`interaction_notify` 会报告推送失败——需要人决定的事就该停下来找宿主装通道，而不是自己决定。'
             : `- 通道：可问 ${askable.length} 个（${askable.map((channel) => channel.name).join(', ') || '无'}）、可推送 ${notifiable.length} 个（${notifiable.map((channel) => channel.name).join(', ') || '无'}）` +

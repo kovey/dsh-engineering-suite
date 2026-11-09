@@ -47,6 +47,7 @@ import { resolveConfig, resolveEffectiveConfig, type EffectiveConfig, type Inter
 import { installImChannel, type ImBinding, type ImInject } from './im-binding.js'
 import { createOutbox, describeReplay, type Outbox } from './outbox.js'
 import { PROMPT_SECTION, sectionText } from './prompt.js'
+import { approvalRoutingOf, mappingReportOf } from './workspace-mapping.js'
 import { artifactPathOf, hostApproverReportOf, registerTools, type ToolDeps } from './tools.js'
 import type { InteractionRegistry } from './channels.js'
 
@@ -88,6 +89,28 @@ export type { ApprovalAnswererHandle, ApprovalAnswererOptions, ApprovalOutcome, 
 export type { ImBinding, ImBindingLogger, ImBindingOptions, ImInjectionContext, ImInjectionHost, ImInject, ImTimerControl } from './im-binding.js'
 export type { ImConfig } from './config.js'
 export { DEFAULT_APPROVERS_FILE, LEGACY_PROJECT_APPROVERS_FILE } from './config.js'
+export {
+    DEFAULT_UNMAPPED_WORKSPACE_POLICY,
+    UNMAPPED_WORKSPACE_POLICIES,
+    approvalRoutingOf,
+    describeAmbiguousWorkspace,
+    describeUnmappedWorkspace,
+    mappingReportOf,
+    maskChatId,
+    resolveApprovalRouting,
+    resolveWorkspaceApprovals,
+    specificityOf,
+    workspaceMatches,
+} from './workspace-mapping.js'
+export type {
+    ApprovalRouting,
+    ApprovalSpecificity,
+    ImWorkspaceApprovalConfig,
+    MatchedApprovalEntry,
+    UnmappedWorkspacePolicy,
+    WorkspaceApprovalEntry,
+    WorkspaceMappingReport,
+} from './workspace-mapping.js'
 export type { Attention, AttentionRecord, AttentionSource, AttentionState, WhyYou } from './attention.js'
 export type { Outbox, OutboxRecord, OutboxReplayReport, OutboxRow, OutboxState, OutboxSummary } from './outbox.js'
 export {
@@ -151,7 +174,13 @@ export function apply(ctx: Context, config: unknown = {}): void {
             ...(resolved.logFileTemplate === undefined ? {} : { template: resolved.logFileTemplate }),
         })
         const stores = new MissionStoreRegistry({ ...resolved.layout, logger })
-        const registry = createInteractionRegistry({ logger })
+        // P3.2: `im()` is process-wide while the workspace mapping is per
+        // workspace, so the registry is handed a RESOLVER and the caller says
+        // which workspace it is asking about (the doctor passes its own).
+        const registry = createInteractionRegistry({
+            logger,
+            workspaceMapping: (workspace) => mappingReportOf(approvalRoutingOf(workspace, resolved.im)),
+        })
         // A workspace-independent ledger (an absolute profile path) can be read
         // without a session context, so `interaction.pending()` reports asks
         // that are still waiting even before any tool of this process ran.

@@ -63,12 +63,13 @@ export {
     IM_APPROVAL_CHECK_ID,
     IM_APPROVAL_LEGACY_CHECK_ID,
     IM_APPROVAL_P2P_CHECK_ID,
+    IM_APPROVAL_WORKSPACE_CHECK_ID,
     LEGACY_APPROVERS_FILE,
     imApprovalChecks,
     legacyApproverListOf,
     maskTarget,
 } from './im-approval.js'
-export type { ApprovalVia, HostApproverFact, ImApprovalFact, LegacyApproverFact } from './im-approval.js'
+export type { ApprovalVia, HostApproverFact, ImApprovalFact, LegacyApproverFact, WorkspaceMappingFact } from './im-approval.js'
 export { buildReport } from './tools.js'
 export { PROMPT_SECTION, sectionText } from './prompt.js'
 export type { SuiteDoctorConfig } from './config.js'

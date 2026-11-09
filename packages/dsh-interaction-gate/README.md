@@ -175,6 +175,12 @@ profile（宿主上限）与 `<repo>/.dsh/interaction-gate.json`（项目只能�
       approvers: ['ou_alice']            # 宿主侧审批人（内联）；默认 []
       approversFile: '~/.dsh/interaction-approvers.txt'   # 宿主侧名单文件（必须绝对路径或 ~/…）
       denyApprovers: []                  # 宿主侧减法；项目级同名键只能再往上加 deny
+      # P3.2：按工作区分配审批会话与审批人（默认 [] = 功能未启用，沿用上面的 approvalChatId）
+      approvals:
+        - workspace: /Users/me/work/app  # 绝对路径，或用 * （一段）/ ** （任意深度）
+          chatId: oc_xxxxxxxx            # 这个工作区的审批会话
+          approvers: ['ou_alice']        # 可选：省略则回落到上面的宿主名单（denyApprovers 仍会先减）
+      unmappedWorkspace: refuse          # 未命中的工作区：refuse（默认）或 host-default
     
     prompt: { enabled: true, order: 600 }
 ```
@@ -224,7 +230,9 @@ profile（宿主上限）与 `<repo>/.dsh/interaction-gate.json`（项目只能�
   `notified` / `notify-failed` / `progress` / `filtered`。`refused:` 的原因有：
   `no-channel`、`channel-unusable`、`approvers-missing`、`timeout`、`cancelled`、`unauthorized`、
   `unknown-answer`、`secret`、`send-failed`、`token-lost`、`ledger-unwritable`、`bad-request`、`im-required`、
-  `superseded`（提问已作废，迟到的答案被拒绝）、`withdrawn`（提问已被撤回）。
+  `superseded`（提问已作废，迟到的答案被拒绝）、`withdrawn`（提问已被撤回）；
+  P3.2 起还会出现 `no-workspace-mapping`（工作区没被 `im.approvals` 命中，且策略是 `refuse`）与
+  `ambiguous-workspace-mapping`（两条映射同等具体，不替人挑一条）。
 - 读取**容忍截断的尾行**（崩溃不是台账损坏），并且**计数**跳过了几行：`interaction_status` 会写
   "行数 N，可用行 M，跳过 K"——"0 行"和"解析不了"绝不长得一样。
 - 台账写不进去 = **拒绝**：一次决定如果拿不到可审计的行 id，`interaction_ask` 不会把它交出去

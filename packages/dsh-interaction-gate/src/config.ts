@@ -35,6 +35,13 @@ import { loadProjectConfig, type Layout, type LayoutOptions } from 'dsh-eng-core
 import { DEFAULT_ATTENTION_FILE, DEFAULT_ATTENTION_MAX_AGE_MS } from './attention.js'
 import type { ImChannelMode } from './channels.js'
 import { DEFAULT_OUTBOX_FILE } from './outbox.js'
+import {
+    DEFAULT_UNMAPPED_WORKSPACE_POLICY,
+    resolveWorkspaceApprovals,
+    UNMAPPED_WORKSPACE_POLICIES,
+    type ImWorkspaceApprovalConfig,
+    type UnmappedWorkspacePolicy,
+} from './workspace-mapping.js'
 
 /** Levels a notification may carry. `progress` is its own tool, not a level. */
 export type NotifyLevel = 'info' | 'warn' | 'error'
@@ -154,7 +161,7 @@ export const APPROVAL_VIA_MODES: readonly ApprovalVia[] = ['off', 'fallback', 'o
 export const DEFAULT_APPROVAL_VIA: ApprovalVia = 'off'
 
 /** The host-owned `im` block. */
-export interface ImConfig {
+export interface ImConfig extends ImWorkspaceApprovalConfig {
     /**
      * `auto` (default): use the IM channel whenever the `chatInteraction`
      * service exposes `api.apiVersion >= 1` — at `apply` or whenever it
@@ -588,6 +595,43 @@ export function resolveConfig(input: unknown, warn?: (message: string) => void):
         }
     }
 
+    // --- im.approvals / im.unmappedWorkspace (P3.2) --------------------------
+    // Which conversation an approval belongs to is decided PER WORKSPACE, and
+    // that decision is the host's: a repository that could name its own approval
+    // conversation would be choosing the room it is judged in (the same argument
+    // that put the approver list in `im.*` in P3.1). Both keys therefore live in
+    // the host-only `im` block, and a project file that sets them is refused with
+    // a problem like every other `im.*` key.
+    //
+    // Validation fails CLOSED in the one way that matters: an unusable entry
+    // contributes NOTHING (no chat id, no approvers) and is reported. It is never
+    // coerced into "the host default", because that would silently send one
+    // repository's card into another repository's conversation.
+    const approvals = resolveWorkspaceApprovals(
+        imBlock['approvals'],
+        (message) => warn?.(`profile 配置: ${message}`),
+        { maxChatIdLength: MAX_APPROVAL_CHAT_ID_LENGTH },
+    )
+    if (approvals.declared > 0 && approvals.entries.length === 0) {
+        warn?.(
+            `profile 配置: im.approvals 声明了 ${approvals.declared} 条映射，但没有一条可用：映射仍被视为**已启用**，` +
+                '因此每个工作区都会按未映射处理（refuse 时拒绝发问）——修好上面的条目，而不是指望它"等于没配"',
+        )
+    }
+    const rawUnmapped = imBlock['unmappedWorkspace']
+    let unmappedWorkspace: UnmappedWorkspacePolicy = DEFAULT_UNMAPPED_WORKSPACE_POLICY
+    if (rawUnmapped !== undefined) {
+        if (typeof rawUnmapped === 'string' && (UNMAPPED_WORKSPACE_POLICIES as readonly string[]).includes(rawUnmapped)) {
+            unmappedWorkspace = rawUnmapped as UnmappedWorkspacePolicy
+        } else {
+            warn?.(
+                `profile 配置: im.unmappedWorkspace 只能是 ${UNMAPPED_WORKSPACE_POLICIES.map((mode) => `"${mode}"`).join(' / ')}（收到 ${JSON.stringify(rawUnmapped)}），` +
+                    `已按 fail-closed 的默认值 "${DEFAULT_UNMAPPED_WORKSPACE_POLICY}" 处理` +
+                    '（拼错就退回宿主默认会话，等于把卡片发到为别的工作区配置的会话里）',
+            )
+        }
+    }
+
     // The pre-P3.1 top-level key: reported, never applied. Silently ignoring it
     // would leave a host believing its list is in force while every approval
     // refuses, and reading it would keep the repository's file authoritative.
@@ -635,6 +679,12 @@ export function resolveConfig(input: unknown, warn?: (message: string) => void):
             approversFile: imApproversFile,
             denyApprovers: imDenyApprovers,
             hostDenyApprovers: imDenyApprovers,
+            // The workspace mapping (P3.2): entries already validated, plus how
+            // many were DECLARED (a typo must not read as "no mapping declared").
+            approvals: approvals.entries,
+            approvalsDeclared: approvals.declared,
+            approvalsProblems: approvals.problems,
+            unmappedWorkspace,
             // At profile level there is no project file yet: the project's part
             // is filled in by `resolveEffectiveConfig`.
             projectDenyApprovers: [],
@@ -679,6 +729,10 @@ const REFUSED_KEY_REASONS: Record<string, string> = {
         `P3.1 起审批人名单的权威在宿主（im.approvers / im.approversFile，默认 ${DEFAULT_APPROVERS_FILE}）：` +
         `仓库不能再提供名单（否则仓库能自己给自己发权限），${LEGACY_PROJECT_APPROVERS_FILE} 也不再被任何审批路径读取；` +
         '项目只能用 denyApprovers 做减法',
+    im:
+        'P3.2 起"这次审批发到哪个会话、由谁回答"也按工作区由宿主分配（im.approvals / im.unmappedWorkspace）：' +
+        '仓库能给自己选审批会话，就等于选自己受审的房间，也能把卡片发给自己人；' +
+        '项目能改的仍然只有 denyApprovers 这个减法（从宿主名单里划掉人）',
 }
 
 /**
@@ -705,7 +759,9 @@ export const HOST_OWNED_KEYS: readonly { key: string; why: string }[] = [
             '是否由本插件回答宿主的审批接缝（im.approvalVia）都是宿主决定：' +
             '仓库能选自己的审批会话，就等于绕过审批边界把卡片发给自己；而 approvalVia=fallback/only 决定的是"谁能放行一次权限"。' +
             `审批人名单本身也是宿主键（im.approvers / im.approversFile，默认 ${DEFAULT_APPROVERS_FILE}）：` +
-            '仓库能提供名单就等于自己给自己发权限——项目能做的只有 im.denyApprovers 这个减法',
+            '仓库能提供名单就等于自己给自己发权限——项目能做的只有 im.denyApprovers 这个减法。' +
+            'P3.2：按工作区分配"审批发到哪个会话、由谁回答"（im.approvals / im.unmappedWorkspace）同理——' +
+            '仓库能给自己选审批会话，就等于选自己受审的房间',
     },
 ]
 

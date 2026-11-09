@@ -101,6 +101,13 @@ import {
     type OutboxDeliver,
 } from './outbox.js'
 import { checkOutgoing, compileRedactPatterns, describeHits, scanApprovalContext, truncate, type SecretRule } from './redact.js'
+import {
+    approvalRoutingOf,
+    describeAmbiguousWorkspace,
+    describeUnmappedWorkspace,
+    maskChatId,
+    type ApprovalRouting,
+} from './workspace-mapping.js'
 
 const TEXT_OUTPUT = { type: 'string' } as const
 
@@ -319,6 +326,20 @@ function hostApproverIdsOf(file: string): { present: boolean; ids: string[] } {
 }
 
 /**
+ * A replacement source for the approver list (P3.2: a mapped workspace entry).
+ *
+ * `ids` REPLACES the host's own sources for that workspace; `source` is the
+ * phrase a report prints instead of the host keys, so nobody has to guess where
+ * the list came from. `denyApprovers` still applies afterwards — a project's
+ * subtraction survives a mapped entry, because subtraction is the one lever a
+ * repository has and nothing may quietly remove it.
+ */
+export interface ApproversOverride {
+    ids: string[]
+    source: string
+}
+
+/**
  * Resolve the effective approver list of one workspace.
  *
  * `有效名单 = (im.approvers ∪ im.approversFile) − (im.denyApprovers ∪ 项目 denyApprovers)`,
@@ -326,15 +347,22 @@ function hostApproverIdsOf(file: string): { present: boolean; ids: string[] } {
  * applies to an answerer). There is no third source: `cwd` is used only to
  * NOTICE the legacy repository file so the migration can be stated — its ids
  * never enter the list.
+ *
+ * P3.2 adds ONE optional replacement: when the calling workspace matched an
+ * `im.approvals` entry that declares `approvers`, those ids take the place of the
+ * host sources ({@link ApproversOverride}). The substitution is host configuration
+ * (a repository cannot write an `im` block), and the deny list still subtracts.
  * @param cwd - the calling workspace (legacy-file reporting only).
  * @param config - the EFFECTIVE configuration of that workspace.
+ * @param base - the mapped entry's ids, when one declares them.
  */
-export function approversOf(cwd: string, config: InteractionGateConfig): ApproversState {
+export function approversOf(cwd: string, config: InteractionGateConfig, base?: ApproversOverride): ApproversState {
     const im = config.im
-    const file = im.approversFile === '' ? '' : expandHome(im.approversFile)
+    const file = base !== undefined || im.approversFile === '' ? '' : expandHome(im.approversFile)
     const fromFile = file === '' ? { present: false, ids: [] as string[] } : hostApproverIdsOf(file)
+    const declaredHost = base === undefined ? [...im.approvers, ...fromFile.ids] : [...base.ids]
     const host: string[] = []
-    for (const id of [...im.approvers, ...fromFile.ids]) {
+    for (const id of declaredHost) {
         if (!host.some((known) => known.toLowerCase() === id.toLowerCase())) host.push(id)
     }
     const deny = im.denyApprovers
@@ -349,20 +377,26 @@ export function approversOf(cwd: string, config: InteractionGateConfig): Approve
     // is reported (the migration must be visible), nothing more.
     const legacy = fs.existsSync(path.join(cwd, LEGACY_PROJECT_APPROVERS_FILE))
     const problems: string[] = []
-    if (im.approversFileProblem !== undefined) problems.push(im.approversFileProblem)
+    if (im.approversFileProblem !== undefined && base === undefined) problems.push(im.approversFileProblem)
     // An absent file is NOT a problem on its own (the deployment may name its
     // ids inline, and the default path is simply a place that may not exist
     // yet): it is stated in `source` (存在=…), and it becomes a problem exactly
     // when it is what makes the list unusable.
     if (config.requireApproverList && ids.length === 0) {
         problems.push(
-            `宿主审批人名单为空：im.approvers ${im.approvers.length} 个 id + im.approversFile ${file === '' ? '（路径不可用）' : `${file}（存在=${fromFile.present}，${fromFile.ids.length} 个 id）`}` +
-                `；denyApprovers 去掉了 ${denied.length} 个（仓库里的 ${LEGACY_PROJECT_APPROVERS_FILE} 不再被读取）`,
+            base === undefined
+                ? `宿主审批人名单为空：im.approvers ${im.approvers.length} 个 id + im.approversFile ${file === '' ? '（路径不可用）' : `${file}（存在=${fromFile.present}，${fromFile.ids.length} 个 id）`}` +
+                      `；denyApprovers 去掉了 ${denied.length} 个（仓库里的 ${LEGACY_PROJECT_APPROVERS_FILE} 不再被读取）`
+                : `映射项的审批人名单为空：${base.source} 声明了 ${base.ids.length} 个 id，denyApprovers 去掉了 ${denied.length} 个；` +
+                      '该工作区因此没有可用的审批人（不会退回宿主名单——那会让审批人的归属随配置漂移）',
         )
     }
     const parts: string[] = []
-    if (im.approvers.length > 0) parts.push(`im.approvers（${im.approvers.length} 个内联 id）`)
-    if (file !== '') parts.push(`im.approversFile=${file}（存在=${fromFile.present}，${fromFile.ids.length} 个 id）`)
+    if (base !== undefined) parts.push(`${base.source}（${base.ids.length} 个 id）`)
+    else {
+        if (im.approvers.length > 0) parts.push(`im.approvers（${im.approvers.length} 个内联 id）`)
+        if (file !== '') parts.push(`im.approversFile=${file}（存在=${fromFile.present}，${fromFile.ids.length} 个 id）`)
+    }
     // An empty list must not read like a configured one: the source phrase says
     // where it would come FROM, and the explicit tail says it produced no id.
     const source =
@@ -433,16 +467,16 @@ export type ImAskTargetPlan =
       }
 
 /**
- * What THIS ask may do about the IM approval target (P0), or why it must not be
- * sent at all.
+ * What THIS ask may do about the IM approval target (P0, extended by P3.2), or
+ * why it must not be sent at all.
  *
  * The three-layer model, and where each layer lives:
  *
  *  1. **target + whitelist** (computed here, sent by the channel adapter): the
- *     card goes to `im.approvalChatId` and `from`/`chatId` are passed to the IM
- *     plugin, so the conversation is a host decision rather than the plugin's
- *     `p2pChat` (which is simply "the last chat that messaged the bot" — anyone
- *     who DMs the bot could redirect our card);
+ *     card goes to the configured conversation and `from`/`chatId` are passed to
+ *     the IM plugin, so the conversation is a host decision rather than the
+ *     plugin's `p2pChat` (which is simply "the last chat that messaged the bot" —
+ *     anyone who DMs the bot could redirect our card);
  *  2. **post-answer provenance** (below, in the ask tool): `answer.chatId` must
  *     be the configured target and, with `p2pOnly`, `answer.chatKind` must be
  *     proven `p2p` — a mismatch is `refused:wrong-chat` / `refused:not-p2p`, no
@@ -451,19 +485,42 @@ export type ImAskTargetPlan =
  *     answer, so a forged/forwarded answer inside the right chat is still
  *     checked against the named people.
  *
- * Fail closed BEFORE sending: a configured target with no usable whitelist (or
- * an unusable target) refuses instead of degrading into "whoever the plugin
- * picks can answer". With NO configured target the behaviour is exactly today's
- * — except for one guard: an operator who explicitly turned `p2pOnly` on but
- * configured no target gets a refusal rather than a gate that only looks
- * hardened.
+ * Fail closed BEFORE sending. Since P3.2 the target may come from the WORKSPACE
+ * mapping (`routing`), which is consulted first: a workspace no entry claims is
+ * refused (`no-workspace-mapping`) under the `refuse` policy, and two entries of
+ * equal specificity are refused (`ambiguous-workspace-mapping`) rather than one
+ * of them being picked. With no mapping declared at all the routing falls
+ * through to `im.approvalChatId` and the behaviour is exactly P0's — including
+ * the guard for an operator who turned `p2pOnly` on but configured no target.
  *
  * @param config - the EFFECTIVE configuration of the calling workspace.
  * @param approvers - that workspace's approver list (the `from` whitelist).
+ * @param routing - the workspace mapping resolved for the calling workspace.
  */
-export function imAskTargetOf(config: InteractionGateConfig, approvers: ApproversState): ImAskTargetPlan {
+export function imAskTargetOf(config: InteractionGateConfig, approvers: ApproversState, routing?: ApprovalRouting): ImAskTargetPlan {
     const im = config.im
-    if (im.approvalChatIdProblem !== undefined) {
+    // --- the workspace mapping FIRST: it decides where this ask belongs ------
+    // A mapping in force says "approvals for this workspace live in THIS
+    // conversation". An unmapped workspace under `refuse` therefore has no answer
+    // at all, and no other key may supply one: falling back to
+    // `im.approvalChatId` is precisely the cross-workspace misrouting P3.2 stops.
+    if (routing !== undefined && routing.configured) {
+        if (routing.conflict !== undefined) {
+            const text = describeAmbiguousWorkspace(routing)
+            return { ok: false, reason: 'ambiguous-workspace-mapping', detail: text.detail, extraLines: text.extraLines, next: text.next }
+        }
+        if (routing.matched === undefined && routing.policy === 'refuse') {
+            const text = describeUnmappedWorkspace(routing)
+            return { ok: false, reason: 'no-workspace-mapping', detail: text.detail, extraLines: text.extraLines, next: text.next }
+        }
+    }
+    const matched = routing?.matched
+    const fromMapping = routing !== undefined && routing.chatIdSource === 'mapping'
+    const target = routing === undefined ? im.approvalChatId : routing.chatId
+    // A mapped entry's conversation is validated on its own, so a broken
+    // `im.approvalChatId` must not block a workspace whose entry supplies one —
+    // it still blocks everything that would actually USE that key.
+    if (im.approvalChatIdProblem !== undefined && !fromMapping) {
         return {
             ok: false,
             reason: 'bad-target',
@@ -474,26 +531,37 @@ export function imAskTargetOf(config: InteractionGateConfig, approvers: Approver
                 '在它可用之前不会发出审批卡片——因为剩下的唯一出路就是"让 IM 插件自己挑目标"，而那正是任何人私聊 bot 都能覆写的那条路。',
         }
     }
-    if (im.approvalChatId !== '') {
+    const where =
+        fromMapping && matched !== undefined
+            ? `im.approvals[${matched.index}] ${matched.entry.workspace}（会话 ${maskChatId(matched.entry.chatId)}）`
+            : `im.approvalChatId=${im.approvalChatId}`
+    if (target !== '') {
         if (approvers.ids.length === 0) {
             return {
                 ok: false,
                 reason: 'approvers-missing',
                 detail:
-                    `im.approvalChatId=${im.approvalChatId} 已配置（审批走 IM），但宿主审批人名单为空或不可读：` +
+                    `${where} 已配置（审批走 IM），但${fromMapping ? '该映射项的' : '宿主'}审批人名单为空或不可读：` +
                     `没有名单就没有"谁可以回答"（from 白名单），一张发出去谁都能答的卡片不是审批`,
                 extraLines: [
                     `- 名单来源：${approvers.source}（有效 id=${approvers.ids.length}，被 denyApprovers 去掉 ${approvers.denied.length} 个）`,
+                    ...(fromMapping
+                        ? [
+                              '- 该工作区命中的映射项没有可用的 approvers：补上它的 approvers，或删掉这个字段以回落到宿主名单' +
+                                  '（`approvers: []` 是"谁也不能批"，不是"用宿主名单"）',
+                          ]
+                        : []),
                     ...(approvers.legacyFile === undefined
                         ? []
                         : [`- ${approvers.legacyFile} 仍存在，但**不再被读取**：它属于仓库，而审批人名单的权威在宿主`]),
                 ],
                 next:
-                    `由宿主配置 im.approvers（内联 id 数组）或 im.approversFile（宿主侧路径，默认 ${DEFAULT_APPROVERS_FILE}，一行一个平台用户 id，# 开头为注释）：` +
+                    `由宿主配置 im.approvers（内联 id 数组）或 im.approversFile（宿主侧路径，默认 ${DEFAULT_APPROVERS_FILE}，一行一个平台用户 id，# 开头为注释），` +
+                    '或在工作区命中的 im.approvals 条目里写 approvers：' +
                     '它同时是卡片的 from 白名单和落账前的审批人校验；名单为空时不会发卡片（不会降级成"谁都能答"，也不会回落到仓库里的名单文件）。',
             }
         }
-        return { ok: true, target: { chatId: im.approvalChatId, from: [...approvers.ids], p2pOnly: im.p2pOnly } }
+        return { ok: true, target: { chatId: target, from: [...approvers.ids], p2pOnly: im.p2pOnly } }
     }
     if (im.p2pOnlyConfigured && im.p2pOnly) {
         return {
@@ -509,6 +577,66 @@ export function imAskTargetOf(config: InteractionGateConfig, approvers: Approver
         }
     }
     return { ok: true }
+}
+
+/**
+ * The 「工作区映射」 lines of `interaction_status` (P3.2).
+ *
+ * Read-only prose about ONE resolved routing, and deliberate about the three
+ * states an operator must be able to tell apart at a glance:
+ *
+ *  - **not configured** (`im.approvals` empty) — the feature is off and today's
+ *    host keys decide. This is NOT "the workspace is unmapped": a mapping nobody
+ *    declared cannot refuse anything, and reading the two as one fact is how a
+ *    default deployment would look broken;
+ *  - **matched** — which entry won, the conversation (masked: a status line is
+ *    read in chats and logs), how many approvers and whether they FELL BACK to
+ *    the host list (an entry without `approvers` must not look like it decided
+ *    the list);
+ *  - **unmatched / ambiguous** — that every ask in this workspace will be
+ *    refused before a card, with the reason id and the policy that produced it.
+ *
+ * @param routing - the routing of the workspace the status call is about.
+ * @returns the line(s) to append, never empty.
+ */
+export function renderWorkspaceMapping(routing: ApprovalRouting): string[] {
+    const lines: string[] = []
+    const where =
+        routing.resolved === '' || routing.resolved === routing.workspace
+            ? routing.workspace
+            : `${routing.workspace}（realpath ${routing.resolved}）`
+    const counts = `${routing.declared} 条声明/${routing.usable} 条可用`
+    if (!routing.configured) {
+        lines.push(
+            `- 工作区映射（im.approvals）：未声明（${counts}）——沿用 im.approvalChatId + 宿主名单，映射功能未启用` +
+                '（**未声明映射**与"工作区未映射"是两件事：没有映射可依据时不会因此拒绝任何提问）',
+        )
+    } else if (routing.conflict !== undefined) {
+        const candidates = routing.conflict.candidates.map((candidate) => `im.approvals[${candidate.index}] ${candidate.entry.workspace}（会话 ${maskChatId(candidate.entry.chatId)}）`)
+        lines.push(
+            `- 工作区映射（im.approvals，${counts}）：⚠️ **歧义**——工作区 ${where} 同时命中 ${candidates.length} 条同等具体的映射项` +
+                `（${candidates.join(' / ')}）；具体度相同就不挑一条，每次提问都会在发卡前被拒绝（refused:ambiguous-workspace-mapping）`,
+        )
+    } else if (routing.matched === undefined) {
+        const policy =
+            routing.policy === 'refuse'
+                ? `im.unmappedWorkspace=refuse → 每次提问都会在发卡前被拒绝（refused:no-workspace-mapping）`
+                : `im.unmappedWorkspace=host-default → 回落到 im.approvalChatId + 宿主名单（这是策略允许的回落，不是映射命中的结果）`
+        lines.push(`- 工作区映射（im.approvals，${counts}）：未命中——工作区 ${where} 不在任何映射项里；${policy}`)
+    } else {
+        const entry = routing.matched
+        const approvers = entry.entry.approvers
+        lines.push(
+            `- 工作区映射（im.approvals，${counts}）：命中 im.approvals[${entry.index}] ${entry.entry.workspace}` +
+                `（会话 ${maskChatId(entry.entry.chatId)}；工作区 ${where}）` +
+                (approvers === undefined
+                    ? `；审批人 **回落到宿主名单**（该条没有声明 approvers），有效 ${routing.approvers?.ids.length ?? 0} 个 id`
+                    : `；审批人 ${approvers.length} 个，来自该映射项（有效 ${routing.approvers?.ids.length ?? 0} 个 id，denyApprovers 之后再算）`),
+        )
+    }
+    if (routing.realpathProblem !== undefined) lines.push(`  ⚠️ ${routing.realpathProblem}`)
+    for (const problem of routing.problems) lines.push(`  ⚠️ ${problem}`)
+    return lines
 }
 
 /** The `approval-context` fields a caller may pass, validated field by field. */
@@ -1078,12 +1206,17 @@ export async function askThroughChannels(deps: ToolDeps, request: AskRequest, ca
     }
 
     // --- approver list: refuse BEFORE sending a card nobody may answer ---
-    const approvers = approversOf(cwd, config)
+    // P3.2: the workspace decides WHICH list and WHICH conversation. The routing
+    // is resolved first (it is pure and realpath-based), because a mapped entry
+    // may replace the host list — and because an unmapped workspace under the
+    // `refuse` policy must not reach the second half of this function at all.
+    const routing = approvalRoutingOf(cwd, config.im)
+    const approvers = approversOf(cwd, config, routing.approvers)
     // --- the IM approval target (P0): fail closed BEFORE any card ----
     // A configured target with no usable whitelist (or an unusable
     // target) must never degrade into "send it and see who answers":
     // that is precisely the hole this P0 closes.
-    const imPlan = imAskTargetOf(config, approvers)
+    const imPlan = imAskTargetOf(config, approvers, routing)
     if (!imPlan.ok) {
         refuseAsk({
             ledgerFile,
@@ -1101,6 +1234,13 @@ export async function askThroughChannels(deps: ToolDeps, request: AskRequest, ca
     // compares the answer's provenance against exactly this value, so
     // "what we asked for" and "what we accept" cannot drift apart.
     const imTarget = imPlan.target
+    // Where this ask's conversation came from — the mapping entry or the host key.
+    // The provenance check below must name the SAME source the card was sent
+    // under, or an operator would go looking for a key that did not decide it.
+    const mappedTargetForAsk = routing.chatIdSource === 'mapping' && routing.matched !== undefined
+    const targetSource = mappedTargetForAsk
+        ? `im.approvals[${routing.matched?.index ?? 0}]（${routing.matched?.entry.workspace ?? ''}）`
+        : 'im.approvalChatId'
     if ((config.requireApproverList || request.requireAllowlist === true) && approvers.ids.length === 0) {
         refuseAsk({
             ledgerFile,
@@ -1470,7 +1610,7 @@ export async function askThroughChannels(deps: ToolDeps, request: AskRequest, ca
                     reason: 'wrong-chat',
                     detail:
                         `答案来自另一个会话（${answeredChat === '' ? '通道没有报告 chatId' : answeredChat}），` +
-                        `不是配置的审批目标（im.approvalChatId=${imTarget.chatId}）：这道回答不是决定，` +
+                        `不是配置的审批目标（${mappedTargetForAsk ? `${targetSource} 指定 ${imTarget.chatId}` : `im.approvalChatId=${imTarget.chatId}`}）：这道回答不是决定，` +
                         '一次性令牌也不会被换成一次放行',
                     title: titleOut.text,
                     questionId,
@@ -1485,7 +1625,7 @@ export async function askThroughChannels(deps: ToolDeps, request: AskRequest, ca
                     outbox,
                     settle: { state: 'withdrawn', reason: 'refused:wrong-chat：答案来自非审批目标会话，这次提问没有被回答' },
                     next:
-                        `核对 im.approvalChatId 是否就是你与 bot 私聊的那个会话（interaction_status 里的"IM 审批目标"一行）；` +
+                        `核对 ${targetSource} 是否就是你与 bot 私聊的那个会话（interaction_status 里的"IM 审批目标"与"工作区映射"两行）；` +
                         '然后重新提问，让目标会话里的人再答一次。不要因为"有人答了"就继续——那张卡可能根本不在审批人手里。',
                     ...(missionId === undefined ? {} : { missionId }),
                 })
@@ -2100,7 +2240,11 @@ export function registerTools(
                 const summary = summarizeLedger(selected, deps.now(), read.skipped)
                 const list = deps.registry.list()
                 const missing = missingPreferred(config, list)
-                const approvers = approversOf(cwd, config)
+                // P3.2: WHICH entry decides this workspace's conversation and
+                // approvers. Resolved once and used by both the mapping line and
+                // the target line, so the two can never disagree.
+                const routing = approvalRoutingOf(cwd, config.im)
+                const approvers = approversOf(cwd, config, routing.approvers)
                 const lines: string[] = []
 
                 lines.push(`配置来源：${describeSource(effective)}${effective.problems.length === 0 ? '' : `（${effective.problems.length} 条配置问题，见插件日志）`}`)
@@ -2145,12 +2289,26 @@ export function registerTools(
                 // needs to answer "where would an approval card go, and who could
                 // answer it" — plus whether the current configuration would refuse
                 // to ask at all (fail closed, named).
-                const imPlan = imAskTargetOf(config, approvers)
+                const imPlan = imAskTargetOf(config, approvers, routing)
+                // P3.2 first: which entry (if any) decides this workspace, and
+                // whether that decision is a fallback. Then the effective target,
+                // which is that entry's conversation when one matched.
+                lines.push(...renderWorkspaceMapping(routing))
+                const mappedTarget = routing.chatIdSource === 'mapping'
                 lines.push(
                     `- IM 审批目标：${
-                        config.im.approvalChatId === ''
-                            ? '未配置（沿用今日行为：卡片目标由 IM 插件的 p2pChat/activeChat 决定——任何人私聊 bot 都能改写它）'
-                            : `${config.im.approvalChatId}（p2pOnly=${config.im.p2pOnly}；from 白名单 ${approvers.ids.length} 个 id，来自 ${approvers.source}）`
+                        routing.chatId === ''
+                            ? routing.configured
+                                ? '未使用（这个工作区没有被任何映射项命中，且策略是 im.unmappedWorkspace=refuse：不会发出卡片，也不会回落到宿主默认会话）'
+                                : '未配置（沿用今日行为：卡片目标由 IM 插件的 p2pChat/activeChat 决定——任何人私聊 bot 都能改写它）'
+                            : `${
+                                  // A mapped conversation is masked (it is one of
+                                  // several, and a status line travels); the host's
+                                  // own key keeps its exact previous rendering.
+                                  mappedTarget ? maskChatId(routing.chatId) : routing.chatId
+                              }（${
+                                  mappedTarget ? '来自命中的 im.approvals 条目；' : ''
+                              }p2pOnly=${config.im.p2pOnly}；from 白名单 ${approvers.ids.length} 个 id，来自 ${approvers.source}）`
                     }${imPlan.ok ? '' : `；⚠️ 当前会**拒绝发问**（refused:${imPlan.reason}）：${imPlan.detail}`}`,
                 )
                 // WHO supplies the whitelist is the fact P3.1 changed, so the line

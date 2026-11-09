@@ -36,6 +36,7 @@ import {
     legacyApproverListOf,
     type ApprovalVia,
     type HostApproverFact,
+    type WorkspaceMappingFact,
 } from './im-approval.js'
 import {
     PHASES,
@@ -349,6 +350,14 @@ export interface ImApprovalReport {
      * repository file, which is exactly the source P3.1 retired.
      */
     approvers?: HostApproverFact
+    /**
+     * The workspace mapping as it applies to the workspace this report was asked
+     * about (P3.2, `im(workspace)`). Absent = the service has no mapping feature
+     * (an older build) or was not asked about a workspace — which is NOT the same
+     * as "the workspace is mapped", so the check stays silent rather than
+     * inventing a state.
+     */
+    workspaceMapping?: WorkspaceMappingFact
 }
 
 /** What the interaction service could (not) answer. */
@@ -441,13 +450,25 @@ async function settled<T>(value: Promise<T>, timeoutMs: number): Promise<{ value
     }
 }
 
-/** Call one accessor (function or plain value) and await it under the deadline. */
-async function readAccessor(service: Record<string, unknown>, key: string, timeoutMs: number): Promise<{ value?: unknown; problem?: string }> {
+/**
+ * Call one accessor (function or plain value) and await it under the deadline.
+ *
+ * `args` exist for ONE accessor: `im(workspace)`, which answers per workspace
+ * because the approval mapping is per workspace (P3.2). An accessor that ignores
+ * them (an older service) simply gets its own no-argument behaviour — never an
+ * error, and never a fabricated answer.
+ */
+async function readAccessor(
+    service: Record<string, unknown>,
+    key: string,
+    timeoutMs: number,
+    args: readonly unknown[] = [],
+): Promise<{ value?: unknown; problem?: string }> {
     const accessor = service[key]
     if (accessor === undefined) return {}
     if (typeof accessor !== 'function') return { value: accessor }
     try {
-        const called = (accessor as (this: unknown) => unknown).call(service)
+        const called = (accessor as (this: unknown, ...rest: unknown[]) => unknown).call(service, ...args)
         return await settled(Promise.resolve(called), timeoutMs)
     } catch (error) {
         return { problem: error instanceof Error ? error.message : String(error) }
@@ -576,13 +597,84 @@ function parseImApproval(value: unknown): { report?: ImApprovalReport; problem?:
     const target = typeof record['approvalChatId'] === 'string' ? record['approvalChatId'] : undefined
     const p2pOnly = typeof record['p2pOnly'] === 'boolean' ? record['p2pOnly'] : undefined
     const approvers = parseApprovers(record['approvers'])
+    const workspaceMapping = parseWorkspaceMapping(record['workspaceMapping'])
     return {
         report: {
             ...(mode === undefined ? {} : { approvalVia: mode }),
             ...(target === undefined ? {} : { approvalChatId: target }),
             ...(p2pOnly === undefined ? {} : { p2pOnly }),
             ...(approvers === undefined ? {} : { approvers }),
+            ...(workspaceMapping === undefined ? {} : { workspaceMapping }),
         },
+    }
+}
+
+/**
+ * Parse the workspace-mapping projection (`im(workspace).workspaceMapping`).
+ *
+ * Structural, field by field, and deliberately strict about the two spellings
+ * that matter: `policy` must be one of the two documented values (anything else
+ * is dropped rather than guessed), and a `matched` object without a usable
+ * `workspace` key is treated as no match at all — "an entry matched, I just
+ * cannot say which" would be a claim the report cannot support.
+ * @param value - the raw field.
+ * @returns the fact, or `undefined` when the field is absent/unusable.
+ */
+function parseWorkspaceMapping(value: unknown): WorkspaceMappingFact | undefined {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined
+    const record = value as Record<string, unknown>
+    const count = (key: string): number | undefined =>
+        typeof record[key] === 'number' && Number.isFinite(record[key] as number) ? (record[key] as number) : undefined
+    const text = (key: string): string | undefined => (typeof record[key] === 'string' ? (record[key] as string) : undefined)
+    const policy = record['policy'] === 'refuse' || record['policy'] === 'host-default' ? (record['policy'] as 'refuse' | 'host-default') : undefined
+    const entry = (raw: unknown): { index?: number; workspace?: string; chatId?: string } | undefined => {
+        if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return undefined
+        const candidate = raw as Record<string, unknown>
+        const workspace = typeof candidate['workspace'] === 'string' ? candidate['workspace'] : undefined
+        if (workspace === undefined) return undefined
+        return {
+            workspace,
+            ...(typeof candidate['index'] === 'number' && Number.isFinite(candidate['index'] as number) ? { index: candidate['index'] as number } : {}),
+            ...(typeof candidate['chatId'] === 'string' ? { chatId: candidate['chatId'] as string } : {}),
+        }
+    }
+    const matchedRaw = record['matched']
+    let matched: WorkspaceMappingFact['matched']
+    if (typeof matchedRaw === 'object' && matchedRaw !== null && !Array.isArray(matchedRaw)) {
+        const found = entry(matchedRaw)
+        if (found !== undefined) {
+            const raw = matchedRaw as Record<string, unknown>
+            matched = {
+                ...found,
+                ...(typeof raw['approvers'] === 'number' && Number.isFinite(raw['approvers'] as number) ? { approvers: raw['approvers'] as number } : {}),
+                ...(typeof raw['approversFallback'] === 'boolean' ? { approversFallback: raw['approversFallback'] as boolean } : {}),
+            }
+        }
+    }
+    const conflictRaw = record['conflict']
+    let conflict: WorkspaceMappingFact['conflict']
+    if (typeof conflictRaw === 'object' && conflictRaw !== null && !Array.isArray(conflictRaw)) {
+        const candidatesRaw = (conflictRaw as Record<string, unknown>)['candidates']
+        if (Array.isArray(candidatesRaw)) {
+            const candidates = candidatesRaw.map(entry).filter((candidate): candidate is { index?: number; workspace: string; chatId?: string } => candidate !== undefined)
+            conflict = { candidates }
+        }
+    }
+    const problems = Array.isArray(record['problems']) ? record['problems'].filter((item): item is string => typeof item === 'string') : undefined
+    const configured = typeof record['configured'] === 'boolean' ? record['configured'] : undefined
+    const workspace = text('workspace')
+    if (configured === undefined && matched === undefined && conflict === undefined) return undefined
+    return {
+        ...(configured === undefined ? {} : { configured }),
+        ...(count('declared') === undefined ? {} : { declared: count('declared') }),
+        ...(count('usable') === undefined ? {} : { usable: count('usable') }),
+        ...(policy === undefined ? {} : { policy }),
+        ...(workspace === undefined ? {} : { workspace }),
+        ...(text('resolved') === undefined ? {} : { resolved: text('resolved') }),
+        ...(text('realpathProblem') === undefined ? {} : { realpathProblem: text('realpathProblem') }),
+        ...(matched === undefined ? {} : { matched }),
+        ...(conflict === undefined ? {} : { conflict }),
+        ...(problems === undefined ? {} : { problems }),
     }
 }
 
@@ -629,9 +721,13 @@ function parseApprovers(value: unknown): HostApproverFact | undefined {
  * @param ctx - structural host context.
  * @param timeoutMs - deadline for one accessor.
  * @param now - clock used to derive an ask's age.
+ * @param workspace - the workspace this report is ABOUT, when the caller knows
+ *   one. It is passed to `im(workspace)` so the approval mapping (P3.2) can be
+ *   answered for the right workspace; without it the mapping fact is simply
+ *   absent, which is `unknown` and never "mapped".
  * @returns channels / pending asks, each `undefined` when unreadable.
  */
-export async function probeInteraction(ctx: ProbeContext, timeoutMs: number, now: number): Promise<InteractionProbe> {
+export async function probeInteraction(ctx: ProbeContext, timeoutMs: number, now: number, workspace?: string): Promise<InteractionProbe> {
     let service: unknown
     try {
         service = ctx.get('interaction')
@@ -669,7 +765,11 @@ export async function probeInteraction(ctx: ProbeContext, timeoutMs: number, now
     if (imAccessor === undefined) {
         out.imApprovalProblem = `interaction 服务没有暴露 IM 通道报告（试过 ${IM_ACCESSORS.map((key) => `${key}()`).join(' / ')}）：无法判断 im.approvalVia 是哪一档`
     } else {
-        const read = await readAccessor(record, imAccessor, timeoutMs)
+        // `im(workspace)` when we know the workspace: the approval mapping is per
+        // workspace, and a process-wide report cannot answer "would an approval
+        // in THIS repository find a conversation". An older service ignores the
+        // argument and reports what it can.
+        const read = await readAccessor(record, imAccessor, timeoutMs, workspace === undefined || workspace === '' ? [] : [workspace])
         if (read.problem !== undefined) out.imApprovalProblem = `interaction.${imAccessor}() 失败：${read.problem}`
         else {
             const parsed = parseImApproval(read.value)
@@ -958,7 +1058,7 @@ export async function probeRuntime(options: RuntimeProbeOptions): Promise<Runtim
     checks.push(gateObserveCheck(store))
 
     // ---- interaction -----------------------------------------------------
-    const interaction = await probeInteraction(options.ctx, options.probeTimeoutMs, now)
+    const interaction = await probeInteraction(options.ctx, options.probeTimeoutMs, now, options.cwd)
     if (interaction.channels === undefined) {
         problems.push(interaction.channelsProblem ?? '无法读取交互通道')
         checks.push({
@@ -1004,6 +1104,7 @@ export async function probeRuntime(options: RuntimeProbeOptions): Promise<Runtim
         // approvals, so reading it here would report a stale truth in exactly
         // the deployment that will refuse every approval.
         approvers: interaction.imApproval?.approvers ?? {},
+        ...(interaction.imApproval?.workspaceMapping === undefined ? {} : { mapping: interaction.imApproval.workspaceMapping }),
         legacy: legacyApproverListOf(layout),
     })
     checks.push(...approvalChecks)
