@@ -282,6 +282,65 @@ expect_rc 1 "one renamed member (the real 0.2.1 incident) fails the whole check"
 expect_rc 2 "a tree that does not exist is a usage error (exit 2)" bash "$ROOT/scripts/check-host-api.sh" --harness-root "$TMP/no-such-tree"
 
 # ---------------------------------------------------------------------------
+# C13 — verify.sh --changed: the iteration mode must SELECT the touched packages,
+# keep the full command intact, and refuse when it cannot tell what changed. A
+# partial run that silently reports green would be worse than no fast path.
+section "C13 — verify.sh --changed: selects the touched package, refuses without git"
+# A stub workspace: verify.sh derives ROOT from its own location, so a copy in a
+# temp tree runs against stubs and never touches the real repository.
+CHANGED_TREE="$TMP/changed-tree"
+mkdir -p "$CHANGED_TREE/scripts" "$CHANGED_TREE/packages/dsh-alpha/src" "$CHANGED_TREE/packages/dsh-beta/src"
+cp "$ROOT/scripts/verify.sh" "$CHANGED_TREE/scripts/verify.sh"
+for stub in build-all typecheck-all test-all; do
+  printf '#!/usr/bin/env bash\nprintf "%%s %%s\\n" "%s" "$*"\n' "$stub" > "$CHANGED_TREE/scripts/$stub.sh"
+  chmod +x "$CHANGED_TREE/scripts/$stub.sh"
+done
+mkdir -p "$CHANGED_TREE/test"
+printf 'export {};\n' > "$CHANGED_TREE/test/noop.test.ts"
+(cd "$CHANGED_TREE" && git init -q . && git config user.email selftest@example.com && git config user.name selftest && \
+  git add -A >/dev/null 2>&1 && git commit -qm base >/dev/null 2>&1 && printf 'x\n' > packages/dsh-alpha/src/index.ts)
+changed_out="$(cd "$CHANGED_TREE" && bash scripts/verify.sh --changed 2>&1 || true)"
+case "$changed_out" in
+  *"部分验收"*) pass "changed: prints the partial-run banner" ;;
+  *) fail "changed: the banner is missing" "$changed_out" ;;
+esac
+case "$changed_out" in
+  *"交付依据是完整"*) pass "changed: states that it is not a delivery argument" ;;
+  *) fail "changed: the disclaimer is missing" "$changed_out" ;;
+esac
+case "$changed_out" in
+  *"test-all --quiet dsh-alpha"*) pass "changed: only the touched package reaches the runner" ;;
+  *) fail "changed: the runner did not receive exactly the touched package" "$changed_out" ;;
+esac
+case "$changed_out" in
+  *dsh-beta*) fail "changed: an untouched package was run" "$changed_out" ;;
+  *) pass "changed: untouched packages are skipped" ;;
+esac
+# No changes at all: a fast, loud no-op — never a green "verified".
+# The touched file is UNTRACKED, so `checkout -- .` cannot remove it; clean it.
+(cd "$CHANGED_TREE" && git clean -qfd 2>/dev/null || true; git checkout -q -- . 2>/dev/null || true)
+nochange_out="$(cd "$CHANGED_TREE" && bash scripts/verify.sh --changed 2>&1 || true)"
+case "$nochange_out" in
+  *"没有包内改动"*) pass "changed: an empty change set says so instead of passing" ;;
+  *) fail "changed: an empty change set did not report itself" "$nochange_out" ;;
+esac
+# Not a git work tree: refuse (exit 2), never print green.
+rm -rf "$CHANGED_TREE/.git"
+expect_rc 2 "changed: a tree without git is refused" bash "$CHANGED_TREE/scripts/verify.sh" --changed
+
+# C14 — wait-quiet: quiescence detection is what stops the "gate while the agent
+# is still writing" collision (a 2-minute acceptance run thrown away).
+section "C14 — wait-quiet: a settling tree passes, a moving one times out"
+QUIET_DIR="$TMP/quiet-dir"
+mkdir -p "$QUIET_DIR"
+expect_rc 0 "wait-quiet: a still tree passes" bash "$ROOT/scripts/wait-quiet.sh" 1 5 "$QUIET_DIR"
+# A writer that keeps touching a file: the wait must refuse rather than claim quiet.
+( for _ in 1 2 3 4 5 6 7 8 9 10; do printf 'tick\n' >> "$QUIET_DIR/moving.txt"; sleep 0.4; done ) &
+writer=$!
+expect_rc 1 "wait-quiet: a moving tree times out instead of claiming quiet" bash "$ROOT/scripts/wait-quiet.sh" 1 3 "$QUIET_DIR"
+wait "$writer" 2>/dev/null || true
+expect_rc 2 "wait-quiet: a missing path is a usage error" bash "$ROOT/scripts/wait-quiet.sh" 1 5 "$TMP/definitely-absent"
+
 section "summary"
 if [ "$FAILURES" = "0" ]; then
   printf '  \033[32mOPS SELFTEST GREEN\033[0m — every finding above is still refused.\n'
