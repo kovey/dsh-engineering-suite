@@ -57,6 +57,16 @@ export {
     effectiveProbeTimeoutMs,
 } from './config.js'
 export { PLUGIN_SIGNATURES, PHASE_PLUGINS, CORE_PLUGINS, probePlugin, probeRuntime } from './probe.js'
+export {
+    APPROVAL_VIA_MODES,
+    DEFAULT_APPROVERS_FILE,
+    IM_APPROVAL_CHECK_ID,
+    IM_APPROVAL_P2P_CHECK_ID,
+    approverListOf,
+    imApprovalChecks,
+    maskTarget,
+} from './im-approval.js'
+export type { ApprovalVia, ApproverListFact, ImApprovalFact } from './im-approval.js'
 export { buildReport } from './tools.js'
 export { PROMPT_SECTION, sectionText } from './prompt.js'
 export type { SuiteDoctorConfig } from './config.js'

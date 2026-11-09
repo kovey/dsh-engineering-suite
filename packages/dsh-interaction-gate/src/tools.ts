@@ -1987,7 +1987,31 @@ export function registerTools(
                 )
                 for (const problem of read.problems) lines.push(`  ⚠️ ${problem}`)
 
-                lines.push(`- IM 通道：${describeIm(deps.registry.im())}`)
+                // ---- IM 审批：一个问题，一处看完 ------------------------------
+                // The operator's question is not "which keys exist" but "can an
+                // approval actually be DECIDED over IM?". Four facts answer it,
+                // and they are grouped here on purpose: mode / target / whitelist
+                // size / refused-answer counters. The words for the counters are
+                // the point — "无法观测"(no hook upstream) and "没有发生"(hooked,
+                // zero events) are different facts and must never read the same.
+                const imReport = deps.registry.im()
+                const ignored = imReport.ignoredAnswers
+                lines.push('IM 审批（IM 上能不能真的做出决定？——模式 / 目标会话 / 审批人名单 / 被忽略的回答，一处看完）')
+                lines.push(`- IM 通道：${describeIm(imReport)}`)
+                // The host's own approval seam (P1): whether THIS plugin answers
+                // it, and what it has decided so far. `off` must read as "we did
+                // not touch it", never as "we answer it and nothing happened".
+                lines.push(
+                    `- IM 审批应答者（approval/request）：${
+                        config.im.approvalVia === 'off'
+                            ? 'off（本插件未注册监听器：审批接缝由宿主原有的应答者回答，IM 上做不出任何审批决定——这是默认部署，不是故障）'
+                            : `${config.im.approvalVia}（prepend=true：先问 IM；${
+                                  config.im.approvalVia === 'fallback'
+                                      ? '问不了且没发过卡片 → next() 交还原通道；卡片发出后等不到答案 = unavailable）'
+                                      : '问不了一律 unavailable，绝不落回原通道）'
+                              }`
+                    }`,
+                )
                 // The approval TARGET and its whitelist: the two facts an operator
                 // needs to answer "where would an approval card go, and who could
                 // answer it" — plus whether the current configuration would refuse
@@ -2000,24 +2024,15 @@ export function registerTools(
                             : `${config.im.approvalChatId}（p2pOnly=${config.im.p2pOnly}；from 白名单 ${approvers.ids.length} 个 id，来自 ${approvers.file}）`
                     }${imPlan.ok ? '' : `；⚠️ 当前会**拒绝发问**（refused:${imPlan.reason}）：${imPlan.detail}`}`,
                 )
+                lines.push(
+                    `- 审批人名单（审批卡片的 from 白名单）：${approvers.ids.length} 个 id（${approvers.file}，存在=${approvers.present}` +
+                        `${config.requireApproverList ? '；宿主设为必须' : ''}）` +
+                        (approvers.ids.length === 0 ? '——名单为空时审批连卡片都不发（refused:approvers-missing）' : ''),
+                )
                 if (config.im.approvalChatIdProblem !== undefined) lines.push(`  ⚠️ ${config.im.approvalChatIdProblem}`)
                 if (config.im.p2pOnlyConfigured && config.im.approvalChatId === '') {
                     lines.push(`  ⚠️ im.p2pOnly 被显式设为 ${config.im.p2pOnly}，但没有 im.approvalChatId：这个要求无从执行`)
                 }
-                // The host's own approval seam (P1): whether THIS plugin answers
-                // it, and what it has decided so far. `off` must read as "we did
-                // not touch it", never as "we answer it and nothing happened".
-                lines.push(
-                    `- IM 审批应答者（approval/request）：${
-                        config.im.approvalVia === 'off'
-                            ? 'off（本插件未注册监听器：审批接缝由宿主原有的应答者回答）'
-                            : `${config.im.approvalVia}（prepend=true：先问 IM；${
-                                  config.im.approvalVia === 'fallback'
-                                      ? '问不了且没发过卡片 → next() 交还原通道；卡片发出后等不到答案 = unavailable）'
-                                      : '问不了一律 unavailable，绝不落回原通道）'
-                              }`
-                    }`,
-                )
                 if (config.im.approvalViaProblem !== undefined) lines.push(`  ⚠️ ${config.im.approvalViaProblem}`)
                 const approvalRows = summary.sources[APPROVAL_SOURCE]
                 if (approvalRows !== undefined && approvalRows.rows > 0) {
@@ -2034,10 +2049,13 @@ export function registerTools(
                 }
                 // Refused answer attempts: "someone tried to answer for the
                 // approver" must be visible, and NOT visible must never read as
-                // "nobody tried" (an upstream without the hook cannot tell us).
-                const ignored = deps.registry.im().ignoredAnswers
+                // "nobody tried" (an unregistered channel or an upstream without
+                // the hook cannot tell us — those are the two "无法观测" cases).
                 if (ignored === undefined) {
-                    lines.push('- IM 被忽略的回答尝试：暂无观测（IM 通道未注册，或还没有走过一次提问）')
+                    lines.push(
+                        '- IM 被忽略的回答尝试：**无法观测**（IM 通道未注册：没有 `onAnswerIgnored` 可挂钩，这里的 0 次**不等于**' +
+                            '"没人试过"）——只有最终结果（超时/拒绝）是可信的',
+                    )
                 } else if (ignored.upstream === 'unavailable') {
                     lines.push(
                         '- IM 被忽略的回答尝试：**无法观测**（上游没有 `onAnswerIgnored`）：这里的 0 次**不等于**"没人试过"，' +
@@ -2046,7 +2064,9 @@ export function registerTools(
                 } else {
                     lines.push(
                         `- IM 被忽略的回答尝试：${ignored.total} 次（发起者不在白名单 ${ignored.bySender} 次，答非所问 ${ignored.byOptions} 次）` +
-                            '——它们**不是**决定，提问仍在等待',
+                            (ignored.total === 0
+                                ? '——上游已接钩子（`onAnswerIgnored`）：这里是**没有发生**，不是"看不到"'
+                                : '——它们**不是**决定，提问仍在等待'),
                     )
                     for (const attempt of ignored.recent.slice(-3)) {
                         lines.push(

@@ -159,6 +159,10 @@ export async function buildOperatorReport(
         expectedPlugins: config.expectedPlugins,
         stores: deps.stores,
         cwd,
+        // The layout the host declared (`config.layout`): the checks that read a
+        // workspace artifact must look where the suite writes it, not at a
+        // hard-coded `.dsh` — a profile may relocate the ledger.
+        layout,
         now,
         // The effective budget, not the raw key: a project value is clamped to the
         // host ceiling in resolveConfig/resolveEffectiveConfig, and the DEFAULT is

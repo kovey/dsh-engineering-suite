@@ -33,6 +33,7 @@
 
 import { randomBytes } from 'node:crypto'
 import type { Attention, AttentionSource } from './attention.js'
+import type { ApprovalVia } from './config.js'
 import { readLedger, summarizeLedger } from './ledger.js'
 
 /** What the suite is sending. */
@@ -294,6 +295,18 @@ export interface ImChannelReport {
     approvalChatId?: string
     /** Whether an answer must be proven to come from a p2p chat (`im.p2pOnly`). */
     p2pOnly?: boolean
+    /**
+     * The configured `im.approvalVia` (host-owned): whether this plugin answers
+     * the host's `approval/request` seam, and in which mode.
+     *
+     * Stated here for the same reason as the target above: the operator's
+     * question is "can an approval actually be decided over IM?", and the answer
+     * starts with this mode. No API of the IM plugin can report it — it is the
+     * HOST's configuration — so the gate publishes what it will actually do.
+     * Absent = this build does not report it (an older service), and that must
+     * never be read as `off`.
+     */
+    approvalVia?: ApprovalVia
     /**
      * Ignored answer attempts observed through the upstream's
      * `onAnswerIgnored` hook. Absent = nothing was observed (either no ask ran

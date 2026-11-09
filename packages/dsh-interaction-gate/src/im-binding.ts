@@ -54,7 +54,7 @@ import {
     type ChatChannelHandle,
     type ChatProbe,
 } from './chat-channel.js'
-import { DEFAULT_IM_REQUIRED_WAIT_MS } from './config.js'
+import { DEFAULT_IM_REQUIRED_WAIT_MS, type ApprovalVia } from './config.js'
 
 /** The slice of the plugin logger this module needs. */
 export interface ImBindingLogger {
@@ -105,6 +105,13 @@ export interface ImBindingOptions {
     approvalChatId?: string
     /** The host's `im.p2pOnly` (reporting only; the per-answer check is in `tools.ts`). */
     p2pOnly?: boolean
+    /**
+     * The host's `im.approvalVia`: who answers the HOST's `approval/request`
+     * seam. Reported only — the answerer itself is installed in `approval.ts`;
+     * this option exists so the verdict an operator reads (`im()` /
+     * `interaction_status`) starts with the mode the deployment actually chose.
+     */
+    approvalVia?: ApprovalVia
     /** The host's ask deadline handed to the adapter. */
     askTimeoutMs: number
     /** Host `redactPatterns` (built-in credential rules always apply too). */
@@ -202,6 +209,11 @@ export function installImChannel(host: ImInjectionHost, options: ImBindingOption
             // "IM 未注册、也没配目标", and the doctor may show either.
             approvalChatId: options.approvalChatId ?? '',
             p2pOnly: options.p2pOnly === true,
+            // Who answers the host's approval seam is reported whether or not
+            // the IM channel is registered: `approvalVia=only` with no channel
+            // is "every approval becomes unavailable", a fact the doctor must be
+            // able to state before somebody is stuck waiting for a card.
+            ...(options.approvalVia === undefined ? {} : { approvalVia: options.approvalVia }),
             reason,
         }
         if (phase !== 'registered') return base

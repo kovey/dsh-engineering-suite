@@ -1,5 +1,29 @@
 ## [未发布]
 
+### 新增 · IM 审批变成可运维的（P2：自检一项 + 状态一处看完）
+
+P1 让宿主的审批接缝能走 IM 了，但"配了 `approvalVia` 却缺目标/名单"的部署会看起来收紧了、实际每一次审批都在发卡之前被拒绝
+（`refused:no-target` / `refused:approvers-missing`）。P2 把这个问题挪到自检阶段，并把四件事实收进 `interaction_status` 的一段。
+
+- **`suite_status` 新增交互段检查 `runtime.im-approval`（必需项）**：读宿主通过 `im()` 报告的生效配置（`im.approvalVia` /
+  `im.approvalChatId` / `im.p2pOnly`——这些是宿主键，仓库文件里根本看不到）与项目级 `approversFile` 指向的审批人名单：
+  - `off` → 一行 `ok`：「审批仍走宿主接缝（TUI）」，**零告警**；进程里根本没有 interaction 服务的默认部署同样只给一行 `ok`；
+  - `fallback`/`only` 且目标与名单齐全 → `ok`，写明模式、目标已配置（可掩码）、名单人数与文件；
+  - 目标缺失或名单为空/不可读 → **必需项失败**，点名 `im.approvalChatId` / 名单文件路径与后果，修复给出两条路：
+    补配置，或把 `im.approvalVia` 设回 `off`；
+  - 服务不报 `approvalVia`（旧版本）→ `unknown` + 升级指引：**读不到不写成 `off`**。
+- **`runtime.im-approval-p2p`（建议项，绝不阻断）**：`im.p2pOnly=true` 而上游可能不报 `chatKind` 时，写明后果
+  （每一次 IM 审批回答都会被按"未证明"拒绝）与两种处置（`im.p2pOnly: false`，或留在 `off`）。上游能力**无法从任何 API 判定**，
+  所以自检不发明探测器，也不把它写成通过。
+- **`interaction_status` 的 IM 段变成「IM 审批（一处看完）」**：模式 / 目标会话（说"已配置/未配置"，不隐藏缺席）/ 审批人名单人数 /
+  被忽略的回答尝试，四行连续；「无法观测」（通道未注册 = 没有钩子可挂；或上游没有 `onAnswerIgnored`）与「没有发生」
+  （已挂钩且 0 次）用不同的词，被忽略尝试的计数与最近几条仍逐条列出。
+- **`dsh-interaction-gate` 的通道报告多一个 `approvalVia` 字段**（只读）：监听器仍由 `approval.ts` 决定是否注册，
+  这个字段只是让自检不必猜 profile 里写了什么。
+- **测试**：`dsh-suite-doctor` 53 → **59**（TC-921/923/924/925/926 + 「旧服务不报 approvalVia 是 unknown」）；
+  `dsh-interaction-gate` 83 → **87**（TC-922 的三种计数措辞 + TC-926 的 `off` 零告警）。
+- **文档**：`docs/ARCHITECTURE.md` §5.18 补"为什么这属于自检，以及为什么 `chatKind` 风险只能是建议"。
+
 ### 新增 · 宿主的审批接缝可以走 IM 回答了（P1，`im.approvalVia`）
 
 在此之前套件自己的提问能到手机上，而**宿主的**审批接缝（`ctx.approval` / `approval/request`）只有一个终端应答者：

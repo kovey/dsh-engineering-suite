@@ -30,14 +30,17 @@
 
 import { SUITE_PLUGINS } from './config.js'
 import { gateObserveCheck } from './observe.js'
+import { APPROVAL_VIA_MODES, approverListOf, imApprovalChecks, type ApprovalVia } from './im-approval.js'
 import {
     PHASES,
     mandateState,
     policyVersion,
+    resolveLayout,
     type AgentLike,
     type CheckState,
     type DoctorCheck,
     type DoctorRuntimeFacts,
+    type Layout,
     type MissionStore,
     type MissionStoreRegistry,
     type PhaseName,
@@ -323,11 +326,34 @@ export interface AttentionFact {
     deadlineAt?: number
 }
 
+/**
+ * The IM approval facts exactly as `dsh-interaction-gate`'s `im()` reports them.
+ *
+ * Structural and all-optional: the service is not part of this package and may
+ * be an older build. `approvalVia` absent is "this service does not report the
+ * mode" — the check turns that into `unknown`, never into `off`.
+ */
+export interface ImApprovalReport {
+    approvalVia?: ApprovalVia
+    approvalChatId?: string
+    p2pOnly?: boolean
+}
+
 /** What the interaction service could (not) answer. */
 export interface InteractionProbe {
+    /** Whether this process mounts an `interaction` service at all. */
+    serviceMounted?: boolean
     /** `undefined` = could not be read; the report renders that as `unknown`. */
     channels?: InteractionChannel[]
     pendingAsks?: PendingAsk[]
+    /**
+     * The IM channel's own report (`im()`), which is the ONLY place the
+     * host-owned approval keys can be read from: `im.approvalVia` /
+     * `im.approvalChatId` / `im.p2pOnly` never live in a repository config file.
+     */
+    imApproval?: ImApprovalReport
+    /** Why the IM approval facts are unknown (an older service, a throwing accessor). */
+    imApprovalProblem?: string
     /** Why the channel fact is unknown. */
     channelsProblem?: string
     /** Why the pending-ask fact is unknown. */
@@ -373,6 +399,15 @@ const ASK_ACCESSORS: readonly string[] = ['pending', 'pendingAsks', 'listPending
  * first, labelled with `whyYou` and a stale reason.
  */
 const ATTENTION_ACCESSORS: readonly string[] = ['attentions', 'attentionQueue', 'attention']
+
+/**
+ * The accessors of the IM channel report, in the order we try them.
+ *
+ * `im()` is the interaction gate's name for "the optional IM channel's verdict";
+ * it is the only surface that can report the HOST-owned approval keys. It is
+ * deliberately single: an alias with different fields would be a different fact.
+ */
+const IM_ACCESSORS: readonly string[] = ['im']
 
 /** Await a probe with a deadline; a hung channel plugin must not hang the doctor. */
 async function settled<T>(value: Promise<T>, timeoutMs: number): Promise<{ value?: T; problem?: string }> {
@@ -513,6 +548,31 @@ function parseAttentions(value: unknown, now: number): { attentions?: AttentionF
 }
 
 /**
+ * Parse the IM channel report; only the three approval facts are read.
+ *
+ * An unusable shape is a `problem`, never a default: reading a missing mode as
+ * `off` would turn "we could not see the configuration" into "approvals are not
+ * over IM", which is exactly the guess this report exists to avoid.
+ */
+function parseImApproval(value: unknown): { report?: ImApprovalReport; problem?: string } {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+        return { problem: `im() 返回的不是 IM 通道报告（收到 ${preview(value)}）` }
+    }
+    const record = value as Record<string, unknown>
+    const raw = record['approvalVia']
+    const mode = typeof raw === 'string' && (APPROVAL_VIA_MODES as readonly string[]).includes(raw) ? (raw as ApprovalVia) : undefined
+    const target = typeof record['approvalChatId'] === 'string' ? record['approvalChatId'] : undefined
+    const p2pOnly = typeof record['p2pOnly'] === 'boolean' ? record['p2pOnly'] : undefined
+    return {
+        report: {
+            ...(mode === undefined ? {} : { approvalVia: mode }),
+            ...(target === undefined ? {} : { approvalChatId: target }),
+            ...(p2pOnly === undefined ? {} : { p2pOnly }),
+        },
+    }
+}
+
+/**
  * Read the `interaction` service, when the host mounts one.
  *
  * The service is NOT part of this suite's default eleven plugins and its shape
@@ -542,7 +602,7 @@ export async function probeInteraction(ctx: ProbeContext, timeoutMs: number, now
         return { channelsProblem: problem, pendingProblem: problem }
     }
     const record = service as Record<string, unknown>
-    const out: InteractionProbe = {}
+    const out: InteractionProbe = { serviceMounted: true }
 
     const channelAccessor = CHANNEL_ACCESSORS.find((key) => typeof record[key] === 'function' || record[key] !== undefined)
     if (channelAccessor === undefined) {
@@ -554,6 +614,24 @@ export async function probeInteraction(ctx: ProbeContext, timeoutMs: number, now
             const parsed = parseChannels(read.value)
             if (parsed.channels === undefined) out.channelsProblem = `interaction.${channelAccessor}(): ${parsed.problem ?? '无法解析通道列表'}`
             else out.channels = parsed.channels
+        }
+    }
+
+    // The IM channel's verdict (`im()`): the only place the HOST-owned approval
+    // keys can be read from. They live in the profile's loader row, never in a
+    // repository config file — so "read the effective interaction config" means
+    // "read what the gate publishes about itself". An older service without
+    // `im()` is `unknown` with the upgrade as the fix, never `off`.
+    const imAccessor = IM_ACCESSORS.find((key) => record[key] !== undefined)
+    if (imAccessor === undefined) {
+        out.imApprovalProblem = `interaction 服务没有暴露 IM 通道报告（试过 ${IM_ACCESSORS.map((key) => `${key}()`).join(' / ')}）：无法判断 im.approvalVia 是哪一档`
+    } else {
+        const read = await readAccessor(record, imAccessor, timeoutMs)
+        if (read.problem !== undefined) out.imApprovalProblem = `interaction.${imAccessor}() 失败：${read.problem}`
+        else {
+            const parsed = parseImApproval(read.value)
+            if (parsed.report === undefined) out.imApprovalProblem = `interaction.${imAccessor}(): ${parsed.problem ?? '无法解析 IM 通道报告'}`
+            else out.imApproval = parsed.report
         }
     }
 
@@ -686,6 +764,13 @@ export interface RuntimeProbeOptions {
     stores: MissionStoreRegistry
     /** The calling agent's workspace (already validated by the tool). */
     cwd: string
+    /**
+     * The workspace layout (`config.layout` applied). Used by the checks that
+     * read a workspace artifact — the IM approver list lives next to the
+     * ledger, and a host that relocated the ledger relocated that too.
+     * Defaults to `resolveLayout(cwd)`.
+     */
+    layout?: Layout
     probeTimeoutMs: number
     /** Explicit mission id; an unknown one is refused, never silently ignored. */
     missionId?: string
@@ -732,6 +817,7 @@ export interface AttentionProbe {
  */
 export async function probeRuntime(options: RuntimeProbeOptions): Promise<RuntimeProbe> {
     const now = options.now ?? Date.now()
+    const layout = options.layout ?? resolveLayout(options.cwd)
     const checks: DoctorCheck[] = []
     const problems: string[] = []
 
@@ -859,6 +945,22 @@ export async function probeRuntime(options: RuntimeProbeOptions): Promise<Runtim
             })
         }
     }
+    // "Can an approval actually be DECIDED over IM?" — a configuration question
+    // a run should not be the first place to learn the answer to. The mode comes
+    // from the gate's own report (the host-owned keys exist nowhere a repository
+    // can read), the whitelist from the file the gate would read. When the seam
+    // is off this is ONE quiet `ok` line: the default deployment is not nagged.
+    const approvalChecks = imApprovalChecks({
+        service: interaction.serviceMounted === true,
+        ...(interaction.imApproval?.approvalVia === undefined ? {} : { mode: interaction.imApproval.approvalVia }),
+        ...(interaction.imApproval?.approvalChatId === undefined ? {} : { target: interaction.imApproval.approvalChatId }),
+        ...(interaction.imApproval?.p2pOnly === undefined ? {} : { p2pOnly: interaction.imApproval.p2pOnly }),
+        ...(interaction.imApprovalProblem === undefined ? {} : { modeProblem: interaction.imApprovalProblem }),
+        approvers: interaction.serviceMounted === true ? approverListOf(layout) : { file: '', present: false, count: 0 },
+    })
+    checks.push(...approvalChecks)
+    if (interaction.imApprovalProblem !== undefined) problems.push(`IM 审批：${interaction.imApprovalProblem}`)
+
     if (interaction.pendingAsks === undefined) {
         problems.push(interaction.pendingProblem ?? '无法读取待回答提问')
         checks.push({

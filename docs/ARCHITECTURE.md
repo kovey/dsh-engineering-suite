@@ -666,6 +666,19 @@ unavailable`。所以本插件在 `approvalVia != off` 时用 **`{ prepend: true
 - **诚实的边界**：瀑布里**表达不出**"先问终端、终端拒绝再问 IM"——最先返回的那个监听器就赢了，所以 `prepend` 的真实含义是
   "我们先问 IM"，而不是"IM 只是兜底"。`only` 则是明确拒绝这种兜底。一个部署若需要"终端优先"，就不该开 `approvalVia`。
 
+**可运维性（P2）：这个问题属于自检，不属于"跑到一半才发现"**：`im.approvalVia` 非 `off` 而缺少 `im.approvalChatId`、
+或审批人名单为空时，**每一次**审批都会在发卡之前被拒绝（`refused:no-target` / `refused:approvers-missing`）——
+这个部署看起来"审批上手机了"，实际一次决定也做不出来，而人只会在需要放行的那一刻才发现。
+所以 `suite_status` 的交互段有一项 `runtime.im-approval`（必需项）：它读宿主通过 `im()` 报告的**生效**配置
+（`im.approvalVia` / `im.approvalChatId` / `im.p2pOnly` 都是宿主键，仓库文件里看不到，只有插件自己知道它要做什么）
+与项目级 `approversFile` 指向的名单，把修复的两条路一起写出来：补配置，或把 `im.approvalVia` 设回 `off`。
+`off`（以及根本没有 interaction 服务的默认部署）只给一行 `ok`——默认部署不该被自己的自检唠叨。
+`im.p2pOnly=true` 与"上游是否在答案里报告 `chatKind`"只能是**建议**（`runtime.im-approval-p2p`，`recommended`）：
+没有任何 API 声明这项上游能力，写一个探测器就等于发明事实，所以报告只写后果（每个 IM 答案都会被按"未证明"拒绝）
+与两种处置（`im.p2pOnly: false`，或留在 `off`）。同一组事实在 `interaction_status` 的「IM 审批」段一处看完：
+模式、目标会话（说"已配置/未配置"，不隐藏缺席）、名单人数、被忽略的回答——其中"无法观测"（没有钩子可挂）与
+"没有发生"（已挂钩、0 次）用不同的词，因为混用会让"看不到"读成"没人试过"。
+
 ### 5.19 授权前史：Mandate v2（准入记录 + 策略版本 + 恢复前重校验）
 
 在此之前，套件只能证明"这次交付被允许"，不能证明"这项工作从一开始就被允许、依据的是哪一版规则"。

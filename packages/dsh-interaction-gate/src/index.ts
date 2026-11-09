@@ -170,6 +170,11 @@ export function apply(ctx: Context, config: unknown = {}): void {
             // (and its approver list) is actually known.
             approvalChatId: resolved.im.approvalChatId,
             p2pOnly: resolved.im.p2pOnly,
+            // Reported, not used here: the listener is installed by
+            // `installApprovalAnswerer` below. Stating the mode on the channel
+            // report is what lets the suite's self-check answer "can an approval
+            // actually be decided over IM?" without reading the host's profile.
+            approvalVia: resolved.im.approvalVia,
             askTimeoutMs: resolved.askTimeoutMs,
             redactPatterns: resolved.redactPatterns,
             registry,
