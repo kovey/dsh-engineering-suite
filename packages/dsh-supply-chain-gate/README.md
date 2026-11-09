@@ -113,7 +113,9 @@ profile（宿主上限）与 `<repo>/.dsh/supply-chain-gate.json`（项目级只
       enabled: true
       requireApprovalForNewDeps: true   # 宿主开关：项目级改不了
       manifests: [go.mod, go.sum, package.json, pnpm-lock.yaml, package-lock.json, yarn.lock,
-                  requirements.txt, pyproject.toml, Cargo.toml, Cargo.lock, pom.xml, build.gradle]
+                  requirements.txt, pyproject.toml, Cargo.toml, Cargo.lock,
+                  composer.json, composer.lock, Gemfile, Gemfile.lock, packages.lock.json,
+                  pom.xml, build.gradle]
       auditCommands: []                 # argv 形式，不过 shell；空 = 依赖侧最多 WARN
       auditSeverities:
         block: [high, critical]
@@ -136,11 +138,11 @@ profile（宿主上限）与 `<repo>/.dsh/supply-chain-gate.json`（项目级只
 
 | 类别 | 处理 |
 |---|---|
-| `go.mod` / `package.json` / `requirements*.txt` / `pyproject.toml`（PEP 621 + poetry）/ `Cargo.toml` | 解析出声明依赖，做 added/removed/changed |
-| `go.sum` / `package-lock.json` / `pnpm-lock.yaml` / `yarn.lock` / `Cargo.lock` | **不解析**（那是传递依赖的洪流），只做孤儿变更判定 |
+| `go.mod` / `package.json` / `requirements*.txt` / `pyproject.toml`（PEP 621 + poetry）/ `Cargo.toml` / `composer.json`（`require` + `require-dev`，跳过 `php`/`ext-*`/`lib-*` 等平台包）/ `Gemfile`（`gem` 行，`group … do` 作为 kind） | 解析出声明依赖，做 added/removed/changed |
+| `go.sum` / `package-lock.json` / `pnpm-lock.yaml` / `yarn.lock` / `Cargo.lock` / `composer.lock` / `Gemfile.lock` / `packages.lock.json` | **不解析**（那是传递依赖的洪流），只做孤儿变更判定；`.NET` 锁文件对比它旁边的 `*.csproj` |
 | `pom.xml` / `build.gradle` | 只观察：变了就报告"无法判断变了什么"（WARN），不静默放过 |
 | 其他名字 | 报一条问题（不支持的清单格式），不参与判定 |
-| `govulncheck`（text / JSON/JSONL）、`npm audit --json`、`pip-audit --format json`、通用 JSON 里带 severity 字段的报告 | 解析成 findings；按 `auditSeverities` 分类 |
+| `govulncheck`（text / JSON/JSONL）、`npm audit --json`、`pip-audit --format json`、`composer audit --format=json`、`cargo audit --json`、`bundler-audit` json、`dotnet list package --vulnerable --format json`、通用 JSON 里带 severity 字段的报告 | 解析成 findings；按 `auditSeverities` 分类 |
 | 短报告里的 "no vulnerabilities found" / "0 vulnerabilities" | 干净（但整段里一旦出现 `Vulnerability #`/`CVE-…`/`GHSA-…`/`"severity":` 就不认这句话） |
 | 其他一切（含空输出、退出码非 0 却没有任何条目） | **problem → BLOCK** |
 
@@ -154,6 +156,7 @@ profile（宿主上限）与 `<repo>/.dsh/supply-chain-gate.json`（项目级只
 | 新增依赖未获批 / 审批通道不可用 / 审批报错 | BLOCK |
 | 锁文件变了而声明文件没变 | BLOCK |
 | 审计报告无法识别、命令启动失败、超时、被 tokenizer 拒绝（含 shell 元字符） | BLOCK |
+| 审计命令退出码非零但报告里有条目（`composer audit` 发现 advisory 就是这样） | **按报告判定**，不因退出码把它当作"看不懂" |
 | 审计条目 severity 在 `block` 名单里 | BLOCK |
 | 审计条目 severity 既不在 `block` 也不在 `warn`（含 `govulncheck`/`pip-audit` 的"报告里没有 severity"） | 报告 + 至少 WARN，**不 BLOCK**；想让它们阻断就把 `"unknown"` 加进 `block` |
 | 清单没变、也没配审计命令 | WARN（"没有可判定的对象"），并说明该配什么——绝不静默 PASS |
@@ -180,6 +183,9 @@ profile（宿主上限）与 `<repo>/.dsh/supply-chain-gate.json`（项目级只
   没配命令 = 依赖是否已知漏洞无人检查——门禁只会给 WARN，不会替你假装检查过。
 - **pip-audit / govulncheck 的报告里没有 severity**，所以默认不 BLOCK（只报告 + WARN），这是刻意的：
   与其编一个 severity，不如把"没有严重度信息"如实标成 `unknown`，并让你显式决定是否阻断。
+- **composer / cargo / bundler / dotnet 的 severity 是"报告里有什么就映射什么"**：composer 的部分 advisory 没有
+  `severity`、cargo 的 `cvss` 只有数值才映射成级别（向量串不猜）、dotnet 的 `severity` 由 SDK 给；缺失一律 `unknown`
+  （不会被悄悄当成 `low`）。composer 的 `abandoned` 与 bundler 的 `unpatched_gems` 各有自己的条目类型，不当成 CVE。
 - **"新增依赖"看的是声明**：锁文件的传递依赖不逐个批准（那是几百条噪声），改由孤儿变更规则兜住；
   版本变更只报告、不要求批准（已知漏洞由审计命令覆盖）。
 - **不判"这个依赖是否可信"**：抢注/投毒/维护者变更/许可证兼容性都不在本插件的判定范围内，

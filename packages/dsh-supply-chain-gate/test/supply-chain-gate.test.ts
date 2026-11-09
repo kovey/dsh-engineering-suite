@@ -19,7 +19,7 @@ import {
     isCredentialPath,
     looksLikeWordList,
 } from '../dist/secrets.js'
-import { classifyFindings, diffManifests, parseAuditOutput } from '../dist/deps.js'
+import { classifyFindings, diffManifests, formatOf, isLockfile, lockfileManifestOf, parseAuditOutput, parseManifest } from '../dist/deps.js'
 import { loadAllowlist, splitAuditCommand } from '../dist/tools.js'
 
 // Fixtures are OBVIOUSLY fake on purpose: the AWS pair is the documented example
@@ -486,6 +486,301 @@ test('severity classification: block, warn, and the honest "unknown" bucket', ()
     assert.deepEqual(strict.blocking.map((finding) => finding.package), ['a', 'c'], '"unknown" can be made blocking by config')
 })
 
+// --- multi-ecosystem manifests and audit reports (TC-1001 … TC-1008) --------
+
+// Fixtures follow the documented shapes of each auditor. They are inline strings
+// on purpose: every value below is obvious test data, and no fixture needs a real
+// advisory database to be meaningful.
+const COMPOSER_AUDIT = JSON.stringify({
+    advisories: {
+        'monolog/monolog': [
+            {
+                advisoryId: 'PKSA-1234',
+                packageName: 'monolog/monolog',
+                affectedVersions: '>=2.0,<2.9.1',
+                title: 'Header injection',
+                cve: 'CVE-2024-12345',
+                link: 'https://example.test/monolog',
+                reportedAt: '2024-01-02T03:04:05+00:00',
+                severity: 'High',
+            },
+        ],
+        'guzzlehttp/guzzle': [
+            {
+                advisoryId: 'PKSA-5678',
+                packageName: 'guzzlehttp/guzzle',
+                affectedVersions: '>=7.0,<7.8.1',
+                title: 'Cookie leak',
+                severity: 'low',
+            },
+        ],
+    },
+    abandoned: {},
+})
+
+const CARGO_AUDIT = JSON.stringify({
+    vulnerabilities: {
+        found: true,
+        count: 2,
+        list: [
+            {
+                advisory: {
+                    id: 'RUSTSEC-2021-0079',
+                    package: 'hyper',
+                    title: 'Integer overflow in parsing',
+                    cvss: 7.5,
+                    aliases: ['CVE-2021-32714'],
+                    url: 'https://rustsec.org/advisories/RUSTSEC-2021-0079',
+                },
+                versions: { patched: ['>=0.14.10'] },
+                package: { name: 'hyper', version: '0.14.9' },
+            },
+            {
+                advisory: { id: 'RUSTSEC-2020-0001', package: 'time', title: 'Segfault in time', aliases: ['CVE-2020-26235'] },
+                package: { name: 'time', version: '0.1.0' },
+            },
+        ],
+    },
+    warnings: {},
+})
+
+const BUNDLER_AUDIT = JSON.stringify({
+    results: [
+        {
+            gem: { name: 'rack', version: '2.0.0' },
+            advisory: {
+                cve: 'CVE-2022-30123',
+                ghsa: 'GHSA-xxxx-yyyy-zzzz',
+                title: 'Shell escape sequence',
+                criticality: 'high',
+                patched_versions: ['~> 2.0.9'],
+            },
+        },
+    ],
+    unpatched_gems: [{ name: 'oldgem', version: '1.0.0' }],
+})
+
+const DOTNET_AUDIT = JSON.stringify({
+    version: 1,
+    parameters: '--vulnerable --format json',
+    projects: [
+        {
+            path: 'src/Demo.csproj',
+            frameworks: [
+                {
+                    framework: 'net8.0',
+                    topLevelPackages: [
+                        {
+                            id: 'Newtonsoft.Json',
+                            resolvedVersion: '12.0.1',
+                            vulnerabilities: [{ severity: 'High', advisoryurl: 'https://github.com/advisories/GHSA-5crp-9r3c-p9vr' }],
+                        },
+                        { id: 'Serilog', resolvedVersion: '3.0.0', vulnerabilities: [] },
+                    ],
+                    transitivePackages: [
+                        {
+                            id: 'System.Text.Json',
+                            resolvedVersion: '6.0.0',
+                            vulnerabilities: [{ severity: 'Moderate', advisoryurl: 'https://github.com/advisories/GHSA-8g4q-xg66-9fp4' }],
+                        },
+                    ],
+                },
+            ],
+        },
+    ],
+})
+
+test('composer.json / composer.lock are PHP declarations and a lockfile (TC-1001, TC-1007)', () => {
+    const before = JSON.stringify({
+        require: { php: '>=8.2', 'ext-json': '*', 'monolog/monolog': '^2.0' },
+        'require-dev': { 'phpunit/phpunit': '^10.0' },
+    })
+    const after = JSON.stringify({
+        require: { php: '>=8.3', 'ext-json': '*', 'lib-icu': '*', 'monolog/monolog': '^3.0', 'guzzlehttp/guzzle': '^7.8' },
+        'require-dev': { 'phpunit/phpunit': '^10.0' },
+    })
+    const diff = diffManifests({ path: 'composer.json', before, after })
+    assert.equal(diff.problem, undefined)
+    assert.equal(diff.format, 'composer.json')
+    assert.deepEqual(diff.added, [{ name: 'guzzlehttp/guzzle', version: '^7.8', kind: 'require' }])
+    assert.deepEqual(diff.changed, [{ name: 'monolog/monolog', from: '^2.0', to: '^3.0', kind: 'require' }])
+    assert.deepEqual(diff.counts, { before: 2, after: 3 }, 'php / ext-* / lib-* are platform packages, not dependencies')
+    // A composer.json WITHOUT a lockfile is a normal declaration, not "unable to judge".
+    const withoutLock = diffManifests({ path: 'composer.json', before: JSON.stringify({ require: {} }), after })
+    assert.equal(withoutLock.problem, undefined)
+    assert.equal(withoutLock.added.length, 3)
+    assert.match(diffManifests({ path: 'composer.json', before: '{not json', after }).problem ?? '', /不是合法 JSON/)
+
+    // composer.lock is recognised as composer.json's lockfile and parses both sections.
+    assert.equal(formatOf('composer.lock'), 'composer.lock')
+    assert.equal(isLockfile('composer.lock'), true)
+    assert.equal(lockfileManifestOf('composer.lock'), 'composer.json')
+    const lock = parseManifest(
+        'composer.lock',
+        JSON.stringify({ packages: [{ name: 'monolog/monolog', version: '3.0.0' }], 'packages-dev': [{ name: 'phpunit/phpunit', version: '10.5.0' }] }),
+    )
+    assert.equal(lock.problem, undefined)
+    assert.deepEqual(lock.entries, [
+        { name: 'monolog/monolog', version: '3.0.0', kind: 'packages' },
+        { name: 'phpunit/phpunit', version: '10.5.0', kind: 'packages-dev' },
+    ])
+})
+
+test('Gemfile declares gem lines (groups as kind) and Gemfile.lock is its lockfile (TC-1006)', () => {
+    const gemfile = [
+        "source 'https://rubygems.org'",
+        '',
+        "gem 'rails', '~> 7.1'",
+        'gem "pg", ">= 1.1", "< 2.0"',
+        '',
+        'group :development, :test do',
+        "  gem 'rspec', '~> 3.13'",
+        'end',
+        '',
+        'gem "local", path: "../local"',
+    ].join('\n')
+    const diff = diffManifests({ path: 'Gemfile', before: "gem 'rails', '~> 7.0'\n", after: gemfile })
+    assert.equal(diff.problem, undefined)
+    assert.equal(diff.format, 'Gemfile')
+    assert.deepEqual(
+        diff.added.map((entry) => `${entry.name}=${entry.version}（${entry.kind}）`),
+        ['local=*（gem）', 'pg=>= 1.1（gem）', 'rspec=~> 3.13（group development,test）'],
+    )
+    assert.deepEqual(diff.changed, [{ name: 'rails', from: '~> 7.0', to: '~> 7.1', kind: 'gem' }])
+    assert.equal(isLockfile('Gemfile.lock'), true)
+    assert.equal(lockfileManifestOf('Gemfile.lock'), 'Gemfile')
+})
+
+test('composer audit JSON becomes findings even on a NON-ZERO exit (TC-1001, TC-1005)', () => {
+    const parsed = parseAuditOutput({ command: 'composer audit --format=json', stdout: COMPOSER_AUDIT, stderr: '', exitCode: 1 })
+    assert.equal(parsed.shape, 'composer-audit-json')
+    assert.equal(parsed.problem, undefined, 'composer exits non-zero when it FINDS advisories: findings win over the exit code')
+    assert.deepEqual(
+        parsed.findings.map((finding) => `${finding.package}:${finding.severity}:${finding.id}`),
+        ['monolog/monolog:high:PKSA-1234', 'guzzlehttp/guzzle:low:PKSA-5678'],
+    )
+    assert.match(parsed.findings[0]?.title ?? '', /受影响版本 >=2\.0,<2\.9\.1/)
+    assert.equal(parsed.findings[0]?.url, 'https://example.test/monolog')
+
+    // Composer 2.x writes a CLEAN report with PHP empty arrays (`[]`, not `{}`):
+    // that must be a clean parse, never a false BLOCK.
+    const clean = parseAuditOutput({
+        command: 'composer audit --format=json',
+        stdout: JSON.stringify({ advisories: [], abandoned: [], filter: [] }),
+        stderr: '',
+        exitCode: 0,
+    })
+    assert.equal(clean.shape, 'composer-audit-json')
+    assert.equal(clean.findings.length, 0)
+    assert.equal(clean.problem, undefined)
+
+    // A non-zero exit with NO findings is still "cannot judge" — the guard is unmoved.
+    const failed = parseAuditOutput({
+        command: 'composer audit --format=json',
+        stdout: JSON.stringify({ advisories: [], abandoned: [] }),
+        stderr: '',
+        exitCode: 1,
+    })
+    assert.equal(failed.shape, 'composer-audit-json')
+    assert.equal(failed.findings.length, 0)
+    assert.match(failed.problem ?? '', /退出码 1 但报告里没有任何条目/)
+})
+
+test('composer `abandoned` entries are their own finding class, never dropped (TC-1002)', () => {
+    const parsed = parseAuditOutput({
+        command: 'composer audit --format=json',
+        // The real shape when there are no advisories: `advisories` is `[]`, and
+        // Composer 2.10 writes `null` for "no replacement was suggested".
+        stdout: JSON.stringify({ advisories: [], abandoned: { 'old/pkg': 'no replacement', 'gone/pkg': null } }),
+        stderr: '',
+        exitCode: 0,
+    })
+    assert.equal(parsed.shape, 'composer-audit-json')
+    assert.equal(parsed.problem, undefined)
+    assert.deepEqual(
+        parsed.findings.map((finding) => `${finding.package}:${finding.kind}:${finding.severity}`),
+        ['gone/pkg:abandoned:unknown', 'old/pkg:abandoned:unknown'],
+        'an abandoned package is not a CVE: it is reported with its own kind and an unknown severity',
+    )
+    assert.match(parsed.findings[1]?.title ?? '', /包已废弃.*no replacement/)
+})
+
+test('cargo audit, bundler-audit and dotnet vulnerable JSON are recognised (TC-1003)', () => {
+    const cargo = parseAuditOutput({ command: 'cargo audit --json', stdout: CARGO_AUDIT, stderr: '', exitCode: 1 })
+    assert.equal(cargo.shape, 'cargo-audit-json')
+    assert.equal(cargo.problem, undefined)
+    assert.deepEqual(
+        cargo.findings.map((finding) => `${finding.package}:${finding.severity}:${finding.id}`),
+        ['hyper:high:RUSTSEC-2021-0079', 'time:unknown:RUSTSEC-2020-0001'],
+    )
+    assert.equal(cargo.findings[0]?.fixedIn, '>=0.14.10', 'the CVSS score maps onto the severity vocabulary')
+    const cleanCargo = parseAuditOutput({
+        command: 'cargo audit --json',
+        stdout: JSON.stringify({ vulnerabilities: { found: false, count: 0, list: [] } }),
+        stderr: '',
+        exitCode: 0,
+    })
+    assert.equal(cleanCargo.shape, 'cargo-audit-json')
+    assert.equal(cleanCargo.findings.length, 0)
+    assert.equal(cleanCargo.problem, undefined)
+
+    const bundler = parseAuditOutput({ command: 'bundle audit check --format json', stdout: BUNDLER_AUDIT, stderr: '', exitCode: 1 })
+    assert.equal(bundler.shape, 'bundler-audit-json')
+    assert.deepEqual(
+        bundler.findings.map((finding) => `${finding.package}:${finding.severity}:${finding.id ?? finding.kind}`),
+        ['rack:high:CVE-2022-30123', 'oldgem:unknown:unpatched'],
+    )
+    assert.equal(bundler.findings[0]?.fixedIn, '~> 2.0.9')
+    const cleanBundler = parseAuditOutput({
+        command: 'bundle audit check --format json',
+        stdout: JSON.stringify({ results: [], unpatched_gems: [] }),
+        stderr: '',
+        exitCode: 0,
+    })
+    assert.equal(cleanBundler.shape, 'bundler-audit-json')
+    assert.equal(cleanBundler.problem, undefined)
+
+    const dotnet = parseAuditOutput({ command: 'dotnet list package --vulnerable --format json', stdout: DOTNET_AUDIT, stderr: '', exitCode: 0 })
+    assert.equal(dotnet.shape, 'dotnet-vulnerable-json')
+    assert.equal(dotnet.problem, undefined)
+    assert.deepEqual(
+        dotnet.findings.map((finding) => `${finding.package}:${finding.severity}:${finding.id}`),
+        ['Newtonsoft.Json:high:GHSA-5crp-9r3c-p9vr', 'System.Text.Json:moderate:GHSA-8g4q-xg66-9fp4'],
+    )
+    assert.equal(dotnet.findings[0]?.url, 'https://github.com/advisories/GHSA-5crp-9r3c-p9vr')
+    // The older SDK shape puts the package lists directly on the project.
+    const flat = parseAuditOutput({
+        command: 'dotnet list package --vulnerable --format json',
+        stdout: JSON.stringify({
+            projects: [
+                {
+                    path: 'src/demo.csproj',
+                    topLevelPackages: [
+                        { id: 'A', resolvedVersion: '1.0.0', vulnerabilities: [{ severity: 'Low', advisoryurl: 'https://example.test/advisories/GHSA-aaaa-bbbb-cccc' }] },
+                    ],
+                },
+            ],
+        }),
+        stderr: '',
+        exitCode: 0,
+    })
+    assert.equal(flat.shape, 'dotnet-vulnerable-json')
+    assert.deepEqual(flat.findings.map((finding) => `${finding.package}:${finding.severity}:${finding.id}`), ['A:low:GHSA-aaaa-bbbb-cccc'])
+})
+
+test('a document that only LOOKS like one of the new shapes still fails closed (TC-1004)', () => {
+    for (const [name, stdout] of [
+        ['composer', JSON.stringify({ advisories: [] })],
+        ['composer', JSON.stringify({ advisories: {} })],
+        ['dotnet', JSON.stringify({ projects: [] })],
+        ['bundler', JSON.stringify({ results: [] })],
+    ] as const) {
+        const parsed = parseAuditOutput({ command: `${name} audit`, stdout, stderr: '', exitCode: 0 })
+        assert.equal(parsed.shape, 'unknown', `${name}: an empty/ambiguous document is not evidence of a clean repository`)
+        assert.match(parsed.problem ?? '', /找不到任何 severity/)
+    }
+})
+
 // --- shell-free command tokenising ------------------------------------------
 
 test('audit commands are tokenised without a shell and shell metacharacters are refused', () => {
@@ -798,6 +1093,140 @@ test('dependency_audit: a audit command that times out BLOCKs (fail-closed)', as
     const out = runText(await fake.runTool('dependency_audit', {}))
     assert.match(out, /裁决：BLOCK/)
     assert.match(out, /审计命令超时（5000ms）后被杀/)
+})
+
+test('dependency_audit: composer advisories on a NON-ZERO exit are judged, not "无法判定" (TC-1001)', async () => {
+    const cwd = gitRepo('scg-composer-')
+    write(cwd, 'composer.json', `${JSON.stringify({ require: { 'monolog/monolog': '^2.0' } }, undefined, 2)}\n`)
+    write(cwd, 'composer.lock', `${JSON.stringify({ packages: [{ name: 'monolog/monolog', version: '2.0.0' }] }, undefined, 2)}\n`)
+    commitAll(cwd, 'base')
+    write(cwd, 'composer.json', `${JSON.stringify({ require: { 'monolog/monolog': '^3.0', 'guzzlehttp/guzzle': '^7.8' } }, undefined, 2)}\n`)
+    write(
+        cwd,
+        'composer.lock',
+        `${JSON.stringify({ packages: [{ name: 'monolog/monolog', version: '3.0.0' }, { name: 'guzzlehttp/guzzle', version: '7.8.0' }] }, undefined, 2)}\n`,
+    )
+    // composer exits 1 when it FINDS advisories — the exact shape that used to
+    // come back as "unable to judge".
+    const command = auditScript(cwd, `process.stdout.write(${JSON.stringify(COMPOSER_AUDIT)}); process.exitCode = 1\n`)
+    const missionId = bindMission(cwd)
+    const fake = host(cwd, { deps: { auditCommands: [command] }, auditTimeoutMs: 8_000 })
+
+    const out = runText(await fake.runTool('dependency_audit', {}))
+    assert.equal(fake.approvals.length, 1)
+    assert.match(fake.approvals[0] ?? '', /guzzlehttp\/guzzle \^7\.8（require）/)
+    assert.match(out, /新增 1/)
+    assert.match(out, /shape=composer-audit-json/)
+    assert.match(out, /findings=2/)
+    assert.match(out, /exit=1/)
+    assert.equal(/无法识别审计输出格式/.test(out), false, 'the exit code must not hide a report it understood')
+    assert.match(out, /裁决：BLOCK/)
+    assert.match(out, /block=1/)
+    assert.equal(gates(cwd, missionId).at(-1)?.state, 'BLOCK')
+    assert.match(artifactText(cwd, missionId), /composer-audit-json/)
+
+    // …and a CLEAN composer report (`[]` for the empty PHP arrays) is a PASS: the
+    // gate must not turn "nothing found" into "unable to judge".
+    const clean = JSON.stringify({ advisories: [], abandoned: [], filter: [] })
+    const cleanCommand = auditScript(cwd, `process.stdout.write(${JSON.stringify(clean)})\n`, 'scripts/clean-audit.js')
+    const cleanHost = host(cwd, { deps: { auditCommands: [cleanCommand] }, auditTimeoutMs: 8_000 })
+    const cleanOut = runText(await cleanHost.runTool('dependency_audit', {}))
+    assert.match(cleanOut, /shape=composer-audit-json/)
+    assert.match(cleanOut, /findings=0/)
+    assert.match(cleanOut, /裁决：PASS/)
+})
+
+test('dependency_audit: composer abandoned packages are their own class (TC-1002)', async () => {
+    const cwd = gitRepo('scg-abandoned-')
+    write(cwd, 'composer.json', `${JSON.stringify({ require: { 'old/pkg': '^1.0' } }, undefined, 2)}\n`)
+    commitAll(cwd, 'base')
+    const abandoned = JSON.stringify({ advisories: {}, abandoned: { 'old/pkg': 'no replacement' } })
+    const command = auditScript(cwd, `process.stdout.write(${JSON.stringify(abandoned)})\n`)
+    const missionId = bindMission(cwd)
+    const fake = host(cwd, { deps: { auditCommands: [command] }, auditTimeoutMs: 8_000 })
+
+    const out = runText(await fake.runTool('dependency_audit', {}))
+    assert.match(out, /shape=composer-audit-json/)
+    assert.match(out, /findings=1/)
+    assert.match(out, /未分类 1/)
+    // Abandoned carries no severity: reported + WARN, never silently dropped and
+    // never a BLOCK unless a host puts "unknown" in the block list.
+    assert.match(out, /裁决：WARN/)
+    assert.match(artifactText(cwd, missionId), /"kind": "abandoned"/)
+})
+
+test('dependency_audit: composer.lock / Gemfile.lock / packages.lock.json are orphan-checked (TC-1006)', async () => {
+    const cwd = gitRepo('scg-orphans-')
+    write(cwd, 'composer.json', `${JSON.stringify({ require: { 'monolog/monolog': '^2.0' } })}\n`)
+    write(cwd, 'composer.lock', `${JSON.stringify({ packages: [{ name: 'monolog/monolog', version: '2.0.0' }] })}\n`)
+    write(cwd, 'Gemfile', "source 'https://rubygems.org'\n\ngem 'rack', '~> 2.0'\n")
+    write(cwd, 'Gemfile.lock', 'GEM\n  specs:\n    rack (2.0.0)\n')
+    write(cwd, 'Demo.csproj', '<Project Sdk="Microsoft.NET.Sdk"></Project>\n')
+    write(cwd, 'packages.lock.json', `${JSON.stringify({ version: 1, dependencies: {} })}\n`)
+    commitAll(cwd, 'base')
+    // Every lockfile changes; none of the declaring manifests does.
+    write(cwd, 'composer.lock', `${JSON.stringify({ packages: [{ name: 'monolog/monolog', version: '2.1.0' }] })}\n`)
+    write(cwd, 'Gemfile.lock', 'GEM\n  specs:\n    rack (2.0.1)\n')
+    write(cwd, 'packages.lock.json', `${JSON.stringify({ version: 1, dependencies: { 'Newtonsoft.Json': {} } })}\n`)
+    const fake = host(cwd, {})
+
+    const out = runText(await fake.runTool('dependency_audit', {}))
+    assert.match(out, /裁决：BLOCK/)
+    assert.match(out, /composer\.lock 变了但 composer\.json 没变/)
+    assert.match(out, /Gemfile\.lock 变了但 Gemfile 没变/)
+    assert.match(out, /packages\.lock\.json 变了但 \*\.csproj 没变/, 'a .NET lockfile belongs to whichever .csproj sits beside it')
+
+    // Now the declarations change too: the same lockfiles are no longer orphans.
+    write(cwd, 'composer.json', `${JSON.stringify({ require: { 'monolog/monolog': '^2.1' } })}\n`)
+    write(cwd, 'Gemfile', "source 'https://rubygems.org'\n\ngem 'rack', '~> 2.0.1'\n")
+    write(cwd, 'Demo.csproj', '<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><Version>2.0.0</Version></PropertyGroup></Project>\n')
+    const together = runText(await fake.runTool('dependency_audit', {}))
+    assert.match(together, /与声明文件一起变更 3 个（正常）/)
+    assert.equal(/裁决：BLOCK/.test(together), false)
+})
+
+test('dependency_audit: a composer.json without a lockfile parses, and the advice names the PHP command (TC-1007)', async () => {
+    const cwd = gitRepo('scg-composer-only-')
+    write(cwd, 'composer.json', `${JSON.stringify({ require: { 'monolog/monolog': '^2.0' } })}\n`)
+    commitAll(cwd, 'base')
+    write(cwd, 'composer.json', `${JSON.stringify({ require: { 'monolog/monolog': '^3.0', 'guzzlehttp/guzzle': '^7.8' } })}\n`)
+    const fake = host(cwd, {})
+
+    const out = runText(await fake.runTool('dependency_audit', {}))
+    assert.match(out, /新增 1/)
+    assert.match(out, /版本变更 1/)
+    assert.match(out, /孤儿变更 0 个/, 'a missing lockfile is not a problem')
+    assert.match(out, /裁决：WARN/, 'no audit command configured: it can only be a WARN, never a PASS')
+    assert.match(out, /composer audit --format=json/)
+})
+
+test('the "no audit command" advice names a command for each detected ecosystem (TC-1008 / AC-004)', async () => {
+    const cwd = gitRepo('scg-advice-')
+    write(cwd, 'go.mod', 'module example.com/demo\n\ngo 1.26\n')
+    write(cwd, 'package.json', `${JSON.stringify({ dependencies: {} })}\n`)
+    write(cwd, 'requirements.txt', 'django==5.0\n')
+    write(cwd, 'Cargo.toml', '[dependencies]\nserde = "1.0"\n')
+    write(cwd, 'composer.json', `${JSON.stringify({ require: {} })}\n`)
+    write(cwd, 'Gemfile', "source 'https://rubygems.org'\n")
+    write(cwd, 'packages.lock.json', `${JSON.stringify({ version: 1, dependencies: {} })}\n`)
+    commitAll(cwd, 'base')
+    const fake = host(cwd, {})
+
+    const out = runText(await fake.runTool('dependency_audit', {}))
+    assert.match(out, /裁决：WARN/)
+    assert.match(out, /配置 deps\.auditCommands/)
+    // The existing suggestions stay, and every detected ecosystem adds its own.
+    assert.match(out, /govulncheck \.\/\.\.\./)
+    assert.match(out, /npm audit --json/)
+    assert.match(out, /pip-audit --format json/)
+    assert.match(out, /cargo audit --json/)
+    assert.match(out, /composer audit --format=json/)
+    assert.match(out, /bundle audit check --format json/)
+    assert.match(out, /dotnet list package --vulnerable --format json/)
+
+    const status = runText(await fake.runTool('supply_chain_status', {}))
+    assert.match(status, /审计命令（0）：\*\*未配置\*\*/)
+    assert.match(status, /composer audit --format=json/)
 })
 
 test('secret_scan never scans the engineering trail, and says so in the design notes', async () => {

@@ -870,7 +870,7 @@ export function registerTools(
                 for (const diff of diffs.filter((entry) => entry.treatment === 'lockfile')) {
                     if (!diff.textChanged) continue
                     const manifest = lockfileManifestOf(diff.path) ?? '(未知)'
-                    const manifestChanged = await manifestChangedAgainstBase(cwd, base, manifest, baseResolved)
+                    const manifestChanged = await manifestChangedAgainstBase(cwd, base, manifest, baseResolved, config.maxFiles)
                     if (manifestChanged) companion.push({ path: diff.path, manifest })
                     else orphans.push({ path: diff.path, manifest })
                 }
@@ -1143,6 +1143,7 @@ export function registerTools(
                 }
 
                 const unclassified = audits.reduce((sum, audit) => sum + audit.unclassified, 0)
+                const auditAdvice = auditAdviceFor(manifestPaths)
                 const report = [
                     ...header,
                     `清单：配置 ${depsConfig.manifests.length} 项 → 命中 ${manifestPaths.length} 个；变更 ${changedManifests.length} 个${changedManifests.length === 0 ? '' : `（${changedManifests.join('、')}）`}`,
@@ -1189,7 +1190,11 @@ export function registerTools(
                                 : '下一步：修掉上面的阻断项（漏洞/审批），改完重跑 dependency_audit。'
                         : state === 'WARN'
                           ? depsConfig.auditCommands.length === 0
-                              ? '下一步：配置 deps.auditCommands（例如 "govulncheck ./..."、"npm audit --json"、"pip-audit --format json"）——没有审计命令时，依赖是否已知漏洞无人检查，所以这里最多只能是 WARN。注意 govulncheck / pip-audit 的输出里没有 severity，要阻断它们请把 "unknown" 加进 deps.auditSeverities.block。'
+                              ? '下一步：配置 deps.auditCommands（例如 "govulncheck ./..."、"npm audit --json"、"pip-audit --format json"）——没有审计命令时，依赖是否已知漏洞无人检查，所以这里最多只能是 WARN。' +
+                                (auditAdvice.length === 0
+                                    ? ''
+                                    : `按检测到的清单，本仓库还可以配：${auditAdvice.map((command) => `"${command}"`).join('、')}（这几家的 JSON 带着 severity 或可映射的 CVSS 分数；缺失的按 "unknown" 报告，不会被当成 low）。`) +
+                                '注意 govulncheck / pip-audit 的输出里没有 severity，要阻断它们请把 "unknown" 加进 deps.auditSeverities.block。'
                               : '下一步：按上面的问题行与"为什么不是 PASS"补齐判定（清单格式/锁文件/未分类 severity），或让人类确认后再交付；本次 WARN 不是"依赖没问题"的结论。'
                           : '下一步：依赖变化已被判定（新增依赖已获人工批准，审计命令已跑且无阻断项）。交付前让最新一条 supply-chain 门禁覆盖当前改动，并注意：审计命令只覆盖它自己认识的那部分生态。',
                 ].join('\n')
@@ -1221,6 +1226,10 @@ export function registerTools(
                 const allowlistFileAbs = path.isAbsolute(config.secretScan.allowlistFile)
                     ? config.secretScan.allowlistFile
                     : path.join(cwd, config.secretScan.allowlistFile)
+                // Advice only, and only when nothing is configured: the status
+                // view must not imply a command was (or should be) run.
+                const auditSuggestions =
+                    config.deps.auditCommands.length === 0 ? auditAdviceFor(resolveManifests(cwd, config.deps.manifests, config.maxFiles)) : []
                 const lines = [
                     '## 供应链门禁现状（supply_chain_status）',
                     '',
@@ -1253,7 +1262,11 @@ export function registerTools(
                     `- 观察清单（${config.deps.manifests.length}）：${config.deps.manifests.join('、')}`,
                     `- 审计命令（${config.deps.auditCommands.length}）：${
                         config.deps.auditCommands.length === 0
-                            ? '**未配置**（依赖是否已知漏洞无人检查 → 依赖侧最多 WARN）'
+                            ? `**未配置**（依赖是否已知漏洞无人检查 → 依赖侧最多 WARN）${
+                                  auditSuggestions.length === 0
+                                      ? ''
+                                      : `；按检测到的清单可以配：${auditSuggestions.map((command) => `\`${command}\``).join('、')}`
+                              }`
                             : config.deps.auditCommands.map((command) => `\`${command}\``).join('、')
                     }`,
                     `- 阻断 severity：${config.deps.auditSeverities.block.join('、') || '(空)'}；警告 severity：${config.deps.auditSeverities.warn.join('、') || '(空)'}（不在两者里的 severity 只报告，可用 "unknown" 显式纳入阻断）`,
@@ -1358,13 +1371,47 @@ function resolveManifests(cwd: string, manifests: readonly string[], maxFiles: n
 }
 
 /** Whether a lockfile's declaring manifest differs from `base` (or is absent there). */
-async function manifestChangedAgainstBase(cwd: string, base: string, manifest: string, baseResolved: boolean): Promise<boolean> {
-    const after = readText(path.join(cwd, manifest))
-    if (after === undefined) return false
+async function manifestChangedAgainstBase(
+    cwd: string,
+    base: string,
+    manifest: string,
+    baseResolved: boolean,
+    maxFiles: number,
+): Promise<boolean> {
     if (!baseResolved) return false
-    const show = await runCommand({ argv: ['git', 'show', `${base}:${manifest}`], cwd, timeoutMs: 20_000 })
-    const before = show.exitCode === 0 ? show.stdout : ''
-    return before !== after
+    // A glob means the declaring manifest's NAME varies (.NET lockfiles belong to
+    // whichever `*.csproj` sits beside them), so it is resolved against the
+    // workspace. Nothing matching = no declaration to compare against, and the
+    // caller then reports an orphan: the lockfile changed without a visible cause.
+    const candidates = manifest.includes('*') || manifest.includes('?') ? resolveManifests(cwd, [manifest], maxFiles) : [manifest]
+    for (const candidate of candidates) {
+        const after = readText(path.join(cwd, candidate))
+        if (after === undefined) continue
+        const show = await runCommand({ argv: ['git', 'show', `${base}:${candidate}`], cwd, timeoutMs: 20_000 })
+        const before = show.exitCode === 0 ? show.stdout : ''
+        if (before !== after) return true
+    }
+    return false
+}
+
+/**
+ * The audit command to suggest for the ecosystems whose manifests were FOUND.
+ *
+ * Advice only: the gate never runs a command it was not configured with, and a
+ * suggestion is not a verdict. Fixed order, so the same repository always renders
+ * the same advice.
+ */
+function auditAdviceFor(manifestPaths: readonly string[]): string[] {
+    const names = new Set(manifestPaths.map((entry) => path.basename(entry)))
+    const advice: string[] = []
+    if (names.has('go.mod')) advice.push('govulncheck ./...')
+    if (names.has('package.json')) advice.push('npm audit --json')
+    if (names.has('pyproject.toml') || [...names].some((name) => /^requirements.*\.txt$/.test(name))) advice.push('pip-audit --format json')
+    if (names.has('Cargo.toml')) advice.push('cargo audit --json')
+    if (names.has('composer.json')) advice.push('composer audit --format=json')
+    if (names.has('Gemfile')) advice.push('bundle audit check --format json')
+    if (names.has('packages.lock.json')) advice.push('dotnet list package --vulnerable --format json')
+    return advice
 }
 
 /** The human reads this before granting a new-dependency allowance. */

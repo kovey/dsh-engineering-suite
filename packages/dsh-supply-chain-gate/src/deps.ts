@@ -9,9 +9,11 @@
  *     instead: a lockfile that changed while its declaring manifest did not.
  *  2. **"Does the auditor say something is wrong?"** — {@link parseAuditOutput}
  *     understands the shapes the common auditors actually print
- *     (`govulncheck`, `npm audit --json`, `pip-audit --format json`) plus a
- *     bounded generic JSON walker. An output it does NOT understand is a
- *     `problem` — the one thing it may never be is "no vulnerabilities found".
+ *     (`govulncheck`, `npm audit --json`, `pip-audit --format json`,
+ *     `composer audit --format=json`, `cargo audit --json`, `bundler-audit`'s
+ *     JSON and `dotnet list package --vulnerable --format json`) plus a bounded
+ *     generic JSON walker. An output it does NOT understand is a `problem` — the
+ *     one thing it may never be is "no vulnerabilities found".
  *
  * The parsers are line/JSON oriented on purpose (no TOML or YAML dependency):
  * they cover the manifest constructs that declare dependencies, and the README
@@ -41,7 +43,15 @@ export interface DependencyChange {
 }
 
 /** Supported manifest formats. */
-export type ManifestFormat = 'go.mod' | 'package.json' | 'requirements.txt' | 'pyproject.toml' | 'Cargo.toml'
+export type ManifestFormat =
+    | 'go.mod'
+    | 'package.json'
+    | 'requirements.txt'
+    | 'pyproject.toml'
+    | 'Cargo.toml'
+    | 'composer.json'
+    | 'composer.lock'
+    | 'Gemfile'
 
 /** The result of diffing one manifest against its base revision. */
 export interface ManifestDiff {
@@ -65,20 +75,33 @@ export interface ManifestDiff {
 }
 
 /** Formats this module can parse. */
-const PARSERS = new Map<string, ManifestFormat>([
+const MANIFESTS = new Map<string, ManifestFormat>([
     ['go.mod', 'go.mod'],
     ['package.json', 'package.json'],
     ['pyproject.toml', 'pyproject.toml'],
     ['Cargo.toml', 'Cargo.toml'],
+    ['composer.json', 'composer.json'],
+    ['composer.lock', 'composer.lock'],
+    ['Gemfile', 'Gemfile'],
 ])
 
-/** Lockfiles: never diffed for new dependencies, only checked for orphan changes. */
+/**
+ * Lockfiles: never diffed for new dependencies, only checked for orphan changes.
+ *
+ * The value is the DECLARING manifest the orphan check compares against. A glob
+ * is allowed when the declaring manifest's name varies (a .NET lockfile belongs
+ * to whichever `*.csproj` sits beside it) — the tool layer resolves it against
+ * the workspace, so "lock changed, manifest did not" stays checkable.
+ */
 const LOCKFILES: ReadonlyMap<string, string> = new Map([
     ['go.sum', 'go.mod'],
     ['package-lock.json', 'package.json'],
     ['pnpm-lock.yaml', 'package.json'],
     ['yarn.lock', 'package.json'],
     ['Cargo.lock', 'Cargo.toml'],
+    ['composer.lock', 'composer.json'],
+    ['Gemfile.lock', 'Gemfile'],
+    ['packages.lock.json', '*.csproj'],
 ])
 
 /**
@@ -117,7 +140,7 @@ export function treatmentOf(path: string): ManifestDiff['treatment'] {
 /** The format for a path, when a parser exists for it. */
 export function formatOf(path: string): ManifestFormat | undefined {
     const name = basename(path)
-    const direct = PARSERS.get(name)
+    const direct = MANIFESTS.get(name)
     if (direct !== undefined) return direct
     if (/^requirements.*\.txt$/.test(name)) return 'requirements.txt'
     return undefined
@@ -140,7 +163,7 @@ export function parseManifest(path: string, text: string): ParsedManifest {
     if (format === undefined) {
         return {
             entries: [],
-            problem: `不支持的清单格式（${basename(path)}）：支持 go.mod / package.json / requirements*.txt / pyproject.toml / Cargo.toml`,
+            problem: `不支持的清单格式（${basename(path)}）：支持 go.mod / package.json / requirements*.txt / pyproject.toml / Cargo.toml / composer.json / composer.lock / Gemfile`,
         }
     }
     switch (format) {
@@ -154,6 +177,12 @@ export function parseManifest(path: string, text: string): ParsedManifest {
             return { format, entries: parsePyproject(text) }
         case 'Cargo.toml':
             return { format, entries: parseCargo(text) }
+        case 'composer.json':
+            return parseComposerJson(text)
+        case 'composer.lock':
+            return parseComposerLock(text)
+        case 'Gemfile':
+            return { format, entries: parseGemfile(text) }
     }
 }
 
@@ -350,6 +379,127 @@ function parseCargo(text: string): DependencyEntry[] {
     return entries
 }
 
+// --- composer.json ----------------------------------------------------------
+
+/**
+ * `require` / `require-dev`.
+ *
+ * Composer's PLATFORM packages are skipped: `php`, `ext-*`, `lib-*` and the
+ * `composer-plugin-api` / `composer-runtime-api` constraints are requirements on
+ * the runtime, not installable dependencies. Counting them would report a
+ * phantom "new dependency" on every PHP upgrade — the same reason pyproject
+ * skips `python`.
+ */
+function parseComposerJson(text: string): ParsedManifest {
+    let parsed: unknown
+    try {
+        parsed = JSON.parse(text)
+    } catch (error) {
+        return {
+            format: 'composer.json',
+            entries: [],
+            problem: `composer.json 不是合法 JSON（${error instanceof Error ? error.message : String(error)}）：无法判定依赖变化`,
+        }
+    }
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+        return { format: 'composer.json', entries: [], problem: 'composer.json 顶层不是对象' }
+    }
+    const entries: DependencyEntry[] = []
+    for (const section of ['require', 'require-dev']) {
+        const value = (parsed as Record<string, unknown>)[section]
+        if (typeof value !== 'object' || value === null || Array.isArray(value)) continue
+        for (const [name, version] of Object.entries(value as Record<string, unknown>)) {
+            if (typeof version !== 'string') continue
+            if (isComposerPlatformPackage(name)) continue
+            entries.push({ name, version, kind: section })
+        }
+    }
+    return { format: 'composer.json', entries }
+}
+
+/** Whether a `require` key names a Composer platform package, not a library. */
+function isComposerPlatformPackage(name: string): boolean {
+    return name === 'php' || /^ext-/.test(name) || /^lib-/.test(name) || name === 'composer-plugin-api' || name === 'composer-runtime-api'
+}
+
+// --- composer.lock ----------------------------------------------------------
+
+/**
+ * `packages[]` / `packages-dev[]`, each an object with `name` and `version`.
+ *
+ * A lockfile is never diffed for new dependencies (its delta is a flood of
+ * transitive pins), so this parser serves `parseManifest` callers and the
+ * artifact's format label; the orphan check is the table lookup above.
+ */
+function parseComposerLock(text: string): ParsedManifest {
+    let parsed: unknown
+    try {
+        parsed = JSON.parse(text)
+    } catch (error) {
+        return {
+            format: 'composer.lock',
+            entries: [],
+            problem: `composer.lock 不是合法 JSON（${error instanceof Error ? error.message : String(error)}）：无法判定锁文件内容`,
+        }
+    }
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+        return { format: 'composer.lock', entries: [], problem: 'composer.lock 顶层不是对象' }
+    }
+    const entries: DependencyEntry[] = []
+    for (const section of ['packages', 'packages-dev']) {
+        const value = (parsed as Record<string, unknown>)[section]
+        if (!Array.isArray(value)) continue
+        for (const raw of value) {
+            if (typeof raw !== 'object' || raw === null) continue
+            const record = raw as Record<string, unknown>
+            const name = typeof record['name'] === 'string' ? record['name'] : undefined
+            if (name === undefined || name === '') continue
+            entries.push({ name, version: typeof record['version'] === 'string' ? record['version'] : '*', kind: section })
+        }
+    }
+    return { format: 'composer.lock', entries }
+}
+
+// --- Gemfile ----------------------------------------------------------------
+
+/**
+ * `gem 'name', '~> 1.0'` declarations, grouped by the surrounding `group … do`
+ * block (one level: a nested group is recorded under the inner one).
+ *
+ * Bounded on purpose — this is not a Ruby parser. `gemspec` (dependencies come
+ * from a gemspec) and `eval_gemfile` are NOT followed, only the FIRST version
+ * constraint after the name is read, and a `gem` line inside an `if` is still
+ * read: being wrong about scope is better than dropping a declaration the
+ * repository actually has.
+ */
+function parseGemfile(text: string): DependencyEntry[] {
+    const entries: DependencyEntry[] = []
+    let kind = 'gem'
+    for (const raw of text.split('\n')) {
+        const line = raw.replace(/(^|\s)#.*$/, '').trim()
+        if (line === '') continue
+        const group = /^group\s+(.+?)\s+do\b/.exec(line)
+        if (group !== null) {
+            const names = (group[1] ?? '')
+                .replace(/:/g, '')
+                .replace(/\s*,\s*/g, ',')
+                .trim()
+            kind = `group ${names}`
+            continue
+        }
+        if (line === 'end') {
+            kind = 'gem'
+            continue
+        }
+        const declared = /^gem\s+(['"])([^'"]+)\1\s*(?:,\s*(['"])([^'"]*)\3)?/.exec(line)
+        const name = declared?.[2]
+        if (name === undefined || name === '') continue
+        const version = (declared?.[4] ?? '').trim()
+        entries.push({ name, version: version === '' ? '*' : version, kind })
+    }
+    return entries
+}
+
 // --- a bounded TOML-lite reader --------------------------------------------
 
 /** One `key = value` line with the section path it lives under. */
@@ -439,15 +589,22 @@ export type AuditShape =
     | 'govulncheck-text'
     | 'npm-audit-json'
     | 'pip-audit-json'
+    | 'composer-audit-json'
+    | 'cargo-audit-json'
+    | 'bundler-audit-json'
+    | 'dotnet-vulnerable-json'
     | 'generic-json'
     | 'text-clean'
     | 'unknown'
+
+/** What kind of entry a finding is (a CVE-less entry is still an entry). */
+export type AuditFindingKind = 'vulnerability' | 'abandoned' | 'unpatched'
 
 /** One vulnerability an auditor reported. */
 export interface AuditFinding {
     /** Package / module the finding is about, when the shape says. */
     package?: string
-    /** Advisory id (`GO-2022-0969`, `GHSA-…`, `CVE-…`). */
+    /** Advisory id (`GO-2022-0969`, `GHSA-…`, `CVE-…`, `RUSTSEC-…`). */
     id?: string
     /** Lower-case severity, or `unknown` when the report carries none. */
     severity: string
@@ -455,6 +612,12 @@ export interface AuditFinding {
     url?: string
     /** Version the auditor says fixes it, when reported. */
     fixedIn?: string
+    /**
+     * Entry class. Defaults to `vulnerability`; `abandoned` (composer) and
+     * `unpatched` (bundler-audit) are NOT CVEs and are reported as their own
+     * class instead of being dropped or disguised as one.
+     */
+    kind?: AuditFindingKind
 }
 
 /** The result of parsing one audit command's output. */
@@ -540,7 +703,8 @@ export function parseAuditOutput(input: {
         findings: [],
         problem:
             `无法识别审计输出格式（${text.length} 字节、${text.split('\n').length} 行）：` +
-            '既不是 govulncheck / npm audit --json / pip-audit --format json，也不是"没有漏洞"的结论。' +
+            '既不是 govulncheck / npm audit --json / pip-audit --format json / composer audit --format=json / cargo audit --json / ' +
+            'bundler-audit json / dotnet list package --vulnerable json，也不是"没有漏洞"的结论。' +
             '按 fail-closed 处理为 BLOCK —— 未识别的报告不等于干净的仓库。',
     }
 }
@@ -582,17 +746,38 @@ function tryJsonl(text: string): unknown[] | undefined {
     return out
 }
 
+/** Whether a value is a JSON object (not null, and not an array). */
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+    return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
 /** Recognise a parsed JSON document. */
 function shapeJson(document: unknown): AuditParseResult {
     if (typeof document !== 'object' || document === null) {
         return { shape: 'unknown', findings: [], problem: '审计输出是合法 JSON 但不是对象（无法判定）' }
     }
     const record = document as Record<string, unknown>
-    if (typeof record['vulnerabilities'] === 'object' && record['vulnerabilities'] !== null && !Array.isArray(record['vulnerabilities'])) {
-        return { shape: 'npm-audit-json', findings: parseNpmAudit(record['vulnerabilities'] as Record<string, unknown>) }
+    // Order matters: cargo audit's `vulnerabilities` is ONE object
+    // (found/count/list) while npm's is a map keyed by package name, so the
+    // stricter shape is tested first. Composer's `advisories` is likewise a map
+    // of ARRAYS and cannot be confused with npm's (objects keyed by id).
+    if (isComposerAudit(record)) {
+        return { shape: 'composer-audit-json', findings: parseComposerAudit(record) }
+    }
+    if (isCargoAudit(record)) {
+        return { shape: 'cargo-audit-json', findings: parseCargoAudit(record) }
+    }
+    if (isPlainObject(record['vulnerabilities'])) {
+        return { shape: 'npm-audit-json', findings: parseNpmAudit(record['vulnerabilities']) }
     }
     if (Array.isArray(record['dependencies'])) {
         return { shape: 'pip-audit-json', findings: parsePipAudit(record['dependencies']) }
+    }
+    if (isBundlerAudit(record)) {
+        return { shape: 'bundler-audit-json', findings: parseBundlerAudit(record) }
+    }
+    if (isDotnetVulnerable(record)) {
+        return { shape: 'dotnet-vulnerable-json', findings: parseDotnetVulnerable(record) }
     }
     if (record['finding'] !== undefined || Array.isArray(record['findings'])) {
         return { shape: 'govulncheck-json', findings: parseGovulncheckJson([record]) }
@@ -671,6 +856,266 @@ function parsePipAudit(dependencies: readonly unknown[]): AuditFinding[] {
         }
     }
     return sortFindings(findings)
+}
+
+// --- composer audit ---------------------------------------------------------
+
+/**
+ * `composer audit --format=json`:
+ * `{ "advisories": { "vendor/pkg": [ { advisoryId, packageName,
+ * affectedVersions, title, cve?, link?, reportedAt?, severity? } ] },
+ * "abandoned": { "vendor/pkg": "no replacement" | true | null } }`.
+ *
+ * The recogniser requires the per-package ARRAY (composer groups advisories that
+ * way). npm v6's `advisories` map holds OBJECTS keyed by advisory id, so it is
+ * not mistaken for composer's report.
+ *
+ * A CLEAN composer report is `{"advisories": [], "abandoned": [], "filter": []}`:
+ * Composer encodes PHP arrays with `JsonFile::encode` (no `JSON_FORCE_OBJECT`),
+ * so "nothing found" is `[]`, not `{}` — verified against Composer 2.10's
+ * `AuditCommand` source. Both spellings are accepted, but only when BOTH keys are
+ * present: `{"advisories":[]}` alone is not evidence of a clean PHP project.
+ */
+function isComposerAudit(record: Record<string, unknown>): boolean {
+    const advisories = record['advisories']
+    const abandoned = record['abandoned']
+    const abandonedIsReport = isPlainObject(abandoned) || (Array.isArray(abandoned) && abandoned.length === 0)
+    if (isPlainObject(advisories)) {
+        if (Object.values(advisories).some(Array.isArray)) return true
+        if (Object.keys(advisories).length === 0 && abandonedIsReport) return true
+    }
+    if (Array.isArray(advisories) && advisories.length === 0) return abandonedIsReport
+    return advisories === undefined && isPlainObject(abandoned) && Object.keys(abandoned).length > 0
+}
+
+/** One finding per advisory, plus one per abandoned package (its own class). */
+function parseComposerAudit(record: Record<string, unknown>): AuditFinding[] {
+    const findings: AuditFinding[] = []
+    const advisories = isPlainObject(record['advisories']) ? record['advisories'] : {}
+    for (const [pkg, raw] of Object.entries(advisories)) {
+        if (!Array.isArray(raw)) continue
+        for (const item of raw) {
+            if (!isPlainObject(item)) continue
+            const affected = typeof item['affectedVersions'] === 'string' && item['affectedVersions'] !== '' ? item['affectedVersions'] : undefined
+            const title = typeof item['title'] === 'string' && item['title'] !== '' ? item['title'] : undefined
+            const id =
+                typeof item['advisoryId'] === 'string' && item['advisoryId'] !== ''
+                    ? item['advisoryId']
+                    : typeof item['cve'] === 'string' && item['cve'] !== ''
+                      ? item['cve']
+                      : undefined
+            findings.push({
+                package: typeof item['packageName'] === 'string' && item['packageName'] !== '' ? item['packageName'] : pkg,
+                ...(id === undefined ? {} : { id }),
+                // Composer reports a severity for many (not all) advisories; the
+                // affected range is NOT a fix version, so it goes into the title.
+                severity: normalizeSeverity(item['severity']),
+                ...(title === undefined ? {} : { title: affected === undefined ? title : `${title}（受影响版本 ${affected}）` }),
+                ...(typeof item['link'] === 'string' && item['link'] !== '' ? { url: item['link'] } : {}),
+            })
+        }
+    }
+    const abandoned = isPlainObject(record['abandoned']) ? record['abandoned'] : {}
+    for (const [pkg, raw] of Object.entries(abandoned)) {
+        // `getReplacementPackage()` is `?string` (null = no suggestion); older
+        // Composer wrote `true` for the same state.
+        const replacement = typeof raw === 'string' ? raw : raw === true || raw === null ? 'no replacement' : undefined
+        findings.push({
+            package: pkg,
+            kind: 'abandoned',
+            severity: 'unknown',
+            title: `包已废弃（abandoned）${replacement === undefined ? '' : `：${replacement}`}`,
+        })
+    }
+    return sortFindings(findings)
+}
+
+// --- cargo audit ------------------------------------------------------------
+
+/**
+ * `cargo audit --json`:
+ * `{ "vulnerabilities": { "found": bool, "count": n, "list": [ { "advisory":
+ * { id, package, title, cvss?, aliases? }, "package": { name, version },
+ * "versions": { "patched": [ … ] } } ] } }`.
+ */
+function isCargoAudit(record: Record<string, unknown>): boolean {
+    const vulnerabilities = record['vulnerabilities']
+    if (!isPlainObject(vulnerabilities)) return false
+    return typeof vulnerabilities['found'] === 'boolean' || Array.isArray(vulnerabilities['list'])
+}
+
+/** `cvss` is a number (or numeric string) on current cargo-audit, a vector on old ones. */
+function parseCargoAudit(record: Record<string, unknown>): AuditFinding[] {
+    const findings: AuditFinding[] = []
+    const vulnerabilities = isPlainObject(record['vulnerabilities']) ? record['vulnerabilities'] : {}
+    const list = Array.isArray(vulnerabilities['list']) ? vulnerabilities['list'] : []
+    for (const raw of list) {
+        if (!isPlainObject(raw)) continue
+        const advisory = isPlainObject(raw['advisory']) ? raw['advisory'] : {}
+        const pkg = isPlainObject(raw['package']) ? raw['package'] : {}
+        const aliases = Array.isArray(advisory['aliases']) ? advisory['aliases'].filter((entry): entry is string => typeof entry === 'string') : []
+        const id =
+            typeof advisory['id'] === 'string' && advisory['id'] !== ''
+                ? advisory['id']
+                : (aliases.find((entry) => /^CVE-/i.test(entry)) ?? aliases[0])
+        const cvss = advisory['cvss']
+        // A CVSS SCORE is a severity in disguise (normalizeSeverity's documented
+        // mapping); a vector string (`CVSS:3.1/AV:N/…`) carries no level we can
+        // read here, so it falls through to the advisory's own severity field
+        // and finally to `unknown` — never silently to "low".
+        const score =
+            typeof cvss === 'number'
+                ? cvss
+                : typeof cvss === 'string' && cvss.trim() !== '' && Number.isFinite(Number(cvss))
+                  ? Number(cvss)
+                  : undefined
+        const patched =
+            isPlainObject(raw['versions']) && Array.isArray(raw['versions']['patched'])
+                ? raw['versions']['patched'].filter((entry): entry is string => typeof entry === 'string')
+                : []
+        const name = typeof pkg['name'] === 'string' ? pkg['name'] : typeof advisory['package'] === 'string' ? advisory['package'] : undefined
+        findings.push({
+            ...(name === undefined ? {} : { package: name }),
+            ...(id === undefined ? {} : { id }),
+            severity: normalizeSeverity(score ?? advisory['severity']),
+            ...(typeof advisory['title'] === 'string' && advisory['title'] !== '' ? { title: advisory['title'] } : {}),
+            ...(typeof advisory['url'] === 'string' && advisory['url'] !== '' ? { url: advisory['url'] } : {}),
+            ...(patched.length === 0 ? {} : { fixedIn: patched.join(', ') }),
+        })
+    }
+    return sortFindings(findings)
+}
+
+// --- bundler-audit ----------------------------------------------------------
+
+/**
+ * `bundle audit check --format json`:
+ * `{ "results": [ { "gem": { name, version }, "advisory": { cve?, ghsa?, title,
+ * criticality?, patched_versions? } } ], "unpatched_gems"?: [ { name, version } ] }`.
+ */
+function isBundlerAudit(record: Record<string, unknown>): boolean {
+    const results = record['results']
+    if (!Array.isArray(results)) return false
+    if (results.some((item) => isPlainObject(item) && isPlainObject(item['gem']) && isPlainObject(item['advisory']))) return true
+    // A CLEAN bundler-audit report is `results: []` plus `unpatched_gems: []`. A
+    // bare `{"results":[]}` from some other tool is NOT assumed clean.
+    return Array.isArray(record['unpatched_gems'])
+}
+
+/** Gems with a patched version, then gems the auditor says are unpatched. */
+function parseBundlerAudit(record: Record<string, unknown>): AuditFinding[] {
+    const findings: AuditFinding[] = []
+    const results = Array.isArray(record['results']) ? record['results'] : []
+    for (const raw of results) {
+        if (!isPlainObject(raw)) continue
+        const gem = isPlainObject(raw['gem']) ? raw['gem'] : {}
+        const advisory = isPlainObject(raw['advisory']) ? raw['advisory'] : {}
+        const id =
+            typeof advisory['cve'] === 'string' && advisory['cve'] !== ''
+                ? advisory['cve']
+                : typeof advisory['ghsa'] === 'string' && advisory['ghsa'] !== ''
+                  ? advisory['ghsa']
+                  : undefined
+        const patched = Array.isArray(advisory['patched_versions'])
+            ? advisory['patched_versions'].filter((entry): entry is string => typeof entry === 'string')
+            : []
+        findings.push({
+            ...(typeof gem['name'] === 'string' ? { package: gem['name'] } : {}),
+            ...(id === undefined ? {} : { id }),
+            severity: normalizeSeverity(advisory['criticality']),
+            ...(typeof advisory['title'] === 'string' && advisory['title'] !== '' ? { title: advisory['title'] } : {}),
+            ...(patched.length === 0 ? {} : { fixedIn: patched.join(', ') }),
+        })
+    }
+    const unpatched = Array.isArray(record['unpatched_gems']) ? record['unpatched_gems'] : []
+    for (const raw of unpatched) {
+        if (!isPlainObject(raw)) continue
+        const name = typeof raw['name'] === 'string' && raw['name'] !== '' ? raw['name'] : undefined
+        if (name === undefined) continue
+        const version = typeof raw['version'] === 'string' && raw['version'] !== '' ? raw['version'] : undefined
+        findings.push({
+            package: name,
+            kind: 'unpatched',
+            severity: 'unknown',
+            title: `${name}${version === undefined ? '' : `@${version}`} 没有可用的修复版本（unpatched）`,
+        })
+    }
+    return sortFindings(findings)
+}
+
+// --- dotnet list package --vulnerable ---------------------------------------
+
+/**
+ * `dotnet list package --vulnerable --format json`:
+ * `{ "projects": [ { "frameworks": [ { "topLevelPackages": [ { id,
+ * resolvedVersion, vulnerabilities: [ { severity, advisoryurl } ] } ],
+ * "transitivePackages": [ … ] } ] } ] }`.
+ *
+ * The SDK's JSON spells the field `advisoryurl` (lower case); `advisoryUrl` is
+ * accepted too. An older SDK shape puts the package lists directly on the
+ * project (no `frameworks`), which is also read — a project with neither is NOT
+ * this shape, so an unrelated `{"projects": […]}` still fails closed.
+ */
+function isDotnetVulnerable(record: Record<string, unknown>): boolean {
+    const projects = record['projects']
+    if (!Array.isArray(projects)) return false
+    return projects.some(
+        (project) =>
+            isPlainObject(project) &&
+            (Array.isArray(project['frameworks']) || Array.isArray(project['topLevelPackages']) || Array.isArray(project['transitivePackages'])),
+    )
+}
+
+/** One finding per (package, vulnerability) pair; packages without one are quiet. */
+function parseDotnetVulnerable(record: Record<string, unknown>): AuditFinding[] {
+    const findings: AuditFinding[] = []
+    const projects = Array.isArray(record['projects']) ? record['projects'] : []
+    for (const project of projects) {
+        if (!isPlainObject(project)) continue
+        const scopes: Record<string, unknown>[] = Array.isArray(project['frameworks']) ? project['frameworks'].filter(isPlainObject) : [project]
+        for (const scope of scopes) {
+            for (const section of ['topLevelPackages', 'transitivePackages']) {
+                const packages = Array.isArray(scope[section]) ? scope[section] : []
+                for (const raw of packages) {
+                    if (!isPlainObject(raw)) continue
+                    const id = typeof raw['id'] === 'string' && raw['id'] !== '' ? raw['id'] : undefined
+                    if (id === undefined) continue
+                    const version = typeof raw['resolvedVersion'] === 'string' && raw['resolvedVersion'] !== '' ? raw['resolvedVersion'] : undefined
+                    const advisories = Array.isArray(raw['vulnerabilities']) ? raw['vulnerabilities'].filter(isPlainObject) : []
+                    for (const advisory of advisories) {
+                        const url =
+                            typeof advisory['advisoryurl'] === 'string'
+                                ? advisory['advisoryurl']
+                                : typeof advisory['advisoryUrl'] === 'string'
+                                  ? advisory['advisoryUrl']
+                                  : undefined
+                        const advisoryId = advisoryIdFromUrl(url)
+                        findings.push({
+                            package: id,
+                            ...(advisoryId === undefined ? {} : { id: advisoryId }),
+                            severity: normalizeSeverity(advisory['severity']),
+                            title: `${id}${version === undefined ? '' : `@${version}`} 存在已知漏洞（${
+                                section === 'transitivePackages' ? '传递依赖' : '直接依赖'
+                            }）`,
+                            ...(url === undefined || url === '' ? {} : { url }),
+                        })
+                    }
+                }
+            }
+        }
+    }
+    return sortFindings(findings)
+}
+
+/** The advisory id embedded in a dotnet advisory URL (`…/advisories/GHSA-…`). */
+function advisoryIdFromUrl(url: string | undefined): string | undefined {
+    if (url === undefined || url === '') return undefined
+    const withoutQuery = url.split(/[?#]/)[0] ?? ''
+    const last = withoutQuery
+        .split('/')
+        .filter((segment) => segment !== '')
+        .at(-1)
+    return last !== undefined && /^(?:GHSA|CVE|RUSTSEC|GO)-[A-Za-z0-9-]{4,}$/i.test(last) ? last : undefined
 }
 
 /** govulncheck JSON/JSONL: `finding.trace[].vulnerability` + `finding.osv`. */

@@ -113,6 +113,11 @@ export const DEFAULT_MANIFESTS: readonly string[] = [
     'pyproject.toml',
     'Cargo.toml',
     'Cargo.lock',
+    'composer.json',
+    'composer.lock',
+    'Gemfile',
+    'Gemfile.lock',
+    'packages.lock.json',
     'pom.xml',
     'build.gradle',
 ]

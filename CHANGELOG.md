@@ -1,5 +1,20 @@
 ## [未发布]
 
+### 新增 · `dependency_audit` 认识 PHP composer / Rust cargo / Ruby bundler / .NET 的报告
+
+一个 PHP 仓库的 `dependency_audit` 会返回 `BLOCK(无法判定)`：清单只认 go/npm/pip/Cargo，报告只认
+govulncheck/npm/pip-audit——两端都不认识 composer。两端都补上了：
+
+- 清单：`composer.json`（`require` + `require-dev`，跳过 `php`/`ext-*`/`lib-*` 等平台包）、`composer.lock`、
+  `Gemfile`；锁文件表新增 `composer.lock` / `Gemfile.lock` / `packages.lock.json`（`.NET` 的锁文件对比它旁边的
+  `*.csproj`）。孤儿锁检测仍是表查询，glob 由工具层解析；
+- 报告：`composer audit --format=json`（`advisories` 逐条成 finding、`abandoned` 单独一类）、`cargo audit --json`
+  （`vulnerabilities.list`，`cvss` 数值映射成级别）、`bundler-audit` json（`results` + `unpatched_gems`）、
+  `dotnet list package --vulnerable --format json`（`projects[].frameworks[].topLevel/transitivePackages`）。
+  四种都有严格的顶层识别，认不出来仍是 `problem` → BLOCK；
+- composer 发现 advisory 时**退出码非零**：报告里有条目就按报告判定（"非零且没有任何条目"仍然无法判定）；
+- 没配审计命令时，配置建议按**检测到的清单**给出对应命令（composer/cargo/bundler/dotnet）。
+
 ### 新增 · `im.unmappedWorkspace: local`：没配映射的工作区降级到本地审批，而不是卡死
 
 P3.2 的默认策略是 `refuse`——未映射的工作区**一次决定也做不出来**（`refused:no-workspace-mapping`）。
