@@ -427,3 +427,33 @@ test('TC-917 approvalVia=off（默认）：不注册任何监听器，请求落�
     assert.ok(built.question.includes('发起方没有给出原因'), '没有原因时必须如实说，不要编一个')
     assert.ok(built.question.includes('工具 bash'), built.question)
 })
+
+test('TC-991 未命中 + local + fallback：审批交还原通道（TUI），一张卡都没发', async () => {
+    const cwd = tempWorkspace('interaction-p1-local-')
+    const channel = scriptedChannel('chat-interaction')
+    const { fake, behind } = assemble(cwd, TARGET('fallback', {
+        approvals: [{ workspace: '/definitely/elsewhere', chatId: 'oc_other_room' }],
+        unmappedWorkspace: 'local',
+    }), channel)
+    const tui = behind('allowed-once')
+
+    const outcome = await fake.waterfall('approval/request', approvalRequest(fake.agent), () => 'unavailable')
+    assert.equal(outcome, 'allowed-once', 'local：审批该由宿主接缝决定（next() 的下层）')
+    assert.equal(tui.calls(), 1, '下层应答者必须被问到，且正好一次')
+    assert.equal(channel.sent.length, 0, 'local 策略下不允许发出任何 IM 卡片')
+})
+
+test('TC-993 未命中 + local + only：矛盾配置返回 unavailable，且不调用 next()', async () => {
+    const cwd = tempWorkspace('interaction-p1-local-only-')
+    const channel = scriptedChannel('chat-interaction')
+    const { fake, behind } = assemble(cwd, TARGET('only', {
+        approvals: [{ workspace: '/definitely/elsewhere', chatId: 'oc_other_room' }],
+        unmappedWorkspace: 'local',
+    }), channel)
+    const tui = behind('allowed-once')
+
+    const outcome = await fake.waterfall('approval/request', approvalRequest(fake.agent), () => 'unavailable')
+    assert.equal(outcome, 'unavailable', 'only 表示"IM 或无人决定"，不得悄悄回落')
+    assert.equal(tui.calls(), 0, 'only 不允许调用 next()')
+    assert.equal(channel.sent.length, 0)
+})

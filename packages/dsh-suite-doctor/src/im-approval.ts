@@ -98,7 +98,7 @@ export interface WorkspaceMappingFact {
     configured?: boolean
     declared?: number
     usable?: number
-    policy?: 'refuse' | 'host-default'
+    policy?: 'refuse' | 'host-default' | 'local'
     workspace?: string
     resolved?: string
     realpathProblem?: string
@@ -357,6 +357,45 @@ function workspaceMappingCheckOf(mode: ApprovalVia, mapping: WorkspaceMappingFac
     const entryHint =
         `{ "workspace": ${JSON.stringify(where)}, "chatId": "<该工作区与 bot 私聊的会话 id>" }` +
         '（approvers 省略则回落到宿主名单，写上则替换它）'
+    if ((mapping.policy ?? 'refuse') === 'local') {
+        // `local` is a written-down policy, not a gap: approvals for this
+        // workspace stay on the host seam (TUI) and no IM card is ever sent, so
+        // there is nothing to fail. The one combination that must not pass is
+        // `approvalVia=only`, which promises "IM or nobody decides" — with
+        // `local` that promise cannot be kept, and quietly falling back would be
+        // a decision surface the operator did not choose.
+        if (mode === 'only') {
+            return {
+                id: IM_APPROVAL_WORKSPACE_CHECK_ID,
+                area: 'interact',
+                state: 'missing',
+                severity: 'required',
+                label: `${label}（only 与 local 矛盾）`,
+                detail:
+                    `im.approvalVia=only 表示"IM 或无人决定"，但工作区 ${where} 未命中任何映射且 im.unmappedWorkspace=local，` +
+                    '两者互相否定：审批既不会走 IM（没有目标会话），也不会落回宿主接缝（only 不回落），' +
+                    '结果是每次审批都返回 unavailable，一次决定也做不出来' +
+                    suffix,
+                fix:
+                    '二选一：① 把 im.approvalVia 改成 fallback（未映射时交还 TUI），或 ② 给这个工作区在 im.approvals 里加一条 ' +
+                    `${entryHint}，或 ③ 把 im.unmappedWorkspace 改成 refuse（显式拒绝，而不是假装能批）`,
+            }
+        }
+        return {
+            id: IM_APPROVAL_WORKSPACE_CHECK_ID,
+            area: 'interact',
+            state: 'ok',
+            severity: 'required',
+            label: `${label}（未命中 → local：走本地审批）`,
+            detail:
+                `工作区 ${where} 不在 im.approvals 的条目里（${counts}），而 im.unmappedWorkspace=local：` +
+                `这个工作区的审批**不走 IM**，交给宿主接缝（本机是 TUI）；interaction_ask 会跳过 IM 通道改用本地通道，不会发出任何 IM 卡片` +
+                suffix,
+            fix:
+                `要让这个工作区的审批也走 IM，就由宿主在 im.approvals 里加一条 ${entryHint}；` +
+                '不加也安全：只是审批留在本机终端做决定',
+        }
+    }
     if ((mapping.policy ?? 'refuse') === 'host-default') {
         return {
             id: IM_APPROVAL_WORKSPACE_CHECK_ID,
@@ -388,7 +427,7 @@ function workspaceMappingCheckOf(mode: ApprovalVia, mapping: WorkspaceMappingFac
             suffix,
         fix:
             `① 由宿主在 profile 的 dsh-interaction-gate 配置里给 im.approvals 加一条 ${entryHint}；` +
-            '② 或把 im.unmappedWorkspace 设为 host-default（明确接受这里使用宿主默认会话 im.approvalChatId）；' +
+            '② 或把 im.unmappedWorkspace 设为 host-default（明确接受这里使用宿主默认会话 im.approvalChatId），或设为 local（未映射时走本地审批，不走 IM）；' +
             '③ 或把 im.approvalVia 设回 off，让审批继续走宿主接缝（TUI）。这三个键都是宿主配置，模型和仓库都改不了',
     }
 }

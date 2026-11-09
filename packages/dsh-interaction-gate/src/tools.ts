@@ -74,7 +74,7 @@ import {
     type InteractionGateConfig,
     type NotifyLevel,
 } from './config.js'
-import { imRequiredHint } from './chat-channel.js'
+import { CHAT_CHANNEL_NAME, imRequiredHint } from './chat-channel.js'
 import {
     appendLedgerRow,
     APPROVAL_SOURCE,
@@ -455,8 +455,13 @@ export function approveCheck(by: string, approvers: ApproversState, required: bo
 
 /** What the ask tool may do about the IM approval target (see {@link imAskTargetOf}). */
 export type ImAskTargetPlan =
-    /** `target` absent = no configured target = today's behaviour, byte for byte. */
-    | { ok: true; target?: ImAskTarget }
+    /**
+     * `target` absent = no configured target = today's behaviour, byte for byte.
+     * `excludeIm` = this workspace is unmatched under `im.unmappedWorkspace=local`:
+     * the IM channel must not be used for this ask at all (no card, no target),
+     * and the other registered channels decide.
+     */
+    | { ok: true; target?: ImAskTarget; excludeIm?: true }
     | {
           ok: false
           /** Refusal reason id (rendered as `refused:<reason>`). */
@@ -512,6 +517,14 @@ export function imAskTargetOf(config: InteractionGateConfig, approvers: Approver
         if (routing.matched === undefined && routing.policy === 'refuse') {
             const text = describeUnmappedWorkspace(routing)
             return { ok: false, reason: 'no-workspace-mapping', detail: text.detail, extraLines: text.extraLines, next: text.next }
+        }
+        if (routing.matched === undefined && routing.policy === 'local') {
+            // `local`: this workspace has no approval conversation, so this ask
+            // does not belong to IM at all. No target is planned (nothing can be
+            // sent to the wrong chat) and the IM channel is excluded below; the
+            // approval answerer pins IM as its channel, so for approvals this
+            // becomes "IM cannot ask" and the host seam (TUI) decides.
+            return { ok: true, excludeIm: true }
         }
     }
     const matched = routing?.matched
@@ -621,7 +634,9 @@ export function renderWorkspaceMapping(routing: ApprovalRouting): string[] {
         const policy =
             routing.policy === 'refuse'
                 ? `im.unmappedWorkspace=refuse → 每次提问都会在发卡前被拒绝（refused:no-workspace-mapping）`
-                : `im.unmappedWorkspace=host-default → 回落到 im.approvalChatId + 宿主名单（这是策略允许的回落，不是映射命中的结果）`
+                : routing.policy === 'local'
+                  ? 'im.unmappedWorkspace=local → 这个工作区**不走 IM**：审批交给宿主接缝（本机是 TUI），interaction_ask 跳过 IM 通道改用本地通道——不会发出任何 IM 卡片'
+                  : `im.unmappedWorkspace=host-default → 回落到 im.approvalChatId + 宿主名单（这是策略允许的回落，不是映射命中的结果）`
         lines.push(`- 工作区映射（im.approvals，${counts}）：未命中——工作区 ${where} 不在任何映射项里；${policy}`)
     } else {
         const entry = routing.matched
@@ -737,7 +752,20 @@ export function askCandidates(
     config: InteractionGateConfig,
     list: readonly ChannelInfo[],
     prefer?: string,
+    exclude?: readonly string[],
 ): { candidates: ChannelInfo[]; problem?: string } {
+    const skipped = exclude ?? []
+    if (prefer !== undefined && prefer !== '' && skipped.includes(prefer)) {
+        // An explicit `prefer` that this workspace may not use is a CONFLICT, not
+        // an invitation to pick another channel: sending the question somewhere
+        // the caller did not name is exactly the misrouting this guards.
+        return {
+            candidates: [],
+            problem:
+                `prefer="${prefer}" 这个通道在本工作区被排除（im.unmappedWorkspace=local 且本工作区未命中 im.approvals）——` +
+                '要么给 im.approvals 加一条覆盖本工作区的映射，要么不指定该通道，改让本地通道回答',
+        }
+    }
     if (prefer !== undefined && prefer !== '') {
         const named = list.find((info) => info.name === prefer)
         if (named === undefined) {
@@ -757,7 +785,7 @@ export function askCandidates(
         if (found !== undefined && !ordered.includes(found)) ordered.push(found)
     }
     for (const info of list) if (!ordered.includes(info)) ordered.push(info)
-    return { candidates: ordered.filter((info) => info.canAsk) }
+    return { candidates: ordered.filter((info) => info.canAsk && !skipped.includes(info.name)) }
 }
 
 /** The channels `interaction_notify` / `interaction_progress` push to. */
@@ -1293,7 +1321,10 @@ export async function askThroughChannels(deps: ToolDeps, request: AskRequest, ca
 
     // --- channel selection ---
     const list = deps.registry.list()
-    const selection = askCandidates(config, list, request.prefer)
+    // `excludeIm`: the workspace is unmatched under `unmappedWorkspace=local`, so
+    // this ask must not touch the IM channel at all (see imAskTargetOf).
+    const excludeIm = imPlan.excludeIm === true ? [CHAT_CHANNEL_NAME] : []
+    const selection = askCandidates(config, list, request.prefer, excludeIm)
     if (selection.problem !== undefined || selection.candidates.length === 0) {
         const explicit = request.prefer !== undefined && request.prefer !== ''
         refuseAsk({

@@ -543,3 +543,94 @@ test('配置校验：不可用的条目被报告且不贡献任何会话/审批�
     assert.equal(broken.im.unmappedWorkspace, 'refuse', '拼错不会放松策略')
     assert.ok(policyProblems.some((problem) => problem.includes('im.unmappedWorkspace')), policyProblems.join('\n'))
 })
+
+test('TC-992 未命中 + local：interaction_ask 不碰 IM，改由本地通道回答', async () => {
+    const cwd = tempWorkspace('workspace-mapping-local-')
+    const fake = host(cwd, {
+        requireApproverList: true,
+        im: {
+            approvals: [{ workspace: '/definitely/elsewhere', chatId: 'oc_other_room' }],
+            approvalChatId: 'oc_should_not_be_used',
+            approvers: ['ou_alice'],
+            unmappedWorkspace: 'local',
+        },
+    })
+    const im = scriptedChannel('chat-interaction')
+    const local = scriptedChannel('local-tui')
+    fake.registry.register(im.channel)
+    fake.registry.register(local.channel)
+
+    const running = fake.runTool('interaction_ask', { question: '这个工作区放行吗？', options: ['yes'], timeoutMs: ASK_TIMEOUT_MS })
+    await answerWith(local, 'yes', 'ou_alice', 'oc_local')
+    const run = await running
+    assert.equal(run.isError, false, runText(run))
+    assert.equal(im.sent.length, 0, 'local 策略下 IM 不该收到任何卡片')
+    assert.equal(local.sent.length, 1, 'local 通道才是提问的那一方')
+})
+
+test('TC-996 未命中 + local：显式 prefer IM 是冲突，绝不改发到别的通道', async () => {
+    const cwd = tempWorkspace('workspace-mapping-local-prefer-')
+    const fake = host(cwd, {
+        requireApproverList: true,
+        im: {
+            approvals: [{ workspace: '/definitely/elsewhere', chatId: 'oc_other_room' }],
+            approvalChatId: 'oc_should_not_be_used',
+            approvers: ['ou_alice'],
+            unmappedWorkspace: 'local',
+        },
+    })
+    const im = scriptedChannel('chat-interaction')
+    const local = scriptedChannel('local-tui')
+    fake.registry.register(im.channel)
+    fake.registry.register(local.channel)
+
+    const run = await fake.runTool('interaction_ask', {
+        question: '这个工作区放行吗？',
+        options: ['yes'],
+        prefer: 'chat-interaction',
+        timeoutMs: ASK_TIMEOUT_MS,
+    })
+    assert.equal(run.isError, true, runText(run))
+    assert.ok(runText(run).includes('被排除'), runText(run))
+    assert.equal(im.sent.length, 0)
+    assert.equal(local.sent.length, 0, '冲突时不能悄悄换通道')
+})
+
+test('TC-995 未命中 + local 且只有 IM 一个通道：按没有通道能问人拒绝，IM 仍然不发卡', async () => {
+    const cwd = tempWorkspace('workspace-mapping-local-nochannel-')
+    const fake = host(cwd, {
+        requireApproverList: true,
+        im: {
+            approvals: [{ workspace: '/definitely/elsewhere', chatId: 'oc_other_room' }],
+            approvalChatId: 'oc_should_not_be_used',
+            approvers: ['ou_alice'],
+            unmappedWorkspace: 'local',
+        },
+    })
+    const im = scriptedChannel('chat-interaction')
+    fake.registry.register(im.channel)
+
+    const run = await fake.runTool('interaction_ask', { question: '这个工作区放行吗？', options: ['yes'], timeoutMs: ASK_TIMEOUT_MS })
+    assert.equal(run.isError, true, runText(run))
+    assert.ok(runText(run).includes('refused:no-channel'), runText(run))
+    assert.equal(im.sent.length, 0, 'IM 被排除，即使它是唯一注册的通道')
+})
+
+test('TC-997 未命中 + refuse（默认）：仍然在发卡前拒绝，语义未变', async () => {
+    const cwd = tempWorkspace('workspace-mapping-refuse-')
+    const fake = host(cwd, {
+        requireApproverList: true,
+        im: {
+            approvals: [{ workspace: '/definitely/elsewhere', chatId: 'oc_other_room' }],
+            approvalChatId: 'oc_default_room',
+            approvers: ['ou_alice'],
+        },
+    })
+    const im = scriptedChannel('chat-interaction')
+    fake.registry.register(im.channel)
+
+    const run = await fake.runTool('interaction_ask', { question: '这个工作区放行吗？', options: ['yes'], timeoutMs: ASK_TIMEOUT_MS })
+    assert.equal(run.isError, true, runText(run))
+    assert.ok(runText(run).includes('refused:no-workspace-mapping'), runText(run))
+    assert.equal(im.sent.length, 0)
+})

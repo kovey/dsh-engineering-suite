@@ -56,11 +56,25 @@ import fs from 'node:fs'
 import path from 'node:path'
 
 /** What happens to a workspace no entry matches. */
-export type UnmappedWorkspacePolicy = 'refuse' | 'host-default'
+export type UnmappedWorkspacePolicy = 'refuse' | 'host-default' | 'local'
 
 /** Every accepted value of `im.unmappedWorkspace`. */
-export const UNMAPPED_WORKSPACE_POLICIES: readonly UnmappedWorkspacePolicy[] = ['refuse', 'host-default']
+export const UNMAPPED_WORKSPACE_POLICIES: readonly UnmappedWorkspacePolicy[] = [
+    'refuse',
+    'host-default',
+    'local',
+]
 
+/**
+ * `local` — an unmapped workspace does not use IM at all: the approval goes back
+ * to the host's own approval seam (the terminal), and `interaction_ask` skips the
+ * IM channel and uses whatever local channel can answer.
+ *
+ * Why this is not a hole: it never sends a card anywhere (the refusal to pick a
+ * conversation is preserved), it can only LOSE the remote convenience. The one
+ * case it must not silently do is `approvalVia=only`, which promises "IM or
+ * nobody decides" — that combination is reported as a contradiction.
+ */
 /**
  * Default for `im.unmappedWorkspace`: an unmapped workspace is REFUSED.
  *

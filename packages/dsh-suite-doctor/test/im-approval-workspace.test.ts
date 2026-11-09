@@ -295,3 +295,39 @@ test('端到端：suite_status 把当前工作区交给 im(workspace)，并按�
     assert.equal(jsonCheckOf(run, IM_APPROVAL_CHECK_ID)?.state, 'ok')
     assert.ok(HOST_APPROVERS_FILE.length > 0)
 })
+
+test('TC-994 未命中 + local（fallback）：通过并说明走本地审批，不劝人补映射', () => {
+    const mapping: WorkspaceMappingFact = {
+        configured: true,
+        declared: 1,
+        usable: 1,
+        policy: 'local',
+        workspace: WORKSPACE,
+        resolved: WORKSPACE,
+    }
+    const check = checkOf(fact({ mode: 'fallback', mapping }))
+    assert.equal(check?.state, 'ok', 'local 是写下来的策略，不是配置遗漏')
+    assert.equal(check?.severity, 'required')
+    assert.match(check?.label ?? '', /local：走本地审批/)
+    assert.match(check?.detail ?? '', /不走 IM/, '必须说清这个工作区的审批不经 IM')
+    assert.match(check?.detail ?? '', /TUI|宿主接缝/, '必须说清由谁决定')
+})
+
+test('TC-994 未命中 + local + only：矛盾，必需项失败并给出三条出路', () => {
+    const mapping: WorkspaceMappingFact = {
+        configured: true,
+        declared: 1,
+        usable: 1,
+        policy: 'local',
+        workspace: WORKSPACE,
+        resolved: WORKSPACE,
+    }
+    const check = checkOf(fact({ mode: 'only', mapping }))
+    assert.equal(check?.state, 'missing', 'only 与 local 互相否定，不能让配置看起来能用')
+    assert.equal(check?.severity, 'required')
+    assert.match(check?.label ?? '', /only 与 local 矛盾/)
+    assert.match(check?.detail ?? '', /unavailable/, '必须说明后果是每次审批都拿不到决定')
+    assert.match(check?.fix ?? '', /fallback/, '第一条出路：改回 fallback')
+    assert.match(check?.fix ?? '', /im\.approvals/, '第二条出路：给这个工作区补一条映射')
+    assert.match(check?.fix ?? '', /refuse/, '第三条出路：改成显式拒绝')
+})
