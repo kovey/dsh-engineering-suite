@@ -33,7 +33,8 @@ export function sectionText(
     return [
         '需要人拍板的时刻走本套件自己的交互层（不是宿主的 approval 弹窗，手机/无头会话同样能回答）：',
         '- `interaction_ask`：**真的需要人决定**时才用（规格/交付/放宽门禁/新增依赖这类）。每个提问带一个一次性令牌，',
-        '  答案必须对得上声明选项；没有可用通道、超时、回答者不在项目审批人名单、答非所问 → 一律**拒绝**，绝不由你替人猜一个"是"。',
+        '  答案必须对得上声明选项；没有可用通道、超时、回答者不在项目审批人名单、答非所问、',
+        '  答案不是来自配置的审批会话或不是已证明的私聊 → 一律**拒绝**，绝不由你替人猜一个"是"。',
         '- `interaction_notify`：状态变化（门禁 BLOCK、阶段完成、环境变更）。**通知不是许可**：推送失败不会让门禁通过，也不会让它失败。',
         '- `interaction_progress`：长阶段报"还在跑"。它**不是日志**——同样的内容会在窗口内被去重抑制，别拿它当调试输出。',
         '- 提问要说明 **whyYou**：`decision-required`（有门禁在等决定，默认）或 `result-usable`（有结果等人去用），',
@@ -41,7 +42,8 @@ export function sectionText(
         '  mission 处于 blocked 时等待期限不流逝（暂停多久，截止时间就顺延多久）。',
         '- `interaction_status`：只读的体检（通道能力、生效配置、审批人名单、台账里**未决定**的提问、作废/撤回的提问）。',
         `- 生效配置来源：${describeSource(effective)}${problems.length === 0 ? '' : `（${problems.length} 条配置问题，见插件日志）`}；` +
-            `提问超时上限 ${effective.config.askTimeoutMs}ms（只能缩短）；审批人名单${effective.config.requireApproverList ? '**必须**' : '不强制'}。`,
+            `提问超时上限 ${effective.config.askTimeoutMs}ms（只能缩短）；审批人名单${effective.config.requireApproverList ? '**必须**' : '不强制'}；` +
+            `IM 审批目标${effective.config.im.approvalChatId === '' ? '未配置（卡片目标由 IM 插件决定）' : `=${effective.config.im.approvalChatId}（p2pOnly=${effective.config.im.p2pOnly}）`}。`,
         channels.length === 0
             ? '- ⚠️ 当前**没有注册任何通道**：`interaction_ask` 会直接拒绝，`interaction_notify` 会报告推送失败——需要人决定的事就该停下来找宿主装通道，而不是自己决定。'
             : `- 通道：可问 ${askable.length} 个（${askable.map((channel) => channel.name).join(', ') || '无'}）、可推送 ${notifiable.length} 个（${notifiable.map((channel) => channel.name).join(', ') || '无'}）` +

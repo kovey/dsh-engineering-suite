@@ -77,7 +77,7 @@ export { describeIm, imLogLine } from './channels.js'
 export { CHAT_CHANNEL_NAME, CHAT_API_MIN_VERSION, CHAT_SERVICE, createChatChannel, imRequiredHint, probeChatInteraction } from './chat-channel.js'
 export { installImChannel } from './im-binding.js'
 export type { EffectiveConfig, InteractionGateConfig, InteractionRegistry }
-export type { ImChannelMode, ImChannelReport, ImPhase } from './channels.js'
+export type { ImChannelMode, ImChannelReport, ImIgnoredAttempt, ImIgnoredReport, ImPhase } from './channels.js'
 export type { ChatApiLike, ChatChannelHandle, ChatChannelOptions, ChatProbe } from './chat-channel.js'
 export type { ImBinding, ImBindingLogger, ImBindingOptions, ImInjectionContext, ImInjectionHost, ImInject, ImTimerControl } from './im-binding.js'
 export type { ImConfig } from './config.js'
@@ -159,6 +159,14 @@ export function apply(ctx: Context, config: unknown = {}): void {
             mode: imMode,
             ...(resolved.im.channelId === undefined ? {} : { channelId: resolved.im.channelId }),
             requiredWaitMs: resolved.im.requiredWaitMs,
+            // P0: the explicit approval conversation + the p2p requirement. The
+            // adapter uses the target to fail closed (an ask without an explicit
+            // target is refused once this is set) and to name the conversation
+            // the outbox serializes; the per-workspace whitelist and the
+            // post-answer provenance check live in `tools.ts`, where a workspace
+            // (and its approver list) is actually known.
+            approvalChatId: resolved.im.approvalChatId,
+            p2pOnly: resolved.im.p2pOnly,
             askTimeoutMs: resolved.askTimeoutMs,
             redactPatterns: resolved.redactPatterns,
             registry,
@@ -335,7 +343,8 @@ export function apply(ctx: Context, config: unknown = {}): void {
             `applied (tools: ${tools.registered.join(', ') || 'none'}${tools.failed.length === 0 ? '' : `; failed: ${tools.failed.join(', ')}`}; ` +
                 `service=${serviceState}; ledger=${resolved.ledgerFile}; outbox=${resolved.outboxFile}; approvers=${resolved.approversFile}${resolved.requireApproverList ? '(required)' : ''}; ` +
                 `askTimeout=${resolved.askTimeoutMs}ms; notifyLevels=${resolved.notifyLevels.join(',')}; prompt=${resolved.prompt.enabled}; ` +
-                `im=${imFinal.registered ? `chat-interaction(api v${imFinal.apiVersion})` : imFinal.phase}(im.channel=${imMode}${imMode === 'required' ? `; requiredWaitMs=${resolved.im.requiredWaitMs}` : ''}))`,
+                `im=${imFinal.registered ? `chat-interaction(api v${imFinal.apiVersion})` : imFinal.phase}(im.channel=${imMode}${imMode === 'required' ? `; requiredWaitMs=${resolved.im.requiredWaitMs}` : ''}; ` +
+                `approvalChatId=${resolved.im.approvalChatId === '' ? '(未配置)' : resolved.im.approvalChatId}; p2pOnly=${resolved.im.p2pOnly})${resolved.im.approvalChatIdProblem === undefined ? '' : ' ⚠️ im.approvalChatId 不可用（见上）'}))`,
         )
     } catch (error) {
         log.error('apply failed:', error)

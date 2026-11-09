@@ -38,6 +38,30 @@ import { readLedger, summarizeLedger } from './ledger.js'
 /** What the suite is sending. */
 export type InteractionKind = 'ask' | 'notify' | 'progress'
 
+/**
+ * The explicit IM target of ONE ask (P0: never "whoever DMs the bot").
+ *
+ * Computed where the workspace is known (`tools.ts`, from `im.approvalChatId`
+ * plus that repository's approver list), then carried on the message so:
+ *
+ *  - the channel adapter sends the card to exactly this conversation and tells
+ *    the IM plugin which platform user ids may answer it (`chatId` / `from`);
+ *  - a REPLAY of the same question re-sends it to the same conversation (the
+ *    message, not a process-global "active chat", is the target);
+ *  - the post-answer check in `tools.ts` compares the answer's provenance
+ *    against the very target this ask was sent with.
+ *
+ * Absent = today's behaviour (the IM plugin resolves its own active chat).
+ */
+export interface ImAskTarget {
+    /** The one conversation this card may go to. */
+    chatId: string
+    /** Platform user ids allowed to answer (`from`); non-empty by construction. */
+    from: string[]
+    /** Whether the answer chat must be proven p2p (`im.p2pOnly`). */
+    p2pOnly: boolean
+}
+
 /** One outgoing message. */
 export interface InteractionMessage {
     kind: InteractionKind
@@ -49,6 +73,13 @@ export interface InteractionMessage {
     questionId?: string
     /** Declared options, for a channel that can render buttons. */
     buttons?: { value: string; label: string }[]
+    /**
+     * The explicit IM target + answer whitelist of this ask, when the host
+     * configured one (see {@link ImAskTarget}). Channels that do not speak IM
+     * ignore it; the IM adapter refuses to send without it once
+     * `im.approvalChatId` is configured.
+     */
+    im?: ImAskTarget
 }
 
 /** What a channel reports about one send. */
@@ -86,6 +117,23 @@ export interface InteractionAnswer {
     by?: string
     /** Channel-side id of the message/card the answer came from. */
     messageId?: string
+    /**
+     * The conversation the answer came FROM (the IM plugin's own report).
+     *
+     * This is provenance, not decoration: with `im.approvalChatId` configured,
+     * an answer whose `chatId` is not the configured target is not a decision
+     * (`refused:wrong-chat`). Absent = the channel cannot prove where it came
+     * from, which is exactly what the check must be able to see.
+     */
+    chatId?: string
+    /**
+     * The kind of chat the answer came from, WHEN the platform reported it.
+     *
+     * Absent is deliberately "not proven" rather than "probably fine": with
+     * `im.p2pOnly` on, an unproven kind is refused (`refused:not-p2p`), because
+     * a group is a room the approver does not control.
+     */
+    chatKind?: 'p2p' | 'group'
 }
 
 /**
@@ -112,13 +160,15 @@ export interface InteractionChannel {
         body: string
         questionId?: string
         buttons?: { value: string; label: string }[]
+        /** Explicit IM target + answer whitelist (see {@link ImAskTarget}); ignored by non-IM channels. */
+        im?: ImAskTarget
     }): Promise<{ ok: boolean; messageId?: string; error?: string; permanent?: boolean; defer?: boolean }>
     /** wait for the answer to `questionId`; resolve null on timeout/abort */
     wait?(
         questionId: string,
         timeoutMs: number,
         signal?: AbortSignal,
-    ): Promise<{ value: string; by?: string; messageId?: string } | null>
+    ): Promise<{ value: string; by?: string; messageId?: string; chatId?: string; chatKind?: 'p2p' | 'group' } | null>
     /** per-channel capability report for the doctor */
     describe(): { canAsk: boolean; canNotify: boolean }
 }
@@ -161,6 +211,45 @@ export type ImChannelMode = 'auto' | 'off' | 'required'
 export type ImPhase = 'off' | 'absent' | 'waiting' | 'registered' | 'refused'
 
 /**
+ * One answer attempt the IM plugin REFUSED on our behalf (a sender outside
+ * `from`, or a reply matching no offered option).
+ *
+ * Recorded so "someone tried to answer for the approver" cannot look like a
+ * plain timeout in the audit trail. The attempt's raw TEXT is deliberately not
+ * kept: it is not needed to act on the event, and a refused message can still
+ * contain a credential (the same rule the outgoing redaction layer follows).
+ */
+export interface ImIgnoredAttempt {
+    /** Epoch ms reported by the IM plugin. */
+    at: number
+    /** `sender-not-allowed` / `option-mismatch`, or whatever the plugin named. */
+    reason: string
+    /** The conversation the attempt came from, when reported. */
+    chatId?: string
+    /** Platform user id of the sender, when known. */
+    by?: string
+    /** Channel-side message id, when known. */
+    messageId?: string
+}
+
+/** What this process could observe about ignored answer attempts. */
+export interface ImIgnoredReport {
+    /**
+     * `hooked`: the upstream offers `onAnswerIgnored` and we are subscribed.
+     * `unavailable`: it does not (older upstream), so an empty list here means
+     * "not observable", NOT "nobody tried" — the doctor says exactly that.
+     */
+    upstream: 'hooked' | 'unavailable'
+    total: number
+    /** Rejected because the sender was outside the `from` whitelist. */
+    bySender: number
+    /** Rejected because the reply matched no offered option. */
+    byOptions: number
+    /** The last few attempts, newest last (bounded). */
+    recent: ImIgnoredAttempt[]
+}
+
+/**
  * The optional IM channel's verdict: registered or not, and WHY.
  *
  * This exists so "the IM channel is not registered" is a STATED fact on the
@@ -197,6 +286,20 @@ export interface ImChannelReport {
     pluginVersion?: string
     /** The IM channel name pinned by `im.channelId`, when configured. */
     channelId?: string
+    /**
+     * The configured approval target (`im.approvalChatId`); `''` = not
+     * configured (today's behaviour). Stated here so the doctor can show the
+     * target even while the channel itself is absent.
+     */
+    approvalChatId?: string
+    /** Whether an answer must be proven to come from a p2p chat (`im.p2pOnly`). */
+    p2pOnly?: boolean
+    /**
+     * Ignored answer attempts observed through the upstream's
+     * `onAnswerIgnored` hook. Absent = nothing was observed (either no ask ran
+     * yet or the upstream is too old — see `upstream`).
+     */
+    ignoredAnswers?: ImIgnoredReport
     /** Why it is (or is not) registered — always non-empty. */
     reason: string
 }
@@ -214,7 +317,11 @@ export function describeIm(report: ImChannelReport): string {
         const version = report.apiVersion === undefined ? 'api v?' : `api v${report.apiVersion}`
         const plugin = report.pluginVersion === undefined ? '' : `，插件 v${report.pluginVersion}`
         const target = report.channelId === undefined ? '' : `，渠道 ${report.channelId}`
-        return `${report.name ?? 'chat-interaction'}（${version}${plugin}${target}）：需要人决定的提问走 IM，通知/进度仍走本进程通道（phase=registered）`
+        const approval =
+            report.approvalChatId === undefined || report.approvalChatId === ''
+                ? '；审批目标：未配置（目标由 IM 插件的 p2pChat/activeChat 决定）'
+                : `；审批目标：${report.approvalChatId}（p2pOnly=${report.p2pOnly === true}，from=项目审批人名单）`
+        return `${report.name ?? 'chat-interaction'}（${version}${plugin}${target}）：需要人决定的提问走 IM，通知/进度仍走本进程通道（phase=registered）${approval}`
     }
     if (report.mode === 'off' || report.phase === 'off') {
         return '未注册（im.channel=off：宿主未启用）：仅本地通道，行为与未集成时一致（phase=off）'
@@ -478,10 +585,18 @@ function normalizeAnswer(raw: unknown): InteractionAnswer | undefined {
     if (typeof value !== 'string' || value.trim() === '') return undefined
     const by = typeof record['by'] === 'string' ? record['by'] : undefined
     const messageId = typeof record['messageId'] === 'string' ? record['messageId'] : undefined
+    // Provenance travels with the answer, but only in the shapes the IM contract
+    // defines: an unknown `chatKind` is dropped (NOT guessed as 'p2p'), because
+    // the post-answer check treats a missing kind as "not proven".
+    const chatId = typeof record['chatId'] === 'string' && record['chatId'] !== '' ? record['chatId'] : undefined
+    const rawKind = record['chatKind']
+    const chatKind = rawKind === 'p2p' || rawKind === 'group' ? rawKind : undefined
     return {
         value,
         ...(by === undefined ? {} : { by }),
         ...(messageId === undefined ? {} : { messageId }),
+        ...(chatId === undefined ? {} : { chatId }),
+        ...(chatKind === undefined ? {} : { chatKind }),
     }
 }
 

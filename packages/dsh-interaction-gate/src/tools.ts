@@ -56,6 +56,7 @@ import {
     newQuestionToken,
     type AwaitResult,
     type ChannelInfo,
+    type ImAskTarget,
     type InteractionChannel,
     type InteractionMessage,
     type InteractionRegistry,
@@ -293,6 +294,93 @@ export function approveCheck(by: string, approvers: ApproversState, required: bo
         return { ok: false, reason: `${JSON.stringify(by)} 不在项目审批人名单里（${approvers.file}，共 ${approvers.ids.length} 个 id）` }
     }
     return { ok: true, reason: '' }
+}
+
+/** What the ask tool may do about the IM approval target (see {@link imAskTargetOf}). */
+export type ImAskTargetPlan =
+    /** `target` absent = no configured target = today's behaviour, byte for byte. */
+    | { ok: true; target?: ImAskTarget }
+    | {
+          ok: false
+          /** Refusal reason id (rendered as `refused:<reason>`). */
+          reason: string
+          detail: string
+          next: string
+          extraLines: string[]
+      }
+
+/**
+ * What THIS ask may do about the IM approval target (P0), or why it must not be
+ * sent at all.
+ *
+ * The three-layer model, and where each layer lives:
+ *
+ *  1. **target + whitelist** (computed here, sent by the channel adapter): the
+ *     card goes to `im.approvalChatId` and `from`/`chatId` are passed to the IM
+ *     plugin, so the conversation is a host decision rather than the plugin's
+ *     `p2pChat` (which is simply "the last chat that messaged the bot" — anyone
+ *     who DMs the bot could redirect our card);
+ *  2. **post-answer provenance** (below, in the ask tool): `answer.chatId` must
+ *     be the configured target and, with `p2pOnly`, `answer.chatKind` must be
+ *     proven `p2p` — a mismatch is `refused:wrong-chat` / `refused:not-p2p`, no
+ *     decision, no token turned into a permission;
+ *  3. **the approver list** (`approveCheck`, unchanged): still runs on every
+ *     answer, so a forged/forwarded answer inside the right chat is still
+ *     checked against the named people.
+ *
+ * Fail closed BEFORE sending: a configured target with no usable whitelist (or
+ * an unusable target) refuses instead of degrading into "whoever the plugin
+ * picks can answer". With NO configured target the behaviour is exactly today's
+ * — except for one guard: an operator who explicitly turned `p2pOnly` on but
+ * configured no target gets a refusal rather than a gate that only looks
+ * hardened.
+ *
+ * @param config - the EFFECTIVE configuration of the calling workspace.
+ * @param approvers - that workspace's approver list (the `from` whitelist).
+ */
+export function imAskTargetOf(config: InteractionGateConfig, approvers: ApproversState): ImAskTargetPlan {
+    const im = config.im
+    if (im.approvalChatIdProblem !== undefined) {
+        return {
+            ok: false,
+            reason: 'bad-target',
+            detail: `im.approvalChatId 配置不可用：${im.approvalChatIdProblem}`,
+            extraLines: [`- 宿主配置：im.approvalChatId（profile 层，仓库改不了它）`],
+            next:
+                '由宿主把 im.approvalChatId 改成一个真实存在的会话 id（你与 bot 私聊的那个），或删掉这个键回到旧行为；' +
+                '在它可用之前不会发出审批卡片——因为剩下的唯一出路就是"让 IM 插件自己挑目标"，而那正是任何人私聊 bot 都能覆写的那条路。',
+        }
+    }
+    if (im.approvalChatId !== '') {
+        if (approvers.ids.length === 0) {
+            return {
+                ok: false,
+                reason: 'no-allowlist',
+                detail:
+                    `im.approvalChatId=${im.approvalChatId} 已配置，但审批人名单为空或不可读：` +
+                    `没有名单就没有"谁可以回答"（from 白名单），一张发出去谁都能答的卡片不是审批`,
+                extraLines: [`- 名单文件：${approvers.file}（存在=${approvers.present}，有效 id=${approvers.ids.length}）`],
+                next:
+                    `由人写 ${config.approversFile}（一行一个平台用户 id，# 开头为注释）：它同时是卡片的 from 白名单和落账前的审批人校验；` +
+                    '名单为空时不会发卡片（不会降级成"谁都能答"）。',
+            }
+        }
+        return { ok: true, target: { chatId: im.approvalChatId, from: [...approvers.ids], p2pOnly: im.p2pOnly } }
+    }
+    if (im.p2pOnlyConfigured && im.p2pOnly) {
+        return {
+            ok: false,
+            reason: 'no-target',
+            detail:
+                'im.p2pOnly=true（显式开启）但没有配置 im.approvalChatId：' +
+                '没有目标会话就无法证明答案来自哪个会话，"只接受私聊"这个要求无从执行',
+            extraLines: ['- 需要的两个键：im.approvalChatId（目标会话 id）+ 审批人名单（from 白名单）'],
+            next:
+                '由宿主补上 im.approvalChatId（你与 bot 私聊的会话 id），或把 im.p2pOnly 改回 false/删掉；' +
+                '在"要求私聊但没有目标"的状态下不发卡片——否则"看起来收紧了"而实际没有任何校验。',
+        }
+    }
+    return { ok: true }
 }
 
 /** The `approval-context` fields a caller may pass, validated field by field. */
@@ -791,6 +879,28 @@ export function registerTools(
 
                 // --- approver list: refuse BEFORE sending a card nobody may answer ---
                 const approvers = approversOf(cwd, config)
+                // --- the IM approval target (P0): fail closed BEFORE any card ----
+                // A configured target with no usable whitelist (or an unusable
+                // target) must never degrade into "send it and see who answers":
+                // that is precisely the hole this P0 closes.
+                const imPlan = imAskTargetOf(config, approvers)
+                if (!imPlan.ok) {
+                    refuseAsk({
+                        ledgerFile,
+                        reason: imPlan.reason,
+                        detail: imPlan.detail,
+                        title: titleOut.text,
+                        questionId,
+                        durationMs: deps.now() - startedAt,
+                        extraLines: imPlan.extraLines,
+                        next: imPlan.next,
+                        ...(missionId === undefined ? {} : { missionId }),
+                    })
+                }
+                // The target this ask was SENT with. The post-answer check below
+                // compares the answer's provenance against exactly this value, so
+                // "what we asked for" and "what we accept" cannot drift apart.
+                const imTarget = imPlan.target
                 if (config.requireApproverList && approvers.ids.length === 0) {
                     refuseAsk({
                         ledgerFile,
@@ -882,6 +992,10 @@ export function registerTools(
                     body: body.text,
                     questionId,
                     ...(declared.length === 0 ? {} : { buttons: declared.map((option) => ({ value: option, label: option })) }),
+                    // P0: the card's target and its answer whitelist travel WITH
+                    // the question, so a replay re-sends it to the same chat and
+                    // the post-answer check compares against what was sent.
+                    ...(imTarget === undefined ? {} : { im: imTarget }),
                 }
                 const deliverAsk = createAskDeliverer({
                     registry: deps.registry,
@@ -1129,6 +1243,72 @@ export function registerTools(
 
                     const answer = outcome.answer
                     const by = (answer.by ?? '').trim()
+                    // --- provenance (P0): is this answer even OURS to accept? ---
+                    // Runs BEFORE anything reads the answer's text: an answer from
+                    // another conversation is not "a decision with a caveat", it
+                    // is somebody else's message. The token is never turned into a
+                    // decision (no ledger row with a decision, no outbox
+                    // `answered`), and the refusal says exactly which check failed.
+                    if (imTarget !== undefined) {
+                        const answeredChat = (answer.chatId ?? '').trim()
+                        if (answeredChat !== imTarget.chatId) {
+                            refuseAsk({
+                                ledgerFile,
+                                reason: 'wrong-chat',
+                                detail:
+                                    `答案来自另一个会话（${answeredChat === '' ? '通道没有报告 chatId' : answeredChat}），` +
+                                    `不是配置的审批目标（im.approvalChatId=${imTarget.chatId}）：这道回答不是决定，` +
+                                    '一次性令牌也不会被换成一次放行',
+                                title: titleOut.text,
+                                questionId,
+                                durationMs,
+                                channel: candidate.name,
+                                ...(by === '' ? {} : { userId: by }),
+                                ...(answer.messageId === undefined ? {} : { messageId: answer.messageId }),
+                                extraLines: [
+                                    `- 本次提问的目标：${imTarget.chatId}；回答者：${by === '' ? '通道未提供身份' : by}；回答的会话：${answeredChat === '' ? '通道未报告' : answeredChat}`,
+                                    '- 说明：来源不符属于"没有决定"，不是"拒绝"——门禁读不到任何放行。',
+                                ],
+                                outbox,
+                                settle: { state: 'withdrawn', reason: 'refused:wrong-chat：答案来自非审批目标会话，这次提问没有被回答' },
+                                next:
+                                    `核对 im.approvalChatId 是否就是你与 bot 私聊的那个会话（interaction_status 里的"IM 审批目标"一行）；` +
+                                    '然后重新提问，让目标会话里的人再答一次。不要因为"有人答了"就继续——那张卡可能根本不在审批人手里。',
+                                ...(missionId === undefined ? {} : { missionId }),
+                            })
+                        }
+                        // A missing `chatKind` is NOT proven: the IM plugin reports
+                        // the kind only when the platform told it, and accepting an
+                        // unproven kind would let a group answer count exactly when
+                        // the proof is absent. Fail closed, and say which case it is.
+                        if (imTarget.p2pOnly && answer.chatKind !== 'p2p') {
+                            refuseAsk({
+                                ledgerFile,
+                                reason: 'not-p2p',
+                                detail:
+                                    answer.chatKind === 'group'
+                                        ? `答案来自群聊（chatKind=group），而 im.p2pOnly=true：群里任何人按下的按钮都算不到审批人头上，所以它不是决定`
+                                        : '答案的会话类型未被证明（IM 插件没有报告 chatKind，无法确认是私聊还是群聊），而 im.p2pOnly=true：' +
+                                          '"无法证明"不是"大概没问题"，按未满足处理（fail closed）',
+                                title: titleOut.text,
+                                questionId,
+                                durationMs,
+                                channel: candidate.name,
+                                ...(by === '' ? {} : { userId: by }),
+                                ...(answer.messageId === undefined ? {} : { messageId: answer.messageId }),
+                                extraLines: [
+                                    `- 本次提问的目标：${imTarget.chatId}（p2pOnly=true）；回答的会话：${answer.chatId ?? '通道未报告'}；会话类型：${answer.chatKind ?? '未报告'}`,
+                                    '- 说明：来源未证明属于"没有决定"，不是"拒绝"——门禁读不到任何放行。',
+                                ],
+                                outbox,
+                                settle: { state: 'withdrawn', reason: 'refused:not-p2p：答案不是已证明的私聊来源，这次提问没有被回答' },
+                                next:
+                                    '让审批人在与 bot 的**私聊**里重新回答（新提问）；如果这个部署本来就要在群里审批，' +
+                                    '由人把 im.p2pOnly 改成 false，并确认 im.approvalChatId 指向那个群——这两个键是宿主配置，模型改不了。',
+                                ...(missionId === undefined ? {} : { missionId }),
+                            })
+                        }
+                    }
                     const answerVerdict = checkOutgoing([{ name: 'answer', text: answer.value }], compiled.rules)
                     if (!answerVerdict.ok) {
                         refuseAsk({
@@ -1644,6 +1824,45 @@ export function registerTools(
                 for (const problem of read.problems) lines.push(`  ⚠️ ${problem}`)
 
                 lines.push(`- IM 通道：${describeIm(deps.registry.im())}`)
+                // The approval TARGET and its whitelist: the two facts an operator
+                // needs to answer "where would an approval card go, and who could
+                // answer it" — plus whether the current configuration would refuse
+                // to ask at all (fail closed, named).
+                const imPlan = imAskTargetOf(config, approvers)
+                lines.push(
+                    `- IM 审批目标：${
+                        config.im.approvalChatId === ''
+                            ? '未配置（沿用今日行为：卡片目标由 IM 插件的 p2pChat/activeChat 决定——任何人私聊 bot 都能改写它）'
+                            : `${config.im.approvalChatId}（p2pOnly=${config.im.p2pOnly}；from 白名单 ${approvers.ids.length} 个 id，来自 ${approvers.file}）`
+                    }${imPlan.ok ? '' : `；⚠️ 当前会**拒绝发问**（refused:${imPlan.reason}）：${imPlan.detail}`}`,
+                )
+                if (config.im.approvalChatIdProblem !== undefined) lines.push(`  ⚠️ ${config.im.approvalChatIdProblem}`)
+                if (config.im.p2pOnlyConfigured && config.im.approvalChatId === '') {
+                    lines.push(`  ⚠️ im.p2pOnly 被显式设为 ${config.im.p2pOnly}，但没有 im.approvalChatId：这个要求无从执行`)
+                }
+                // Refused answer attempts: "someone tried to answer for the
+                // approver" must be visible, and NOT visible must never read as
+                // "nobody tried" (an upstream without the hook cannot tell us).
+                const ignored = deps.registry.im().ignoredAnswers
+                if (ignored === undefined) {
+                    lines.push('- IM 被忽略的回答尝试：暂无观测（IM 通道未注册，或还没有走过一次提问）')
+                } else if (ignored.upstream === 'unavailable') {
+                    lines.push(
+                        '- IM 被忽略的回答尝试：**无法观测**（上游没有 `onAnswerIgnored`）：这里的 0 次**不等于**"没人试过"，' +
+                            '只有最终结果（超时/拒绝）是可信的',
+                    )
+                } else {
+                    lines.push(
+                        `- IM 被忽略的回答尝试：${ignored.total} 次（发起者不在白名单 ${ignored.bySender} 次，答非所问 ${ignored.byOptions} 次）` +
+                            '——它们**不是**决定，提问仍在等待',
+                    )
+                    for (const attempt of ignored.recent.slice(-3)) {
+                        lines.push(
+                            `  ${formatTime(attempt.at)} ${attempt.by ?? '(未提供身份)'} 在 ${attempt.chatId ?? '(未报告会话)'}：${attempt.reason}` +
+                                `${attempt.messageId === undefined ? '' : `（${attempt.messageId}）`}`,
+                        )
+                    }
+                }
 
                 lines.push('', `通道（注册顺序，共 ${list.length} 个）：`)
                 if (list.length === 0) lines.push('  （无：`interaction_ask` 会拒绝，`interaction_notify` 会报告推送失败）')

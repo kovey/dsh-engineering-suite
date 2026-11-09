@@ -87,6 +87,21 @@ export const MIN_IM_REQUIRED_WAIT_MS = 0
 /** Upper bound for the `required` window (a minute: a turn must eventually fail closed). */
 export const MAX_IM_REQUIRED_WAIT_MS = 60_000
 
+/**
+ * Default for `im.p2pOnly`: an approval must come from a PRIVATE chat.
+ *
+ * A group is a room the approver does not control: anyone in it can press the
+ * button, and "who answered" would then be a fact about the room rather than
+ * about the approver. The default is therefore the strict one, and the
+ * strictness only ever applies to a deployment that named an approval target
+ * (see the go-live guard in `tools.ts`): without a target there is nothing to
+ * prove a chat against, and today's behaviour is kept byte for byte.
+ */
+export const DEFAULT_IM_P2P_ONLY = true
+
+/** Longest `im.approvalChatId` a profile may declare (a platform chat id is short). */
+export const MAX_APPROVAL_CHAT_ID_LENGTH = 512
+
 /** The host-owned `im` block. */
 export interface ImConfig {
     /**
@@ -109,6 +124,44 @@ export interface ImConfig {
      * immediately. Host-owned: a repository cannot widen or shorten it.
      */
     requiredWaitMs: number
+    /**
+     * The ONE conversation an approval card may be sent to (default `''` = not
+     * configured).
+     *
+     * Why this exists: without it the IM plugin resolves the target from its own
+     * state (`p2pChat || activeChat`), and `p2pChat` is simply "the last chat that
+     * messaged the bot" — so anyone who DMs the bot could redirect our approval
+     * card to themselves. Naming the chat here is what makes the target a
+     * decision of the host instead of an observation of traffic.
+     *
+     * `''` = today's behaviour, exactly (the card goes wherever the IM plugin
+     * resolves, with no `from` whitelist and no provenance check afterwards).
+     */
+    approvalChatId: string
+    /**
+     * When true (default) an answer must come from a **p2p** chat, proven by the
+     * IM plugin's own report (`answer.chatKind`). Only meaningful next to
+     * {@link approvalChatId}: without a target nothing can be proven and the
+     * deployment keeps today's behaviour.
+     */
+    p2pOnly: boolean
+    /**
+     * Whether the profile set `im.p2pOnly` EXPLICITLY.
+     *
+     * It drives the go-live guard: an operator who turns the P2P requirement on
+     * but forgets `im.approvalChatId` gets a refusal that says so, instead of a
+     * gate that looks hardened and is not. The DEFAULT must never trigger that
+     * guard — otherwise every existing deployment would stop being able to ask.
+     */
+    p2pOnlyConfigured: boolean
+    /**
+     * Why `im.approvalChatId` is unusable, when it was configured but invalid.
+     *
+     * An unusable target is NOT silently ignored: ignoring it would quietly
+     * restore the pre-P0 hole (whoever DMs the bot decides where the card goes),
+     * so the ask path refuses while this is set.
+     */
+    approvalChatIdProblem?: string
 }
 
 /** Resolved plugin configuration. */
@@ -279,7 +332,7 @@ export function resolveConfig(input: unknown, warn?: (message: string) => void):
     // `auto` and says why, like every other unusable value in this suite.
     const rawIm = raw['im']
     if (rawIm !== undefined && !isRecord(rawIm)) {
-        warn?.(`profile 配置: im 必须是对象（{ channel: 'auto' | 'off' | 'required', channelId?: string }），收到 ${JSON.stringify(rawIm)}，已按默认 im.channel=auto 处理`)
+        warn?.(`profile 配置: im 必须是对象（{ channel: 'auto' | 'off' | 'required', channelId?: string, approvalChatId?: string, p2pOnly?: boolean }），收到 ${JSON.stringify(rawIm)}，已按默认 im.channel=auto 处理`)
     }
     const imBlock = isRecord(rawIm) ? rawIm : {}
     const rawMode = imBlock['channel']
@@ -314,6 +367,49 @@ export function resolveConfig(input: unknown, warn?: (message: string) => void):
         }
     }
 
+    // --- im.approvalChatId / im.p2pOnly: the approval TARGET and its proof ----
+    // Both are validated, never coerced. An unusable target is remembered as a
+    // problem (so the ask refuses instead of silently falling back to "whoever
+    // DMs the bot"), and an unusable `p2pOnly` keeps the strict default `true`.
+    const rawApprovalChatId = imBlock['approvalChatId']
+    let imApprovalChatId = ''
+    let imApprovalChatIdProblem: string | undefined
+    if (rawApprovalChatId !== undefined) {
+        if (typeof rawApprovalChatId !== 'string') {
+            imApprovalChatIdProblem =
+                `im.approvalChatId 必须是字符串（平台会话 id，如 "oc_..."），收到 ${JSON.stringify(rawApprovalChatId)}：` +
+                '审批提问将被拒绝（不会退回"由 IM 插件的 p2pChat/activeChat 决定目标"）'
+        } else {
+            const trimmed = rawApprovalChatId.trim()
+            if (trimmed !== '') {
+                if (trimmed.length > MAX_APPROVAL_CHAT_ID_LENGTH) {
+                    imApprovalChatIdProblem =
+                        `im.approvalChatId 长度 ${trimmed.length} 超过上限 ${MAX_APPROVAL_CHAT_ID_LENGTH}：审批提问将被拒绝（不像是一个会话 id）`
+                } else if (/\s|[\u0000-\u001f\u007f]/.test(trimmed)) {
+                    imApprovalChatIdProblem =
+                        'im.approvalChatId 含空白或控制字符（多半是从别处粘进来的多余内容）：审批提问将被拒绝（这样的 id 匹配不到任何会话）'
+                } else {
+                    imApprovalChatId = trimmed
+                }
+            }
+        }
+        if (imApprovalChatIdProblem !== undefined) warn?.(`profile 配置: ${imApprovalChatIdProblem}`)
+    }
+    const rawP2pOnly = imBlock['p2pOnly']
+    let imP2pOnly = DEFAULT_IM_P2P_ONLY
+    let imP2pOnlyConfigured = false
+    if (rawP2pOnly !== undefined) {
+        if (typeof rawP2pOnly === 'boolean') {
+            imP2pOnly = rawP2pOnly
+            imP2pOnlyConfigured = true
+        } else {
+            warn?.(
+                `profile 配置: im.p2pOnly 必须是布尔值（收到 ${JSON.stringify(rawP2pOnly)}），已按 fail-closed 的默认值 ${DEFAULT_IM_P2P_ONLY} 处理` +
+                    '（关闭它就等于允许群聊里的人替审批人回答，所以不可用的值不会放松要求）',
+            )
+        }
+    }
+
     return {
         enabled: bool(raw['enabled'], true),
         logFile: str(raw['logFile'], '~/.dsh/interaction-gate.log'),
@@ -341,7 +437,15 @@ export function resolveConfig(input: unknown, warn?: (message: string) => void):
         preferredChannels: preferred ?? [],
         maxPayloadChars: payload < MIN_MAX_PAYLOAD_CHARS || payload > MAX_MAX_PAYLOAD_CHARS ? DEFAULT_MAX_PAYLOAD_CHARS : payload,
         redactPatterns: (redact ?? []).slice(0, MAX_REDACT_PATTERNS),
-        im: { channel: imMode, requiredWaitMs: imRequiredWaitMs, ...(imChannelId === undefined ? {} : { channelId: imChannelId }) },
+        im: {
+            channel: imMode,
+            requiredWaitMs: imRequiredWaitMs,
+            approvalChatId: imApprovalChatId,
+            p2pOnly: imP2pOnly,
+            p2pOnlyConfigured: imP2pOnlyConfigured,
+            ...(imChannelId === undefined ? {} : { channelId: imChannelId }),
+            ...(imApprovalChatIdProblem === undefined ? {} : { approvalChatIdProblem: imApprovalChatIdProblem }),
+        },
     }
 }
 
@@ -383,7 +487,9 @@ export const HOST_OWNED_KEYS: readonly { key: string; why: string }[] = [
     { key: 'attentionMaxAgeMs', why: '多久算"过期的提问"是宿主上限：仓库能放宽它就等于让作废的提问继续看起来新鲜' },
     {
         key: 'im',
-        why: 'IM 通道是否启用是宿主决定：仓库能打开/关闭一条把问题发出进程的通道，等于自行改写审批边界',
+        why:
+            'IM 通道是否启用、审批卡片发到哪个会话（im.approvalChatId）、答案是否必须来自私聊（im.p2pOnly）都是宿主决定：' +
+            '仓库能选自己的审批会话，就等于绕过审批边界把卡片发给自己',
     },
 ]
 

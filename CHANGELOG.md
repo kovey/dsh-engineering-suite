@@ -1,5 +1,35 @@
 ## [未发布]
 
+### 安全 · IM 审批改用显式目标会话 + P2P 白名单（P0）
+
+IM 审批卡的目标会话此前由 `dsh-chat-interaction` 自己决定：不传 `chatId` 时它取 `p2pChat || activeChat`，
+而 `p2pChat` 只是"最后一条给 bot 发消息的会话"（`plugin.js:217`）——**任何人私聊 bot 就能把审批卡改投到自己那里**，
+再配上"按钮就是决定"的落账路径就是一条真实的越权链。P0 把目标变成宿主配置，并补上三层校验。
+
+- **配置（profile 宿主键，仓库改不了）**：`im.approvalChatId`（默认 `''` = 不配置 = 今日行为）与
+  `im.p2pOnly`（默认 `true`）。两者都**校验而不是静默强制**：不可用的 `approvalChatId`（非字符串 / 含空白或控制字符 /
+  超 512 字符）会报告配置问题并让发问**拒绝**（不退回"由 IM 插件挑目标"）；不可用的 `p2pOnly` 保持严格默认 `true`。
+  放在宿主侧的理由与 `requireApproverList` 同构：仓库能选自己的审批会话，就等于把卡片发给自己。
+- **发送**：配置了目标时 `api.ask` 显式携带 `chatId = im.approvalChatId` 与 `from = 项目审批人名单`
+  （上游 `dist/api.js:262` 对不在 `from` 里的回复直接忽略并继续等待）；未配置时载荷与今天**逐字一致**（不传这两个字段）。
+- **fail closed（发卡之前）**：目标已配置但名单为空/不可读 → `refused:no-allowlist`，**一张卡片都不发**（也不降级到本地通道）；
+  目标不可用 → `refused:bad-target`；显式开启 `p2pOnly` 却没有目标 → `refused:no-target`。
+- **落账之前校验来源**：`answer.chatId` 必须等于配置目标（否则 `refused:wrong-chat`）；`p2pOnly` 时 `answer.chatKind`
+  必须是 `p2p`——**缺失按"未证明"处理**，fail closed 拒绝（`refused:not-p2p`）。这两种拒绝都**不是决定**：
+  不写决定行、不把令牌换成放行、outbox 记 `withdrawn`；既有的 `approveCheck` 照旧运行（纵深防御）。
+- **可观测**：订阅上游 `onAnswerIgnored`，把"有人试过回答"的次数（按原因分）、发起者与会话记进通道报告，
+  `interaction_status` 显示计数与最近几条；上游没有该钩子时如实写「无法观测」（那里的 0 次**不等于**没人试过）。
+  被忽略消息的**原文不落盘**（拒答里可能仍有凭据）。
+- **预检**：显式目标让旧预检里的"必须先有 active chat（先私聊 bot 一次）"不再适用——上游 `resolve()` 拿到 `chatId` 就直接用。
+  新部署（bot 从没收到过消息）因此能直接发卡；没有目标时预检逐字不变。
+- **上游细节（0.3.4 实测）**：`AskRequest` 的类型里 `channel`/`chatId` 都是可选的，但 `resolve()` 只有在
+  **`channel` 与 `chatId` 同时给出**时才用显式目标；只给 `chatId` 会掉回 `resolveActive()`——即静默回到
+  `p2pChat || activeChat`。所以显式目标必须与渠道名同行：渠道名不可知（没有 `api.channels` 也没配 `im.channelId`）时
+  **拒绝发送**，而不是把一个会被忽略的 `chatId` 发出去。
+- **测试**：`dsh-interaction-gate` 66 → **76**（TC-901…TC-907，另含"未配置目标时载荷逐字不变"、"显式 p2pOnly 却无目标即拒绝"、
+  "没有 active chat 也能发到配置目标"、"渠道名不可知即拒绝"）。
+- **文档**：`docs/ARCHITECTURE.md` §5.18 补"为什么 `p2pChat` 绝不能当审批目标"与三层模型。
+
 ### 新增 · `scripts/check-host-api.sh`：把我们对宿主 API 的假设变成可核对的表
 
 我们已经两次被"宿主删了一个方法、我们的结构类型还在编译"击穿（`subagents.start` 在 0.2.1 被删除，

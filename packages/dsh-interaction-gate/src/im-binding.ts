@@ -98,6 +98,13 @@ export interface ImBindingOptions {
     channelId?: string
     /** The `required` bounded window in ms (default {@link DEFAULT_IM_REQUIRED_WAIT_MS}). */
     requiredWaitMs?: number
+    /**
+     * The host's `im.approvalChatId` (P0): the ONE conversation approvals go to.
+     * `''` = not configured = today's behaviour (the api resolves its target).
+     */
+    approvalChatId?: string
+    /** The host's `im.p2pOnly` (reporting only; the per-answer check is in `tools.ts`). */
+    p2pOnly?: boolean
     /** The host's ask deadline handed to the adapter. */
     askTimeoutMs: number
     /** Host `redactPatterns` (built-in credential rules always apply too). */
@@ -190,6 +197,11 @@ export function installImChannel(host: ImInjectionHost, options: ImBindingOption
             registered: phase === 'registered',
             ...(appeared ? { appeared: true } : {}),
             ...(mode === 'required' ? { requiredWaitMs: waitMs } : {}),
+            // The approval target is stated whether or not the channel is
+            // registered: "IM 未注册 + 目标已配置" is a different fact from
+            // "IM 未注册、也没配目标", and the doctor may show either.
+            approvalChatId: options.approvalChatId ?? '',
+            p2pOnly: options.p2pOnly === true,
             reason,
         }
         if (phase !== 'registered') return base
@@ -199,6 +211,11 @@ export function installImChannel(host: ImInjectionHost, options: ImBindingOption
             ...(apiVersion === undefined ? {} : { apiVersion }),
             ...(pluginVersion === undefined ? {} : { pluginVersion }),
             ...(channelId === undefined ? {} : { channelId }),
+            // What we observed about REFUSED answer attempts. `upstream` says
+            // whether this deployment can see them at all — an empty list from a
+            // 'hooked' channel means "nobody tried", from 'unavailable' it means
+            // "not observable", and the two must never read the same.
+            ...(handle === undefined ? {} : { ignoredAnswers: handle.ignored() }),
         }
     }
 
@@ -313,10 +330,18 @@ export function installImChannel(host: ImInjectionHost, options: ImBindingOption
             created = createChatChannel({
                 api: probe.api,
                 ...(channelId === undefined ? {} : { channelId }),
+                ...(options.approvalChatId === undefined ? {} : { approvalChatId: options.approvalChatId }),
+                ...(options.p2pOnly === undefined ? {} : { p2pOnly: options.p2pOnly }),
                 askTimeoutMs: options.askTimeoutMs,
                 ...(options.redactPatterns === undefined ? {} : { redactPatterns: options.redactPatterns }),
                 logger,
                 note: (message) => note(message),
+                // Re-publish the verdict when a refused attempt is recorded, so
+                // `interaction_status` shows it without waiting for a phase
+                // change. `publish` does not log, so this cannot spam the log.
+                onIgnored: () => {
+                    if (!disposed) publish()
+                },
             })
         } catch (error) {
             phase = mode === 'required' ? 'refused' : 'absent'

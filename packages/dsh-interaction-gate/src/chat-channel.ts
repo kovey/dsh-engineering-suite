@@ -62,7 +62,7 @@
  * @module dsh-interaction-gate/chat-channel
  */
 
-import type { ImChannelReport, InteractionChannel, InteractionAnswer } from './channels.js'
+import type { ImAskTarget, ImChannelReport, ImIgnoredAttempt, ImIgnoredReport, InteractionChannel, InteractionAnswer } from './channels.js'
 import { checkOutgoing, compileRedactPatterns, describeHits, truncate, type SecretRule } from './redact.js'
 
 /** The service the IM plugin provides. */
@@ -95,6 +95,12 @@ export interface ChatApiLike {
     channels?: () => unknown
     capabilities?: (channel: string) => unknown
     authState?: (channel: string) => unknown
+    /**
+     * Optional (0.3.4+): observe answer attempts the plugin refused (a sender
+     * outside `from`, a reply matching no option). Absent on an older upstream,
+     * which is a LIMITATION to report — never a crash and never an error.
+     */
+    onAnswerIgnored?: (handler: (event: unknown) => void) => unknown
 }
 
 /** A usable service, or the reason there is none (never both). */
@@ -243,7 +249,17 @@ interface AskOutcome {
 export interface ChatChannelHandle {
     channel: InteractionChannel
     dispose: () => void
+    /**
+     * What this process observed about REFUSED answer attempts (the upstream's
+     * `onAnswerIgnored` hook). Always readable: `upstream: 'unavailable'` means
+     * "not observable here", which the doctor states instead of implying
+     * "nobody tried".
+     */
+    ignored: () => ImIgnoredReport
 }
+
+/** How many refused attempts the report keeps verbatim. */
+export const MAX_IGNORED_RECENT = 5
 
 /** Options for {@link createChatChannel}. */
 export interface ChatChannelOptions {
@@ -254,6 +270,18 @@ export interface ChatChannelOptions {
      * Omitted = the api resolves its own active chat across channels.
      */
     channelId?: string
+    /**
+     * The configured approval target (`im.approvalChatId`), or `''`/absent.
+     *
+     * Two jobs: it is the CONVERSATION this channel reports (`chatId`, so the
+     * outbox serializes the right chat instead of the channel NAME), and it is
+     * what makes the adapter fail closed when an ask arrives without an explicit
+     * target — a configured target must never be silently replaced by the api's
+     * own `p2pChat || activeChat`.
+     */
+    approvalChatId?: string
+    /** `im.p2pOnly`: only carried into the report (the check is per answer). */
+    p2pOnly?: boolean
     /** The host's `askTimeoutMs` — the deadline the IM api is given. */
     askTimeoutMs: number
     /** Host `redactPatterns` (built-in credential rules always apply too). */
@@ -261,6 +289,8 @@ export interface ChatChannelOptions {
     /** Per-ask defects: the registry's `problems()` sink. */
     note?: (message: string) => void
     logger?: { warn: (message: string) => void }
+    /** Called after one refused attempt was recorded (the report is re-published). */
+    onIgnored?: () => void
     /** Injected clock (tests); no clock in the mapping itself. */
     now?: () => number
 }
@@ -298,6 +328,84 @@ export function createChatChannel(options: ChatChannelOptions): ChatChannelHandl
     }
     for (const problem of compiled.problems) note(problem)
 
+    // --- refused answer attempts (the upstream's onAnswerIgnored) ------------
+    // "Someone tried to answer for the approver" must not look like a plain
+    // timeout. The counts and the last few attempts go into the IM report that
+    // `interaction_status` renders; the attempt's TEXT is not kept (it is not
+    // needed to act on the event, and a refused message can still carry a
+    // credential — the outgoing redaction layer takes the same position).
+    const ignored: {
+        upstream: 'hooked' | 'unavailable'
+        total: number
+        bySender: number
+        byOptions: number
+        recent: ImIgnoredAttempt[]
+    } = { upstream: 'unavailable', total: 0, bySender: 0, byOptions: 0, recent: [] }
+
+    const recordIgnored = (event: unknown): void => {
+        if (disposed) return
+        if (!isRecord(event)) {
+            note('IM 报告了一条形状不可识别的"被拒绝的回答尝试"：无法读出原因/发起者，已忽略该事件（它不是决定）')
+            return
+        }
+        const reason = typeof event['reason'] === 'string' && event['reason'] !== '' ? event['reason'] : 'unknown'
+        const by = typeof event['by'] === 'string' && event['by'].trim() !== '' ? event['by'].trim() : undefined
+        const chatId = typeof event['chatId'] === 'string' && event['chatId'] !== '' ? event['chatId'] : undefined
+        const messageId = typeof event['messageId'] === 'string' && event['messageId'] !== '' ? event['messageId'] : undefined
+        const at = typeof event['at'] === 'number' && Number.isFinite(event['at']) ? event['at'] : now()
+        ignored.total += 1
+        if (reason === 'sender-not-allowed') ignored.bySender += 1
+        else if (reason === 'option-mismatch') ignored.byOptions += 1
+        ignored.recent.push({
+            at,
+            reason,
+            ...(chatId === undefined ? {} : { chatId }),
+            ...(by === undefined ? {} : { by }),
+            ...(messageId === undefined ? {} : { messageId }),
+        })
+        if (ignored.recent.length > MAX_IGNORED_RECENT) ignored.recent.shift()
+        note(
+            `IM 上有一条回答尝试被拒绝（${reason}）：发起者 ${by ?? '未提供身份'}，会话 ${chatId ?? '未提供'}——` +
+                '它没有成为决定，提问仍在等待（这是"有人试过"，不是"没人回答"）',
+        )
+        options.onIgnored?.()
+    }
+
+    /** Parse a subscription handle into a disposer, when the api gives none. */
+    const disposerOf = (handle: unknown): (() => void) | undefined => {
+        const invoke = (call: () => unknown): (() => void) => () => {
+            try {
+                const result = call()
+                if (typeof (result as { then?: unknown } | undefined)?.then === 'function') {
+                    void (result as Promise<unknown>).catch(() => undefined)
+                }
+            } catch {
+                // The subscription is being torn down anyway.
+            }
+        }
+        if (typeof handle === 'function') return invoke(handle as () => unknown)
+        if (isRecord(handle) && typeof handle['dispose'] === 'function') {
+            const dispose = handle['dispose']
+            return invoke(() => (dispose as () => unknown).call(handle))
+        }
+        return undefined
+    }
+
+    let unsubscribeIgnored: (() => void) | undefined
+    if (typeof options.api.onAnswerIgnored === 'function') {
+        try {
+            unsubscribeIgnored = disposerOf(options.api.onAnswerIgnored((event: unknown) => recordIgnored(event)))
+            // Subscribed is not the same as honoured: an unusable handler is
+            // detected when the event arrives (recordIgnored above), not here.
+            ignored.upstream = 'hooked'
+        } catch (error) {
+            note(
+                `订阅 IM 的"被忽略回答"事件失败（api.onAnswerIgnored 抛错）：${reasonOf(error)}——` +
+                    '本部署看不到"有人试过回答"，只能看到最终结果（不会因此崩溃，也不会因此放行）',
+            )
+        }
+    }
+
     /** Forget asks whose deadline has passed and that nobody is waiting on. */
     const prune = (): void => {
         for (const [token, entry] of asks) {
@@ -319,10 +427,17 @@ export function createChatChannel(options: ChatChannelOptions): ChatChannelHandl
      * replies, or has no active chat) wastes the human's deadline and would
      * end as an opaque timeout, so it is refused up front with the exact fix.
      *
+     * @param explicitTarget - the ask names its own conversation (`im.approvalChatId`).
+     *   The "no active chat" requirement then does NOT apply: it exists because
+     *   the api would otherwise have to resolve a chat from traffic, and the
+     *   whole point of an explicit target is that no inbound message is needed
+     *   for the bot to know where to ask (upstream `resolve()` returns the given
+     *   `chatId` directly). Demanding a DM first would make the hardening
+     *   unusable exactly where it matters — a fresh deployment.
      * @returns the channel name the ask should target (pinned, so the api
      *   resolves the same chat this check verified) or the exact refusal.
      */
-    const preflight = (): { ok: true; target?: string } | { ok: false; reason: string } => {
+    const preflight = (explicitTarget: boolean): { ok: true; target?: string } | { ok: false; reason: string } => {
         const api = options.api
         const failures: string[] = []
         let candidates: { name: string; inbound: boolean }[] | undefined
@@ -421,10 +536,59 @@ export function createChatChannel(options: ChatChannelOptions): ChatChannelHandl
                     hasChat = typeof active === 'string' && active.trim() !== ''
                 }
             }
-            if (hasChat !== false) return { ok: true, target: candidate.name }
+            if (hasChat !== false || explicitTarget) return { ok: true, target: candidate.name }
             failures.push(`渠道 "${candidate.name}" 没有 active chat：先在 IM 里给它发一条消息建立会话，再提问`)
         }
         return { ok: false, reason: failures.join('；') || '没有可用的 IM 渠道' }
+    }
+
+    /**
+     * The explicit IM target of ONE ask, or the exact refusal.
+     *
+     * The target comes from the MESSAGE (computed where the workspace and its
+     * approver list are known, see `tools.ts`), never from the api's own state:
+     * `p2pChat` is just "the last chat that messaged the bot", so letting the
+     * plugin pick would let anyone who DMs the bot redirect this card.
+     *
+     * Fail closed: with `im.approvalChatId` configured, an ask that arrives
+     * without a target is REFUSED rather than sent to whatever chat the api
+     * would have resolved. Without a configured target the adapter behaves
+     * exactly as before (no `chatId`, no `from`).
+     */
+    const targetOf = (message: { im?: ImAskTarget }): { ok: true; im?: ImAskTarget } | { ok: false; error: string } => {
+        const requested: unknown = message.im
+        if (requested !== undefined) {
+            if (!isRecord(requested)) return { ok: false, error: '提问携带的 IM 审批目标不是一个对象：拒绝发送（不猜目标会话）' }
+            const chatId = typeof requested['chatId'] === 'string' ? requested['chatId'].trim() : ''
+            const rawFrom = requested['from']
+            const from: string[] = []
+            if (Array.isArray(rawFrom)) {
+                for (const entry of rawFrom) {
+                    if (typeof entry !== 'string') continue
+                    const trimmed = entry.trim()
+                    if (trimmed !== '' && !from.includes(trimmed)) from.push(trimmed)
+                }
+            }
+            if (chatId === '') return { ok: false, error: '提问携带的 IM 审批目标缺少 chatId：拒绝发送（目标不明就不发卡片）' }
+            if (from.length === 0) {
+                return {
+                    ok: false,
+                    error:
+                        '提问携带的 IM 审批目标没有白名单（from 为空）：拒绝发送——没有名单就没有"谁可以回答"，' +
+                        '而一张谁都能答的卡片不是审批',
+                }
+            }
+            return { ok: true, im: { chatId, from, p2pOnly: requested['p2pOnly'] === true } }
+        }
+        if (options.approvalChatId !== undefined && options.approvalChatId !== '') {
+            return {
+                ok: false,
+                error:
+                    `本通道配置了 im.approvalChatId=${options.approvalChatId}，但这个提问没有携带显式审批目标（chatId/from）：` +
+                    '拒绝发送——绝不退回"由 IM 插件的 p2pChat/activeChat 决定目标"',
+            }
+        }
+        return { ok: true }
     }
 
     /** Normalise one `api.ask` resolution. Never invents an approval. */
@@ -458,7 +622,22 @@ export function createChatChannel(options: ChatChannelOptions): ChatChannelHandl
         }
         const by = typeof value['by'] === 'string' && value['by'].trim() !== '' ? value['by'].trim() : undefined
         const messageId = typeof value['messageId'] === 'string' && value['messageId'] !== '' ? value['messageId'] : undefined
-        return { answer: { value: mapped, ...(by === undefined ? {} : { by }), ...(messageId === undefined ? {} : { messageId }) } }
+        // Provenance (0.3.4+): the chat the answer came from, and its kind when
+        // the platform reported one. Forwarded AS REPORTED — the adapter never
+        // invents a `chatKind`, because "not proven" must stay distinguishable
+        // from "proven p2p" for the post-answer check.
+        const answerChatId = typeof value['chatId'] === 'string' && value['chatId'] !== '' ? value['chatId'] : undefined
+        const rawKind = value['chatKind']
+        const answerKind = rawKind === 'p2p' || rawKind === 'group' ? rawKind : undefined
+        return {
+            answer: {
+                value: mapped,
+                ...(by === undefined ? {} : { by }),
+                ...(messageId === undefined ? {} : { messageId }),
+                ...(answerChatId === undefined ? {} : { chatId: answerChatId }),
+                ...(answerKind === undefined ? {} : { chatKind: answerKind }),
+            },
+        }
     }
 
     /** Apply one terminal outcome exactly once (a hostile api may resolve twice). */
@@ -482,12 +661,17 @@ export function createChatChannel(options: ChatChannelOptions): ChatChannelHandl
 
     const channel: InteractionChannel = {
         name: CHAT_CHANNEL_NAME,
-        // The pinned IM channel is the conversation we can NAME without asking
-        // the api (a chat id needs an inbound message to exist). Without a pin
-        // the api resolves its own active chat per send, so every ask through
-        // this adapter shares one implicit conversation — conservative on
-        // purpose: at most one outstanding question in that chat.
-        ...(options.channelId === undefined ? {} : { chatId: options.channelId }),
+        // The conversation this channel reports, so the outbox serializes the
+        // right one. With P0 the conversation is KNOWN (im.approvalChatId); the
+        // pinned channel NAME is only a fallback for a deployment that has not
+        // configured a target yet (then the api still resolves its active chat
+        // per send, so every ask shares one implicit conversation — at most one
+        // outstanding question, conservative on purpose).
+        ...(options.approvalChatId !== undefined && options.approvalChatId !== ''
+            ? { chatId: options.approvalChatId }
+            : options.channelId === undefined
+              ? {}
+              : { chatId: options.channelId }),
 
         async send(message): Promise<{ ok: boolean; messageId?: string; error?: string; permanent?: boolean; defer?: boolean }> {
             // Permanent in the outbox's sense: this adapter will never deliver
@@ -541,7 +725,19 @@ export function createChatChannel(options: ChatChannelOptions): ChatChannelHandl
                 }
             }
 
-            const ready = preflight()
+            // The target must be settled BEFORE the api is touched: with a
+            // configured approval chat there is no such thing as "the api will
+            // figure out where to put it".
+            const resolvedTarget = targetOf(message)
+            if (!resolvedTarget.ok) {
+                note(`IM 通道拒绝发送（目标未确定）：${resolvedTarget.error}`)
+                // Permanent: the target comes from configuration/an ask, and no
+                // retry of THIS message will acquire one.
+                return { ok: false, error: resolvedTarget.error, permanent: true }
+            }
+            const imTarget = resolvedTarget.im
+
+            const ready = preflight(imTarget !== undefined)
             if (!ready.ok) {
                 // Temporarily unavailable (not connected / no active chat yet):
                 // the human can fix it without changing anything here, so this is
@@ -550,6 +746,20 @@ export function createChatChannel(options: ChatChannelOptions): ChatChannelHandl
                 return { ok: false, error: `IM 通道不可用：${ready.reason}`, defer: true }
             }
             const target = ready.target
+            // The upstream only honours an explicit `chatId` when `channel` is
+            // given TOGETHER with it (`resolve()` in the installed 0.3.4:
+            // `if (target?.channel && target.chatId) …`). A `chatId` alone falls
+            // through to `resolveActive()` — i.e. straight back to the
+            // `p2pChat || activeChat` hole this P0 exists to close, silently. So
+            // when we cannot NAME the channel (no discovery, no `im.channelId`)
+            // the explicit target is refused instead of sent half-applied.
+            if (imTarget !== undefined && target === undefined) {
+                const error =
+                    '显式审批目标需要同时确定 IM 渠道名（channel），但本部署既没有渠道发现能力（api.channels）也没有配置 im.channelId：' +
+                    '拒绝发送——上游在只有 chatId、没有 channel 时会忽略 chatId 并从 active chat 解析目标（正是要关掉的那条路）'
+                note(`IM 通道拒绝发送：${error}`)
+                return { ok: false, error, permanent: true }
+            }
 
             const declared = (message.buttons ?? []).map((button) => ({ value: button.value, label: button.label }))
             const controller = new AbortController()
@@ -566,6 +776,11 @@ export function createChatChannel(options: ChatChannelOptions): ChatChannelHandl
             try {
                 started = options.api.ask({
                     ...(target === undefined ? {} : { channel: target }),
+                    // P0: the conversation and the answer whitelist are EXPLICIT.
+                    // `from` makes the upstream ignore a reply from anybody else
+                    // (and keeps waiting), so the whitelist is enforced twice:
+                    // here (who MAY answer) and after the answer (who DID).
+                    ...(imTarget === undefined ? {} : { chatId: imTarget.chatId, from: [...imTarget.from] }),
                     title: message.title,
                     body: message.body,
                     ...(declared.length === 0 ? {} : { options: declared }),
@@ -677,9 +892,19 @@ export function createChatChannel(options: ChatChannelOptions): ChatChannelHandl
 
     return {
         channel,
+        ignored: (): ImIgnoredReport => ({
+            upstream: ignored.upstream,
+            total: ignored.total,
+            bySender: ignored.bySender,
+            byOptions: ignored.byOptions,
+            recent: ignored.recent.map((attempt) => ({ ...attempt })),
+        }),
         dispose(): void {
             if (disposed) return
             disposed = true
+            const unsubscribe = unsubscribeIgnored
+            unsubscribeIgnored = undefined
+            if (unsubscribe !== undefined) unsubscribe()
             for (const entry of asks.values()) {
                 entry.state = 'abandoned'
                 try {
