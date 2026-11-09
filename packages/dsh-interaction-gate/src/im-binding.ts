@@ -42,7 +42,7 @@
  * @module dsh-interaction-gate/im-binding
  */
 
-import type { ImChannelMode, ImChannelReport, ImPhase, InteractionRegistry } from './channels.js'
+import type { ImApproverReport, ImChannelMode, ImChannelReport, ImPhase, InteractionRegistry } from './channels.js'
 import { imLogLine } from './channels.js'
 import {
     CHAT_CHANNEL_NAME,
@@ -112,6 +112,12 @@ export interface ImBindingOptions {
      * `interaction_status`) starts with the mode the deployment actually chose.
      */
     approvalVia?: ApprovalVia
+    /**
+     * The HOST-side approver list as resolved at apply time (P3.1). Reported
+     * only — the per-answer whitelist check lives in `tools.ts`, where the
+     * workspace (and its project `denyApprovers`) is actually known.
+     */
+    approvers?: ImApproverReport
     /** The host's ask deadline handed to the adapter. */
     askTimeoutMs: number
     /** Host `redactPatterns` (built-in credential rules always apply too). */
@@ -214,6 +220,11 @@ export function installImChannel(host: ImInjectionHost, options: ImBindingOption
             // is "every approval becomes unavailable", a fact the doctor must be
             // able to state before somebody is stuck waiting for a card.
             ...(options.approvalVia === undefined ? {} : { approvalVia: options.approvalVia }),
+            // The host-side whitelist (P3.1): stated whether or not the channel
+            // is registered, because "no approver list" refuses every approval
+            // even while the IM service is missing — and the doctor must not
+            // have to read a repository file to learn it.
+            ...(options.approvers === undefined ? {} : { approvers: { ...options.approvers } }),
             reason,
         }
         if (phase !== 'registered') return base

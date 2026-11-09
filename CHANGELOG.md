@@ -1,3 +1,36 @@
+## [未发布]
+
+### 安全修复 · 审批人名单的权威收到宿主，仓库只能做减法（P3.1）
+
+`approversFile` 曾是项目级可覆盖键，而它解析成**仓库里的** `.dsh/interaction-approvers.txt`：一个仓库可以提交自己的
+审批人名单并把自己写进白名单——"审批是权限"（P1 的立场）被没人看的那一半直接废掉。这是安全修复，不是新功能。
+
+- **权威在宿主**：审批人名单只来自 `im.approvers`（内联 id 数组）与 `im.approversFile`（**宿主侧**路径，
+  默认 `~/.dsh/interaction-approvers.txt`，`~` 展开）。工作区相对路径会被拒绝并记问题（按"路径不可用"处理，
+  绝不改按仓库解析），因为那正是这个洞的形状。顶层 `approversFile` 已废弃：宿主写了会记一条迁移问题，仓库写了
+  会走既有的"项目级不可覆盖"路径被拒，并附上迁移理由（不是手写一套拒绝逻辑）。
+- **有效名单的公式**：`(im.approvers ∪ im.approversFile 的 id) − (im.denyApprovers ∪ 项目 denyApprovers)`，
+  比较与去重都是**大小写不敏感**（与落账前的 `approveCheck` 同一规则）。deny 与宿主名单**取并集**而非替换：
+  替换会让项目把宿主 deny 掉的 id 放回来，也就是"加人"。
+- **项目只剩减法**：新增项目级可覆盖键 `denyApprovers: string[]`（对应生效配置的 `im.denyApprovers`）。
+  仓库里的任何文件都不能新增审批人；`.dsh/interaction-approvers.txt` **不再被审批路径读取**。
+- **fail closed**：宿主名单为空而审批要走 IM 时，在发卡之前拒绝（`refused:approvers-missing`，原
+  `refused:no-allowlist` 并入同一原因），绝不回落到仓库文件；拒绝信息里点名 `im.approvers` / `im.approversFile`
+  与默认路径，并指出旧文件"存在但不再被读取"。
+- **迁移可见**：`interaction_status` 的「审批人名单」行改写来源（哪个数组/哪个文件、存在与否、几个 id），
+  新增「项目减法（denyApprovers）」行（宿主几个 + 项目几个、共去掉几个），并在仓库仍留着旧名单（或项目配置仍写
+  `approversFile`）时打一条 `⚠️ 迁移` 行，说明它**不再影响审批**以及宿主侧名单在哪。
+- **`im()` 通道报告新增 `approvers`**（只读：`inline` / `file` / `filePresent` / `fileCount` / `hostCount` / `deny`）：
+  自检的"有没有名单"只能来自宿主，不能让 doctor 去读仓库文件。
+- **`suite_status` 的 `runtime.im-approval`** 改为按**宿主**名单判定：名单为空是必需项失败（修复点名宿主键与默认路径，
+  并说明仓库文件不是回退）；服务不报名单时是 `unknown` 式的失败（"读不到"绝不能写成"为空"）。
+  新增 `runtime.im-approval-legacy-list`（建议项）：仓库里仍有旧名单文件、或项目配置仍写 `approversFile` 时，
+  明确报出"不再影响审批"并给出搬运路径。
+- **测试**：`dsh-interaction-gate` 87 → **95**（TC-931..935 + 宿主文件并集/相对路径拒绝/deny 不可加人）；
+  `dsh-suite-doctor` 59 → **62**（TC-936 ×2 + "宿主名单读不到 ≠ 为空"）。TC-937 = 两次 `bash scripts/verify.sh --quiet` 全绿。
+- **文档**：`docs/ARCHITECTURE.md` §5.18 补"为什么白名单必须宿主所有、而 deny 是项目唯一合法的杠杆"；
+  `docs/KNOWN-LIMITS.md` 记录迁移（旧仓库的名单从此不生效，以及怎么搬）。
+
 ## [0.7.0] — 2026-11-09
 
 ### 修复 · IM 通道在"提供方不发可用信号"时的半坏状态

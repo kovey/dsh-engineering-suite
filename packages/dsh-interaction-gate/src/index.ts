@@ -14,9 +14,12 @@
  *  - register `interaction_ask` / `interaction_notify` / `interaction_progress`
  *    / `interaction_status`: the four model-facing tools, fail closed, Chinese
  *    reports, each ending with a 下一步 line;
- *  - keep the append-only ledger (`<repo>/.dsh/interaction/decisions.jsonl`) and
- *    the project approver list (`<repo>/.dsh/interaction-approvers.txt`) — both
- *    inside `dsh-spec-gate`'s trust root, so the model cannot edit either;
+ *  - keep the append-only ledger (`<repo>/.dsh/interaction/decisions.jsonl`)
+ *    inside `dsh-spec-gate`'s trust root, so the model cannot edit it;
+ *  - resolve the approver list from the HOST only (`im.approvers` /
+ *    `im.approversFile`, default `~/.dsh/interaction-approvers.txt`): a
+ *    repository may subtract from it (`denyApprovers`) and nothing more, so a
+ *    committed file cannot whitelist itself (P3.1);
  *  - keep the ask OUTBOX (`<repo>/.dsh/interaction/outbox.jsonl`): the intent of
  *    a question is written BEFORE the channel is touched, every later transition
  *    is its own row, and a replay settles what can never be asked again instead
@@ -44,7 +47,7 @@ import { resolveConfig, resolveEffectiveConfig, type EffectiveConfig, type Inter
 import { installImChannel, type ImBinding, type ImInject } from './im-binding.js'
 import { createOutbox, describeReplay, type Outbox } from './outbox.js'
 import { PROMPT_SECTION, sectionText } from './prompt.js'
-import { artifactPathOf, registerTools, type ToolDeps } from './tools.js'
+import { artifactPathOf, hostApproverReportOf, registerTools, type ToolDeps } from './tools.js'
 import type { InteractionRegistry } from './channels.js'
 
 export const name = 'dsh-interaction-gate'
@@ -79,11 +82,12 @@ export { CHAT_CHANNEL_NAME, CHAT_API_MIN_VERSION, CHAT_SERVICE, createChatChanne
 export { installImChannel } from './im-binding.js'
 export { APPROVAL_OPTIONS, APPROVAL_OUTCOMES, APPROVAL_SOURCE, agentOfRequest, approvalQuestionOf, installApprovalAnswerer, outcomeOfDecision, reasonTextOf } from './approval.js'
 export type { EffectiveConfig, InteractionGateConfig, InteractionRegistry }
-export type { ImChannelMode, ImChannelReport, ImIgnoredAttempt, ImIgnoredReport, ImPhase } from './channels.js'
+export type { ImApproverReport, ImChannelMode, ImChannelReport, ImIgnoredAttempt, ImIgnoredReport, ImPhase } from './channels.js'
 export type { ChatApiLike, ChatChannelHandle, ChatChannelOptions, ChatProbe } from './chat-channel.js'
 export type { ApprovalAnswererHandle, ApprovalAnswererOptions, ApprovalOutcome, ApprovalQuestion, ApprovalRequestLike } from './approval.js'
 export type { ImBinding, ImBindingLogger, ImBindingOptions, ImInjectionContext, ImInjectionHost, ImInject, ImTimerControl } from './im-binding.js'
 export type { ImConfig } from './config.js'
+export { DEFAULT_APPROVERS_FILE, LEGACY_PROJECT_APPROVERS_FILE } from './config.js'
 export type { Attention, AttentionRecord, AttentionSource, AttentionState, WhyYou } from './attention.js'
 export type { Outbox, OutboxRecord, OutboxReplayReport, OutboxRow, OutboxState, OutboxSummary } from './outbox.js'
 export {
@@ -175,6 +179,10 @@ export function apply(ctx: Context, config: unknown = {}): void {
             // report is what lets the suite's self-check answer "can an approval
             // actually be decided over IM?" without reading the host's profile.
             approvalVia: resolved.im.approvalVia,
+            // The host-side whitelist, published for the self-check: the doctor
+            // must never answer "is there an approver list?" from a repository
+            // file — that is exactly the file P3.1 stopped trusting.
+            approvers: hostApproverReportOf(resolved),
             askTimeoutMs: resolved.askTimeoutMs,
             redactPatterns: resolved.redactPatterns,
             registry,
@@ -356,7 +364,7 @@ export function apply(ctx: Context, config: unknown = {}): void {
         const imFinal = imBinding.report()
         logger.info(
             `applied (tools: ${tools.registered.join(', ') || 'none'}${tools.failed.length === 0 ? '' : `; failed: ${tools.failed.join(', ')}`}; ` +
-                `service=${serviceState}; ledger=${resolved.ledgerFile}; outbox=${resolved.outboxFile}; approvers=${resolved.approversFile}${resolved.requireApproverList ? '(required)' : ''}; ` +
+                `service=${serviceState}; ledger=${resolved.ledgerFile}; outbox=${resolved.outboxFile}; approvers=${resolved.im.approvers.length} inline + ${resolved.im.approversFile}${resolved.requireApproverList ? '(required)' : ''}; ` +
                 `askTimeout=${resolved.askTimeoutMs}ms; notifyLevels=${resolved.notifyLevels.join(',')}; prompt=${resolved.prompt.enabled}; ` +
                 `im=${imFinal.registered ? `chat-interaction(api v${imFinal.apiVersion})` : imFinal.phase}(im.channel=${imMode}${imMode === 'required' ? `; requiredWaitMs=${resolved.im.requiredWaitMs}` : ''}; ` +
                 `approvalChatId=${resolved.im.approvalChatId === '' ? '(未配置)' : resolved.im.approvalChatId}; p2pOnly=${resolved.im.p2pOnly}; approvalVia=${approvalAnswerer.describe()})${resolved.im.approvalChatIdProblem === undefined ? '' : ' ⚠️ im.approvalChatId 不可用（见上）'}))`,

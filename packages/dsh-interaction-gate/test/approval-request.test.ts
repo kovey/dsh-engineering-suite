@@ -36,7 +36,6 @@ import { APPROVAL_OPTIONS, approvalQuestionOf } from '../dist/approval.js'
 
 const LEDGER = '.dsh/interaction/decisions.jsonl'
 const OUTBOX = '.dsh/interaction/outbox.jsonl'
-const APPROVERS = '.dsh/interaction-approvers.txt'
 const LOG = 'interaction-gate.log'
 
 /** The one conversation approvals may go to. */
@@ -59,12 +58,6 @@ async function waitFor(predicate: () => boolean, message: string): Promise<void>
         await sleep(1)
     }
     assert.ok(predicate(), message)
-}
-
-function writeApprovers(cwd: string, ids: string[]): void {
-    const file = path.join(cwd, APPROVERS)
-    fs.mkdirSync(path.dirname(file), { recursive: true })
-    fs.writeFileSync(file, `# approvers\n${ids.join('\n')}\n`, 'utf8')
 }
 
 function rowsOf(file: string): Record<string, any>[] {
@@ -203,14 +196,21 @@ function assemble(cwd: string, config: Record<string, unknown>, channel?: Script
     }
 }
 
+/**
+ * A host-side approver path that cannot exist (a fresh temp directory). Pinning
+ * it keeps the machine's real `~/.dsh/interaction-approvers.txt` out of the
+ * fixture: an allowlist is host config, and a developer's file must not change
+ * what these tests assert.
+ */
+const NO_HOST_FILE = path.join(tempWorkspace('dsh-host-approvers-'), 'approvers.txt')
+
 const TARGET = (via: 'off' | 'fallback' | 'only', extra: Record<string, unknown> = {}): Record<string, unknown> => ({
     askTimeoutMs: 1_000,
-    im: { approvalVia: via, approvalChatId: APPROVAL_CHAT, ...extra },
+    im: { approvalVia: via, approvalChatId: APPROVAL_CHAT, approvers: [ALICE], approversFile: NO_HOST_FILE, ...extra },
 })
 
 test('TC-911 fallback：名单内的人回答 allowed-once → 应答者返回 allowed-once，台账出现 source=approval-request 的行（含 by/chatId/messageId）', async () => {
     const cwd = tempWorkspace('interaction-p1-')
-    writeApprovers(cwd, [ALICE])
     const channel = scriptedChannel('chat-interaction')
     const first = assemble(cwd, TARGET('fallback'), channel)
     const { fake, registrations, behind } = first
@@ -265,7 +265,6 @@ test('TC-911 fallback：名单内的人回答 allowed-once → 应答者返回 a
 test('TC-912 fallback：回答 rejected → rejected；请求信号 abort → cancelled（各自落账）', async () => {
     // --- (a) a human says no ---------------------------------------------------
     const cwd = tempWorkspace('interaction-p1-')
-    writeApprovers(cwd, [ALICE])
     const rejected = scriptedChannel('chat-interaction')
     const first = assemble(cwd, TARGET('fallback'), rejected)
     const runningReject = first.fake.waterfall('approval/request', approvalRequest(first.fake.agent), () => 'unavailable')
@@ -276,7 +275,6 @@ test('TC-912 fallback：回答 rejected → rejected；请求信号 abort → ca
 
     // --- (b) the request is withdrawn while we wait ----------------------------
     const cwd2 = tempWorkspace('interaction-p1-')
-    writeApprovers(cwd2, [ALICE])
     const cancelled = scriptedChannel('chat-interaction', { waitMode: 'never' })
     const second = assemble(cwd2, TARGET('fallback'), cancelled)
     const controller = new AbortController()
@@ -295,7 +293,6 @@ test('TC-912 fallback：回答 rejected → rejected；请求信号 abort → ca
 
 test('TC-913 fallback 但 IM 未注册：调用 next() 落回原通道，返回值来自下层（不是 unavailable），且一张卡都没发', async () => {
     const cwd = tempWorkspace('interaction-p1-')
-    writeApprovers(cwd, [ALICE])
     // No channel at all: the answerer cannot even ask.
     const { fake, behind } = assemble(cwd, TARGET('fallback'))
     const tui = behind('rejected')
@@ -313,26 +310,27 @@ test('TC-913 fallback 但 IM 未注册：调用 next() 落回原通道，返回�
     // The other two "cannot even start" shapes, same rule: no card, delegate.
     // (a) a target with no approver list — there is no `from` whitelist to send.
     const bare = tempWorkspace('interaction-p1-')
-    const noList = assemble(bare, TARGET('fallback'))
+    // Empty host list on purpose: a target with no whitelist cannot ask.
+    const noList = assemble(bare, TARGET('fallback', { approvers: [] }))
     const tui2 = noList.behind('allowed-once')
     assert.equal(await noList.fake.waterfall('approval/request', approvalRequest(noList.fake.agent), () => 'unavailable'), 'allowed-once')
     assert.equal(tui2.calls(), 1)
-    assert.equal(ledgerOf(bare).at(-1)?.decision, refusalOf('no-allowlist'), JSON.stringify(ledgerOf(bare)))
+    assert.equal(ledgerOf(bare).at(-1)?.decision, refusalOf('approvers-missing'), JSON.stringify(ledgerOf(bare)))
     assert.equal(outboxOf(bare).length, 0)
-    // (b) no approval target at all: an approval card must not go to "whoever
-    // DM'd the bot", and `requireAllowlist` still needs a list to check.
+    // (b) no approval target at all: with a host list the ask proceeds (the
+    // no-target path is today's behaviour), and with no channel it still cannot
+    // start — one more "no card, delegate" shape, same rule.
     const untargeted = tempWorkspace('interaction-p1-')
-    const loose = assemble(untargeted, { askTimeoutMs: 1_000, im: { approvalVia: 'fallback' } })
+    const loose = assemble(untargeted, { askTimeoutMs: 1_000, im: { approvalVia: 'fallback', approvers: [ALICE] } })
     const tui3 = loose.behind('rejected')
     assert.equal(await loose.fake.waterfall('approval/request', approvalRequest(loose.fake.agent), () => 'unavailable'), 'rejected')
     assert.equal(tui3.calls(), 1)
-    assert.equal(ledgerOf(untargeted).at(-1)?.decision, refusalOf('approvers-missing'), JSON.stringify(ledgerOf(untargeted)))
+    assert.equal(ledgerOf(untargeted).at(-1)?.decision, refusalOf('channel-unusable'), JSON.stringify(ledgerOf(untargeted)))
     assert.equal(outboxOf(untargeted).length, 0)
 })
 
 test('TC-914 approvalVia=only 且 IM 未注册：直接返回 unavailable，且不调用 next()', async () => {
     const cwd = tempWorkspace('interaction-p1-')
-    writeApprovers(cwd, [ALICE])
     const { fake, registrations, behind } = assemble(cwd, TARGET('only'))
     const tui = behind('allowed-once')
 
@@ -345,7 +343,6 @@ test('TC-914 approvalVia=only 且 IM 未注册：直接返回 unavailable，且�
 
 test('TC-915 名单外的人回答：返回 unavailable（不是决定），台账记 refused 且没有决定行', async () => {
     const cwd = tempWorkspace('interaction-p1-')
-    writeApprovers(cwd, [ALICE])
     const channel = scriptedChannel('chat-interaction')
     const { fake } = assemble(cwd, TARGET('fallback'), channel)
 
@@ -366,7 +363,6 @@ test('TC-915 名单外的人回答：返回 unavailable（不是决定），台�
 
 test('TC-916 无人回答直到超时：返回 unavailable，绝不返回 rejected', async () => {
     const cwd = tempWorkspace('interaction-p1-')
-    writeApprovers(cwd, [ALICE])
     // A channel whose own deadline expires immediately: the engine keeps pulling
     // until its own deadline, then records a timeout (no real 1 s sleep needed).
     const channel = scriptedChannel('chat-interaction', { waitMode: 'null' })
@@ -385,7 +381,6 @@ test('TC-916 无人回答直到超时：返回 unavailable，绝不返回 reject
 
 test('TC-917 approvalVia=off（默认）：不注册任何监听器，请求落到原有应答者；不可用的值按 off 处理并报告', async () => {
     const cwd = tempWorkspace('interaction-p1-')
-    writeApprovers(cwd, [ALICE])
     const channel = scriptedChannel('chat-interaction')
     const { fake, registrations, behind } = assemble(cwd, TARGET('off'), channel)
     const tui = behind('rejected')

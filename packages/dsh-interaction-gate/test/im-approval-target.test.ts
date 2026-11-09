@@ -27,7 +27,6 @@ import { imAskTargetOf } from '../dist/tools.js'
 
 const LEDGER = '.dsh/interaction/decisions.jsonl'
 const OUTBOX = '.dsh/interaction/outbox.jsonl'
-const APPROVERS = '.dsh/interaction-approvers.txt'
 const LOG = 'interaction-gate.log'
 
 /** The one conversation approvals may go to. */
@@ -119,11 +118,15 @@ function makeChat(variant: { withIgnoredHook?: boolean } = {}): FakeChat {
     }
 }
 
-/** Write the project approver list (also the `from` whitelist of an approval card). */
-function writeApprovers(cwd: string, ids: string[]): void {
-    const file = path.join(cwd, APPROVERS)
-    fs.mkdirSync(path.dirname(file), { recursive: true })
-    fs.writeFileSync(file, ids.map((id) => `# approvers\n${id}`).join('\n') + '\n', 'utf8')
+/**
+ * The HOST-side allowlist (P3.1): the only source of the `from` whitelist.
+ *
+ * `approversFile` is pinned to a path inside the fixture that does not exist, so
+ * a developer's real `~/.dsh/interaction-approvers.txt` can never leak ids into
+ * a test.
+ */
+function hostApprovers(cwd: string, ids: string[]): Record<string, unknown> {
+    return { approvers: ids, approversFile: path.join(cwd, '.dsh', 'host-approvers.txt') }
 }
 
 /** Assemble the plugin (the real `apply`) with a fake IM service. */
@@ -153,13 +156,14 @@ const ledgerOf = (cwd: string): Record<string, any>[] => rowsOf(path.join(cwd, L
 const outboxOf = (cwd: string): Record<string, any>[] => rowsOf(path.join(cwd, OUTBOX))
 
 /** The configured-target shape every case below starts from. */
-const TARGET_CONFIG = { im: { channel: 'auto', channelId: 'feishu', approvalChatId: APPROVAL_CHAT } } as const
+const TARGET = (cwd: string, ids: string[] = []): Record<string, unknown> => ({
+    im: { channel: 'auto', channelId: 'feishu', approvalChatId: APPROVAL_CHAT, ...hostApprovers(cwd, ids) },
+})
 
 test('TC-901 P0 目标：ask 显式携带 chatId（im.approvalChatId）与 from（审批人名单），来源匹配后正常落账为决定', async () => {
     const cwd = tempWorkspace('interaction-p0-')
-    writeApprovers(cwd, ['ou_alice', 'ou_bob'])
     const chat = makeChat()
-    const { fake, registry } = assemble(cwd, TARGET_CONFIG, { chatInteraction: chat.layer })
+    const { fake, registry } = assemble(cwd, TARGET(cwd, ['ou_alice', 'ou_bob']), { chatInteraction: chat.layer })
 
     const running = fake.runTool('interaction_ask', { question: '这条交付可以放出去吗？', options: ['allowed-once', 'rejected'] })
     await waitFor(() => chat.asks.length === 1, 'interaction_ask 没有把提问交给 chatInteraction')
@@ -217,9 +221,8 @@ test('TC-901 P0 目标：ask 显式携带 chatId（im.approvalChatId）与 from�
 
 test('TC-902 P0 观测：interaction_status 显示审批目标已配置、名单人数与被忽略回答计数', async () => {
     const cwd = tempWorkspace('interaction-p0-')
-    writeApprovers(cwd, ['ou_alice', 'ou_bob'])
     const chat = makeChat()
-    const { fake, registry } = assemble(cwd, TARGET_CONFIG, { chatInteraction: chat.layer })
+    const { fake, registry } = assemble(cwd, TARGET(cwd, ['ou_alice', 'ou_bob']), { chatInteraction: chat.layer })
 
     // Someone outside the whitelist tried to answer: the upstream ignored it and
     // told us so. That is "someone tried", not "nobody answered".
@@ -257,9 +260,8 @@ test('TC-902 P0 观测：interaction_status 显示审批目标已配置、名单
 
 test('TC-903 P0 来源：答案的 chatId 不是配置目标 → refused:wrong-chat，没有决定、令牌不被换成放行', async () => {
     const cwd = tempWorkspace('interaction-p0-')
-    writeApprovers(cwd, ['ou_alice'])
     const chat = makeChat()
-    const { fake } = assemble(cwd, TARGET_CONFIG, { chatInteraction: chat.layer })
+    const { fake } = assemble(cwd, TARGET(cwd, ['ou_alice']), { chatInteraction: chat.layer })
 
     const running = fake.runTool('interaction_ask', { question: '放行吗？', options: ['allowed-once', 'rejected'] })
     await waitFor(() => chat.asks.length === 1, '提问没有发出去')
@@ -308,9 +310,8 @@ test('TC-904 P0 p2p：群聊答案与"类型未证明"的答案都拒绝（refus
     ]
     for (const testCase of cases) {
         const cwd = tempWorkspace('interaction-p0-')
-        writeApprovers(cwd, ['ou_alice'])
-        const chat = makeChat()
-        const { fake } = assemble(cwd, TARGET_CONFIG, { chatInteraction: chat.layer })
+            const chat = makeChat()
+        const { fake } = assemble(cwd, TARGET(cwd, ['ou_alice']), { chatInteraction: chat.layer })
 
         const running = fake.runTool('interaction_ask', { question: '放行吗？', options: ['allowed-once', 'rejected'] })
         await waitFor(() => chat.asks.length === 1, `${testCase.label}：提问没有发出去`)
@@ -339,11 +340,15 @@ test('TC-904 P0 p2p：群聊答案与"类型未证明"的答案都拒绝（refus
 })
 
 test('TC-905 P0 fail closed：配置了目标但名单为空/缺失 → 拒绝发问，一张卡片都不发（也不降级到本地通道）', async () => {
-    for (const testCase of [{ label: '名单不存在' }, { label: '名单只有注释' }]) {
+    for (const testCase of [{ label: '宿主没有名单（数组为空，文件也不存在）' }, { label: '宿主名单文件只有注释' }]) {
         const cwd = tempWorkspace('interaction-p0-')
-        if (testCase.label === '名单只有注释') writeApprovers(cwd, [])
+        if (testCase.label === '宿主名单文件只有注释') {
+            const file = path.join(cwd, '.dsh', 'host-approvers.txt')
+            fs.mkdirSync(path.dirname(file), { recursive: true })
+            fs.writeFileSync(file, '# 只有注释，没有 id\n', 'utf8')
+        }
         const chat = makeChat()
-        const { fake, registry } = assemble(cwd, TARGET_CONFIG, { chatInteraction: chat.layer })
+        const { fake, registry } = assemble(cwd, TARGET(cwd), { chatInteraction: chat.layer })
         // A perfectly usable LOCAL channel exists: fail-closed must not use it.
         const sent: Record<string, any>[] = []
         registry.register({
@@ -361,24 +366,23 @@ test('TC-905 P0 fail closed：配置了目标但名单为空/缺失 → 拒绝�
         const run = await fake.runTool('interaction_ask', { question: '放行吗？', options: ['allowed-once', 'rejected'] })
         assert.equal(run.isError, true, testCase.label)
         const text = runText(run)
-        assert.ok(text.includes('refused:no-allowlist'), `${testCase.label}：${text}`)
+        assert.ok(text.includes('refused:approvers-missing'), `${testCase.label}：${text}`)
         assert.ok(text.includes('审批人名单为空或不可读'), text)
         assert.equal(chat.asks.length, 0, `${testCase.label}：不得发出任何卡片`)
         assert.equal(sent.length, 0, `${testCase.label}：不得降级到本地通道`)
         const rows = ledgerOf(cwd)
         assert.equal(rows.length, 1, testCase.label)
-        assert.equal(rows[0].decision, refusalOf('no-allowlist'), testCase.label)
+        assert.equal(rows[0].decision, refusalOf('approvers-missing'), testCase.label)
 
         const status = runText(await fake.runTool('interaction_status', {}))
-        assert.ok(status.includes('当前会**拒绝发问**（refused:no-allowlist）'), `${testCase.label}：${status}`)
+        assert.ok(status.includes('当前会**拒绝发问**（refused:approvers-missing）'), `${testCase.label}：${status}`)
     }
 })
 
 test('TC-906 P0 留痕：非名单用户回答被上游忽略 → 记录原因/发起者/会话，提问最终是超时而非决定', async () => {
     const cwd = tempWorkspace('interaction-p0-')
-    writeApprovers(cwd, ['ou_alice'])
     const chat = makeChat()
-    const { fake, registry } = assemble(cwd, TARGET_CONFIG, { chatInteraction: chat.layer })
+    const { fake, registry } = assemble(cwd, TARGET(cwd, ['ou_alice']), { chatInteraction: chat.layer })
 
     const running = fake.runTool('interaction_ask', { question: '放行吗？', options: ['allowed-once', 'rejected'], timeoutMs: 2_500 })
     await waitFor(() => chat.asks.length === 1, '提问没有发出去')
@@ -447,7 +451,6 @@ test('TC-907 P0 未配置目标：ask 不带 chatId/from，行为与今天逐字
 
 test('TC-901/TC-907 显式目标不再依赖 active chat：不先私聊 bot，卡片也能发到配置的目标', async () => {
     const cwd = tempWorkspace('interaction-p0-')
-    writeApprovers(cwd, ['ou_alice'])
     const chat = makeChat()
     // A fresh deployment: the bot has never received a message, so the plugin
     // has no active chat to resolve. An explicit target makes that irrelevant
@@ -462,7 +465,7 @@ test('TC-901/TC-907 显式目标不再依赖 active chat：不先私聊 bot，�
         listenerConnected: true,
         pendingQuestions: [],
     })
-    const { fake } = assemble(cwd, TARGET_CONFIG, { chatInteraction: chat.layer })
+    const { fake } = assemble(cwd, TARGET(cwd, ['ou_alice']), { chatInteraction: chat.layer })
     const running = fake.runTool('interaction_ask', { question: '放行吗？', options: ['allowed-once', 'rejected'] })
     await waitFor(() => chat.asks.length === 1, '显式目标下不应再要求先建立 active chat')
     assert.equal((chat.asks[0] as Record<string, any>).chatId, APPROVAL_CHAT)
@@ -484,7 +487,6 @@ test('TC-901/TC-907 显式目标不再依赖 active chat：不先私聊 bot，�
 
 test('TC-901 显式目标必须与 channel 同行：渠道名不可知时拒绝发送（否则上游静默忽略 chatId）', async () => {
     const cwd = tempWorkspace('interaction-p0-')
-    writeApprovers(cwd, ['ou_alice'])
     const chat = makeChat()
     // A "partial but v1" api: no channel discovery, and the profile pins no
     // channel. The installed upstream only honours `chatId` when `channel` is
@@ -492,7 +494,7 @@ test('TC-901 显式目标必须与 channel 同行：渠道名不可知时拒绝�
     // back to the active chat — the very hole P0 closes.
     delete (chat.layer.api as Record<string, unknown>)['channels']
     delete (chat.layer.api as Record<string, unknown>)['capabilities']
-    const { fake } = assemble(cwd, { im: { channel: 'auto', approvalChatId: APPROVAL_CHAT } }, { chatInteraction: chat.layer })
+    const { fake } = assemble(cwd, { im: { channel: 'auto', approvalChatId: APPROVAL_CHAT, ...hostApprovers(cwd, ['ou_alice']) } }, { chatInteraction: chat.layer })
     const run = await fake.runTool('interaction_ask', { question: '放行吗？', options: ['allowed-once', 'rejected'] })
     assert.equal(run.isError, true, runText(run))
     const text = runText(run)
@@ -513,7 +515,15 @@ test('TC-901/903 配置：不可用的 approvalChatId 报告问题并 fail close
 
     // The plan refuses an unusable target — the ask never degrades to "the IM
     // plugin picks the chat".
-    const approvers = { file: '.dsh/interaction-approvers.txt', present: true, ids: ['ou_alice'], problems: [] }
+    const approvers = {
+        file: '/host/approvers.txt',
+        present: true,
+        host: ['ou_alice'],
+        ids: ['ou_alice'],
+        denied: [],
+        source: 'im.approvers（1 个内联 id）',
+        problems: [],
+    }
     const plan = imAskTargetOf(resolved, approvers)
     assert.equal(plan.ok, false)
     assert.equal(plan.ok ? '' : plan.reason, 'bad-target')
@@ -531,8 +541,8 @@ test('TC-901/903 配置：不可用的 approvalChatId 报告问题并 fail close
     assert.equal(imAskTargetOf(defaults, approvers).ok, true)
     // A configured target with no whitelist has no plan (AC-003).
     const configured = resolveConfig({ im: { approvalChatId: APPROVAL_CHAT } })
-    const empty = imAskTargetOf(configured, { file: 'x', present: false, ids: [], problems: [] })
-    assert.equal(empty.ok ? '' : empty.reason, 'no-allowlist')
+    const empty = imAskTargetOf(configured, { ...approvers, host: [], ids: [], denied: [] })
+    assert.equal(empty.ok ? '' : empty.reason, 'approvers-missing')
     const ready = imAskTargetOf(configured, approvers)
     assert.deepEqual(ready.ok ? ready.target : undefined, { chatId: APPROVAL_CHAT, from: ['ou_alice'], p2pOnly: true })
 })

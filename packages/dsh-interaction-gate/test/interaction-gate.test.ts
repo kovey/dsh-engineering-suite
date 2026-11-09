@@ -94,7 +94,21 @@ function rowsOf(cwd: string, file = LEDGER): any[] {
     return readLedger(path.join(cwd, file)).rows
 }
 
-function writeApprovers(cwd: string, lines: string[]): string {
+/**
+ * The HOST-side approver list (P3.1): the only source an approval accepts.
+ *
+ * `approversFile` is pinned to a path that cannot exist, so the machine's real
+ * `~/.dsh/interaction-approvers.txt` (host config!) never leaks ids into a fixture.
+ */
+function hostApprovers(ids: string[]): Record<string, unknown> {
+    return { im: { approvers: ids, approversFile: path.join(tempWorkspace('dsh-host-approvers-'), 'approvers.txt') } }
+}
+
+/**
+ * A repository list file — the PRE-P3.1 source. Written on purpose in the
+ * migration cases: it must be reported and must never be read for approvals.
+ */
+function writeLegacyApprovers(cwd: string, lines: string[]): string {
     const file = path.join(cwd, '.dsh', 'interaction-approvers.txt')
     fs.mkdirSync(path.dirname(file), { recursive: true })
     fs.writeFileSync(file, `${lines.join('\n')}\n`)
@@ -323,8 +337,7 @@ test('interaction_ask：通道 wait() 回了一个别的令牌 → 丢弃后继�
 
 test('interaction_ask：requireApproverList=true 时未授权回答者 → 拒绝 + 台账行（含回答者）', async () => {
     const cwd = tempWorkspace('interaction-gate-')
-    writeApprovers(cwd, ['# 项目审批人', 'alice'])
-    const fake = host(cwd, { requireApproverList: true })
+    const fake = host(cwd, { requireApproverList: true, ...hostApprovers(['alice']) })
     const mallory = scriptedChannel('im')
     fake.registry.register(mallory.channel)
 
@@ -335,10 +348,11 @@ test('interaction_ask：requireApproverList=true 时未授权回答者 → 拒�
     const text = runText(outcome)
     assert.ok(text.includes('refused:unauthorized'), text)
     assert.ok(text.includes('未获授权'), text)
-    // The refusal points at the FILE and the count, not at the other approvers'
-    // identities: the model needs to know why it failed, not who else may answer.
-    assert.ok(text.includes('不在项目审批人名单里'), text)
-    assert.ok(text.includes('interaction-approvers.txt'), text)
+    // The refusal names the SOURCE (host config) and the count, not the other
+    // approvers' identities: the model needs to know why it failed, not who else
+    // may answer.
+    assert.ok(text.includes('不在宿主审批人名单里'), text)
+    assert.ok(text.includes('im.approvers'), text)
     const rows = rowsOf(cwd)
     assert.equal(rows.at(-1).decision, refusalOf('unauthorized'))
     assert.equal(rows.at(-1).userId, 'mallory', '未授权的回答者也要如实记录')
@@ -346,15 +360,14 @@ test('interaction_ask：requireApproverList=true 时未授权回答者 → 拒�
 
 test('interaction_ask：名单里的人可以回答；名单缺失时在发卡片前就拒绝', async () => {
     const cwd = tempWorkspace('interaction-gate-')
-    writeApprovers(cwd, ['alice'])
-    const fake = host(cwd, { requireApproverList: true })
+    const fake = host(cwd, { requireApproverList: true, ...hostApprovers(['alice']) })
     const im = scriptedChannel('im')
     fake.registry.register(im.channel)
     const running = fake.runTool('interaction_ask', { question: '放行吗？', options: ['allowed-once', 'rejected'] })
     await answerWith(im, { value: 'allowed-once', by: 'ALICE' })
     const run = await running
     assert.equal(run.isError, false, runText(run))
-    assert.ok(runText(run).includes('项目审批人名单：1 个 id'), runText(run))
+    assert.ok(runText(run).includes('宿主审批人名单：1 个 id'), runText(run))
 
     // No list at all: refuse BEFORE sending a card nobody may answer.
     const bare = tempWorkspace('interaction-gate-')
@@ -531,8 +544,7 @@ test('出站载荷里的疑似凭据 → 拒绝发送（打码也不行），原
 
 test('interaction_status：通道能力、生效配置、名单状态、台账计数与未决定的提问（含年龄）', async () => {
     const cwd = tempWorkspace('interaction-gate-')
-    writeApprovers(cwd, ['alice', 'bob'])
-    const fake = host(cwd, { requireApproverList: true, preferredChannels: ['im', 'ghost'] })
+    const fake = host(cwd, { requireApproverList: true, preferredChannels: ['im', 'ghost'], ...hostApprovers(['alice', 'bob']) })
     const im = scriptedChannel('im', { waitMode: 'never' })
     const pushOnly = scriptedChannel('webhook', { withWait: false })
     fake.registry.register(im.channel)
@@ -551,7 +563,7 @@ test('interaction_status：通道能力、生效配置、名单状态、台账�
     assert.ok(text.includes('canAsk=false'), text)
     assert.ok(text.includes('未实现 wait()'), text)
     assert.ok(text.includes('⚠️ 配置偏好但未注册的通道：ghost'), text)
-    assert.ok(text.includes('审批人名单：**必须**；文件 '), text)
+    assert.ok(text.includes('审批人名单：**必须**；来源 im.approvers（2 个内联 id）'), text)
     assert.ok(text.includes('有效 id=2'), text)
     assert.ok(text.includes('未决定的提问（按年龄，共 1 个）'), text)
     assert.match(text, /- q-[0-9a-f]+：年龄 \d+s/)
@@ -584,16 +596,22 @@ test('项目级配置：允许的键生效、非法值与宿主键被拒绝并�
                 preferredChannels: ['im'],
                 notifyLevels: ['info', 'warn', 'error'],
                 redactPatterns: ['INTERNAL-[0-9]{4}', '((('],
+                // The project's ONE legitimate lever over the approver list:
+                denyApprovers: ['bob'],
                 // Host-owned / unusable values, all of which must be refused:
                 requireApproverList: false,
                 askTimeoutMs: 1,
-                approversFile: 42,
+                // The pre-P3.1 key: refused WITH the migration reason.
+                approversFile: '.dsh/interaction-approvers.txt',
             },
             null,
             2,
         )}\n`,
     )
-    const hostConfig = resolveConfig({ requireApproverList: true, askTimeoutMs: 900_000 }, () => undefined)
+    const hostConfig = resolveConfig(
+        { requireApproverList: true, askTimeoutMs: 900_000, im: { approvers: ['alice', 'bob'] } },
+        () => undefined,
+    )
     const effective = resolveEffectiveConfig(hostConfig, resolveLayout(cwd, {}), undefined)
 
     assert.equal(effective.source, 'project')
@@ -603,17 +621,21 @@ test('项目级配置：允许的键生效、非法值与宿主键被拒绝并�
     assert.deepEqual(effective.config.redactPatterns, ['INTERNAL-[0-9]{4}'], '非法正则必须被丢掉')
     assert.equal(effective.config.requireApproverList, true, '宿主键不得被项目关闭')
     assert.equal(effective.config.askTimeoutMs, 900_000, '宿主键不得被项目改写')
-    assert.equal(effective.config.approversFile, '.dsh/interaction-approvers.txt', '类型不对的值回退 profile 值')
+    assert.deepEqual(effective.config.im.approvers, ['alice', 'bob'], '宿主名单不受项目文件影响')
+    assert.deepEqual(effective.config.im.projectDenyApprovers, ['bob'], '项目只能做减法')
+    assert.deepEqual(effective.config.im.denyApprovers, ['bob'], '有效 deny = 宿主 ∪ 项目')
 
     const problems = effective.problems.join('\n')
     assert.ok(problems.includes('"requireApproverList" 不允许在项目级配置里覆盖'), problems)
     assert.ok(problems.includes('"askTimeoutMs" 不允许在项目级配置里覆盖'), problems)
-    assert.ok(problems.includes('approversFile 必须是非空字符串'), problems)
+    assert.ok(
+        problems.includes('"approversFile" 不允许在项目级配置里覆盖') && problems.includes('审批人名单的权威在宿主'),
+        '旧键必须被拒并说明迁移：' + problems,
+    )
     assert.ok(problems.includes('不是合法正则'), problems)
 
     // The plugin, in the same workspace, applies the overlay end to end.
-    const fake = host(cwd, { requireApproverList: true })
-    writeApprovers(cwd, ['alice'])
+    const fake = host(cwd, { requireApproverList: true, ...hostApprovers(['alice', 'bob']) })
     const im = scriptedChannel('im')
     fake.registry.register(im.channel)
     const running = fake.runTool('interaction_ask', { question: '放行吗？', options: ['yes', 'no'] })

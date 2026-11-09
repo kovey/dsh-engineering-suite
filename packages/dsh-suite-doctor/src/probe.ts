@@ -30,7 +30,13 @@
 
 import { SUITE_PLUGINS } from './config.js'
 import { gateObserveCheck } from './observe.js'
-import { APPROVAL_VIA_MODES, approverListOf, imApprovalChecks, type ApprovalVia } from './im-approval.js'
+import {
+    APPROVAL_VIA_MODES,
+    imApprovalChecks,
+    legacyApproverListOf,
+    type ApprovalVia,
+    type HostApproverFact,
+} from './im-approval.js'
 import {
     PHASES,
     mandateState,
@@ -337,6 +343,12 @@ export interface ImApprovalReport {
     approvalVia?: ApprovalVia
     approvalChatId?: string
     p2pOnly?: boolean
+    /**
+     * The HOST-side approver list (P3.1). Absent = the service does not report it
+     * (an older build): `unknown`, never "no approvers" — and never read from a
+     * repository file, which is exactly the source P3.1 retired.
+     */
+    approvers?: HostApproverFact
 }
 
 /** What the interaction service could (not) answer. */
@@ -563,12 +575,43 @@ function parseImApproval(value: unknown): { report?: ImApprovalReport; problem?:
     const mode = typeof raw === 'string' && (APPROVAL_VIA_MODES as readonly string[]).includes(raw) ? (raw as ApprovalVia) : undefined
     const target = typeof record['approvalChatId'] === 'string' ? record['approvalChatId'] : undefined
     const p2pOnly = typeof record['p2pOnly'] === 'boolean' ? record['p2pOnly'] : undefined
+    const approvers = parseApprovers(record['approvers'])
     return {
         report: {
             ...(mode === undefined ? {} : { approvalVia: mode }),
             ...(target === undefined ? {} : { approvalChatId: target }),
             ...(p2pOnly === undefined ? {} : { p2pOnly }),
+            ...(approvers === undefined ? {} : { approvers }),
         },
+    }
+}
+
+/**
+ * The host-side approver facts from the gate's `im()` report.
+ *
+ * Structural and all-optional on purpose: `hostCount` is the fact the check
+ * needs ("is there an allowlist at all?"), the rest explains it. Anything that
+ * is not a finite number is dropped rather than coerced — `0` and "not reported"
+ * must never be the same thing here.
+ * @param value - the raw `approvers` field of the report.
+ * @returns the facts, or `undefined` when the field is absent/unusable.
+ */
+function parseApprovers(value: unknown): HostApproverFact | undefined {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined
+    const record = value as Record<string, unknown>
+    const count = (key: string): number | undefined =>
+        typeof record[key] === 'number' && Number.isFinite(record[key] as number) ? (record[key] as number) : undefined
+    const hostCount = count('hostCount')
+    if (hostCount === undefined) return undefined
+    const file = typeof record['file'] === 'string' ? record['file'] : undefined
+    const filePresent = typeof record['filePresent'] === 'boolean' ? record['filePresent'] : undefined
+    return {
+        count: hostCount,
+        ...(count('inline') === undefined ? {} : { inline: count('inline') }),
+        ...(file === undefined ? {} : { file }),
+        ...(filePresent === undefined ? {} : { filePresent }),
+        ...(count('fileCount') === undefined ? {} : { fileCount: count('fileCount') }),
+        ...(count('deny') === undefined ? {} : { deny: count('deny') }),
     }
 }
 
@@ -956,7 +999,12 @@ export async function probeRuntime(options: RuntimeProbeOptions): Promise<Runtim
         ...(interaction.imApproval?.approvalChatId === undefined ? {} : { target: interaction.imApproval.approvalChatId }),
         ...(interaction.imApproval?.p2pOnly === undefined ? {} : { p2pOnly: interaction.imApproval.p2pOnly }),
         ...(interaction.imApprovalProblem === undefined ? {} : { modeProblem: interaction.imApprovalProblem }),
-        approvers: interaction.serviceMounted === true ? approverListOf(layout) : { file: '', present: false, count: 0 },
+        // The whitelist comes from the SERVICE report (host-owned keys), never
+        // from the repository: the file a repository carries no longer decides
+        // approvals, so reading it here would report a stale truth in exactly
+        // the deployment that will refuse every approval.
+        approvers: interaction.imApproval?.approvers ?? {},
+        legacy: legacyApproverListOf(layout),
     })
     checks.push(...approvalChecks)
     if (interaction.imApprovalProblem !== undefined) problems.push(`IM 审批：${interaction.imApprovalProblem}`)

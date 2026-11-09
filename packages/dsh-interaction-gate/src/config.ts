@@ -30,6 +30,7 @@
  * @module dsh-interaction-gate/config
  */
 
+import path from 'node:path'
 import { loadProjectConfig, type Layout, type LayoutOptions } from 'dsh-eng-core'
 import { DEFAULT_ATTENTION_FILE, DEFAULT_ATTENTION_MAX_AGE_MS } from './attention.js'
 import type { ImChannelMode } from './channels.js'
@@ -101,6 +102,26 @@ export const DEFAULT_IM_P2P_ONLY = true
 
 /** Longest `im.approvalChatId` a profile may declare (a platform chat id is short). */
 export const MAX_APPROVAL_CHAT_ID_LENGTH = 512
+
+/**
+ * Where the HOST keeps its approver list by default (P3.1).
+ *
+ * Host-side ON PURPOSE: this list decides who may grant a permission, so it must
+ * not live inside the repository the permission is about. The pre-P3.1 default
+ * was `<repo>/.dsh/interaction-approvers.txt` — a file the repository owned, which
+ * meant a repository could commit its own approvers and whitelist itself. `~` is
+ * expanded when the file is read.
+ */
+export const DEFAULT_APPROVERS_FILE = '~/.dsh/interaction-approvers.txt'
+
+/**
+ * Where the approver list used to live: `<repo>/.dsh/interaction-approvers.txt`.
+ *
+ * Named only so the MIGRATION is visible (`interaction_status`, the doctor check
+ * `runtime.im-approval-legacy-list`): no approval path reads this file any more,
+ * and a repository file must never be able to ADD an approver.
+ */
+export const LEGACY_PROJECT_APPROVERS_FILE = '.dsh/interaction-approvers.txt'
 
 /**
  * Whether the plugin answers the HOST's approval seam
@@ -205,6 +226,43 @@ export interface ImConfig {
      * miss this suite refuses to have.
      */
     approvalViaProblem?: string
+    /**
+     * Approver ids declared INLINE in the profile (`im.approvers`, host-owned).
+     *
+     * One of the two host-side sources of the whitelist an answer must belong to.
+     * Empty is a legitimate state (a deployment may use the file only) and is
+     * fail-closed at the ask: no usable id anywhere = `refused:approvers-missing`.
+     */
+    approvers: string[]
+    /**
+     * The HOST-side approver file (`im.approversFile`, default
+     * {@link DEFAULT_APPROVERS_FILE}); `~` is expanded when it is read.
+     *
+     * `''` = unusable path (see {@link approversFileProblem}): the file then
+     * contributes nothing, because the only alternative would be resolving a
+     * path inside the workspace — the hole P3.1 exists to close.
+     */
+    approversFile: string
+    /** Why `im.approversFile` is unusable; set only when it was declared badly. */
+    approversFileProblem?: string
+    /**
+     * The EFFECTIVE deny list (host `im.denyApprovers` ∪ the project's
+     * `denyApprovers`), already case-insensitively deduplicated.
+     *
+     * The allowlist is host-owned; subtraction is the ONE lever a repository
+     * keeps. It can never add an id — the union with the host list is what makes
+     * that true structurally rather than by convention.
+     */
+    denyApprovers: string[]
+    /** The HOST's own deny list (`im.denyApprovers` in the profile), before the project's part. */
+    hostDenyApprovers: string[]
+    /**
+     * The project's OWN part of {@link denyApprovers} (∅ at profile level).
+     *
+     * Kept separately so reporting can say how many ids the PROJECT removed,
+     * instead of attributing the host's own denials to the repository.
+     */
+    projectDenyApprovers: string[]
 }
 
 /** Resolved plugin configuration. */
@@ -225,13 +283,12 @@ export interface InteractionGateConfig {
      */
     askTimeoutMs: number
     /**
-     * When true, an answer counts only if the answerer's id is in
-     * `approversFile`. Default false: any participant of the channel may answer
-     * (the channel's transport is then the only authentication — see the README).
+     * When true, an answer counts only if the answerer's id is in the HOST
+     * approver list (`im.approvers` / `im.approversFile`). Default false: any
+     * participant of the channel may answer (the channel's transport is then the
+     * only authentication — see the README).
      */
     requireApproverList: boolean
-    /** Repository-owned approver list, relative to the workspace. */
-    approversFile: string
     /** Append-only decision ledger, relative to the workspace. */
     ledgerFile: string
     /**
@@ -471,6 +528,76 @@ export function resolveConfig(input: unknown, warn?: (message: string) => void):
         }
     }
 
+    // --- im.approvers / im.approversFile / im.denyApprovers (P3.1) ----------
+    // The approver list decides who may grant a permission, so its authority
+    // lives HERE (the profile, i.e. the host) and nowhere a repository can
+    // write. Both sources are validated, never coerced: an unusable value is
+    // reported and contributes no id (fail closed) instead of falling back to
+    // some path inside the workspace.
+    const rawApprovers = imBlock['approvers']
+    let imApprovers: string[] = []
+    if (rawApprovers !== undefined) {
+        const list = stringList(rawApprovers)
+        if (list === undefined) {
+            warn?.(
+                `profile 配置: im.approvers 必须是平台用户 id 的字符串数组（收到 ${JSON.stringify(rawApprovers)}），已按空处理` +
+                    '——名单为空时每次审批都会在发卡之前被拒绝（refused:approvers-missing）',
+            )
+        } else {
+            imApprovers = list
+        }
+    }
+    const rawApproversFile = imBlock['approversFile']
+    let imApproversFile = DEFAULT_APPROVERS_FILE
+    let imApproversFileProblem: string | undefined
+    if (rawApproversFile !== undefined) {
+        if (typeof rawApproversFile !== 'string' || rawApproversFile.trim() === '') {
+            imApproversFileProblem =
+                `im.approversFile 必须是非空字符串（收到 ${JSON.stringify(rawApproversFile)}）：审批人名单文件不可用，` +
+                '审批会在发卡之前被拒绝（refused:approvers-missing）'
+        } else {
+            const trimmed = rawApproversFile.trim()
+            // Host-side or nothing. A workspace-relative path would be resolved
+            // INSIDE the repository — a repository could then commit its own
+            // approver list and whitelist itself, which is exactly the hole
+            // P3.1 closes. The path is ignored rather than re-based.
+            if (!path.isAbsolute(trimmed) && !(trimmed === '~' || trimmed.startsWith('~/'))) {
+                imApproversFileProblem =
+                    `im.approversFile=${JSON.stringify(trimmed)} 是工作区相对路径：审批人名单必须放在宿主侧` +
+                    '（绝对路径或 ~/…），否则仓库里的文件就能决定谁能审批。该文件已被忽略（按名单为空处理）'
+            } else {
+                imApproversFile = trimmed
+            }
+        }
+    }
+    if (imApproversFileProblem !== undefined) {
+        imApproversFile = ''
+        warn?.(`profile 配置: ${imApproversFileProblem}`)
+    }
+    const rawDenyApprovers = imBlock['denyApprovers']
+    let imDenyApprovers: string[] = []
+    if (rawDenyApprovers !== undefined) {
+        const list = stringList(rawDenyApprovers)
+        if (list === undefined) {
+            warn?.(
+                `profile 配置: im.denyApprovers 必须是字符串数组（收到 ${JSON.stringify(rawDenyApprovers)}），已按空处理` +
+                    '（deny 只能减人；不可用的值不会变成"多放一个人"）',
+            )
+        } else {
+            imDenyApprovers = list
+        }
+    }
+
+    // The pre-P3.1 top-level key: reported, never applied. Silently ignoring it
+    // would leave a host believing its list is in force while every approval
+    // refuses, and reading it would keep the repository's file authoritative.
+    if (raw['approversFile'] !== undefined) {
+        warn?.(
+            'profile 配置: 顶层 approversFile 已不再支持（P3.1：审批人名单的权威收到宿主）——改用 im.approvers（内联 id 数组）' +
+                `或 im.approversFile（宿主侧路径，默认 ${DEFAULT_APPROVERS_FILE}）；仓库里的 ${LEGACY_PROJECT_APPROVERS_FILE} 也不再被任何审批路径读取`,
+        )
+    }
+
     return {
         enabled: bool(raw['enabled'], true),
         logFile: str(raw['logFile'], '~/.dsh/interaction-gate.log'),
@@ -488,7 +615,6 @@ export function resolveConfig(input: unknown, warn?: (message: string) => void):
         },
         askTimeoutMs: timeout < MIN_ASK_TIMEOUT_MS || timeout > MAX_ASK_TIMEOUT_MS ? DEFAULT_ASK_TIMEOUT_MS : timeout,
         requireApproverList: bool(raw['requireApproverList'], false),
-        approversFile: str(raw['approversFile'], '.dsh/interaction-approvers.txt'),
         ledgerFile: str(raw['ledgerFile'], '.dsh/interaction/decisions.jsonl'),
         outboxFile: str(raw['outboxFile'], DEFAULT_OUTBOX_FILE),
         attentionFile: str(raw['attentionFile'], DEFAULT_ATTENTION_FILE),
@@ -505,9 +631,17 @@ export function resolveConfig(input: unknown, warn?: (message: string) => void):
             p2pOnly: imP2pOnly,
             p2pOnlyConfigured: imP2pOnlyConfigured,
             approvalVia: imApprovalVia,
+            approvers: imApprovers,
+            approversFile: imApproversFile,
+            denyApprovers: imDenyApprovers,
+            hostDenyApprovers: imDenyApprovers,
+            // At profile level there is no project file yet: the project's part
+            // is filled in by `resolveEffectiveConfig`.
+            projectDenyApprovers: [],
             ...(imChannelId === undefined ? {} : { channelId: imChannelId }),
             ...(imApprovalChatIdProblem === undefined ? {} : { approvalChatIdProblem: imApprovalChatIdProblem }),
             ...(imApprovalViaProblem === undefined ? {} : { approvalViaProblem: imApprovalViaProblem }),
+            ...(imApproversFileProblem === undefined ? {} : { approversFileProblem: imApproversFileProblem }),
         },
     }
 }
@@ -515,8 +649,12 @@ export function resolveConfig(input: unknown, warn?: (message: string) => void):
 /**
  * Keys a repository may refine through `<repo>/.dsh/interaction-gate.json`.
  *
- *  - `approversFile` / `ledgerFile`: where THIS repository's approvers and
- *    decisions live — repository knowledge, like `standardsFile`.
+ *  - `ledgerFile`: where THIS repository's decisions live — repository
+ *    knowledge, like `standardsFile`.
+ *  - `denyApprovers`: the ONE lever a repository keeps over the approver list,
+ *    and it can only SUBTRACT (effective list = host list − denyApprovers). The
+ *    allowlist itself is host-owned (`im.approvers` / `im.approversFile`); a
+ *    repository that could provide it would be granting its own permissions.
  *  - `preferredChannels`: which surface this repository's cards go to (an IM
  *    group per repository, say).
  *  - `notifyLevels`: how noisy this repository wants its channel to be.
@@ -524,12 +662,24 @@ export function resolveConfig(input: unknown, warn?: (message: string) => void):
  *    seam (the built-in credential rules cannot be removed from here).
  */
 export const PROJECT_OVERRIDABLE_KEYS: readonly string[] = [
-    'approversFile',
+    'denyApprovers',
     'ledgerFile',
     'preferredChannels',
     'notifyLevels',
     'redactPatterns',
 ]
+
+/**
+ * Why a project-file key was refused. Only keys whose removal is a MIGRATION
+ * carry one: a bare "not overridable" would leave the operator guessing whether
+ * the value still does something (it does not) and where to put it instead.
+ */
+const REFUSED_KEY_REASONS: Record<string, string> = {
+    approversFile:
+        `P3.1 起审批人名单的权威在宿主（im.approvers / im.approversFile，默认 ${DEFAULT_APPROVERS_FILE}）：` +
+        `仓库不能再提供名单（否则仓库能自己给自己发权限），${LEGACY_PROJECT_APPROVERS_FILE} 也不再被任何审批路径读取；` +
+        '项目只能用 denyApprovers 做减法',
+}
 
 /**
  * Keys that stay host-owned, with the reason (shown by `interaction_status`).
@@ -553,7 +703,9 @@ export const HOST_OWNED_KEYS: readonly { key: string; why: string }[] = [
         why:
             'IM 通道是否启用、审批卡片发到哪个会话（im.approvalChatId）、答案是否必须来自私聊（im.p2pOnly）、' +
             '是否由本插件回答宿主的审批接缝（im.approvalVia）都是宿主决定：' +
-            '仓库能选自己的审批会话，就等于绕过审批边界把卡片发给自己；而 approvalVia=fallback/only 决定的是"谁能放行一次权限"',
+            '仓库能选自己的审批会话，就等于绕过审批边界把卡片发给自己；而 approvalVia=fallback/only 决定的是"谁能放行一次权限"。' +
+            `审批人名单本身也是宿主键（im.approvers / im.approversFile，默认 ${DEFAULT_APPROVERS_FILE}）：` +
+            '仓库能提供名单就等于自己给自己发权限——项目能做的只有 im.denyApprovers 这个减法',
     },
 ]
 
@@ -595,19 +747,22 @@ export function resolveEffectiveConfig(
     const raw = file.value
     for (const key of Object.keys(raw)) {
         if (!PROJECT_OVERRIDABLE_KEYS.includes(key)) {
-            const problem = `${file.file}: 键 "${key}" 不允许在项目级配置里覆盖（profile 是上限），已忽略`
+            const reason = REFUSED_KEY_REASONS[key]
+            const problem =
+                `${file.file}: 键 "${key}" 不允许在项目级配置里覆盖（profile 是上限），已忽略` + (reason === undefined ? '' : `——${reason}`)
             problems.push(problem)
             logger?.warn(problem)
         }
     }
 
     const next: InteractionGateConfig = { ...host, prompt: host.prompt }
+    let imNext = host.im
     let applied = 0
     const reject = (message: string): void => {
         problems.push(message)
         logger?.warn(message)
     }
-    const takePath = (key: 'approversFile' | 'ledgerFile'): void => {
+    const takePath = (key: 'ledgerFile'): void => {
         const value = raw[key]
         if (value === undefined) return
         if (typeof value === 'string' && value.trim() !== '') {
@@ -616,6 +771,31 @@ export function resolveEffectiveConfig(
             return
         }
         reject(`${file.file}: ${key} 必须是非空字符串，已忽略（继续使用 profile 的值 ${host[key]}）`)
+    }
+    if (raw['denyApprovers'] !== undefined) {
+        const list = stringList(raw['denyApprovers'])
+        if (list === undefined) {
+            reject(
+                `${file.file}: denyApprovers 必须是字符串数组，已忽略（继续使用 profile 的 denyApprovers）` +
+                    '——它是项目对审批人名单唯一能改的地方，且只能减不能加',
+            )
+        } else if (list.length > 0) {
+            // UNION with the host's deny list, never replacement. Replacing it
+            // would let a repository put back an id the host denied — i.e. ADD
+            // an approver, the one thing this key must never be able to do.
+            // Case-insensitive on both sides, like every other approver comparison:
+            // `bob` and `BOB` are one person, so the counts a report prints are
+            // the counts that actually decide something.
+            const project: string[] = []
+            for (const id of list) {
+                if (!project.some((known) => known.toLowerCase() === id.toLowerCase())) project.push(id)
+            }
+            const merged = [...host.im.denyApprovers]
+            for (const id of project) {
+                if (!merged.some((known) => known.toLowerCase() === id.toLowerCase())) merged.push(id)
+            }
+            imNext = { ...imNext, denyApprovers: merged, projectDenyApprovers: project }
+        }
     }
     if (raw['preferredChannels'] !== undefined) {
         const list = stringList(raw['preferredChannels'])
@@ -675,8 +855,11 @@ export function resolveEffectiveConfig(
             }
         }
     }
-    takePath('approversFile')
     takePath('ledgerFile')
+    if (imNext !== host.im) {
+        next.im = imNext
+        applied += 1
+    }
 
     if (applied === 0) return { config: host, source: 'profile', file: file.file, problems }
     return { config: next, source: 'project', file: file.file, problems }

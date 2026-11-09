@@ -628,13 +628,13 @@ IM 侧的职责（不在本仓库）：卡片按钮不可伪造且一次性、�
 而 `p2pChat` 只是"最后一条给 bot 发消息的会话"——**任何人私聊 bot 都能把审批卡改投到自己那里**，如果落账只认"按钮被按了"，
 这就是一条完整的越权链。所以审批路径上目标必须是**宿主的决定**（`im.approvalChatId`），并有三层校验：
 
-1. **目标 + 白名单**：`api.ask({ chatId: im.approvalChatId, from: 项目审批人名单 })`。上游对不在 `from` 里的回复
+1. **目标 + 白名单**：`api.ask({ chatId: im.approvalChatId, from: 宿主审批人名单 })`。上游对不在 `from` 里的回复
    **直接忽略并继续等待**（`dist/api.js:262`），所以"谁可以回答"不是我们事后挑，而是发送时就限定；
 2. **落账前校验来源**：`answer.chatId` 必须等于配置目标，`im.p2pOnly` 时 `answer.chatKind` 必须是 `p2p`——
    **缺失按"未证明"处理**（fail closed），因为"平台没报会话类型"与"这是私聊"是两件事，而群聊是审批人控制不了的房间；
 3. **既有的 `approveCheck`**：名单校验照旧运行（纵深防御：卡片出现在正确会话里，也不等于回答者在名单里）。
 
-任一层不成立都写 `refused:*`（`wrong-chat` / `not-p2p` / `no-allowlist` / `bad-target` / `no-target`）且**不算决定**：
+任一层不成立都写 `refused:*`（`wrong-chat` / `not-p2p` / `approvers-missing` / `bad-target` / `no-target`）且**不算决定**：
 不写决定行、不把一次性令牌换成放行。目标已配置而名单为空时**连卡片都不发**（fail closed，而不是"先发了再看谁答"）。
 未配置 `im.approvalChatId` 时行为与之前逐字一致（不传 `chatId`/`from`，也不做来源校验）——"没配就不走收紧路径"是默认结果，
 唯一的例外是显式开了 `im.p2pOnly` 却没有目标：那是一个无从执行的要求，直接拒绝而不是看起来收紧了。
@@ -659,7 +659,7 @@ unavailable`。所以本插件在 `approvalVia != off` 时用 **`{ prepend: true
   其余（没有通道、超时、回答者不在名单、来源不符、会话类型未证明）→ **`unavailable`**。
   **"没有人决定"绝不会被写成 `rejected`**——那是替人说"不"，和替人说"是"一样是伪造。
 - **审批比普通提问更严，不会更宽**：审批路径额外要求 `requireAllowlist`（即使宿主没把名单设为强制），
-  因为审批授出的是一次权限；名单为空时**连卡片都不发**（`refused:approvers-missing` / `no-allowlist`）。
+  因为审批授出的是一次权限；名单为空时**连卡片都不发**（`refused:approvers-missing`）。
 - **落账可区分**：由 IM 回答的审批写 `source: "approval-request"`，并带 `userId`（谁答的）、`chatId`（答案来自哪个会话，
   即被校验过的那个）、`messageId`（哪条消息）。`interaction_status` 单独一行计数——"门禁自己的提问被回答了"和
   "模型问了句话"是两件事。
@@ -671,13 +671,38 @@ unavailable`。所以本插件在 `approvalVia != off` 时用 **`{ prepend: true
 这个部署看起来"审批上手机了"，实际一次决定也做不出来，而人只会在需要放行的那一刻才发现。
 所以 `suite_status` 的交互段有一项 `runtime.im-approval`（必需项）：它读宿主通过 `im()` 报告的**生效**配置
 （`im.approvalVia` / `im.approvalChatId` / `im.p2pOnly` 都是宿主键，仓库文件里看不到，只有插件自己知道它要做什么）
-与项目级 `approversFile` 指向的名单，把修复的两条路一起写出来：补配置，或把 `im.approvalVia` 设回 `off`。
+与审批人名单（P2 当时是项目级 `approversFile`；**P3.1 起改成宿主的 `im.approvers` / `im.approversFile`**，见下），把修复的两条路一起写出来：补配置，或把 `im.approvalVia` 设回 `off`。
 `off`（以及根本没有 interaction 服务的默认部署）只给一行 `ok`——默认部署不该被自己的自检唠叨。
 `im.p2pOnly=true` 与"上游是否在答案里报告 `chatKind`"只能是**建议**（`runtime.im-approval-p2p`，`recommended`）：
 没有任何 API 声明这项上游能力，写一个探测器就等于发明事实，所以报告只写后果（每个 IM 答案都会被按"未证明"拒绝）
 与两种处置（`im.p2pOnly: false`，或留在 `off`）。同一组事实在 `interaction_status` 的「IM 审批」段一处看完：
 模式、目标会话（说"已配置/未配置"，不隐藏缺席）、名单人数、被忽略的回答——其中"无法观测"（没有钩子可挂）与
 "没有发生"（已挂钩、0 次）用不同的词，因为混用会让"看不到"读成"没人试过"。
+
+**白名单必须宿主所有，减法才是仓库的杠杆（P3.1）**：P1 把"审批是权限"写进了 `approveCheck`，但名单**从哪来**
+那一半没被看住——`approversFile` 是项目级可覆盖键，且默认解析成仓库里的 `.dsh/interaction-approvers.txt`。
+于是完整的越权链是：仓库提交一个名单文件 → 名单里写上自己的人 → 审批卡片发出去时 `from` 白名单就是他 →
+落账前的 `approveCheck` 也认他。**一条提交就能给自己发权限**，而所有校验都"通过"。
+
+所以权威被收到宿主，并且是**结构性**的，不靠约定：
+
+- `im.approvers`（内联数组）与 `im.approversFile`（宿主侧路径，默认 `~/.dsh/interaction-approvers.txt`）在
+  `im` 块里，而 `im` 整个是宿主键——项目文件写 `im` 会被拒（既有机制）。工作区相对路径也被拒：`approversFile`
+  若按仓库解析，洞就原地长回来，所以"不可用"（fail closed）比"猜一个路径"正确。
+- **有效名单 = (内联 ∪ 文件) − denyApprovers**，大小写不敏感去重。这里的不变量是**单调**：仓库只能从集合里
+  减元素。写一个"项目名单与宿主名单取并集"的实现看起来更灵活，但并集允许加人——那正是漏洞；交集又会把
+  宿主新增的人挡在外面。减法是唯一既保留仓库自治、又不改变"谁能审批"的方向。
+- 因此 deny 与宿主的 deny **取并集而非替换**：替换会让项目把宿主 deny 掉的 id 放回来，等价于加人。
+- 空名单在**发卡之前**就拒绝（`refused:approvers-missing`），绝不回落到仓库文件——回退会让"fail closed"变成
+  "fail open 到仓库"，而这正是被修的那条链。
+- **迁移必须可见**：语义静默改变是比漏洞更糟的失败模式（旧仓库会以为名单还在生效，实际每次都拒绝）。
+  所以 `interaction_status` 打一条 `⚠️ 迁移` 行、`suite_status` 多一项 `runtime.im-approval-legacy-list`，
+  两边都说"这个文件不再影响审批""宿主侧名单在哪""这些 id 该怎么搬"。自检读宿主名单的方式是 `im()` 报告的
+  `approvers` 字段（宿主键的投影），**不是**去读仓库文件——读仓库文件会在"宿主名单为空 + 仓库还有旧名单"这个
+  最危险的组合上报告一个过时的真相。
+
+一句话概括这条边界：**允许的是宿主写下的，仓库只能划掉。** 这与 §5.20 的影子模式、各处"项目只能收紧"的规则同源，
+区别在于这里收紧的对象是"谁能放行一次权限"本身。
 
 ### 5.19 授权前史：Mandate v2（准入记录 + 策略版本 + 恢复前重校验）
 

@@ -308,6 +308,18 @@ export interface ImChannelReport {
      */
     approvalVia?: ApprovalVia
     /**
+     * The HOST-side approver list as this process resolved it (P3.1).
+     *
+     * The workspace-specific part (a project's `denyApprovers`) cannot be in a
+     * process-wide report, so the counts here are the host's own: what the
+     * profile declared (`im.approvers` inline) and what its file holds. The
+     * doctor's question — "does an approver list exist at all?" — is exactly
+     * this fact, and it must never be answered from a repository file (that is
+     * the migration P3.1 makes). Absent = this build does not report it, which
+     * is `unknown`, never "no approvers".
+     */
+    approvers?: ImApproverReport
+    /**
      * Ignored answer attempts observed through the upstream's
      * `onAnswerIgnored` hook. Absent = nothing was observed (either no ask ran
      * yet or the upstream is too old — see `upstream`).
@@ -315,6 +327,34 @@ export interface ImChannelReport {
     ignoredAnswers?: ImIgnoredReport
     /** Why it is (or is not) registered — always non-empty. */
     reason: string
+}
+
+/**
+ * The host-side approver list, as the gate resolved it (P3.1).
+ *
+ * Workspace-independent by construction: `im.approvers` / `im.approversFile` /
+ * `im.denyApprovers` are host-owned keys, so this report is the same for every
+ * repository a process serves. A project's own `denyApprovers` only ever
+ * SUBTRACTS, and the per-workspace effective list stays in
+ * `interaction_status` (which knows the workspace).
+ *
+ * Read once, at apply time: a host file edited later is visible in
+ * `interaction_status` (it re-reads per call), not here — this is a snapshot of
+ * what the process resolved, and it says so rather than pretending to be live.
+ */
+export interface ImApproverReport {
+    /** Host ids declared inline (`im.approvers`). */
+    inline: number
+    /** The host-side file inspected (`im.approversFile`, `~` expanded); `''` = unusable path. */
+    file: string
+    /** Whether that file was readable. */
+    filePresent: boolean
+    /** Usable ids the file holds. */
+    fileCount: number
+    /** Deduplicated host ids from both sources (before any deny list). */
+    hostCount: number
+    /** Host-declared deny ids (`im.denyApprovers`). */
+    deny: number
 }
 
 /**

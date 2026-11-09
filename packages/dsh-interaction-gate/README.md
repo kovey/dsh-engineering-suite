@@ -138,9 +138,13 @@ IM 插件后装配"的合法顺序；窗口长度是宿主配置（`im.requiredW
 1. **令牌**：`questionId = q-<128bit hex>`，与时钟、计数器无关；提问时装上（arm），落定即作废（一次性），
    发卡片前先 arm，所以答案比 HTTP 响应先到也不会丢。**答错令牌的答案被丢弃，提问继续等**；
    通道如果回了一个别的令牌，同样丢弃并重新进入等待（上限 8 次，截止时间仍由我们决定）。
-2. **资格**：`requireApproverList: true` 时，回答者的 `by` 必须在 `<repo>/.dsh/interaction-approvers.txt`
-   （一行一个 id，`#` 注释）里；名单缺失/为空时**在发卡片之前**就拒绝（发出去也没人能合法回答）。
-   默认 `false`：通道内的任何参与者都能回答——此时**通道的传输就是唯一的认证**。
+2. **资格**：`requireApproverList: true` 时，回答者的 `by` 必须在**宿主**的审批人名单里——`im.approvers`
+   （内联 id 数组）和/或 `im.approversFile`（宿主侧路径，默认 `~/.dsh/interaction-approvers.txt`，
+   一行一个 id，`#` 注释，`~` 会展开）。有效名单 = (内联 ∪ 文件) **−** `denyApprovers`（宿主 `im.denyApprovers`
+   ∪ 项目级 `denyApprovers`，大小写不敏感）。名单缺失/为空时**在发卡片之前**就拒绝（发出去也没人能合法回答），
+   绝不回落到仓库文件。默认 `false`：通道内的任何参与者都能回答——此时**通道的传输就是唯一的认证**。
+   **P3.1 起仓库不能提供名单**：`<repo>/.dsh/interaction-approvers.txt` 不再被任何审批路径读取（仓库能提交
+   自己的名单就等于自己给自己发权限），项目唯一的杠杆是**减法**（`denyApprovers`），它能减、永远不能加。
 3. **选项**：声明了 `options` 就必须命中其中之一（去空格、大小写不敏感）；
    选项里出现 `allowed-once` / `rejected` / `cancelled` / `unavailable` 时，决定会走套件的
    `normalizeApprovalReply`（`dsh-eng-core`）——门禁可以把自己的四个词直接交给这里。
@@ -157,7 +161,6 @@ profile（宿主上限）与 `<repo>/.dsh/interaction-gate.json`（项目只能�
     logFileTemplate: '~/.dsh/logs/{project}/interaction-gate.log'   # 可选，按工作区分文件
     askTimeoutMs: 900000                 # 15 分钟；调用方只能缩短，不能延长
     requireApproverList: false           # true = 只有名单里的人能回答
-    approversFile: .dsh/interaction-approvers.txt
     ledgerFile: .dsh/interaction/decisions.jsonl
     attentionFile: .dsh/interaction/attention.jsonl   # 注意力旁路（whyYou / 作废 / 暂停区间）
     attentionMaxAgeMs: 86400000          # 超过 24h 未回答 → 标 stale（仍列出）
@@ -165,13 +168,21 @@ profile（宿主上限）与 `<repo>/.dsh/interaction-gate.json`（项目只能�
     preferredChannels: []                # 空 = 全部已注册通道（注册顺序）
     maxPayloadChars: 4000
     redactPatterns: []                   # 额外拒绝规则（命中即拒绝发送）
-    im: { channel: auto, channelId: feishu, requiredWaitMs: 5000 }   # 可选 IM 通道（见「可选 IM 通道」）；默认 auto
+    im:
+      channel: auto                      # 可选 IM 通道（见「可选 IM 通道」）；默认 auto
+      channelId: feishu
+      requiredWaitMs: 5000
+      approvers: ['ou_alice']            # 宿主侧审批人（内联）；默认 []
+      approversFile: '~/.dsh/interaction-approvers.txt'   # 宿主侧名单文件（必须绝对路径或 ~/…）
+      denyApprovers: []                  # 宿主侧减法；项目级同名键只能再往上加 deny
+    
     prompt: { enabled: true, order: 600 }
 ```
 
 | 项目级可覆盖 | 为什么 |
 |---|---|
-| `approversFile` / `ledgerFile` | 这个仓库的名单与台账放在哪，是仓库知识（同 `standardsFile`） |
+| `denyApprovers` | 这个仓库**唯一**能改审批人名单的地方，且只能减（有效名单 = 宿主名单 − denyApprovers）；仓库若能提供名单，就等于自己给自己发权限 |
+| `ledgerFile` | 这个仓库的台账放在哪，是仓库知识（同 `standardsFile`） |
 | `preferredChannels` | 这个仓库的卡片走哪个通道（例如每个仓库一个群） |
 | `notifyLevels` | 这个仓库想被通知到什么程度 |
 | `redactPatterns` | 额外拒绝规则只会**收紧**：与 profile 的规则**取并集**（内置凭据规则无法从这里删掉，host 的规则也不会被项目列表替换掉；非法正则逐项忽略，全非法时 host 的规则原样保留） |
@@ -182,6 +193,10 @@ profile（宿主上限）与 `<repo>/.dsh/interaction-gate.json`（项目只能�
 - `askTimeoutMs`：等待人的时长决定一轮对话能挂多久，仓库抬高它等于给自己放长绳；
 - `requireApproverList`：仓库若能否掉它，就是把自己的审批人名单关掉。
 - `im`：打开/关闭一条"把问题发到聊天"的通道，等于改写审批边界；这必须是宿主的决定（`channelId` 也是宿主配置）。
+  **审批人名单本身也是宿主键**（`im.approvers` / `im.approversFile`）：仓库能提供名单就等于自己给自己发权限。
+  旧的顶层 `approversFile` 已废弃（宿主写了会记一条问题、仓库写了会被拒并说明迁移），仓库里的
+  `.dsh/interaction-approvers.txt` 不再被读取——`interaction_status` 与 `suite_status` 的
+  `runtime.im-approval-legacy-list` 会明确说出这条迁移事实与宿主侧配置位置。
 - `attentionFile` / `attentionMaxAgeMs`：注意力旁路的位置，以及"多久算过期的提问"——仓库能放宽它，就等于让已经作废的提问继续看起来新鲜。
 
 数值不做猜测：不可用的值**保留 profile 的值**并记一条问题（`interaction_status` 会写"（N 条配置问题）"）。

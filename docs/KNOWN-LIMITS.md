@@ -325,7 +325,7 @@ bash scripts/e2e-mission.sh          # 建立隔离 profile、起 stub、跑一�
 - **无 mission 不部署**：go/no-go 的 `mission`、`receipt` 是恒开项（部署必须以一次已交付为前提），
   所以脱离 mission 的临时部署会被拒绝（只记一条 `state=refused` 台账，不写门禁、不编造 mission id）。
   紧急通道不是"绕过门禁"，而是让宿主显式声明一个应急环境/流程并留下记录。
-- **审批身份由通道层负责**：`approversFile` 只做名单比对；卡片是谁点的、有没有被转发，取决于通道实现。
+- **审批身份由通道层负责**：审批人名单（宿主 `im.approvers` / `im.approversFile`；P3.1 起仓库不再能提供名单）只做名单比对；卡片是谁点的、有没有被转发，取决于通道实现。
 - **凭据不要写进命令**：命令行会原样进门禁记录与报告（套件既有规则）。
 
 ## 附一之十一 · 交互层（`dsh-interaction-gate`）的边界
@@ -337,6 +337,24 @@ bash scripts/e2e-mission.sh          # 建立隔离 profile、起 stub、跑一�
 - **超时是 fail-closed**：问人的结果只有"有人答了"和"没人答（拒绝）"两种；通知失败永远不构成决定。
 - **密钥不出门**：命中凭据规则的载荷会被拒绝发送（不是打码后照发）。
 - **台账是记录不是授权**：写了行不等于谁批准了什么；授权语义仍在各门禁自己的记录里。
+
+### 附一之十一之一 · P3.1 迁移：仓库里的审批人名单不再生效
+
+- **旧仓库的名单会停用，而且这是刻意的**：`<repo>/.dsh/interaction-approvers.txt`（以及项目配置里的
+  `approversFile`）不再被任何审批路径读取。原因是它能让仓库提交自己的审批人并把自己写进白名单——**一条提交就能
+  给自己发权限**。名单的权威现在只在宿主：profile 的 `im.approvers`（内联 id 数组）和/或 `im.approversFile`
+  （宿主侧路径，默认 `~/.dsh/interaction-approvers.txt`）。
+- **怎么搬**：把旧文件里的 id 抄进 `im.approvers`，或写进宿主侧的名单文件（一行一个，`#` 注释），然后删掉仓库里的
+  旧文件与项目配置里的 `approversFile`。搬完用 `interaction_status` 的「审批人名单」「项目减法」两行核对生效值。
+- **谁来提醒**：`suite_status` 的 `runtime.im-approval-legacy-list`（建议项）与 `interaction_status` 的
+  `⚠️ 迁移` 行都会报"这个文件不再影响审批"并给出宿主侧位置——**不会静默**。但自检只是报告：它不会替你搬。
+- **搬之前会发生什么**：若宿主名单为空而审批要走 IM，每次审批都会在**发卡之前**被拒绝
+  （`refused:approvers-missing`），台账如实记一行 `refused:*`。不会回落到仓库文件——回落会让"fail closed"
+  变成"fail open 到仓库"。
+- **仓库还能收紧**：新增的项目级可覆盖键 `denyApprovers` 可以减去宿主名单里的 id（大小写不敏感），
+  但它**只能减**：与宿主 `im.denyApprovers` 取并集，永远不能把宿主 deny 掉的 id 加回来。
+- **残余的诚实边界**：宿主名单文件本身不在仓库里，因此**不进审计、不受 `.dsh/**` 信任根保护**——谁能写宿主的
+  `~/.dsh/` 谁就能改审批人。这是"权威在宿主"的必然代价（与 profile 里其它宿主键一致），不是本套件能封闭的洞。
 
 ## 附一之十二 · 自检（`suite_status` / `doctor.sh`）的诚实边界
 

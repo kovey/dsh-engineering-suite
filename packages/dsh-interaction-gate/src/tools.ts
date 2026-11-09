@@ -23,11 +23,13 @@
  * @module dsh-interaction-gate/tools
  */
 
+import fs from 'node:fs'
 import path from 'node:path'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import {
     approverName,
     assertSafeId,
+    expandHome,
     formatTime,
     isSafeId,
     normalizeApprovalReply,
@@ -56,12 +58,22 @@ import {
     newQuestionToken,
     type AwaitResult,
     type ChannelInfo,
+    type ImApproverReport,
     type ImAskTarget,
     type InteractionChannel,
     type InteractionMessage,
     type InteractionRegistry,
 } from './channels.js'
-import { DEFAULT_MAX_PAYLOAD_CHARS, describeSource, NOTIFY_LEVELS, type EffectiveConfig, type InteractionGateConfig, type NotifyLevel } from './config.js'
+import {
+    DEFAULT_APPROVERS_FILE,
+    DEFAULT_MAX_PAYLOAD_CHARS,
+    describeSource,
+    LEGACY_PROJECT_APPROVERS_FILE,
+    NOTIFY_LEVELS,
+    type EffectiveConfig,
+    type InteractionGateConfig,
+    type NotifyLevel,
+} from './config.js'
 import { imRequiredHint } from './chat-channel.js'
 import {
     appendLedgerRow,
@@ -264,30 +276,130 @@ export function normalizeDecision(
     return { decision: outcome.decision, allowed: outcome.allowed, userId: approverName(outcome, by) }
 }
 
-/** Approver-list state for one workspace. */
+/**
+ * Approver-list state for one workspace (P3.1: the HOST owns the allowlist).
+ *
+ * Two host-side sources (`im.approvers` inline + `im.approversFile` ids) minus
+ * the deny list (host ∪ project). A repository contributes ONLY the subtraction,
+ * so nothing on disk inside the workspace can add an approver — the legacy
+ * `.dsh/interaction-approvers.txt` is reported (`legacyFile`) and never read.
+ */
 export interface ApproversState {
+    /** The host-side file inspected; `''` when the declared path was unusable. */
     file: string
+    /** Whether that host-side file was readable. */
     present: boolean
+    /** Host ids (inline ∪ file, deduplicated), BEFORE the deny list. */
+    host: string[]
+    /** The EFFECTIVE whitelist: `host − denyApprovers` (case-insensitive). */
     ids: string[]
+    /** Ids the deny list removed (so a report can say how many, never which). */
+    denied: string[]
+    /** One phrase naming where the effective list came from (for messages). */
+    source: string
+    /** The legacy repository file when one still exists: reported, NOT read. */
+    legacyFile?: string
+    /** Recoverable problems (unusable host path, empty list when it must not be). */
     problems: string[]
 }
 
-/** Read the project approver list (one id per line, `#` comments, blank lines ignored). */
-export function approversOf(cwd: string, config: InteractionGateConfig): ApproversState {
-    const file = artifactPathOf(cwd, config.approversFile)
+/** Read the host-side approver list: one id per line, `#` comments, blanks ignored. */
+function hostApproverIdsOf(file: string): { present: boolean; ids: string[] } {
     const text = readText(file)
-    if (text === undefined) {
-        return { file, present: false, ids: [], problems: config.requireApproverList ? [`审批人名单不存在：${file}`] : [] }
-    }
+    if (text === undefined) return { present: false, ids: [] }
     const ids: string[] = []
-    const problems: string[] = []
     for (const line of text.split('\n')) {
         const trimmed = line.trim()
         if (trimmed === '' || trimmed.startsWith('#')) continue
-        if (!ids.includes(trimmed)) ids.push(trimmed)
+        // Case-insensitive, exactly like `approveCheck`: `ou_alice` and `OU_ALICE`
+        // are one approver, so the count a report shows is the count that can answer.
+        if (!ids.some((known) => known.toLowerCase() === trimmed.toLowerCase())) ids.push(trimmed)
     }
-    if (config.requireApproverList && ids.length === 0) problems.push(`审批人名单为空（全是注释/空行）：${file}`)
-    return { file, present: true, ids, problems }
+    return { present: true, ids }
+}
+
+/**
+ * Resolve the effective approver list of one workspace.
+ *
+ * `有效名单 = (im.approvers ∪ im.approversFile) − (im.denyApprovers ∪ 项目 denyApprovers)`,
+ * compared case-insensitively and deduplicated (the same rule `approveCheck`
+ * applies to an answerer). There is no third source: `cwd` is used only to
+ * NOTICE the legacy repository file so the migration can be stated — its ids
+ * never enter the list.
+ * @param cwd - the calling workspace (legacy-file reporting only).
+ * @param config - the EFFECTIVE configuration of that workspace.
+ */
+export function approversOf(cwd: string, config: InteractionGateConfig): ApproversState {
+    const im = config.im
+    const file = im.approversFile === '' ? '' : expandHome(im.approversFile)
+    const fromFile = file === '' ? { present: false, ids: [] as string[] } : hostApproverIdsOf(file)
+    const host: string[] = []
+    for (const id of [...im.approvers, ...fromFile.ids]) {
+        if (!host.some((known) => known.toLowerCase() === id.toLowerCase())) host.push(id)
+    }
+    const deny = im.denyApprovers
+    const denied: string[] = []
+    const ids: string[] = []
+    for (const id of host) {
+        if (deny.some((entry) => entry.toLowerCase() === id.toLowerCase())) denied.push(id)
+        else ids.push(id)
+    }
+    // A STAT-only check: the legacy repository list is never opened by the
+    // approval path, so its bytes cannot influence anything here. Its existence
+    // is reported (the migration must be visible), nothing more.
+    const legacy = fs.existsSync(path.join(cwd, LEGACY_PROJECT_APPROVERS_FILE))
+    const problems: string[] = []
+    if (im.approversFileProblem !== undefined) problems.push(im.approversFileProblem)
+    // An absent file is NOT a problem on its own (the deployment may name its
+    // ids inline, and the default path is simply a place that may not exist
+    // yet): it is stated in `source` (存在=…), and it becomes a problem exactly
+    // when it is what makes the list unusable.
+    if (config.requireApproverList && ids.length === 0) {
+        problems.push(
+            `宿主审批人名单为空：im.approvers ${im.approvers.length} 个 id + im.approversFile ${file === '' ? '（路径不可用）' : `${file}（存在=${fromFile.present}，${fromFile.ids.length} 个 id）`}` +
+                `；denyApprovers 去掉了 ${denied.length} 个（仓库里的 ${LEGACY_PROJECT_APPROVERS_FILE} 不再被读取）`,
+        )
+    }
+    const parts: string[] = []
+    if (im.approvers.length > 0) parts.push(`im.approvers（${im.approvers.length} 个内联 id）`)
+    if (file !== '') parts.push(`im.approversFile=${file}（存在=${fromFile.present}，${fromFile.ids.length} 个 id）`)
+    const source = parts.length === 0 ? '宿主未配置任何来源' : parts.join(' + ')
+    return {
+        file,
+        present: fromFile.present,
+        host,
+        ids,
+        denied,
+        source,
+        ...(legacy ? { legacyFile: path.join(cwd, LEGACY_PROJECT_APPROVERS_FILE) } : {}),
+        problems,
+    }
+}
+
+/**
+ * The HOST-side approver facts, without a workspace.
+ *
+ * Published on the `im()` report so the suite's self-check can answer "is there
+ * an approver list at all?" without reading a repository file — which is exactly
+ * the file P3.1 stopped trusting. The workspace-specific part (a project's
+ * `denyApprovers`) is deliberately absent: it cannot be one process-wide fact.
+ * @param config - the profile-resolved configuration.
+ */
+export function hostApproverReportOf(config: InteractionGateConfig): ImApproverReport {
+    const file = config.im.approversFile === '' ? '' : expandHome(config.im.approversFile)
+    const fromFile = file === '' ? { present: false, ids: [] as string[] } : hostApproverIdsOf(file)
+    const host: string[] = []
+    for (const id of [...config.im.approvers, ...fromFile.ids]) {
+        if (!host.some((known) => known.toLowerCase() === id.toLowerCase())) host.push(id)
+    }
+    return {
+        inline: config.im.approvers.length,
+        file,
+        filePresent: fromFile.present,
+        fileCount: fromFile.ids.length,
+        hostCount: host.length,
+        deny: config.im.hostDenyApprovers.length,
+    }
 }
 
 /** Whether an answerer may answer, and why not. */
@@ -299,7 +411,7 @@ export function approveCheck(by: string, approvers: ApproversState, required: bo
     const exact = approvers.ids.includes(by)
     const folded = approvers.ids.some((id) => id.toLowerCase() === by.toLowerCase())
     if (!exact && !folded) {
-        return { ok: false, reason: `${JSON.stringify(by)} 不在项目审批人名单里（${approvers.file}，共 ${approvers.ids.length} 个 id）` }
+        return { ok: false, reason: `${JSON.stringify(by)} 不在宿主审批人名单里（来自 ${approvers.source}；有效 ${approvers.ids.length} 个 id）` }
     }
     return { ok: true, reason: '' }
 }
@@ -363,14 +475,19 @@ export function imAskTargetOf(config: InteractionGateConfig, approvers: Approver
         if (approvers.ids.length === 0) {
             return {
                 ok: false,
-                reason: 'no-allowlist',
+                reason: 'approvers-missing',
                 detail:
-                    `im.approvalChatId=${im.approvalChatId} 已配置，但审批人名单为空或不可读：` +
+                    `im.approvalChatId=${im.approvalChatId} 已配置（审批走 IM），但宿主审批人名单为空或不可读：` +
                     `没有名单就没有"谁可以回答"（from 白名单），一张发出去谁都能答的卡片不是审批`,
-                extraLines: [`- 名单文件：${approvers.file}（存在=${approvers.present}，有效 id=${approvers.ids.length}）`],
+                extraLines: [
+                    `- 名单来源：${approvers.source}（有效 id=${approvers.ids.length}，被 denyApprovers 去掉 ${approvers.denied.length} 个）`,
+                    ...(approvers.legacyFile === undefined
+                        ? []
+                        : [`- ${approvers.legacyFile} 仍存在，但**不再被读取**：它属于仓库，而审批人名单的权威在宿主`]),
+                ],
                 next:
-                    `由人写 ${config.approversFile}（一行一个平台用户 id，# 开头为注释）：它同时是卡片的 from 白名单和落账前的审批人校验；` +
-                    '名单为空时不会发卡片（不会降级成"谁都能答"）。',
+                    `由宿主配置 im.approvers（内联 id 数组）或 im.approversFile（宿主侧路径，默认 ${DEFAULT_APPROVERS_FILE}，一行一个平台用户 id，# 开头为注释）：` +
+                    '它同时是卡片的 from 白名单和落账前的审批人校验；名单为空时不会发卡片（不会降级成"谁都能答"，也不会回落到仓库里的名单文件）。',
             }
         }
         return { ok: true, target: { chatId: im.approvalChatId, from: [...approvers.ids], p2pOnly: im.p2pOnly } }
@@ -985,12 +1102,21 @@ export async function askThroughChannels(deps: ToolDeps, request: AskRequest, ca
         refuseAsk({
             ledgerFile,
             reason: 'approvers-missing',
-            detail: `requireApproverList=true，但项目审批人名单不可用：${approvers.problems.join('；') || approvers.file}`,
+            detail:
+                `${request.requireAllowlist === true ? '这次审批要求' : 'requireApproverList=true，要求'}回答者在审批人名单里，但宿主审批人名单不可用：` +
+                `${approvers.problems.join('；') || approvers.source}`,
             title: titleOut.text,
             questionId,
             durationMs: deps.now() - startedAt,
-            extraLines: [`- 名单文件：${approvers.file}（存在=${approvers.present}，有效 id=${approvers.ids.length}）`],
-            next: `由人写 ${config.approversFile}（一行一个 id，# 开头为注释）；名单为空时问出去也没人能合法回答，所以这里不发卡片。`,
+            extraLines: [
+                `- 名单来源：${approvers.source}（有效 id=${approvers.ids.length}，被 denyApprovers 去掉 ${approvers.denied.length} 个）`,
+                ...(approvers.legacyFile === undefined
+                    ? []
+                    : [`- ${approvers.legacyFile} 仍存在，但**不再被读取**：仓库文件不能提供审批人`]),
+            ],
+            next:
+                `由宿主配置 im.approvers（内联 id 数组）或 im.approversFile（宿主侧路径，默认 ${DEFAULT_APPROVERS_FILE}）；` +
+                '名单为空时问出去也没人能合法回答，所以这里不发卡片——不会回落到仓库里的名单文件。',
             ...(missionId === undefined ? {} : { missionId }),
         })
     }
@@ -1425,7 +1551,7 @@ export async function askThroughChannels(deps: ToolDeps, request: AskRequest, ca
                 ...(answer.messageId === undefined ? {} : { messageId: answer.messageId }),
                 outbox,
                 settle: { state: 'withdrawn', reason: 'refused:unauthorized：回答者未获授权（无决定）' },
-                next: `让名单里的人回答（由人维护 ${config.approversFile}）；未授权的回答只算"发生了这件事"，不算决定。`,
+                next: `让宿主审批人名单里的人回答（im.approvers / im.approversFile，默认 ${DEFAULT_APPROVERS_FILE}）；未授权的回答只算"发生了这件事"，不算决定。`,
                 ...(missionId === undefined ? {} : { missionId }),
             })
         }
@@ -1524,7 +1650,7 @@ export async function askThroughChannels(deps: ToolDeps, request: AskRequest, ca
             'interaction_ask：已决定',
             `- 问题：${headline(prose, 120)}`,
             `- 决定：${storedDecision}${declared.length === 0 ? '（自由文本回答）' : '（声明选项之一）'}`,
-            `- 回答者：${by === '' ? '（通道未提供身份）' : by}${config.requireApproverList ? `（项目审批人名单：${approvers.ids.length} 个 id）` : '（未启用审批人名单：通道内的任何参与者都可回答）'}`,
+            `- 回答者：${by === '' ? '（通道未提供身份）' : by}${config.requireApproverList ? `（宿主审批人名单：${approvers.ids.length} 个 id）` : '（未启用审批人名单：通道内的任何参与者都可回答）'}`,
             `- 通道：${candidate.name}${(answer.messageId ?? sendResult.messageId) === undefined ? '' : `（消息 ${answer.messageId ?? sendResult.messageId}）`}`,
             `- 一次性令牌：${questionId}（一次性，已作废）`,
             `- 台账：${ledgerFile}（行 ${row.id}）`,
@@ -1979,7 +2105,7 @@ export function registerTools(
                 lines.push(`- 提问超时上限：${config.askTimeoutMs}ms（调用方只能缩短）`)
                 lines.push(`- 通知级别：${config.notifyLevels.join(', ')}；通道偏好：${config.preferredChannels.length === 0 ? '[]（= 全部已注册通道）' : `[${config.preferredChannels.join(', ')}]`}`)
                 lines.push(`- 载荷上限：${config.maxPayloadChars} 字符（默认 ${DEFAULT_MAX_PAYLOAD_CHARS}）；额外拒绝规则：${config.redactPatterns.length} 条`)
-                lines.push(`- 审批人名单：${config.requireApproverList ? '**必须**' : '不强制'}；文件 ${approvers.file}（存在=${approvers.present}，有效 id=${approvers.ids.length}）`)
+                lines.push(`- 审批人名单：${config.requireApproverList ? '**必须**' : '不强制'}；来源 ${approvers.source}（有效 id=${approvers.ids.length}）`)
                 for (const problem of approvers.problems) lines.push(`  ⚠️ ${problem}`)
                 lines.push(
                     `- 台账：${ledgerFile}（存在=${read.present}，行数 ${read.lines}，可用行 ${read.rows.length}，跳过 ${read.skipped}）` +
@@ -2021,14 +2147,38 @@ export function registerTools(
                     `- IM 审批目标：${
                         config.im.approvalChatId === ''
                             ? '未配置（沿用今日行为：卡片目标由 IM 插件的 p2pChat/activeChat 决定——任何人私聊 bot 都能改写它）'
-                            : `${config.im.approvalChatId}（p2pOnly=${config.im.p2pOnly}；from 白名单 ${approvers.ids.length} 个 id，来自 ${approvers.file}）`
+                            : `${config.im.approvalChatId}（p2pOnly=${config.im.p2pOnly}；from 白名单 ${approvers.ids.length} 个 id，来自 ${approvers.source}）`
                     }${imPlan.ok ? '' : `；⚠️ 当前会**拒绝发问**（refused:${imPlan.reason}）：${imPlan.detail}`}`,
                 )
+                // WHO supplies the whitelist is the fact P3.1 changed, so the line
+                // names the host-side source(s) verbatim and states what the project
+                // removed — never "the file the repository happens to have".
                 lines.push(
-                    `- 审批人名单（审批卡片的 from 白名单）：${approvers.ids.length} 个 id（${approvers.file}，存在=${approvers.present}` +
-                        `${config.requireApproverList ? '；宿主设为必须' : ''}）` +
+                    `- 审批人名单（审批卡片的 from 白名单）：有效 ${approvers.ids.length} 个 id；来源：${approvers.source}` +
+                        `${config.requireApproverList ? '（宿主设为必须）' : ''}` +
                         (approvers.ids.length === 0 ? '——名单为空时审批连卡片都不发（refused:approvers-missing）' : ''),
                 )
+                lines.push(
+                    `- 项目减法（denyApprovers）：去掉 ${approvers.denied.length} 个 id` +
+                        `（宿主 im.denyApprovers ${config.im.hostDenyApprovers.length} 个` +
+                        ` + 项目级 ${config.im.projectDenyApprovers.length} 个；仓库只能减，永远不能加）`,
+                )
+                // The migration, stated where an operator looks: a repository list
+                // that used to decide approvals now decides nothing at all. Saying
+                // "0 ids" without saying WHY would read like a missing file.
+                const legacyFile = approvers.legacyFile
+                const legacyDeclared = effective.problems.some((problem) => problem.includes('"approversFile"'))
+                if (legacyFile !== undefined || legacyDeclared) {
+                    const found = [
+                        ...(legacyFile === undefined ? [] : [`${legacyFile} 仍存在（旧名单文件）`]),
+                        ...(legacyDeclared ? ['项目配置里的 approversFile（已忽略并记问题）'] : []),
+                    ]
+                    lines.push(
+                        `- ⚠️ 迁移：${found.join(' + ')}——它们**不再影响审批**` +
+                            '（P3.1：仓库不能再提供审批人，否则仓库能自己给自己发权限）；' +
+                            `宿主侧名单在 im.approvers（内联数组）或 im.approversFile（默认 ${DEFAULT_APPROVERS_FILE}）`,
+                    )
+                }
                 if (config.im.approvalChatIdProblem !== undefined) lines.push(`  ⚠️ ${config.im.approvalChatIdProblem}`)
                 if (config.im.p2pOnlyConfigured && config.im.approvalChatId === '') {
                     lines.push(`  ⚠️ im.p2pOnly 被显式设为 ${config.im.p2pOnly}，但没有 im.approvalChatId：这个要求无从执行`)
@@ -2043,8 +2193,8 @@ export function registerTools(
                 }
                 if (config.im.approvalVia !== 'off' && config.im.approvalViaProblem === undefined && approvers.ids.length === 0) {
                     lines.push(
-                        `  ⚠️ 审批接缝走 IM（${config.im.approvalVia}）但审批人名单为空：每次审批都会在发卡之前被拒绝（refused:approvers-missing）——` +
-                            `审批是权限，所以它只认名单里的人（由人写 ${config.approversFile}）`,
+                        `  ⚠️ 审批接缝走 IM（${config.im.approvalVia}）但宿主审批人名单为空：每次审批都会在发卡之前被拒绝（refused:approvers-missing）——` +
+                            `审批是权限，所以它只认名单里的人（由宿主写 im.approvers 或 ${DEFAULT_APPROVERS_FILE}；仓库文件不再被读取）`,
                     )
                 }
                 // Refused answer attempts: "someone tried to answer for the

@@ -29,9 +29,17 @@ import test from 'node:test'
 import { createFakeHost, runText, tempWorkspace, type FakeHost } from 'dsh-eng-core/testing'
 import { apply } from '../dist/index.js'
 
-const APPROVERS = '.dsh/interaction-approvers.txt'
 const LOG = 'interaction-gate.log'
 const APPROVAL_CHAT = 'oc_approvals'
+
+/**
+ * The HOST-side allowlist (P3.1). `approversFile` is pinned to a path that does
+ * not exist so the test never depends on the machine's `~/.dsh` (an allowlist is
+ * host config; a developer's real file must not leak into a fixture).
+ */
+function hostApprovers(cwd: string, ids: string[]): Record<string, unknown> {
+    return { approvers: ids, approversFile: path.join(cwd, '.dsh', 'host-approvers.txt') }
+}
 
 const hosts: FakeHost[] = []
 test.after(() => {
@@ -69,11 +77,6 @@ function makeChat(variant: { withIgnoredHook?: boolean } = {}): {
     }
 }
 
-function writeApprovers(cwd: string, ids: string[]): void {
-    const file = path.join(cwd, APPROVERS)
-    fs.mkdirSync(path.dirname(file), { recursive: true })
-    fs.writeFileSync(file, `# approvers\n${ids.join('\n')}\n`, 'utf8')
-}
 
 /** Assemble the real plugin (a fake IM service stands in for chatInteraction). */
 function assemble(cwd: string, config: Record<string, unknown>, services: Record<string, unknown>): FakeHost {
@@ -85,11 +88,10 @@ function assemble(cwd: string, config: Record<string, unknown>, services: Record
 
 test('TC-922 approvalVia=fallback 且目标与名单已配置：IM 段一处显示模式/目标/名单人数/被忽略回答，并区分无法观测与没有发生', async () => {
     const cwd = tempWorkspace('interaction-p2-')
-    writeApprovers(cwd, ['ou_alice', 'ou_bob'])
     const chat = makeChat()
     const fake = assemble(
         cwd,
-        { im: { channel: 'auto', channelId: 'feishu', approvalChatId: APPROVAL_CHAT, approvalVia: 'fallback' } },
+        { im: { channel: 'auto', channelId: 'feishu', approvalChatId: APPROVAL_CHAT, approvalVia: 'fallback', ...hostApprovers(cwd, ['ou_alice', 'ou_bob']) } },
         { chatInteraction: chat.layer },
     )
 
@@ -108,8 +110,8 @@ test('TC-922 approvalVia=fallback 且目标与名单已配置：IM 段一处显�
     // ONE section: the header, then the four facts as consecutive lines.
     const header = status.indexOf('IM 审批（IM 上能不能真的做出决定？')
     const mode = status.indexOf('IM 审批应答者（approval/request）：fallback')
-    const target = status.indexOf(`IM 审批目标：${APPROVAL_CHAT}（p2pOnly=true；from 白名单 2 个 id`)
-    const approvers = status.indexOf('审批人名单（审批卡片的 from 白名单）：2 个 id')
+    const target = status.indexOf(`IM 审批目标：${APPROVAL_CHAT}（p2pOnly=true；from 白名单 2 个 id，来自 im.approvers`)
+    const approvers = status.indexOf('审批人名单（审批卡片的 from 白名单）：有效 2 个 id')
     const ignored = status.indexOf('IM 被忽略的回答尝试：1 次（发起者不在白名单 1 次，答非所问 0 次）')
     assert.ok(header >= 0, status)
     assert.ok(mode > header, `模式必须在同一段里、在标题之后：\n${status}`)
@@ -124,9 +126,8 @@ test('TC-922 approvalVia=fallback 且目标与名单已配置：IM 段一处显�
 
 test('TC-922 上游没有 onAnswerIgnored：计数写"无法观测"，绝不写"没有发生"', async () => {
     const cwd = tempWorkspace('interaction-p2-')
-    writeApprovers(cwd, ['ou_alice'])
     // The channel is registered, but the plugin cannot see refused attempts.
-    const fake = assemble(cwd, { im: { channel: 'auto', channelId: 'feishu', approvalChatId: APPROVAL_CHAT, approvalVia: 'fallback' } }, {
+    const fake = assemble(cwd, { im: { channel: 'auto', channelId: 'feishu', approvalChatId: APPROVAL_CHAT, approvalVia: 'fallback', ...hostApprovers(cwd, ['ou_alice']) } }, {
         chatInteraction: makeChat({ withIgnoredHook: false }).layer,
     })
 
