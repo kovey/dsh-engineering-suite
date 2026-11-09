@@ -24,6 +24,24 @@ const LEDGER = '.dsh/interaction/decisions.jsonl'
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
 const hosts: FakeHost[] = []
 
+
+/**
+ * A host-side approver path that CANNOT exist (a fresh temp directory).
+ *
+ * P3.1 made the approver list host config, and its default is
+ * `~/.dsh/interaction-approvers.txt` — a real file on a real machine. Every
+ * assembly below pins that path so a developer's (or a deployment's) actual
+ * allowlist can never change what these tests assert: `approversFile` is host
+ * config, not fixture data. Callers that set their own path still win.
+ */
+const PINNED_HOST_FILE = path.join(tempWorkspace('dsh-host-approvers-'), 'approvers.txt')
+
+/** Pin the host approver file unless the case declares its own. */
+function withPinnedHostFile(config: Record<string, unknown>): Record<string, unknown> {
+    const im = typeof config['im'] === 'object' && config['im'] !== null ? (config['im'] as Record<string, unknown>) : {}
+    return { ...config, im: { approversFile: PINNED_HOST_FILE, ...im } }
+}
+
 /** Assemble the plugin in a throwaway workspace. */
 function host(
     cwd: string,
@@ -32,7 +50,7 @@ function host(
 ): FakeHost & { registry: any } {
     const fake = createFakeHost({ cwd, ...(services === undefined ? {} : { services: { ...services } }) })
     hosts.push(fake)
-    apply(fake.ctx as never, { logFile: path.join(cwd, 'interaction-gate.log'), ...config })
+    apply(fake.ctx as never, { logFile: path.join(cwd, 'interaction-gate.log'), ...withPinnedHostFile(config) })
     const registry = (fake.ctx as { get: (service: string) => unknown }).get('interaction')
     return Object.assign(fake, { registry })
 }
@@ -54,7 +72,7 @@ function scriptedChannel(
     } = {},
 ) {
     const sent: any[] = []
-    const state: { waiter?: (value: unknown) => void; attempts: number; tokens: string[] } = { attempts: 0, tokens: [] }
+    const state: { waiter?: (value: unknown) => void; attempts: number; tokens: string[]; delivered?: { value: unknown } } = { attempts: 0, tokens: [] }
     const channel: any = {
         name: channelName,
         async send(message: any) {
@@ -71,8 +89,18 @@ function scriptedChannel(
             const attempt = state.attempts
             state.tokens.push(questionId)
             if (options.waitMode === 'null') return null
+            // IDEMPOTENT across re-waits: the product may wait() more than once
+            // for one question, and an answer delivered to an earlier resolver
+            // would otherwise be dropped — the ask then waits until its deadline
+            // (this is how a 900-second hang appeared under load). A delivered
+            // answer is remembered and handed to every later attempt.
+            if (state.delivered !== undefined) return state.delivered.value
             return await new Promise((resolve) => {
-                state.waiter = resolve
+                state.waiter = (value: unknown) => {
+                    state.delivered = { value }
+                    state.waiter = undefined
+                    resolve(value)
+                }
                 // 'never' = the channel waits forever on its own; the test may
                 // still answer by hand (or let the ask's deadline fire).
                 if (options.waitMode === 'never') return
@@ -84,10 +112,26 @@ function scriptedChannel(
 }
 
 /** Answer once the channel has reached its wait. */
+/**
+ * Answer through a scripted channel, waiting until it is really listening.
+ *
+ * Two test-hygiene rules learned the hard way (2026-11-09): the budget must
+ * survive a fully parallel run (500ms was not enough and the whole suite then
+ * waited 900s for a call nobody would ever answer), and on timeout the waiter is
+ * released BEFORE the assertion — otherwise a failed assertion leaves the tool
+ * call parked until the product's own ask timeout expires.
+ * @param scripted - the scripted channel.
+ * @param value - the answer to deliver.
+ */
 async function answerWith(scripted: ReturnType<typeof scriptedChannel>, value: unknown): Promise<void> {
-    for (let index = 0; index < 500 && scripted.state.waiter === undefined; index += 1) await sleep(1)
-    assert.ok(scripted.state.waiter !== undefined, `${scripted.name} 没有进入等待状态`)
-    scripted.state.waiter(value)
+    for (let index = 0; index < 5_000 && scripted.state.waiter === undefined; index += 1) await sleep(1)
+    const waiter = scripted.state.waiter
+    if (waiter === undefined) {
+        // Nothing will answer this call: release it so the run ends now instead of
+        // hanging until the product's default timeout.
+        throw new Error(`${scripted.name} 没有进入等待状态（5s 预算用尽）——本次用例以此失败结束，不再挂在工具调用上`)
+    }
+    waiter(value)
 }
 
 function rowsOf(cwd: string, file = LEDGER): any[] {
@@ -101,7 +145,7 @@ function rowsOf(cwd: string, file = LEDGER): any[] {
  * `~/.dsh/interaction-approvers.txt` (host config!) never leaks ids into a fixture.
  */
 function hostApprovers(ids: string[]): Record<string, unknown> {
-    return { im: { approvers: ids, approversFile: path.join(tempWorkspace('dsh-host-approvers-'), 'approvers.txt') } }
+    return { im: { approvers: ids, approversFile: PINNED_HOST_FILE } }
 }
 
 /**
@@ -199,7 +243,7 @@ test('describe()：没有 wait() 的通道 canAsk=false 且说明原因，提问
     assert.equal(info.canNotify, true)
     assert.ok(info.reason.includes('wait'), `原因里应说明缺 wait()：${info.reason}`)
 
-    const run = await fake.runTool('interaction_ask', { question: '要部署吗？', options: ['yes', 'no'] })
+    const run = await fake.runTool('interaction_ask', { question: '要部署吗？', options: ['yes', 'no']  , timeoutMs: 2_000 })
     assert.equal(run.isError, true)
     const text = runText(run)
     assert.ok(text.includes('interaction_ask 拒绝（refused:no-channel）'), text)
@@ -325,7 +369,7 @@ test('interaction_ask：通道 wait() 回了一个别的令牌 → 丢弃后继�
     })
     fake.registry.register(echo.channel)
 
-    const run = await fake.runTool('interaction_ask', { question: '放行吗？', options: ['yes', 'no'], timeoutMs: 2_000 })
+    const run = await fake.runTool('interaction_ask', { question: '放行吗？', options: ['yes', 'no'] , timeoutMs: 2_000 })
     assert.equal(run.isError, false)
     const text = runText(run)
     assert.ok(text.includes('决定：no'), text)
@@ -341,7 +385,7 @@ test('interaction_ask：requireApproverList=true 时未授权回答者 → 拒�
     const mallory = scriptedChannel('im')
     fake.registry.register(mallory.channel)
 
-    const run = fake.runTool('interaction_ask', { question: '放行吗？', options: ['yes', 'no'] })
+    const run = fake.runTool('interaction_ask', { question: '放行吗？', options: ['yes', 'no']  , timeoutMs: 2_000 })
     await answerWith(mallory, { value: 'yes', by: 'mallory' })
     const outcome = await run
     assert.equal(outcome.isError, true)
@@ -363,7 +407,7 @@ test('interaction_ask：名单里的人可以回答；名单缺失时在发卡�
     const fake = host(cwd, { requireApproverList: true, ...hostApprovers(['alice']) })
     const im = scriptedChannel('im')
     fake.registry.register(im.channel)
-    const running = fake.runTool('interaction_ask', { question: '放行吗？', options: ['allowed-once', 'rejected'] })
+    const running = fake.runTool('interaction_ask', { question: '放行吗？', options: ['allowed-once', 'rejected']  , timeoutMs: 2_000 })
     await answerWith(im, { value: 'allowed-once', by: 'ALICE' })
     const run = await running
     assert.equal(run.isError, false, runText(run))
@@ -374,7 +418,7 @@ test('interaction_ask：名单里的人可以回答；名单缺失时在发卡�
     const bareHost = host(bare, { requireApproverList: true })
     const channel = scriptedChannel('im')
     bareHost.registry.register(channel.channel)
-    const refused = await bareHost.runTool('interaction_ask', { question: '放行吗？', options: ['yes'] })
+    const refused = await bareHost.runTool('interaction_ask', { question: '放行吗？', options: ['yes']  , timeoutMs: 2_000 })
     assert.equal(refused.isError, true)
     assert.ok(runText(refused).includes('refused:approvers-missing'), runText(refused))
     assert.equal(channel.sent.length, 0, '名单不可用时不该发出卡片')
@@ -386,7 +430,7 @@ test('interaction_ask：答案不是声明选项之一 → 拒绝（refused:unkn
     const fake = host(cwd)
     const im = scriptedChannel('im')
     fake.registry.register(im.channel)
-    const running = fake.runTool('interaction_ask', { question: '放行吗？', options: ['yes', 'no'] })
+    const running = fake.runTool('interaction_ask', { question: '放行吗？', options: ['yes', 'no']  , timeoutMs: 2_000 })
     await answerWith(im, { value: 'maybe', by: 'user-1' })
     const run = await running
     assert.equal(run.isError, true)
@@ -638,7 +682,7 @@ test('项目级配置：允许的键生效、非法值与宿主键被拒绝并�
     const fake = host(cwd, { requireApproverList: true, ...hostApprovers(['alice', 'bob']) })
     const im = scriptedChannel('im')
     fake.registry.register(im.channel)
-    const running = fake.runTool('interaction_ask', { question: '放行吗？', options: ['yes', 'no'] })
+    const running = fake.runTool('interaction_ask', { question: '放行吗？', options: ['yes', 'no']  , timeoutMs: 2_000 })
     await answerWith(im, { value: 'yes', by: 'alice' })
     const run = await running
     assert.equal(run.isError, false, runText(run))
@@ -660,7 +704,7 @@ test('交互层不猜工作区：没有 session.header.cwd 时四个工具都拒
     const cwd = tempWorkspace('interaction-gate-')
     const fake = createFakeHost({ cwd, agent: { id: 'agent-x', session: { id: 'session-x', header: { id: 'session-x' } } } })
     hosts.push(fake)
-    apply(fake.ctx as never, { logFile: path.join(cwd, 'interaction-gate.log') })
+    apply(fake.ctx as never, { logFile: path.join(cwd, 'interaction-gate.log'), ...withPinnedHostFile({}) })
     for (const [tool, args] of [
         ['interaction_ask', { question: '放行吗？', options: ['yes'] }],
         ['interaction_notify', { level: 'warn', title: 't', body: 'b' }],
@@ -726,7 +770,7 @@ test('项目级 redactPatterns 与宿主取并集：加规则只会收紧，绝�
     // End to end: with a project file present, the HOST rule still refuses a payload.
     const fake = host(cwd, { redactPatterns: ['ACME-SECRET-[0-9]{4}'] })
     fake.registry.register(scriptedChannel('im').channel)
-    const refused = await fake.runTool('interaction_ask', { question: '密钥 ACME-SECRET-1234 可以发吗？' })
+    const refused = await fake.runTool('interaction_ask', { question: '密钥 ACME-SECRET-1234 可以发吗？'  , timeoutMs: 2_000 })
     assert.equal(refused.isError, true)
     assert.ok(runText(refused).includes('refused:secret'), runText(refused))
     assert.ok(runText(refused).includes('ACME-SECRET-[0-9]{4}'), runText(refused))
@@ -741,7 +785,7 @@ test('自由文本答案落账与回显都被 maxPayloadChars 限界，并说明
     const im = scriptedChannel('im', { onWait: (_questionId, resolve) => resolve({ value: huge, by: 'user-9' }) })
     fake.registry.register(im.channel)
 
-    const run = await fake.runTool('interaction_ask', { question: '随便说点什么' })
+    const run = await fake.runTool('interaction_ask', { question: '随便说点什么'  , timeoutMs: 2_000 })
     assert.equal(run.isError, false)
     const text = runText(run)
     assert.ok(text.length < 5_000, `the answer must be bounded, got ${text.length} chars`)

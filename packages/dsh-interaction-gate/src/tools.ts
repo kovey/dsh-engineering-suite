@@ -363,7 +363,10 @@ export function approversOf(cwd: string, config: InteractionGateConfig): Approve
     const parts: string[] = []
     if (im.approvers.length > 0) parts.push(`im.approvers（${im.approvers.length} 个内联 id）`)
     if (file !== '') parts.push(`im.approversFile=${file}（存在=${fromFile.present}，${fromFile.ids.length} 个 id）`)
-    const source = parts.length === 0 ? '宿主未配置任何来源' : parts.join(' + ')
+    // An empty list must not read like a configured one: the source phrase says
+    // where it would come FROM, and the explicit tail says it produced no id.
+    const source =
+        parts.length === 0 ? '宿主未配置任何来源' : host.length === 0 ? `${parts.join(' + ')}——未提供任何 id` : parts.join(' + ')
     return {
         file,
         present: fromFile.present,

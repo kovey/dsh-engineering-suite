@@ -33,12 +33,25 @@ const LOG = 'interaction-gate.log'
 const APPROVAL_CHAT = 'oc_approvals'
 
 /**
- * The HOST-side allowlist (P3.1). `approversFile` is pinned to a path that does
- * not exist so the test never depends on the machine's `~/.dsh` (an allowlist is
- * host config; a developer's real file must not leak into a fixture).
+ * A host-side approver path that CANNOT exist (a fresh temp directory).
+ *
+ * P3.1 made the approver list host config, and its default is
+ * `~/.dsh/interaction-approvers.txt` — a real file on a real machine. Every
+ * assembly below pins that path so a developer's (or a deployment's) actual
+ * allowlist can never change what these tests assert: `approversFile` is host
+ * config, not fixture data. Callers that set their own path still win.
  */
+const PINNED_HOST_FILE = path.join(tempWorkspace('dsh-host-approvers-'), 'approvers.txt')
+
+/** Pin the host approver file unless the case declares its own. */
+function withPinnedHostFile(config: Record<string, unknown>): Record<string, unknown> {
+    const im = typeof config['im'] === 'object' && config['im'] !== null ? (config['im'] as Record<string, unknown>) : {}
+    return { ...config, im: { approversFile: PINNED_HOST_FILE, ...im } }
+}
+
+/** The HOST-side allowlist (P3.1): ids inline, the file pinned as above. */
 function hostApprovers(cwd: string, ids: string[]): Record<string, unknown> {
-    return { approvers: ids, approversFile: path.join(cwd, '.dsh', 'host-approvers.txt') }
+    return { approvers: ids, approversFile: PINNED_HOST_FILE }
 }
 
 const hosts: FakeHost[] = []
@@ -82,7 +95,7 @@ function makeChat(variant: { withIgnoredHook?: boolean } = {}): {
 function assemble(cwd: string, config: Record<string, unknown>, services: Record<string, unknown>): FakeHost {
     const fake = createFakeHost({ cwd, services })
     hosts.push(fake)
-    apply(fake.ctx as never, { logFile: path.join(cwd, LOG), askTimeoutMs: 1_000, ...config })
+    apply(fake.ctx as never, { logFile: path.join(cwd, LOG), askTimeoutMs: 1_000, ...withPinnedHostFile(config) })
     return fake
 }
 

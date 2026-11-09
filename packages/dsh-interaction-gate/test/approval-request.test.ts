@@ -38,6 +38,23 @@ const LEDGER = '.dsh/interaction/decisions.jsonl'
 const OUTBOX = '.dsh/interaction/outbox.jsonl'
 const LOG = 'interaction-gate.log'
 
+/**
+ * A host-side approver path that CANNOT exist (a fresh temp directory).
+ *
+ * P3.1 made the approver list host config, and its default is
+ * `~/.dsh/interaction-approvers.txt` — a real file on a real machine. Every
+ * assembly below pins that path so a developer's (or a deployment's) actual
+ * allowlist can never change what these tests assert: `approversFile` is host
+ * config, not fixture data. Callers that set their own path still win.
+ */
+const PINNED_HOST_FILE = path.join(tempWorkspace('dsh-host-approvers-'), 'approvers.txt')
+
+/** Pin the host approver file unless the case declares its own. */
+function withPinnedHostFile(config: Record<string, unknown>): Record<string, unknown> {
+    const im = typeof config['im'] === 'object' && config['im'] !== null ? (config['im'] as Record<string, unknown>) : {}
+    return { ...config, im: { approversFile: PINNED_HOST_FILE, ...im } }
+}
+
 /** The one conversation approvals may go to. */
 const APPROVAL_CHAT = 'oc_approvals'
 /** The person the approver list names. */
@@ -175,7 +192,7 @@ function assemble(cwd: string, config: Record<string, unknown>, channel?: Script
         }
         return dispose
     }
-    apply(fake.ctx as never, { logFile: path.join(cwd, LOG), ...config })
+    apply(fake.ctx as never, { logFile: path.join(cwd, LOG), ...withPinnedHostFile(config) })
     const registry = (fake.ctx as { get: (name: string) => unknown }).get('interaction')
     if (channel !== undefined) {
         const dispose = registry.register(channel.channel)
@@ -196,13 +213,7 @@ function assemble(cwd: string, config: Record<string, unknown>, channel?: Script
     }
 }
 
-/**
- * A host-side approver path that cannot exist (a fresh temp directory). Pinning
- * it keeps the machine's real `~/.dsh/interaction-approvers.txt` out of the
- * fixture: an allowlist is host config, and a developer's file must not change
- * what these tests assert.
- */
-const NO_HOST_FILE = path.join(tempWorkspace('dsh-host-approvers-'), 'approvers.txt')
+const NO_HOST_FILE = PINNED_HOST_FILE
 
 const TARGET = (via: 'off' | 'fallback' | 'only', extra: Record<string, unknown> = {}): Record<string, unknown> => ({
     askTimeoutMs: 1_000,

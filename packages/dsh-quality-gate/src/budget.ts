@@ -909,6 +909,46 @@ function readLockRecord(file: string): { record?: LockRecord; problem?: string; 
  * @param options - lock bounds and injected clock/sleep.
  * @returns the lock path, or a refusal naming the fix.
  */
+/**
+ * Publish one lock record atomically.
+ *
+ * `open(path, 'wx')` is already an atomic ACQUISITION, but the file then exists
+ * before it says anything. A concurrent reader that saw that window could not
+ * determine the age and used to treat the lock as abandoned — which is exactly
+ * how two writers both "succeeded" one day and one of them lost its measurement
+ * the next. Writing the record to a temp file and `link`ing it into place makes
+ * the publication itself atomic: readers either see the whole record or no file.
+ * @param lockPath - the lock file to create.
+ * @param record - the record to publish.
+ * @returns whether this process published (i.e. acquired) the lock.
+ */
+function publishLockRecord(lockPath: string, record: LockRecord): boolean {
+    const temp = `${lockPath}.tmp-${process.pid}-${Math.random().toString(36).slice(2)}`
+    try {
+        fs.writeFileSync(temp, `${JSON.stringify(record)}\n`)
+        fs.linkSync(temp, lockPath)
+        return true
+    } catch (error) {
+        const code = (error as { code?: string }).code
+        if (code === 'EEXIST') return false
+        // A filesystem without hard links (or a sandbox that refuses them) falls
+        // back to the previous create-then-write path; the reader no longer
+        // assumes the worst, so the fallback is safe even though it is not atomic.
+        if (code === 'EPERM' || code === 'ENOSYS' || code === 'EOPNOTSUPP' || code === 'EXDEV') {
+            const wrapped = new Error('hard links are not available here') as Error & { code?: string }
+            wrapped.code = 'ERR_LINK_UNSUPPORTED'
+            throw wrapped
+        }
+        throw error
+    } finally {
+        try {
+            fs.unlinkSync(temp)
+        } catch {
+            // best effort: the temp file is inside the baseline directory
+        }
+    }
+}
+
 export function acquireBaselineLock(file: string, options: AppendBaselineOptions = {}): string {
     const now = options.now ?? (() => Date.now())
     const sleep = options.sleep ?? ((ms: number) => atomicsWaitMs(ms))
@@ -929,6 +969,23 @@ export function acquireBaselineLock(file: string, options: AppendBaselineOptions
         attempt += 1
         try {
             ensureDir(path.dirname(lockPath))
+            // Publish the record ATOMICALLY: build it in a temp file and `link`
+            // it into place. `open(wx)` guarantees the acquisition but leaves a
+            // window where the file exists and says nothing, and a reader that
+            // saw that window used to conclude "stale" (it could not know the
+            // age, so it assumed the worst). A link either publishes the whole
+            // record or fails with EEXIST, which is the same conflict the caller
+            // already handles.
+            if (publishLockRecord(lockPath, { pid: process.pid, at: now(), file })) {
+                return lockPath
+            }
+        } catch (error) {
+            if ((error as { code?: string }).code !== 'EEXIST' && (error as { code?: string }).code !== 'ERR_LINK_UNSUPPORTED') {
+                throw error
+            }
+            // EEXIST: someone else owns it — fall through to the observer below.
+        }
+        try {
             const handle = fs.openSync(lockPath, 'wx')
             try {
                 const record: LockRecord = { pid: process.pid, at: now(), file }
@@ -963,7 +1020,13 @@ export function acquireBaselineLock(file: string, options: AppendBaselineOptions
             }
             const observed = readLockRecord(lockPath)
             const age = observed.record === undefined ? undefined : now() - observed.record.at
-            const stale = observed.record === undefined ? true : (age as number) > staleMs
+            // "Unreadable" is NOT "stale". An empty or half-written lock file means
+            // the owner is mid-publication (or a crashed run left it behind), and
+            // neither is evidence that the lock was abandoned. Declaring it stale
+            // here made two concurrent writers fail under load: one appended, the
+            // other was told its peer's fresh lock had expired.
+            const unreadable = observed.record === undefined
+            const stale = !unreadable && (age as number) > staleMs
             if (stale) {
                 const ageText =
                     age === undefined
@@ -986,9 +1049,24 @@ export function acquireBaselineLock(file: string, options: AppendBaselineOptions
             // the bounded retry into an unbounded loop.
             const waited = Math.max(now() - started, Date.now() - realStarted)
             if (waited >= retryMs || Date.now() >= hardDeadline) {
+                if (unreadable) {
+                    // Deliberately does NOT advise deleting the file: at this point
+                    // we cannot tell "a writer is inside its publication window"
+                    // from "a crash left an empty lock", and telling an operator to
+                    // delete the first one is how measurements get lost.
+                    throw new Error(
+                        `等待基线文件 ${file} 的锁超时（${retryMs}ms，尝试 ${attempt} 次，锁文件 ${lockPath} 存在但内容不可读${options.where === undefined ? '' : `；${options.where}`}）。` +
+                            `观测到的锁年龄：无法判定（${observed.problem ?? '内容为空或不是完整的锁记录'}；mtime=${
+                                observed.observedAt === undefined ? '未知' : formatTime(observed.observedAt)
+                            }）。` +
+                            '下一步：先确认是否还有 budget_check 在跑（另一个预算检查可能正处在这个文件的发布窗口内）；' +
+                            '若长时间保持为空且确认没有进程在写，按团队约定人工处理该锁文件后重跑。' +
+                            '按 fail closed 拒绝：没有锁的读-改-写会丢掉其中一次测量，而"少了一条历史"看起来和"通过"一模一样。',
+                    )
+                }
                 throw new Error(
                     `等待基线文件 ${file} 的锁超时（${retryMs}ms，尝试 ${attempt} 次，锁文件 ${lockPath} 仍被占用${options.where === undefined ? '' : `；${options.where}`}）。` +
-                        (age === undefined ? '' : `该锁的年龄约 ${Math.round(age / 1000)}s，尚未超过过期上限 ${Math.round(staleMs / 1000)}s。`) +
+                        `该锁的年龄约 ${Math.round((age as number) / 1000)}s，尚未超过过期上限 ${Math.round(staleMs / 1000)}s。` +
                         '下一步：等另一个 budget_check 结束后重跑（同一个工作区上并发的预算检查会排队，不会丢测量）；' +
                         `若确认那个进程已经不在了，手动删除 ${lockPath} 后重跑。` +
                         '按 fail closed 拒绝：没有锁的读-改-写会丢掉其中一次测量，而"少了一条历史"看起来和"通过"一模一样。',

@@ -38,8 +38,22 @@ import { refusalOf } from '../dist/ledger.js'
 
 const LEDGER = '.dsh/interaction/decisions.jsonl'
 const LEGACY = LEGACY_PROJECT_APPROVERS_FILE
-/** A host-side approver path that cannot exist (keeps the machine's `~/.dsh` out). */
-const NO_HOST_FILE = path.join(tempWorkspace('interaction-host-approvers-'), 'approvers.txt')
+/**
+ * A host-side approver path that CANNOT exist (a fresh temp directory).
+ *
+ * P3.1 made the approver list host config, and its default is
+ * `~/.dsh/interaction-approvers.txt` — a real file on a real machine. Every
+ * assembly below pins that path so a developer's (or a deployment's) actual
+ * allowlist can never change what these tests assert: `approversFile` is host
+ * config, not fixture data. Callers that set their own path still win.
+ */
+const NO_HOST_FILE = path.join(tempWorkspace('dsh-host-approvers-'), 'approvers.txt')
+
+/** Pin the host approver file unless the case declares its own. */
+function withPinnedHostFile(config: Record<string, unknown>): Record<string, unknown> {
+    const im = typeof config['im'] === 'object' && config['im'] !== null ? (config['im'] as Record<string, unknown>) : {}
+    return { ...config, im: { approversFile: NO_HOST_FILE, ...im } }
+}
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
 
@@ -107,7 +121,7 @@ async function answerWith(scripted: ScriptedChannel, value: string, by: string):
 function host(cwd: string, config: Record<string, unknown> = {}): FakeHost & { registry: any } {
     const fake = createFakeHost({ cwd })
     hosts.push(fake)
-    apply(fake.ctx as never, { logFile: path.join(cwd, 'interaction-gate.log'), ...config })
+    apply(fake.ctx as never, { logFile: path.join(cwd, 'interaction-gate.log'), ...withPinnedHostFile(config) })
     return Object.assign(fake, { registry: (fake.ctx as { get: (name: string) => unknown }).get('interaction') })
 }
 

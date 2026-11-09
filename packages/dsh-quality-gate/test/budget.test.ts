@@ -948,9 +948,12 @@ test('budgets: the lock file is created exclusively, written atomically and alwa
     // other run: this is the shape a crash mid-create leaves behind.
     fs.writeFileSync(held, '')
     try {
+        // Semantics changed on 2026-11-09: an empty lock file is "the owner is
+        // mid-publication or crashed", NOT "the lock expired". The refusal says
+        // it cannot determine the age and deliberately does not invite deletion.
         assert.throws(
             () => appendBaseline(heldTarget, 'b', sample(CLOCK, 1), { lockRetryMs: 0 }),
-            /已过期[\s\S]*手动删除/,
+            /无法判定[\s\S]*没有进程在写/,
         )
     } finally {
         fs.unlinkSync(held)
@@ -993,4 +996,102 @@ test('budgets: the lock bounds are host keys with defaults, a ceiling and a repo
     assert.equal(config.baselineLockStaleMs, DEFAULT_BASELINE_LOCK_STALE_MS)
     assert.match(projectProblems.join('\n'), /键 "baselineLockRetryMs" 不允许在项目级配置里覆盖/)
     assert.match(projectProblems.join('\n'), /键 "baselineLockStaleMs" 不允许在项目级配置里覆盖/)
+})
+
+// --- 锁语义：不可读 ≠ 过期（2026-11-09 门禁抓到的并发失败） --------------------
+
+/** Create a lock file whose content cannot be read as a record. */
+function writeEmptyLock(file: string): string {
+    const lockPath = `${file}.lock`
+    fs.writeFileSync(lockPath, '')
+    return lockPath
+}
+
+function writeLockRecord(file: string, at: number): string {
+    const lockPath = `${file}.lock`
+    fs.writeFileSync(lockPath, `${JSON.stringify({ pid: 4242, at, file })}\n`)
+    return lockPath
+}
+
+test('an UNREADABLE lock is waited for, not declared stale (regression: two writers, one lost)', () => {
+    const dir = tempWorkspace('budget-lock-unreadable-')
+    const file = path.join(dir, 'budgets.json')
+    appendBaseline(file, 'b', sample(CLOCK, 1))
+    const lockPath = writeEmptyLock(file)
+    // The injected sleep PLAYS the other writer: its first wake publishes a valid
+    // record (the publication window closing), the second releases the lock. A
+    // real timer cannot be used here — the retry sleep is `Atomics.wait`, which
+    // blocks the event loop, so a `setTimeout` would never fire and the test would
+    // assert on its own harness instead of on the lock.
+    let wakes = 0
+    const publishThenRelease = (): void => {
+        wakes += 1
+        if (wakes === 1) {
+            fs.writeFileSync(lockPath, `${JSON.stringify({ pid: 7, at: Date.now(), file })}\n`)
+            return
+        }
+        if (wakes === 2) {
+            try {
+                fs.unlinkSync(lockPath)
+            } catch {
+                // already gone
+            }
+        }
+    }
+    try {
+        appendBaseline(file, 'b', sample(CLOCK + 1_000, 2), {
+            lockRetryMs: 3_000,
+            lockSleepMs: 20,
+            sleep: publishThenRelease,
+        })
+    } finally {
+        try {
+            fs.unlinkSync(lockPath)
+        } catch {
+            // already released
+        }
+    }
+    assert.equal(readBaseline(file, 'b').entries.length, 2, 'the second append must not be lost')
+})
+
+test('an unreadable lock that never resolves refuses with 无法判定 and does NOT advise deleting it', () => {
+    const dir = tempWorkspace('budget-lock-unreadable-refuse-')
+    const file = path.join(dir, 'budgets.json')
+    appendBaseline(file, 'b', sample(CLOCK, 1))
+    writeEmptyLock(file)
+    let message = ''
+    try {
+        appendBaseline(file, 'b', sample(CLOCK + 1_000, 2), { lockRetryMs: 120, lockSleepMs: 10 })
+    } catch (error) {
+        message = (error as Error).message
+    }
+    assert.match(message, /无法判定/)
+    assert.doesNotMatch(message, /手动删除/, 'deleting an unreadable lock is how measurements get lost')
+    assert.match(message, /没有进程在写/, 'the next step must be "check for a live writer", not "delete it"')
+})
+
+test('a readable lock past the stale bound still refuses as EXPIRED, with its age', () => {
+    const dir = tempWorkspace('budget-lock-stale-')
+    const file = path.join(dir, 'budgets.json')
+    appendBaseline(file, 'b', sample(CLOCK, 1))
+    writeLockRecord(file, Date.now() - 10 * 60_000)
+    assert.throws(
+        () => appendBaseline(file, 'b', sample(CLOCK + 1_000, 2), { lockRetryMs: 100, lockStaleMs: 1_000 }),
+        /已过期/,
+    )
+})
+
+test('a readable lock INSIDE the stale bound waits, then refuses as HELD (not expired)', () => {
+    const dir = tempWorkspace('budget-lock-held-')
+    const file = path.join(dir, 'budgets.json')
+    appendBaseline(file, 'b', sample(CLOCK, 1))
+    writeLockRecord(file, Date.now())
+    let message = ''
+    try {
+        appendBaseline(file, 'b', sample(CLOCK + 1_000, 2), { lockRetryMs: 120, lockSleepMs: 10 })
+    } catch (error) {
+        message = (error as Error).message
+    }
+    assert.match(message, /仍被占用/)
+    assert.doesNotMatch(message, /已过期/, 'a live lock is not an expired one')
 })
