@@ -1,5 +1,23 @@
 ## [未发布]
 
+### 安全 · shell 分析器现在能看见"脚本里的写操作"（文件边界曾可绕过）
+
+审查时实测到：`python3 - <<'PY' … open('../../outside.txt','w') … PY` 会改写 mission 文件边界
+**之外**的文件，而分析器一个目标都没报——同样的写入换成 `cat >> file` 会被拦下。原因是分析器只看
+外层 shell，解释器内联载荷（`-c`/`-e`/stdin heredoc）从未进入视野。
+
+现在载荷也被检查：
+
+- `python/python3 -c`、`node -e/--eval`、`bun`、`deno eval`、`ruby -e`、`perl -e`、`php -r` 的载荷里
+  检测到写意图（`open(...,'w')`、`writeFileSync`、`File.write`、`file_put_contents` 等）时，
+  **字面量路径**计入 targets，照常做边界与越界检查；
+- 目标不是字面量（变量/拼装/子进程）→ `undecidable` 并点名原因（fail-closed），绝不"假定无害"；
+- `bash/sh/zsh -c` 的载荷递归分析（深度上限 2，自嵌套会终止）；
+- heredoc **正文仍是数据**：提交信息里的 `>`、`#` 不会产生目标；纯计算载荷（`python3 -c "print(1)"`）
+  不产生目标、也不新增不可判定原因。
+
+## [未发布]
+
 ### 修复 · `team_delegate` 全面不可用：scope 插件用属性访问读可选服务
 
 `dsh-eng-core/scope`（role preset 在子作用域里挂载的那个）写了 `ctx.tools?.restrict`。cordis 的

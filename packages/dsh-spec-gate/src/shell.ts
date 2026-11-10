@@ -291,7 +291,170 @@ function operandsFor(tokens: readonly string[], mode: 'all' | 'last' | 'except-f
  * @param command - the raw command string.
  * @returns the extracted targets plus whether anything stayed unattributed.
  */
+
+// --- interpreter payloads ---------------------------------------------------
+//
+// The analyser used to look at the OUTER shell only, so a write performed inside
+// a payload was invisible: `python3 - <<'PY' ... open('../../x','w') ... PY`
+// rewrote files outside the mission's boundary and the guard never saw a target
+// (found the hard way — a real edit through a heredoc slipped past it while the
+// equivalent `cat >> file` was refused). Payloads are now inspected: a detected
+// write with a literal path becomes a target (boundary-checked as usual), and a
+// write whose path cannot be located is `undecidable` — fail closed, never
+// "assume it is harmless".
+
+/** Interpreters whose `-c`/`-e` payload is single-line code. */
+const CODE_FLAG_INTERPRETERS: Record<string, readonly string[]> = {
+    python: ['-c'],
+    python3: ['-c'],
+    node: ['-e', '--eval', '-p'],
+    bun: ['-e', '--eval'],
+    deno: ['eval'],
+    ruby: ['-e'],
+    perl: ['-e', '-E'],
+    php: ['-r'],
+}
+
+/** Shells whose `-c` payload is itself a command line. */
+const SHELL_COMMAND_INTERPRETERS = new Set(['sh', 'bash', 'zsh', 'dash'])
+
+/** Write APIs per language. A hit means "this payload intends to write". */
+const WRITE_INTENT: readonly RegExp[] = [
+    // python
+    /\bopen\s*\([^)]*[,)]\s*['"](?:w|a|x|w\+|a\+|x\+|wb|ab|w+b)['"]/,
+    /\.write_(?:text|bytes)\s*\(/,
+    /\bshutil\.(?:copy|copyfile|copy2|move|rmtree)\s*\(/,
+    /\bos\.(?:remove|unlink|rename|replace|makedirs|mkdir|rmdir|truncate)\s*\(/,
+    // node / bun / deno
+    /\bwriteFile(?:Sync)?\s*\(/,
+    /\bappendFile(?:Sync)?\s*\(/,
+    /\bcreateWriteStream\s*\(/,
+    /\b(?:rm|rmdir|unlink|rename|mkdir|copyFile|truncate)\w*Sync\s*\(/,
+    // ruby / perl / php
+    /\bFile\.(?:write|open|delete|rename)\s*\(/,
+    /\bIO\.write\s*\(/,
+    /\bfile_put_contents\s*\(/,
+    /\bunlink\s*\(/,
+]
+
+/** Extract quoted string literals that look like filesystem paths. */
+function literalPathsIn(payload: string): string[] {
+    const found: string[] = []
+    const pattern = /(['"])([^'"\n]{1,300})\1/g
+    let match: RegExpExecArray | null
+    while ((match = pattern.exec(payload)) !== null) {
+        const text = match[2] ?? ''
+        if (text === '' || text.includes('://')) continue
+        // A path-ish literal: has a separator or a dot, and no format placeholders.
+        if (!/[/.~]/.test(text)) continue
+        if (/[{}%]/.test(text)) continue // f-strings / format templates
+        if (/^\s*$/.test(text)) continue
+        found.push(text)
+    }
+    return found
+}
+
+/** The payload of one code-flag occurrence, or `undefined`. */
+function codeFlagPayload(tokens: readonly string[], flags: readonly string[]): string | undefined {
+    for (const [index, token] of tokens.entries()) {
+        if (!flags.includes(token)) continue
+        const next = tokens[index + 1]
+        if (next !== undefined && next !== '') return next
+    }
+    return undefined
+}
+
+/** One heredoc body that is being piped into an interpreter's stdin. */
+function stdinHeredocBodies(command: string, base: string): string[] {
+    // `python3 - <<'PY' … PY` / `node <<'JS' … JS`: `-` means "read the program
+    // from stdin", so the heredoc body IS code, not data.
+    if (!new RegExp(`(^|[\\s|;&])${base}\\s+(-|--)\\s*<<`).test(command)) return []
+    const bodies: string[] = []
+    const opener = /<<-?\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\1/g
+    let match: RegExpExecArray | null
+    while ((match = opener.exec(command)) !== null) {
+        const marker = match[2] ?? ''
+        if (marker === '') continue
+        const rest = command.slice(match.index + match[0].length)
+        const end = new RegExp(`(^|\\n)\\t*${marker}\\s*(\\n|$)`)
+        const stop = end.exec(rest)
+        if (stop !== null) bodies.push(rest.slice(0, stop.index))
+    }
+    return bodies
+}
+
+/**
+ * Findings from one command's inline interpreter payloads.
+ * @param command - the raw command line (heredoc bodies still present).
+ * @param depth - recursion depth for `sh -c` payloads.
+ */
+function interpreterPayloadFindings(
+    command: string,
+    depth: number,
+): { targets: string[]; undecidable: boolean; reasons: string[] } {
+    const targets: string[] = []
+    const reasons: string[] = []
+    let undecidable = false
+    if (depth > 2) return { targets, undecidable, reasons }
+
+    for (const part of command.split(/\|\||&&|\||;/)) {
+        const tokens = tokenize(part.trim())
+        const head = tokens[0]
+        if (head === undefined) continue
+        const base = head.split('/').pop() ?? head
+
+        if (SHELL_COMMAND_INTERPRETERS.has(base)) {
+            const payload = codeFlagPayload(tokens, ['-c'])
+            if (payload !== undefined) {
+                // The payload is a command line of its own: analyse it the same way.
+                const nested = analyzeShellCommandNested(payload, depth + 1)
+                targets.push(...nested.targets)
+                if (nested.undecidable) {
+                    undecidable = true
+                    reasons.push(`${base} -c 载荷中有无法定位目标的写操作`)
+                }
+            }
+            continue
+        }
+
+        const flags = CODE_FLAG_INTERPRETERS[base]
+        const sources: string[] = []
+        if (flags !== undefined) {
+            const payload = codeFlagPayload(tokens, flags)
+            if (payload !== undefined) sources.push(payload)
+        }
+        sources.push(...stdinHeredocBodies(command, base))
+        if (sources.length === 0) continue
+
+        for (const source of sources) {
+            if (!WRITE_INTENT.some((pattern) => pattern.test(source))) continue
+            const paths = literalPathsIn(source)
+            if (paths.length === 0) {
+                undecidable = true
+                reasons.push(`${base} 的内联载荷里有写操作，但目标路径不是字面量（变量/拼装/子进程），无法归属到文件边界`)
+                continue
+            }
+            targets.push(...paths)
+        }
+    }
+    return { targets, undecidable, reasons }
+}
+
+/**
+ * Analyse a nested command line with a bounded depth (used for `sh -c` payloads).
+ * @param command - the payload.
+ * @param depth - recursion depth.
+ */
+function analyzeShellCommandNested(command: string, depth: number): ShellAnalysis {
+    const inner = analyzeShellCommandInner(command, depth)
+    return inner
+}
+
 export function analyzeShellCommand(command: string): ShellAnalysis {
+    return analyzeShellCommandInner(command, 0)
+}
+
+function analyzeShellCommandInner(command: string, depth: number): ShellAnalysis {
     const { targets: redirected, segments } = redirectTargets(command)
     const targets = [...redirected]
     const reasons: string[] = []
@@ -340,6 +503,14 @@ export function analyzeShellCommand(command: string): ShellAnalysis {
             }
         }
         void tokens
+    }
+
+    // Inline interpreter payloads: the blind spot this closes.
+    const payload = interpreterPayloadFindings(command, depth)
+    targets.push(...payload.targets)
+    if (payload.undecidable) {
+        undecidable = true
+        reasons.push(...payload.reasons)
     }
 
     // Writing to a device/sink is not a workspace change.

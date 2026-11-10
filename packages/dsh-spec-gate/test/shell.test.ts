@@ -90,3 +90,55 @@ test('shellAllow: an empty list and empty patterns allow nothing (regression)', 
 test('shellAllow: extra spacing is normalised before matching (regression)', () => {
     assert.equal(matchesShellAllow('bash   scripts/verify.sh', ['bash scripts/**']), true)
 })
+
+// --- 解释器内联载荷：曾经完全看不见的写操作（2026-11-10 审查发现） ---------------
+
+test('TC-1081 a write inside a python heredoc names its file, so the boundary applies', () => {
+    // The bypass this closes: `python3 - <<'PY' open('../../outside.txt','w') PY`
+    // rewrote files outside the mission boundary while the analyser reported no
+    // target at all — the same write through `cat >>` was refused.
+    const analysis = analyzeShellCommand("python3 - <<'PY'\nopen('../../outside.txt','w').write('x')\nPY")
+    assert.deepEqual(analysis.targets, ['../../outside.txt'])
+})
+
+test('TC-1082 bash -c payloads are analysed recursively', () => {
+    const analysis = analyzeShellCommand("bash -c 'echo hi > notes.md'")
+    assert.deepEqual(analysis.targets, ['notes.md'])
+})
+
+test('TC-1083 node -e writes are attributed to their literal path', () => {
+    const analysis = analyzeShellCommand('node -e "require(\'fs\').writeFileSync(\'/tmp/x\',\'1\')"')
+    assert.deepEqual(analysis.targets, ['/tmp/x'])
+})
+
+test('TC-1084 a write whose path is NOT a literal stays undecidable (fail closed)', () => {
+    const analysis = analyzeShellCommand('python3 -c "open(name,\'w\')"')
+    assert.equal(analysis.undecidable, true)
+    assert.equal(analysis.targets.length, 0)
+    assert.ok(
+        analysis.reasons.some((reason) => /内联载荷里有写操作/.test(reason)),
+        `必须点名"载荷里有写操作但目标不可归属"：${analysis.reasons.join(' / ')}`,
+    )
+})
+
+test('TC-1085 an interpreter payload with no write intent adds no target', () => {
+    for (const command of ['python3 -c "print(1)"', 'node -e "console.log(1)"', 'ruby -e "puts 1"']) {
+        const analysis = analyzeShellCommand(command)
+        assert.deepEqual(analysis.targets, [], command)
+        assert.equal(
+            analysis.reasons.some((reason) => /内联载荷里有写操作/.test(reason)),
+            false,
+            `纯计算载荷不该被当成写操作：${command}`,
+        )
+    }
+})
+
+test('TC-1086 heredoc BODIES stay data: a commit message is not a write', () => {
+    const analysis = analyzeShellCommand("git commit -F - <<'EOF'\nfeat: a > b # 注释\nEOF")
+    assert.deepEqual(analysis.targets, [])
+})
+
+test('TC-1087 nested shell payloads terminate at the depth bound', () => {
+    const analysis = analyzeShellCommand(`bash -c "bash -c 'bash -c \"touch a.txt\"'"`)
+    assert.ok(analysis.targets.includes('a.txt') || analysis.undecidable, '要么定位到 a.txt，要么明确不可判定')
+})
