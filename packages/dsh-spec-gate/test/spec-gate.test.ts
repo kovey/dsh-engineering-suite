@@ -1820,3 +1820,41 @@ test('spec_amend refuses an empty or duplicate statement (regression)', async ()
     const unknown = runText(await fake.runTool('spec_amend', { part: 'criterion', action: 'remove', target: 'AC-099' }))
     assert.match(unknown, /没有 AC-099/)
 })
+
+test('spec_create accepts the snake_case spelling of the multi-word arrays (transport rewriting)', async () => {
+    // The bug this pins: some argument transports rewrite camelCase keys to
+    // snake_case, so a `required` camelCase property becomes UNSATISFIABLE while
+    // the caller really did send the value (`spec_create` was unusable for this
+    // reason). Both spellings must work.
+    const fake = host()
+    const { acceptanceCriteria, fileBoundaries, negativeConstraints, ...rest } = DRAFT as Record<string, unknown>
+    const run = await fake.runTool('spec_create', {
+        ...rest,
+        acceptance_criteria: acceptanceCriteria,
+        file_boundaries: fileBoundaries,
+        negative_constraints: negativeConstraints,
+    })
+    assert.equal(run.isError, false, runText(run))
+    assert.match(runText(run), /规格已写入/)
+    assert.equal(fs.readdirSync(path.join(fake.cwd, '.dsh', 'specs')).length, 1)
+})
+
+test('spec_create refuses to guess when both spellings are present and disagree', async () => {
+    const fake = host()
+    const run = await fake.runTool('spec_create', {
+        ...DRAFT,
+        acceptance_criteria: ['另一个完全不同的验收标准'],
+    })
+    assert.equal(run.isError, true, runText(run))
+    assert.match(runText(run), /拒绝猜测/)
+    assert.equal(fs.existsSync(path.join(fake.cwd, '.dsh', 'specs')), false)
+})
+
+test('spec_create still refuses a draft that omits the criteria under BOTH spellings', async () => {
+    const fake = host()
+    const { acceptanceCriteria, ...rest } = DRAFT as Record<string, unknown>
+    const run = await fake.runTool('spec_create', rest)
+    assert.equal(run.isError, true, runText(run))
+    assert.match(runText(run), /acceptanceCriteria/)
+    assert.equal(fs.existsSync(path.join(fake.cwd, '.dsh', 'specs')), false)
+})

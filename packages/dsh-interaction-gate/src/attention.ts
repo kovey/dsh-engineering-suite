@@ -392,6 +392,14 @@ export interface AttentionMission {
     currentPolicyVersion?: string
     /** Why it ended, in the sentence a superseded row records. */
     endedReason?: string
+    /**
+     * HOW it ended. The two terminal shapes are not equivalent for approvals:
+     * a DELIVERED mission still legitimately needs decisions (deploy/verify/
+     * rollback approvals exist only after delivery), while a mission whose
+     * mandate a person WITHDREW must void every pending question — including
+     * approvals, because the work itself was stopped.
+     */
+    endedBy?: 'delivered' | 'withdrawn'
 }
 
 /**
@@ -409,9 +417,17 @@ export function staleOf(input: {
     ageMs: number
     maxAgeMs: number
     mission?: AttentionMission | undefined
+    /** `LedgerRow.source` of the question (see {@link AttentionRecord.source}). */
+    source?: string | undefined
 }): StaleMark | undefined {
     const mission = input.mission
-    if (mission !== undefined && mission.ended) {
+    // A DELIVERED mission does not void an approval: deployment go/no-go requires
+    // the mission to be delivered, so its verify/rollback approval necessarily
+    // lives AFTER that point. Voiding it there is a contradiction, not a policy
+    // (the card is superseded the instant it is sent). A WITHDRAWN mandate is a
+    // person stopping the work, so it still voids everything.
+    const approvalSurvivesDelivery = input.source === 'approval-request' && mission?.endedBy !== 'withdrawn'
+    if (mission !== undefined && mission.ended && !approvalSurvivesDelivery) {
         return {
             reason: 'mission-ended',
             detail: mission.endedReason ?? `mission ${mission.id} 已结束（状态 ${mission.status}）：这道提问已不再有意义`,
@@ -461,6 +477,13 @@ export interface AttentionRecord {
     channel?: string
     /** The wait window this question was allowed (`windowMs` on the row, else the config ceiling). */
     windowMs: number
+    /**
+     * Who asked (`LedgerRow.source`). `'approval-request'` = the host's approval
+     * seam, i.e. a gate asking a person to authorise an action; absent = the
+     * model's own question (`interaction_ask`). The distinction decides whether a
+     * delivered mission ends the question (see {@link staleOf}).
+     */
+    source?: string
     state: AttentionState
     /** The ledger decision row that ended it (a real decision, or a `refused:<reason>`). */
     decision?: string
@@ -563,7 +586,17 @@ export function deriveRecords(input: AttentionInput): AttentionRecord[] {
         const openPause = state !== 'open' ? undefined : openPauseAt(intervals, { ...(missionId === undefined ? {} : { missionId }), questionId: token, at: input.now })
         const ageMs = Math.max(0, input.now - askedAt)
         const facts = missionOf(missionId)
-        const stale = state === 'open' ? staleOf({ askedAt, ageMs, maxAgeMs: input.maxAgeMs, mission: facts }) : undefined
+        const askedSource = typeof asked.source === 'string' && asked.source !== '' ? asked.source : undefined
+        const stale =
+            state === 'open'
+                ? staleOf({
+                      askedAt,
+                      ageMs,
+                      maxAgeMs: input.maxAgeMs,
+                      mission: facts,
+                      ...(askedSource === undefined ? {} : { source: askedSource }),
+                  })
+                : undefined
         out.push({
             questionId: token,
             ...(missionId === undefined ? {} : { missionId }),
@@ -572,6 +605,7 @@ export function deriveRecords(input: AttentionInput): AttentionRecord[] {
             ageMs,
             ...(asked.channel === undefined ? {} : { channel: asked.channel }),
             windowMs,
+            ...(askedSource === undefined ? {} : { source: askedSource }),
             state,
             ...(answer?.decision === undefined ? {} : { decision: answer.decision }),
             ...(closure === undefined ? {} : { closure }),
@@ -626,6 +660,7 @@ export function missionFactsOf(store: MissionStore, missionId: string): Attentio
         paused: record.status === 'blocked' && !ended,
         ...(mandate.kind === 'present' ? { policyVersion: mandate.mandate.policyVersion } : {}),
         ...(current === undefined ? {} : { currentPolicyVersion: current }),
+        ...(ended ? { endedBy: withdrawn !== undefined ? ('withdrawn' as const) : ('delivered' as const) } : {}),
         ...(ended
             ? {
                   endedReason:
@@ -680,7 +715,7 @@ export interface AttentionSource {
     /** Record WHY a person is being asked (once per question). */
     recordWhy(questionId: string, whyYou: WhyYou): boolean
     /** Supersede one question, or every question of one mission. Returns how many it closed. */
-    supersede(input: { missionId?: string; questionId?: string; reason: string }): number
+    supersede(input: { missionId?: string; questionId?: string; reason: string; endedBy?: 'delivered' | 'withdrawn' }): number
     /** Record that the asker no longer needs the answer. Never an answer, never an approval. */
     withdraw(questionId: string, reason: string): boolean
     /** Open a pause interval for a mission. */
@@ -816,8 +851,21 @@ export function createAttentionSource(options: AttentionSourceOptions): Attentio
                 return 1
             }
             if (input.missionId === undefined) return 0
-            const open = records.filter((entry) => entry.state === 'open' && entry.missionId === input.missionId)
-            if (open.length === 0) return 0
+            // A DELIVERED mission still needs its approvals decided: deployment
+            // requires delivery first, so "delivered ⇒ every question is moot"
+            // makes the verify/rollback approval impossible (it is superseded the
+            // moment the card leaves). Withdrawn mandates keep voiding everything.
+            const survivors =
+                input.endedBy === 'withdrawn'
+                    ? records.filter((entry) => entry.state === 'open' && entry.missionId === input.missionId)
+                    : records.filter((entry) => entry.state === 'open' && entry.missionId === input.missionId && entry.source !== 'approval-request')
+            const open = survivors
+            if (open.length === 0) {
+                // Nothing to close under the exemption, but the mission DID end:
+                // do not record a mission-wide row that would close approvals by
+                // accident later (the row is deliberately not written).
+                return 0
+            }
             // Recorded ONCE per mission: one row closes every question of it, and
             // a second sweep must not add a second row.
             if (rows.some((row) => row.kind === 'superseded' && row.questionId === undefined && row.missionId === input.missionId)) return 0
@@ -872,7 +920,11 @@ export function createAttentionSource(options: AttentionSourceOptions): Attentio
             }
             if (facts === undefined) return out
             if (facts.ended) {
-                out.superseded = source.supersede({ missionId, reason: facts.endedReason ?? `mission ${missionId} 已结束：这道提问已不再有意义` })
+                out.superseded = source.supersede({
+                    missionId,
+                    endedBy: facts.endedBy,
+                    reason: facts.endedReason ?? `mission ${missionId} 已结束：这道提问已不再有意义`,
+                })
                 return out
             }
             if (facts.paused) {

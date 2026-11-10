@@ -216,9 +216,22 @@ interface CreateArgs {
     title: string
     background?: string
     requirements: string[]
-    acceptanceCriteria: string[]
-    fileBoundaries: string[]
-    negativeConstraints: string[]
+    acceptanceCriteria?: string[]
+    fileBoundaries?: string[]
+    negativeConstraints?: string[]
+    /**
+     * snake_case twins of the multi-word arrays.
+     *
+     * Some harnesses rewrite camelCase argument keys to snake_case on the way
+     * in. A `required` property whose name is rewritten can then NEVER be
+     * satisfied — the caller did send the value, yet validation reports it
+     * missing (this is exactly how `spec_create` became unusable). Required-ness
+     * therefore lives in the handler (`pickList`), which accepts either spelling
+     * and refuses to guess when both are present and disagree.
+     */
+    acceptance_criteria?: string[]
+    file_boundaries?: string[]
+    negative_constraints?: string[]
     testDesign?: string
     /** Milestone the requirements belong to (required when `milestoneRequired`). */
     milestone?: string
@@ -289,6 +302,36 @@ interface BootstrapArgs {
 }
 
 /** Bound one child-agent run so a stuck draft cannot wedge the tool call. */
+/**
+ * Read one spec argument that may arrive under either spelling.
+ *
+ * Required-ness lives here rather than in the tool schema on purpose: an
+ * argument transport that rewrites camelCase keys to snake_case turns a
+ * `required` camelCase property into an unsatisfiable one — the caller sends the
+ * value and validation still reports it missing (this is what made
+ * `spec_create` unusable). Accept both spellings, refuse when both are present
+ * and disagree (never guess which one the caller meant), and refuse when
+ * neither is present — so the check is not weakened, only moved where the
+ * names are known.
+ * @param camel - the camelCase value, when the transport kept the name.
+ * @param snake - the snake_case value, when the transport rewrote it.
+ * @param name - the argument name used in the refusal text.
+ */
+function pickList(camel: unknown, snake: unknown, name: string): string[] {
+    const asList = (value: unknown): string[] | undefined =>
+        Array.isArray(value) ? value.map((entry) => String(entry)) : undefined
+    const left = asList(camel)
+    const right = asList(snake)
+    if (left !== undefined && right !== undefined && JSON.stringify(left) !== JSON.stringify(right)) {
+        throw new Error(`${name} 与它的 snake_case 别名同时存在且内容不一致：拒绝猜测，请只传一种写法`)
+    }
+    const list = left ?? right
+    if (list === undefined || list.length === 0) {
+        throw new Error(`缺少必需参数 ${name}（也接受 snake_case 别名；至少要有一条）`)
+    }
+    return list
+}
+
 async function withDeadline<T>(work: Promise<T>, timeoutMs: number, label: string): Promise<T> {
     let timer: ReturnType<typeof setTimeout> | undefined
     try {
@@ -533,23 +576,40 @@ export function registerTools(
                     required: true,
                     description: 'What must be built, one requirement per entry.',
                 },
+                // The four multi-word arrays are validated in the HANDLER, not by
+                // the host: an argument transport that rewrites camelCase to
+                // snake_case would otherwise make `required` unsatisfiable while
+                // the caller really did send the value. Both spellings are
+                // declared so neither is rejected as an unknown property.
                 acceptanceCriteria: {
                     type: 'array',
                     items: { type: 'string' },
-                    required: true,
                     description: 'Verifiable acceptance criteria; ids AC-001… are assigned in order.',
+                },
+                acceptance_criteria: {
+                    type: 'array',
+                    items: { type: 'string' },
+                    description: 'Same as acceptanceCriteria (snake_case alias, for argument transports that rewrite keys).',
                 },
                 fileBoundaries: {
                     type: 'array',
                     items: { type: 'string' },
-                    required: true,
                     description: 'Files/directories this mission may touch.',
+                },
+                file_boundaries: {
+                    type: 'array',
+                    items: { type: 'string' },
+                    description: 'Same as fileBoundaries (snake_case alias).',
                 },
                 negativeConstraints: {
                     type: 'array',
                     items: { type: 'string' },
-                    required: true,
                     description: 'Explicitly forbidden actions (e.g. 不得修改 dsh 核心代码).',
+                },
+                negative_constraints: {
+                    type: 'array',
+                    items: { type: 'string' },
+                    description: 'Same as negativeConstraints (snake_case alias).',
                 },
                 testDesign: {
                     type: 'string',
@@ -605,9 +665,9 @@ export function registerTools(
                     title: args.title ?? '',
                     background: args.background ?? '',
                     requirements: args.requirements ?? [],
-                    acceptanceCriteria: args.acceptanceCriteria ?? [],
-                    fileBoundaries: args.fileBoundaries ?? [],
-                    negativeConstraints: args.negativeConstraints ?? [],
+                    acceptanceCriteria: pickList(args.acceptanceCriteria, args.acceptance_criteria, 'acceptanceCriteria'),
+                    fileBoundaries: pickList(args.fileBoundaries, args.file_boundaries, 'fileBoundaries'),
+                    negativeConstraints: pickList(args.negativeConstraints, args.negative_constraints, 'negativeConstraints'),
                     ...(milestone === undefined ? {} : { milestone }),
                     ...(args.budgets === undefined ? {} : { budgets: args.budgets }),
                     ...(args.note === undefined ? {} : { note: args.note }),
