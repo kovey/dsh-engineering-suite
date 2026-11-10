@@ -22,9 +22,48 @@ import test from 'node:test'
 import { MissionStoreRegistry } from 'dsh-eng-core'
 import { appendLedgerRow } from '../dist/ledger.js'
 import { createAttentionSource, missionFactsOf, staleOf } from '../dist/attention.js'
-import { tempWorkspace } from 'dsh-eng-core/testing'
+import { createFakeHost, runText, tempWorkspace } from 'dsh-eng-core/testing'
+import { apply } from '../dist/index.js'
 
 const LEDGER = '.dsh/interaction/decisions.jsonl'
+const APPROVAL_CHAT = 'oc_approvals'
+const ALICE = 'ou_alice'
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
+
+/** A minimal scripted channel: records cards, answers when the test says so. */
+function scriptedChannelOf(name: string): {
+    name: string
+    channel: Record<string, unknown>
+    waits: () => number
+    answer: (value: string, by: string, chatId: string) => void
+} {
+    let waiter: ((value: unknown) => void) | undefined
+    let waits = 0
+    const channel: Record<string, unknown> = {
+        name,
+        chatId: APPROVAL_CHAT,
+        async send(): Promise<unknown> {
+            return { ok: true, messageId: 'm-1' }
+        },
+        async wait(): Promise<unknown> {
+            waits += 1
+            return await new Promise((resolve) => {
+                waiter = resolve
+            })
+        },
+        describe: () => ({ canAsk: true, canNotify: true }),
+    }
+    return {
+        name,
+        channel,
+        waits: () => waits,
+        answer(value: string, by: string, chatId: string): void {
+            assert.ok(waiter !== undefined, '通道没有进入等待状态')
+            waiter?.({ value, by, messageId: 'om_answer_1', chatId, chatKind: 'p2p' })
+        },
+    }
+}
+
 const ATTENTION = '.dsh/interaction/attention.jsonl'
 
 function sourceOver(
@@ -166,4 +205,48 @@ test('TC-1027 staleOf: the exemption is scoped to approval rows of a DELIVERED m
     assert.equal(staleOf({ ...base, mission: delivered, source: 'interaction_ask' })?.reason, 'mission-ended')
     assert.equal(staleOf({ ...base, mission: delivered })?.reason, 'mission-ended', '没有来源的行沿用旧规则')
     assert.equal(staleOf({ ...base, mission: withdrawn, source: 'approval-request' })?.reason, 'mission-ended')
+})
+
+test('TC-1028 end-to-end: the reported timeline — delivered mission, IM approval, human answer ACCEPTED', async () => {
+    // This is the exact sequence from the deployment that could not finish:
+    //   the mission is DELIVERED (deploy requires it), the approval question goes
+    //   out over IM, the whitelisted approver clicks 27 seconds later — and the
+    //   answer used to come back as `refused:superseded`. Now it must decide.
+    const cwd = tempWorkspace('approval-after-delivery-e2e-')
+    const stores = new MissionStoreRegistry()
+    const store = stores.for(cwd)
+    store.create({ title: '已交付', cwd, id: 'M-8' })
+    store.setStatus('M-8', 'delivered')
+
+    const fake = createFakeHost({ cwd })
+    const channel = scriptedChannelOf('chat-interaction')
+    apply(fake.ctx as never, {
+        logFile: path.join(cwd, 'interaction-gate.log'),
+        askTimeoutMs: 2_000,
+        im: {
+            approvalVia: 'fallback',
+            approvalChatId: APPROVAL_CHAT,
+            approvers: [ALICE],
+            approversFile: path.join(cwd, 'no-such-approvers.txt'),
+        },
+    })
+    const registry = (fake.ctx as { get: (name: string) => unknown }).get('interaction') as { register: (c: unknown) => () => void }
+    fake.effects.push(registry.register(channel.channel))
+
+    // The session is bound to the delivered mission, so the ask row carries it —
+    // exactly how the reported row got its `missionId`.
+    store.bindSession(fake.agent.session.header.id, 'M-8')
+
+    const running = fake.waterfall('approval/request', { agent: fake.agent, toolName: 'deploy_run', callId: 'c-1', reason: '批准部署' }, () => 'unavailable')
+    for (let index = 0; index < 1_000 && channel.waits() < 1; index += 1) await sleep(1)
+    assert.ok(channel.waits() >= 1, '审批提问必须发出去')
+    channel.answer('allowed-once', ALICE, APPROVAL_CHAT)
+
+    const outcome = await running
+    assert.equal(outcome, 'allowed-once', '交付之后的审批回答必须被接受，不能是 refused:superseded')
+
+    // And the refusal that used to poison it must not be in the ledger at all.
+    const ledger = fs.readFileSync(path.join(cwd, LEDGER), 'utf8')
+    assert.equal(ledger.includes('refused:superseded'), false, ledger)
+    assert.equal(ledger.includes('approval-request'), true, '这一行必须标明来源，豁免规则才看得见它')
 })

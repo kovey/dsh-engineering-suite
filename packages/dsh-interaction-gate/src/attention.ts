@@ -426,7 +426,13 @@ export function staleOf(input: {
     // lives AFTER that point. Voiding it there is a contradiction, not a policy
     // (the card is superseded the instant it is sent). A WITHDRAWN mandate is a
     // person stopping the work, so it still voids everything.
-    const approvalSurvivesDelivery = input.source === 'approval-request' && mission?.endedBy !== 'withdrawn'
+    // Any GATE-originated question survives a delivery; only the model's own
+    // questions (`interaction_ask`, or a row with no source at all) die with the
+    // mission. Written as "not the model's" rather than "=== approval-request" on
+    // purpose: `approval-request` is simply today's only gate source, and a new
+    // gate that asks through this layer must not inherit the same contradiction.
+    const gateAsked = input.source !== undefined && input.source !== '' && input.source !== 'interaction_ask'
+    const approvalSurvivesDelivery = gateAsked && mission?.endedBy !== 'withdrawn'
     if (mission !== undefined && mission.ended && !approvalSurvivesDelivery) {
         return {
             reason: 'mission-ended',
@@ -858,7 +864,12 @@ export function createAttentionSource(options: AttentionSourceOptions): Attentio
             const survivors =
                 input.endedBy === 'withdrawn'
                     ? records.filter((entry) => entry.state === 'open' && entry.missionId === input.missionId)
-                    : records.filter((entry) => entry.state === 'open' && entry.missionId === input.missionId && entry.source !== 'approval-request')
+                    : records.filter(
+                          (entry) =>
+                              entry.state === 'open' &&
+                              entry.missionId === input.missionId &&
+                              (entry.source === undefined || entry.source === '' || entry.source === 'interaction_ask'),
+                      )
             const open = survivors
             if (open.length === 0) {
                 // Nothing to close under the exemption, but the mission DID end:
