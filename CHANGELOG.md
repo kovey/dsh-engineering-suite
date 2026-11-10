@@ -1,4 +1,9 @@
-## [未发布]
+## [0.8.0] — 2026-11-10
+
+> **BREAKING**：本套件的产物与配置从 `<repo>/.dsh/` 收进 `<repo>/.dsh/engineering-suite/`。
+> 迁移：`bash scripts/migrate-to-engineering-suite.sh --workspace <repo>`（默认 dry-run，`--apply` 才移动；
+> 只搬本套件认识的条目，别的插件的运行时文件原地不动）。
+> **未迁移的仓库行为不变**——布局解析是"命名空间存在就用它，否则仍用 `.dsh/`"，配置读取在新根缺失时回退旧根。
 
 ### 安全 · 已交付或已停止的 mission 不再放行写操作（"定死"，不靠自觉）
 
@@ -13,7 +18,6 @@
 - 边界内**不是**放行理由（这正是原来的洞）；只读工具与 `ls` 之类的只读命令不受影响；
 - 新 mission 走完审批照常放行，行为不变。
 
-## [未发布]
 
 ### 修复 · 评审卡不再静默截断规格正文（24k 是我拍的，不是官方限制）
 
@@ -28,7 +32,6 @@
 顺带修掉一个自己埋的缺陷：`detail` 变量算出来却没被使用（请求里仍传原始 `markdown`），
 使截断逻辑成了死代码——正是新增的 TC-1152 照出来的。
 
-## [未发布]
 
 ### 新增 · `spec_approve` 的 user-questions 评审通道（desktop / web TUI 与 TUI 对齐）
 
@@ -46,7 +49,6 @@ TUI 里 `spec_approve` 能弹出规格与测试用例文档；web / desktop 之�
 - 顺手修掉一个真缺陷：`resolveConfig` 里 `reviewChannel` 有**两处**手写枚举，其中一处漏了
   `questions`，导致配置被静默降级成 `auto`——现在归一到一个函数。这条是新增用例暴露出来的。
 
-## [未发布]
 
 ### 修复 · IM 审批应答者会抢走 desktop / web TUI 的审批
 
@@ -63,7 +65,6 @@ TUI 里 `spec_approve` 能弹出规格与测试用例文档；web / desktop 之�
 的 `ask_user_question` 调用，拿它承载插件提问等于伪造工具调用）。自由文本提问仍走
 `chat-interaction`，审批才走共享接缝。新增面只需一个通道适配器 + `im.channels` 里的一个值。
 
-## [未发布]
 
 ### 变更 · 本套件的全部产物收进 `<repo>/.dsh/engineering-suite/`（从根上消掉"运行时文件被当成政策"）
 
