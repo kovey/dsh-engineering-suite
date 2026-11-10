@@ -69,6 +69,7 @@ import {
     DEFAULT_MAX_PAYLOAD_CHARS,
     describeSource,
     LEGACY_PROJECT_APPROVERS_FILE,
+    ledgerFileOf,
     NOTIFY_LEVELS,
     type EffectiveConfig,
     type InteractionGateConfig,
@@ -1160,7 +1161,7 @@ export async function askThroughChannels(deps: ToolDeps, request: AskRequest, ca
         timeoutMs = Math.min(configuredTimeout, Math.floor(wanted))
     }
 
-    const ledgerFile = artifactPathOf(cwd, config.ledgerFile)
+    const ledgerFile = artifactPathOf(cwd, ledgerFileOf(cwd, config))
     deps.registry.trackLedger(ledgerFile)
     const outbox = deps.outboxFor(cwd, config)
     // Replay happens on the next OPPORTUNITY, never on a timer: this
@@ -1992,7 +1993,7 @@ export function registerTools(
                     throw new Error('interaction_notify 拒绝（refused:bad-request）：title 不能为空。下一步：写一句人看得懂的标题。')
                 }
                 const body = args.body ?? ''
-                const ledgerFile = artifactPathOf(cwd, config.ledgerFile)
+                const ledgerFile = artifactPathOf(cwd, ledgerFileOf(cwd, config))
                 deps.registry.trackLedger(ledgerFile)
                 deps.registry.attachAttention(deps.attentionFor(cwd, config))
                 const missionId = missionIdOf(deps, cwd, agent, args.missionId)
@@ -2123,7 +2124,7 @@ export function registerTools(
                         `interaction_progress 拒绝（refused:bad-request）：elapsedMs 必须是 ≥0 的数（收到 ${JSON.stringify(elapsedMs)}）。下一步：省略它，或给一个非负毫秒数。`,
                     )
                 }
-                const ledgerFile = artifactPathOf(cwd, config.ledgerFile)
+                const ledgerFile = artifactPathOf(cwd, ledgerFileOf(cwd, config))
                 deps.registry.trackLedger(ledgerFile)
                 deps.registry.attachAttention(deps.attentionFor(cwd, config))
                 const missionId = missionIdOf(deps, cwd, agent, args.missionId)
@@ -2253,7 +2254,7 @@ export function registerTools(
                 // broken provider can heal itself.
                 deps.refreshIm?.()
                 const only = args.missionId !== undefined && args.missionId !== '' ? assertSafeId(args.missionId, 'mission id') : undefined
-                const ledgerFile = artifactPathOf(cwd, config.ledgerFile)
+                const ledgerFile = artifactPathOf(cwd, ledgerFileOf(cwd, config))
                 deps.registry.trackLedger(ledgerFile)
                 // Read-only: attaching only makes `attentions()` readable, and
                 // `records()` derives without writing (the doctor never sweeps).

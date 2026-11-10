@@ -6,7 +6,7 @@ import test from 'node:test'
 import { MissionStoreRegistry, sha256 } from 'dsh-eng-core'
 import { createFakeHost, runText, tempWorkspace, type FakeHost, type ToolRun } from 'dsh-eng-core/testing'
 import { apply, inject, name } from '../dist/index.js'
-import { resolveConfig, resolveEffectiveConfig } from '../dist/config.js'
+import { indexDirOf as indexDirRelativeOf, resolveConfig, resolveEffectiveConfig } from '../dist/config.js'
 import {
     CHUNKS_FILE,
     MANIFEST_FILE,
@@ -1474,6 +1474,41 @@ test('(regression) an unchanged repeat of the SAME coverage is unchanged and wri
     const fullAgain = buildIndex({ cwd, layout, config, now: RECORDED_AT + 180_000 })
     assert.equal(fullAgain.changeKind, 'unchanged')
     assert.deepEqual(snapshot(path.join(cwd, '.dsh', 'kb')), full, 'not one byte may be written')
+})
+
+// --- the index directory default follows the layout root (2026-11, like the rest of the suite) ---
+
+test('TC-1292 a migrated repository builds its index under the NAMESPACE directory', async () => {
+    // `.dsh/` is shared with other tooling; the suite moved into
+    // `.dsh/engineering-suite/`. A literal `.dsh/kb` default meant the tools read a
+    // directory nothing ever wrote while the real index sat right next to it.
+    const { cwd } = fixture('kb-namespace-')
+    fs.mkdirSync(path.join(cwd, '.dsh', 'engineering-suite'), { recursive: true })
+    const fake = host(cwd)
+    assert.equal((await call(fake, 'kb_index')).isError, false)
+    assert.equal(
+        fs.existsSync(path.join(cwd, '.dsh', 'engineering-suite', 'kb', MANIFEST_FILE)),
+        true,
+        'the namespace index must be written',
+    )
+    assert.equal(fs.existsSync(path.join(cwd, '.dsh', 'kb')), false, 'the legacy root must not be written')
+    assert.match(await text(fake, 'kb_status'), /\.dsh\/engineering-suite\/kb/, 'the report names the directory actually read')
+})
+
+test('TC-1293 an UN-migrated repository keeps the legacy .dsh/kb directory (behaviour unchanged)', () => {
+    const { cwd } = fixture('kb-legacy-')
+    const config = resolveConfig({})
+    assert.equal(config.indexDir, '', 'the default is "follow the layout root", not a literal path')
+    assert.equal(indexDirRelativeOf(cwd, config), '.dsh/kb')
+    assert.equal(indexDirOf(cwd, config), path.join(cwd, '.dsh', 'kb'))
+})
+
+test('TC-1294 an EXPLICIT indexDir still wins over the layout default', () => {
+    const { cwd } = fixture('kb-explicit-')
+    fs.mkdirSync(path.join(cwd, '.dsh', 'engineering-suite'), { recursive: true })
+    const config = resolveConfig({ indexDir: 'artifacts/kb' })
+    assert.equal(indexDirRelativeOf(cwd, config), 'artifacts/kb')
+    assert.equal(indexDirOf(cwd, config), path.join(cwd, 'artifacts', 'kb'))
 })
 
 test('every host is disposed without a throw', () => {

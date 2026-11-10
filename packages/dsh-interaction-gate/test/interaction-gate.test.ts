@@ -15,7 +15,7 @@ import { resolveLayout } from 'dsh-eng-core'
 import { createFakeHost, runText, tempWorkspace, type FakeHost } from 'dsh-eng-core/testing'
 import { apply, inject, name } from '../dist/index.js'
 import { createInteractionRegistry } from '../dist/channels.js'
-import { resolveConfig, resolveEffectiveConfig } from '../dist/config.js'
+import { DEFAULT_APPROVERS_FILE, ledgerFileOf, resolveConfig, resolveEffectiveConfig } from '../dist/config.js'
 import { appendLedgerRow, newRowId, readLedger, refusalOf, summarizeLedger } from '../dist/ledger.js'
 import { PROMPT_SECTION } from '../dist/prompt.js'
 import { PROGRESS_DEDUPE_WINDOW_MS } from '../dist/tools.js'
@@ -811,4 +811,47 @@ test('自由文本答案落账与回显都被 maxPayloadChars 限界，并说明
     })
     const again = await fake.runTool('interaction_status', {})
     assert.ok(runText(again).length < 10_000, 'rendering must bound what is already on disk')
+})
+
+// --- the ledger default follows the layout root (2026-11, like the rest of the suite) ---
+
+test('TC-1291 a migrated repository appends its decisions under the NAMESPACE directory', async () => {
+    // `.dsh/` is shared with other tooling; the suite moved into
+    // `.dsh/engineering-suite/`. A literal legacy default meant the decisions were
+    // appended where this plugin never looked — an answered question no later turn
+    // (and no interaction_status) could see.
+    const cwd = tempWorkspace('interaction-gate-namespace-')
+    fs.mkdirSync(path.join(cwd, '.dsh', 'engineering-suite'), { recursive: true })
+    const fake = host(cwd)
+    const namespaceLedger = path.join(cwd, '.dsh', 'engineering-suite', 'interaction', 'decisions.jsonl')
+
+    const before = runText(await fake.runTool('interaction_status', {}))
+    assert.ok(before.includes(namespaceLedger), before)
+
+    const im = scriptedChannel('im')
+    fake.registry.register(im.channel)
+    const running = fake.runTool('interaction_ask', { question: '放行吗？', options: ['yes', 'no'], timeoutMs: 2_000 })
+    await answerWith(im, { value: 'yes', by: 'alice' })
+    const run = await running
+    assert.equal(run.isError, false, runText(run))
+    assert.equal(fs.existsSync(namespaceLedger), true, 'the decision must land in the namespace ledger')
+    assert.equal(
+        fs.existsSync(path.join(cwd, '.dsh', 'interaction', 'decisions.jsonl')),
+        false,
+        'the legacy ledger must not be written',
+    )
+})
+
+test('TC-1293 an UN-migrated repository keeps the legacy .dsh/interaction path (behaviour unchanged)', () => {
+    const cwd = tempWorkspace('interaction-gate-legacy-')
+    const config = resolveConfig({})
+    assert.equal(config.ledgerFile, '', 'the default is "follow the layout root", not a literal path')
+    assert.equal(ledgerFileOf(cwd, config), '.dsh/interaction/decisions.jsonl')
+    assert.equal(config.im.approversFile, DEFAULT_APPROVERS_FILE, 'the approver list stays HOST-side, never in the repository')
+})
+
+test('TC-1294 an EXPLICIT ledgerFile still wins over the layout default', () => {
+    const cwd = tempWorkspace('interaction-gate-explicit-')
+    fs.mkdirSync(path.join(cwd, '.dsh', 'engineering-suite'), { recursive: true })
+    assert.equal(ledgerFileOf(cwd, resolveConfig({ ledgerFile: 'ops/decisions.jsonl' })), 'ops/decisions.jsonl')
 })

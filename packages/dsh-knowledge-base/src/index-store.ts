@@ -53,7 +53,7 @@ import {
     type Layout,
     type Logger,
 } from 'dsh-eng-core'
-import type { KbKind, KnowledgeBaseConfig } from './config.js'
+import { indexDirOf as indexDirRelativeOf, type KbKind, type KnowledgeBaseConfig } from './config.js'
 import { indexFingerprint, indexSpecPath, type KbFingerprint } from './fingerprint.js'
 import { collectDocuments, type KbDocument, type KbSkipped, type KbSymbol, type SourceReport } from './sources.js'
 import { BM25_B, BM25_K1, tokenCounts, tokenize, type TokenizerOptions } from './search.js'
@@ -264,9 +264,17 @@ function compareText(left: string, right: string): number {
     return 0
 }
 
-/** Absolute index directory of one workspace. */
+/**
+ * Absolute index directory of one workspace.
+ *
+ * `config.js`'s `indexDirOf` answers the workspace-RELATIVE directory (the one a
+ * report or the prompt quotes, following the layout root when nothing is
+ * configured); every file operation needs the absolute form, so it is resolved
+ * here — `resolvePath` also expands `~`, which an explicitly configured
+ * directory may carry.
+ */
 export function indexDirOf(cwd: string, config: Pick<KnowledgeBaseConfig, 'indexDir'>): string {
-    return resolvePath(config.indexDir, cwd)
+    return resolvePath(indexDirRelativeOf(cwd, config), cwd)
 }
 
 /**

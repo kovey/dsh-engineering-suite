@@ -43,7 +43,7 @@ import { MissionStoreRegistry, createLogger, expandHome, type AgentLike } from '
 import { installApprovalAnswerer } from './approval.js'
 import { createAttentionSource, missionFactsOf, type AttentionSource } from './attention.js'
 import { createInteractionRegistry } from './channels.js'
-import { resolveConfig, resolveEffectiveConfig, type EffectiveConfig, type InteractionGateConfig } from './config.js'
+import { ledgerFileOf, resolveConfig, resolveEffectiveConfig, type EffectiveConfig, type InteractionGateConfig } from './config.js'
 import { installImChannel, type ImBinding, type ImInject } from './im-binding.js'
 import { createOutbox, describeReplay, type Outbox } from './outbox.js'
 import { PROMPT_SECTION, sectionText } from './prompt.js'
@@ -183,8 +183,10 @@ export function apply(ctx: Context, config: unknown = {}): void {
         })
         // A workspace-independent ledger (an absolute profile path) can be read
         // without a session context, so `interaction.pending()` reports asks
-        // that are still waiting even before any tool of this process ran.
-        const absoluteLedger = expandHome(resolved.ledgerFile)
+        // that are still waiting even before any tool of this process ran. The
+        // default is workspace-relative (it follows the layout root), so it is
+        // tracked per workspace when its tools run — not here.
+        const absoluteLedger = resolved.ledgerFile === '' ? '' : expandHome(resolved.ledgerFile)
         if (path.isAbsolute(absoluteLedger)) registry.trackLedger(absoluteLedger)
 
         // --- the optional IM channel: fast path + reactive upgrade ------------
@@ -257,7 +259,7 @@ export function apply(ctx: Context, config: unknown = {}): void {
         // interval.
         const attentionSources = new Map<string, AttentionSource>()
         const attentionFor = (cwd: string, config: InteractionGateConfig): AttentionSource => {
-            const ledgerFile = artifactPathOf(cwd, config.ledgerFile)
+            const ledgerFile = artifactPathOf(cwd, ledgerFileOf(cwd, config))
             const file = artifactPathOf(cwd, config.attentionFile)
             const key = `${ledgerFile}\u0000${file}`
             const cached = attentionSources.get(key)
@@ -393,7 +395,7 @@ export function apply(ctx: Context, config: unknown = {}): void {
         const imFinal = imBinding.report()
         logger.info(
             `applied (tools: ${tools.registered.join(', ') || 'none'}${tools.failed.length === 0 ? '' : `; failed: ${tools.failed.join(', ')}`}; ` +
-                `service=${serviceState}; ledger=${resolved.ledgerFile}; outbox=${resolved.outboxFile}; approvers=${resolved.im.approvers.length} inline + ${resolved.im.approversFile}${resolved.requireApproverList ? '(required)' : ''}; ` +
+                `service=${serviceState}; ledger=${resolved.ledgerFile === '' ? '(布局根)/interaction/decisions.jsonl' : resolved.ledgerFile}; outbox=${resolved.outboxFile}; approvers=${resolved.im.approvers.length} inline + ${resolved.im.approversFile}${resolved.requireApproverList ? '(required)' : ''}; ` +
                 `askTimeout=${resolved.askTimeoutMs}ms; notifyLevels=${resolved.notifyLevels.join(',')}; prompt=${resolved.prompt.enabled}; ` +
                 `im=${imFinal.registered ? `chat-interaction(api v${imFinal.apiVersion})` : imFinal.phase}(im.channel=${imMode}${imMode === 'required' ? `; requiredWaitMs=${resolved.im.requiredWaitMs}` : ''}; ` +
                 `approvalChatId=${resolved.im.approvalChatId === '' ? '(未配置)' : resolved.im.approvalChatId}; p2pOnly=${resolved.im.p2pOnly}; approvalVia=${approvalAnswerer.describe()})${resolved.im.approvalChatIdProblem === undefined ? '' : ' ⚠️ im.approvalChatId 不可用（见上）'}))`,

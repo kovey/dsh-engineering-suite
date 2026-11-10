@@ -27,7 +27,7 @@
  */
 
 import type { AgentLike } from 'dsh-eng-core'
-import { KB_KINDS, type KbKind, type KnowledgeBaseConfig } from './config.js'
+import { KB_KINDS, indexDirOf, type KbKind, type KnowledgeBaseConfig } from './config.js'
 import { runIndex, runSearch, runStatus, type ToolDeps } from './tools.js'
 
 /** The registered command name (the `/` is the harness's, not ours). */
@@ -77,7 +77,7 @@ export function usageText(config: KnowledgeBaseConfig): string {
     return [
         '/kb —— 项目知识库（人直接敲的命令：不经过模型，报告与 kb_index / kb_search / kb_status 是同一份）',
         '用法：',
-        `  /kb index [--force] [--source <id>]…                 构建/重建索引（唯一会写盘的子命令，写 ${config.indexDir}/）`,
+        `  /kb index [--force] [--source <id>]…                 构建/重建索引（唯一会写盘的子命令，写 ${config.indexDir === '' ? '<布局根>/kb/' : `${config.indexDir}/`}）`,
         '  /kb search <关键词…> [--limit N] [--kind <kind>] [--prefix <path>]   检索（只读）',
         '  /kb status                                           索引状态与新鲜度（只读）',
         '  /kb help                                             这条用法',
@@ -222,12 +222,20 @@ function effectiveConfigOf(deps: ToolDeps, agent: AgentLike | undefined): Knowle
 export function runKbCommand(deps: ToolDeps, invocation: CommandInvocationLike): CommandResultLike | Promise<CommandResultLike> {
     const agent = invocation?.agent
     const config = effectiveConfigOf(deps, agent)
-    const parsed = parseKbInvocation(invocation?.rawInput, config)
+    // The usage text quotes the index directory in force, and in a migrated
+    // repository that is the namespace directory — resolved here, where the
+    // workspace is known, rather than threaded through every parser signature.
+    // The `indexDir` in this view is only ever READ (by `usageText`); the
+    // sub-commands re-resolve the configuration themselves.
+    const cwd = agent?.session?.header?.cwd
+    const view: KnowledgeBaseConfig =
+        typeof cwd === 'string' && cwd !== '' ? { ...config, indexDir: indexDirOf(cwd, config) } : config
+    const parsed = parseKbInvocation(invocation?.rawInput, view)
     if (parsed.kind === 'error') return { kind: 'error', text: parsed.text }
     try {
         switch (parsed.kind) {
             case 'help':
-                return { kind: 'success', text: usageText(config) }
+                return { kind: 'success', text: usageText(view) }
             case 'status':
                 return { kind: 'success', text: runStatus(deps, agent) }
             case 'index':

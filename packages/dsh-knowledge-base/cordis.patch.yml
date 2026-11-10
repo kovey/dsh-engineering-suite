@@ -4,9 +4,13 @@
 # uses the plugin's short id (`knowledge-base`) — a profile overrides parameters
 # with a top-level `- id: knowledge-base` + `config:` block.
 #
-# The index is an ARTIFACT of the repository it describes (`.dsh/kb/`), so what
-# lives here is only the ceiling: where the index goes, how big a file may be,
-# how long a chunk may get, which sources exist and how retrieval is bounded.
+# The index is an ARTIFACT of the repository it describes (under the layout root
+# `.dsh/` — `.dsh/engineering-suite/` once a repository has migrated), so what
+# lives here is only the ceiling: how big a file may be, how long a chunk may
+# get, which sources exist and how retrieval is bounded. Where the index goes is
+# NOT pinned here: it follows the layout root (`indexDir` defaults to the empty
+# string and is resolved per workspace), because a literal `.dsh/kb` default made
+# a migrated repository's index unreadable to the very tools that wrote it.
 # A project narrows those in `<repo>/.dsh/knowledge-base.json`; it can never
 # widen them (a knowledge base that indexes more than the host allowed would
 # answer questions about files the host never agreed to index).
@@ -19,7 +23,6 @@
       config:
         enabled: true
         logFile: '~/.dsh/knowledge-base.log'
-        indexDir: .dsh/kb
         maxFileBytes: 262144
         maxChunkLines: 60
         tokenizer:

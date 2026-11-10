@@ -31,7 +31,7 @@
  */
 
 import path from 'node:path'
-import { loadProjectConfig, type Layout, type LayoutOptions } from 'dsh-eng-core'
+import { loadProjectConfig, resolveLayout, type Layout, type LayoutOptions } from 'dsh-eng-core'
 import { DEFAULT_ATTENTION_FILE, DEFAULT_ATTENTION_MAX_AGE_MS } from './attention.js'
 import type { ImChannelMode } from './channels.js'
 import { DEFAULT_OUTBOX_FILE } from './outbox.js'
@@ -296,7 +296,11 @@ export interface InteractionGateConfig {
      * only authentication — see the README).
      */
     requireApproverList: boolean
-    /** Append-only decision ledger, relative to the workspace. */
+    /**
+     * Append-only decision ledger, relative to the workspace. `''` (the default)
+     * means "follow the layout root" — see {@link ledgerFileOf}; an explicit value
+     * (profile or project) always wins.
+     */
     ledgerFile: string
     /**
      * Append-only ask outbox, relative to the workspace: the durability layer
@@ -659,7 +663,7 @@ export function resolveConfig(input: unknown, warn?: (message: string) => void):
         },
         askTimeoutMs: timeout < MIN_ASK_TIMEOUT_MS || timeout > MAX_ASK_TIMEOUT_MS ? DEFAULT_ASK_TIMEOUT_MS : timeout,
         requireApproverList: bool(raw['requireApproverList'], false),
-        ledgerFile: str(raw['ledgerFile'], '.dsh/interaction/decisions.jsonl'),
+        ledgerFile: str(raw['ledgerFile'], ''),
         outboxFile: str(raw['outboxFile'], DEFAULT_OUTBOX_FILE),
         attentionFile: str(raw['attentionFile'], DEFAULT_ATTENTION_FILE),
         attentionMaxAgeMs:
@@ -694,6 +698,32 @@ export function resolveConfig(input: unknown, warn?: (message: string) => void):
             ...(imApproversFileProblem === undefined ? {} : { approversFileProblem: imApproversFileProblem }),
         },
     }
+}
+
+/**
+ * The workspace-relative path of the decision ledger.
+ *
+ * An explicit `ledgerFile` always wins (profile or project). Otherwise the default
+ * follows the LAYOUT ROOT, like every other plugin in the suite: the namespace
+ * directory when it exists (a migrated repository), the legacy `.dsh/` root when
+ * it does not. A literal legacy default meant a migrated repository's decisions
+ * were appended where this plugin never looked — answered questions that no later
+ * turn (and no `interaction_status`) could see.
+ * @param cwd - workspace root.
+ * @param config - resolved plugin configuration.
+ * @returns path relative to `cwd`, POSIX separators.
+ */
+export function ledgerFileOf(cwd: string, config: InteractionGateConfig): string {
+    return config.ledgerFile !== '' ? config.ledgerFile : relativeRootFile(cwd, 'interaction/decisions.jsonl')
+}
+
+function relativeRootFile(cwd: string, name: string): string {
+    // `path.relative`, not a `slice(cwd.length + 1)`: a caller passing a trailing
+    // separator over-slices by one character and the default silently becomes a
+    // SIBLING of the workspace.
+    const layout = resolveLayout(cwd, {})
+    const relative = path.relative(cwd, layout.rootDir)
+    return relative === '' ? name : `${relative.split(path.sep).join('/')}/${name}`
 }
 
 /**
@@ -826,7 +856,7 @@ export function resolveEffectiveConfig(
             applied += 1
             return
         }
-        reject(`${file.file}: ${key} 必须是非空字符串，已忽略（继续使用 profile 的值 ${host[key]}）`)
+        reject(`${file.file}: ${key} 必须是非空字符串，已忽略（继续使用 profile 的值 ${host[key] === '' ? '布局根下的 interaction/decisions.jsonl' : host[key]}）`)
     }
     if (raw['denyApprovers'] !== undefined) {
         const list = stringList(raw['denyApprovers'])

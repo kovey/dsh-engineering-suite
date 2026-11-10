@@ -20,7 +20,6 @@
       config:
         enabled: true
         logFile: '~/.dsh/deploy-gate.log'
-        ledgerFile: '.dsh/deployments.jsonl'
         verifyRetries: 3
         verifyBackoffMs: 5000
         commandTimeoutMs: 600000

@@ -12,7 +12,7 @@
  * @module dsh-knowledge-base/prompt
  */
 
-import type { KnowledgeBaseConfig } from './config.js'
+import { indexDirOf, type KnowledgeBaseConfig } from './config.js'
 
 /** Section name registered with `ctx.systemPrompt`. */
 export const PROMPT_SECTION = 'eng:knowledge-base'
@@ -21,13 +21,16 @@ export const PROMPT_SECTION = 'eng:knowledge-base'
  * Render the section.
  * @param config - the resolved configuration (for the index location).
  * @param projectFile - the repository's own override file, when it has one.
+ * @param cwd - the workspace the section is rendered for; without it the
+ *   unconfigured index directory is described instead of guessed.
  * @returns the prompt text.
  */
-export function sectionText(config: KnowledgeBaseConfig, projectFile?: string): string {
+export function sectionText(config: KnowledgeBaseConfig, projectFile?: string, cwd?: string): string {
+    const indexDir = cwd === undefined ? (config.indexDir !== '' ? config.indexDir : '布局根下的 kb/') : indexDirOf(cwd, config)
     return [
         '项目知识库：关于"这个仓库"的问题，先查索引再回答：',
         `- 问题涉及规格/需求/决策/交付台账/文档/代码（"AC-003 是什么"、"为什么选 A 不选 B"、"谁改的"、"在哪里实现"）时，先 \`kb_search\`，`,
-        '  **不要凭记忆回答**。索引在 `' + config.indexDir + '`（词法索引：BM25 + 字段加权 + id 精确命中，没有向量、没有网络、没有模型）。',
+        '  **不要凭记忆回答**。索引在 `' + indexDir + '`（词法索引：BM25 + 字段加权 + id 精确命中，没有向量、没有网络、没有模型）。',
         '- **每条结论都要带引用**：用命中给出的 `path:from-to`（形如 `.dsh/specs/x.md:24-30`）。引用不到就不要写这句话——',
         '  宁可说"索引里没有"，也不要给一段没有出处的结论。',
         '- 索引里没有 → 明确说"**索引里没有**"+ 你查了什么（关键词/来源过滤），再给出下一步（`kb_index` 重建、换关键词、用 id 再搜）。',

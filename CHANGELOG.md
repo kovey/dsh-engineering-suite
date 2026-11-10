@@ -1,5 +1,26 @@
 ## [未发布]
 
+### 修复 · 部署台账 / 知识库索引 / 交互台账的默认路径回到布局根
+
+`dsh-deploy-gate`、`dsh-knowledge-base`、`dsh-interaction-gate` 三处仍拿 `.dsh/` 字面量当默认值，
+并且同一个字面量还写在各自的 `cordis.patch.yml` 里。patch 传的是**显式配置**，而显式值永远优先于
+代码默认值——所以 v0.8.0 的"布局根"解析对这三个插件从来没生效（与 standards-gate 同一个形状）。
+后果是可见的：本仓库的索引实际建在 `.dsh/engineering-suite/kb/`，而 `kb_status` 按 `.dsh/kb` 去找，
+报"索引不存在"。
+
+- 三个默认值改为空串，由导出的 `ledgerFileOf(cwd, config)` / `indexDirOf(cwd, config)` 解析：仓库存在
+  `.dsh/engineering-suite/` 时落在该目录下（`deployments.jsonl`、`kb/`、`interaction/decisions.jsonl`），
+  否则回退 `.dsh/`。用 `path.relative(cwd, layout.rootDir)` 而不是切 `cwd.length + 1`：带尾部分隔符的调用
+  会把默认值切成工作区的**兄弟目录**；
+- 三处 `cordis.patch.yml` 的 `ledgerFile` / `indexDir` / `approversFile` 整行删除，不再钉路径；
+- `interaction-gate` 的 `approversFile` 代码默认本来就是宿主侧 `~/.dsh/interaction-approvers.txt`（P3.1），
+  这次只删 patch 里仍指向**仓库内**的 `.dsh/interaction-approvers.txt`——它作为显式值覆盖了宿主默认，
+  等于让仓库文件继续当审批人名单；
+- 未迁移仓库（没有命名空间目录）的解析结果与改动前逐字相同；显式配置（profile / 项目 overlay）仍然优先。
+
+测试：deploy-gate 74→77、knowledge-base 59→62、interaction-gate 124→127（每个包新增"命名空间 / 旧根 /
+显式配置"三条），既有断言一条未放宽。`scripts/verify.sh` 两次全绿。
+
 ### 修复 · standards-gate 的配置路径与其它门禁同源
 
 `packages/dsh-standards-gate/cordis.patch.yml` 把 `standardsFile` / `baselineFile` 写死成

@@ -125,7 +125,7 @@ export function apply(ctx: Context, config: unknown = {}): void {
                             const cwd = workspaceOf(scope)
                             if (cwd === undefined) return sectionText(resolved)
                             const effective = resolveEffectiveConfig(resolved, stores.for(cwd).layout, log)
-                            return sectionText(effective.config, effective.source === 'project' ? effective.file : undefined)
+                            return sectionText(effective.config, effective.source === 'project' ? effective.file : undefined, cwd)
                         } catch {
                             return sectionText(resolved)
                         }
@@ -145,7 +145,7 @@ export function apply(ctx: Context, config: unknown = {}): void {
         })
 
         log.info(
-            `applied (tools: ${tools.registered.join(', ') || 'none'}; command: ${command.registered ? `/${KB_COMMAND_NAME}` : 'none'}; indexDir=${resolved.indexDir}; sources=${resolved.sources
+            `applied (tools: ${tools.registered.join(', ') || 'none'}; command: ${command.registered ? `/${KB_COMMAND_NAME}` : 'none'}; indexDir=${resolved.indexDir === '' ? '(布局根)/kb' : resolved.indexDir}; sources=${resolved.sources
                 .filter((source) => source.enabled)
                 .map((source) => source.id)
                 .join(',')}; limit=${resolved.search.limit}/${resolved.search.maxLimit}; cjkBigrams=${resolved.tokenizer.cjkBigrams})`,

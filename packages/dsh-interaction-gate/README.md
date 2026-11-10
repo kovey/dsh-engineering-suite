@@ -9,7 +9,7 @@
 |---|---|
 | 卡片怎么送达（IM、终端、Web UI、webhook） | **通道**（`register({ name, send, wait, describe })`） |
 | 这个答案属于哪次提问 | **令牌**（不可预测、一次性、作废即失效、回程再校验） |
-| 谁答的、经哪个通道、等了多久 | **台账**（`.dsh/interaction/decisions.jsonl`，append-only） |
+| 谁答的、经哪个通道、等了多久 | **台账**（布局根下的 `interaction/decisions.jsonl`，append-only） |
 | 能不能算通过 | **不由本插件决定**：台账只记录发生过什么，不授予任何权限 |
 
 ## 四个工具
@@ -161,7 +161,9 @@ profile（宿主上限）与 `<repo>/.dsh/interaction-gate.json`（项目只能�
     logFileTemplate: '~/.dsh/logs/{project}/interaction-gate.log'   # 可选，按工作区分文件
     askTimeoutMs: 900000                 # 15 分钟；调用方只能缩短，不能延长
     requireApproverList: false           # true = 只有名单里的人能回答
-    ledgerFile: .dsh/interaction/decisions.jsonl
+    # ledgerFile 不写就是跟随布局根：<布局根>/interaction/decisions.jsonl（有
+    # .dsh/engineering-suite/ 时就是它，否则是 .dsh/）；写了就按写的来。
+    # ledgerFile: .dsh/interaction/decisions.jsonl
     attentionFile: .dsh/interaction/attention.jsonl   # 注意力旁路（whyYou / 作废 / 暂停区间）
     attentionMaxAgeMs: 86400000          # 超过 24h 未回答 → 标 stale（仍列出）
     notifyLevels: [warn, error]          # info 默认不推
@@ -209,7 +211,7 @@ profile（宿主上限）与 `<repo>/.dsh/interaction-gate.json`（项目只能�
 
 ## 台账格式
 
-`<repo>/.dsh/interaction/decisions.jsonl`，一行一个事件（append-only，单次 `appendFileSync` 写一行）：
+`<布局根>/interaction/decisions.jsonl`（`.dsh/interaction/`，或迁移后的 `.dsh/engineering-suite/interaction/`），一行一个事件（append-only，单次 `appendFileSync` 写一行）：
 
 ```json
 {"at":1759000000000,"id":"il-3f2a…","kind":"ask","title":"需要决定：把这个交付放出去？","questionId":"q-9c1d…","channel":"im","missionId":"m-1"}

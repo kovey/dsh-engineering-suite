@@ -35,8 +35,8 @@ import {
     type LedgerRow,
 } from '../dist/ledger.js'
 import { compareRevision, newestEvidenceAt, newestReceipt, type GoNoGoInput, type MissionLike } from '../dist/plan.js'
-import { normalizeInteractionReply, pendingAsksOf, registerTools, type ToolDeps } from '../dist/tools.js'
-import { describeSource } from '../dist/config.js'
+import { ledgerPathOf, normalizeInteractionReply, pendingAsksOf, registerTools, type ToolDeps } from '../dist/tools.js'
+import { describeSource, ledgerFileOf } from '../dist/config.js'
 
 // --- fixtures ---------------------------------------------------------------
 
@@ -311,6 +311,9 @@ test('apply() with no environment declared still registers, and the prompt says 
 
 test('config: an unusable value is reported and the profile value is kept', () => {
     const problems: string[] = []
+    // A fresh temp workspace has no `.dsh/engineering-suite/`, so the layout root
+    // (and therefore the ledger default) is the legacy `.dsh/` root.
+    const cwd = tempWorkspace('deploy-gate-config-')
     const config = resolveConfig(
         {
             verifyRetries: 'many',
@@ -325,7 +328,7 @@ test('config: an unusable value is reported and the profile value is kept', () =
     assert.equal(config.verifyRetries, 3)
     assert.equal(config.verifyBackoffMs, 0)
     assert.equal(config.commandTimeoutMs, 1_000)
-    assert.equal(config.ledgerFile, '.dsh/deployments.jsonl')
+    assert.equal(ledgerFileOf(cwd, config), '.dsh/deployments.jsonl')
     assert.equal(config.goNoGo.requireReceipt, true, 'an unusable boolean keeps the strict default')
     assert.equal(config.goNoGo.maxGateAgeMinutes, 0)
     assert.deepEqual(config.environments, [])
@@ -423,7 +426,8 @@ test('project overlay: environments are replaced by name and the approval ceilin
     assert.equal(effective.config.verifyRetries, 5)
     assert.equal(effective.config.enabled, true, 'a repository cannot disable the gate')
     assert.equal(effective.config.goNoGo.requireReceipt, true, 'a repository cannot lower the go/no-go ceiling')
-    assert.equal(effective.config.ledgerFile, '.dsh/deployments.jsonl')
+    assert.equal(effective.config.ledgerFile, '.dsh/deployments.jsonl', 'a repository cannot point the ledger somewhere of its own choosing')
+    assert.equal(ledgerFileOf(cwd, effective.config), '.dsh/deployments.jsonl')
     const byName = Object.fromEntries(effective.config.environments.map((environment) => [environment.name, environment]))
     assert.deepEqual(byName['staging']?.deployCommands, ['node scripts/deploy2.mjs'])
     assert.equal(byName['production']?.requiresApproval, true, 'the profile demanded a human; the repository cannot opt out')
@@ -1921,4 +1925,34 @@ test('deploy_verify enforces the SAME approver allowlist as deploy_run', async (
     assert.deepEqual(callsOf(calls), ['deploy'], 'an unlisted approver must not run the verification either')
     assert.equal(store.lastGate(missionId, { source: 'dsh-deploy-gate' })?.state, 'BLOCK')
     assert.equal(readLedger(path.join(cwd, '.dsh', 'deployments.jsonl')).rows.at(-1)?.state, 'refused')
+})
+
+// --- the ledger default follows the layout root (2026-11, like the rest of the suite) ---
+
+test('TC-1291 a migrated repository resolves the deployment ledger under the NAMESPACE directory', () => {
+    // `.dsh/` is shared with other tooling; the suite moved into
+    // `.dsh/engineering-suite/`. A literal legacy default meant the ledger was
+    // written where this plugin never looked: present on disk, unread by every tool.
+    const cwd = tempWorkspace('deploy-gate-namespace-')
+    fs.mkdirSync(path.join(cwd, '.dsh', 'engineering-suite'), { recursive: true })
+    const config = resolveConfig({})
+    assert.equal(config.ledgerFile, '', 'the default is "follow the layout root", not a literal path')
+    assert.equal(ledgerFileOf(cwd, config), '.dsh/engineering-suite/deployments.jsonl')
+    assert.equal(ledgerPathOf(cwd, config), path.join(cwd, '.dsh', 'engineering-suite', 'deployments.jsonl'))
+})
+
+test('TC-1293 an UN-migrated repository keeps the legacy .dsh/ root (behaviour unchanged)', () => {
+    const cwd = tempWorkspace('deploy-gate-legacy-')
+    fs.mkdirSync(path.join(cwd, '.dsh'), { recursive: true })
+    const config = resolveConfig({})
+    assert.equal(ledgerFileOf(cwd, config), '.dsh/deployments.jsonl')
+    assert.equal(ledgerPathOf(cwd, config), path.join(cwd, '.dsh', 'deployments.jsonl'))
+})
+
+test('TC-1294 an EXPLICIT ledgerFile still wins over the layout default', () => {
+    const cwd = tempWorkspace('deploy-gate-explicit-')
+    fs.mkdirSync(path.join(cwd, '.dsh', 'engineering-suite'), { recursive: true })
+    assert.equal(ledgerFileOf(cwd, resolveConfig({ ledgerFile: 'ops/deployments.jsonl' })), 'ops/deployments.jsonl')
+    const absolute = path.join(cwd, 'abs.jsonl')
+    assert.equal(ledgerPathOf(cwd, resolveConfig({ ledgerFile: absolute })), absolute, 'an absolute value stays absolute')
 })

@@ -67,7 +67,9 @@ profile（宿主上限）与 `<repo>/.dsh/deploy-gate.json`（项目级细化）
     enabled: true
     logFile: '~/.dsh/deploy-gate.log'
     logFileTemplate: '~/.dsh/logs/{project}/deploy-gate.log'   # 可选：一个进程服务多个仓库时按仓库分文件
-    ledgerFile: '.dsh/deployments.jsonl'    # 部署台账（相对工作区）
+    # ledgerFile 不写就是跟随布局根：<布局根>/deployments.jsonl（有 .dsh/engineering-suite/ 时
+    # 就是它，否则是 .dsh/）。写了就按写的来（相对工作区；绝对路径原样使用）。
+    # ledgerFile: 'ops/deployments.jsonl'    # 可选：覆盖默认的部署台账位置
     verifyRetries: 3        # 1–10：deploy_verify 的**最多尝试次数**
     verifyBackoffMs: 5000   # 两次尝试之间的退避（0–600000）
     commandTimeoutMs: 600000

@@ -24,7 +24,8 @@
  * @module dsh-deploy-gate/config
  */
 
-import { loadProjectConfig, type Layout, type LayoutOptions, type Logger } from 'dsh-eng-core'
+import path from 'node:path'
+import { loadProjectConfig, resolveLayout, type Layout, type LayoutOptions, type Logger } from 'dsh-eng-core'
 
 /** How an environment counts as "production-like" for the approval default. */
 export const ENVIRONMENT_KINDS: readonly string[] = ['local', 'staging', 'production']
@@ -142,7 +143,10 @@ export interface DeployGateConfig {
     /** Per-workspace log template (host-only), e.g. `~/.dsh/logs/{project}/deploy-gate.log`. */
     logFileTemplate?: string
     layout: LayoutOptions
-    /** Deployment ledger, relative to the workspace (default `.dsh/deployments.jsonl`). */
+    /**
+     * Deployment ledger, relative to the workspace. `''` (the default) means "follow
+     * the layout root" — see {@link ledgerFileOf}; an explicit value always wins.
+     */
     ledgerFile: string
     /** Maximum verify attempts per `deploy_verify` (1…{@link MAX_VERIFY_RETRIES}). */
     verifyRetries: number
@@ -580,7 +584,7 @@ export function resolveConfig(input: unknown, warn: (message: string) => void = 
             ...(typeof layout['missionsDir'] === 'string' ? { missionsDir: layout['missionsDir'] } : {}),
             ...(typeof layout['specsDir'] === 'string' ? { specsDir: layout['specsDir'] } : {}),
         },
-        ledgerFile: str(raw['ledgerFile'], '.dsh/deployments.jsonl'),
+        ledgerFile: str(raw['ledgerFile'], ''),
         verifyRetries: retries,
         verifyBackoffMs: backoff,
         commandTimeoutMs: timeout,
@@ -594,6 +598,31 @@ export function resolveConfig(input: unknown, warn: (message: string) => void = 
             order: num(prompt['order'], 650),
         },
     }
+}
+
+/**
+ * The workspace-relative path of the deployment ledger.
+ *
+ * An explicit `ledgerFile` always wins. Otherwise the default follows the LAYOUT
+ * ROOT, like every other plugin in the suite: the namespace directory when it
+ * exists (a migrated repository), the legacy `.dsh/` root when it does not. A
+ * literal legacy default meant a migrated repository's ledger was written where
+ * this plugin never looked — present on disk, unread by every tool.
+ * @param cwd - workspace root.
+ * @param config - resolved plugin configuration.
+ * @returns path relative to `cwd`, POSIX separators.
+ */
+export function ledgerFileOf(cwd: string, config: DeployGateConfig): string {
+    return config.ledgerFile !== '' ? config.ledgerFile : relativeRootFile(cwd, 'deployments.jsonl')
+}
+
+function relativeRootFile(cwd: string, name: string): string {
+    // `path.relative`, not a `slice(cwd.length + 1)`: a caller passing a trailing
+    // separator over-slices by one character and the default silently becomes a
+    // SIBLING of the workspace.
+    const layout = resolveLayout(cwd, {})
+    const relative = path.relative(cwd, layout.rootDir)
+    return relative === '' ? name : `${relative.split(path.sep).join('/')}/${name}`
 }
 
 /**

@@ -154,7 +154,7 @@ export function apply(ctx: Context, config: unknown = {}): void {
         log.info(
             `applied (tools: ${tools.registered.join(', ') || 'none'}; environments: ${
                 resolved.environments.map((environment) => environment.name).join(', ') || 'none'
-            }; ledger=${resolved.ledgerFile}; verify=${resolved.verifyRetries}x/${resolved.verifyBackoffMs}ms)`,
+            }; ledger=${resolved.ledgerFile === '' ? '(布局根)/deployments.jsonl' : resolved.ledgerFile}; verify=${resolved.verifyRetries}x/${resolved.verifyBackoffMs}ms)`,
         )
         if (resolved.environments.length === 0) {
             log.warn('no deployment environment configured — every tool will refuse until the host declares one')

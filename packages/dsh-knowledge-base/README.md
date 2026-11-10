@@ -10,7 +10,7 @@
 
 | 是 | 不是 |
 |---|---|
-| `.dsh/kb/` 下的一份**构建产物**（三个纯文本文件，可读、可 diff、可进版本库） | 向量数据库 / 嵌入索引（**没有** embedding、没有网络、没有模型调用） |
+| 布局根下的 `kb/`（`.dsh/kb/`；迁移过的仓库是 `.dsh/engineering-suite/kb/`）里的一份**构建产物**（三个纯文本文件，可读、可 diff、可进版本库） | 向量数据库 / 嵌入索引（**没有** embedding、没有网络、没有模型调用） |
 | **确定性词法检索**：BM25 + 字段加权 + id 精确命中；同一索引 + 同一查询 → 同一结果与同一顺序 | 语义检索：换个说法可能召回不到（见"诚实的边界"） |
 | 每条命中都带 `path:from-to`、分数、**命中原因**（哪些 token 命中了哪个字段） | 聊天机器人：回答由模型给出，索引只提供带出处的片段 |
 | 契约内的**缺口上报**：跳过的文件带原因，局部索引自己声明是局部的 | git 历史索引：只看工作区**当前内容**与 `.dsh` 台账 |
@@ -52,7 +52,9 @@
   config:
     enabled: true
     logFile: '~/.dsh/knowledge-base.log'
-    indexDir: .dsh/kb              # 索引产物目录（工作区内相对路径）
+    # indexDir 不写就是跟随布局根：<布局根>/kb（有 .dsh/engineering-suite/ 时就是它，
+    # 否则是 .dsh/）；写了就按写的来。
+    # indexDir: .dsh/kb              # 可选：覆盖默认的索引产物目录（工作区内相对路径）
     maxFileBytes: 262144           # 超过就按 stat 跳过，绝不读进内存
     maxChunkLines: 60              # 一块最多多少行
     sources:                       # 六个收集器；globs 以 .dsh/ 开头时跟随 layout.rootDir
@@ -80,7 +82,7 @@
 ## 产物布局
 
 ```
-.dsh/kb/
+<布局根>/kb/      # .dsh/kb/，或迁移后的 .dsh/engineering-suite/kb/
   manifest.json    { version, builtAt, fingerprint, sources:[{id,kind,documents,chunks,skipped:[{path,reason}]}],
                      totals, staleness?: { reason } }
   chunks.jsonl     每行一块：{ id, docId, kind, path, title, from, to, text, symbols? }

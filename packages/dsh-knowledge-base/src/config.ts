@@ -18,7 +18,8 @@
  * @module dsh-knowledge-base/config
  */
 
-import { loadProjectConfig, type Layout, type LayoutOptions } from 'dsh-eng-core'
+import path from 'node:path'
+import { loadProjectConfig, resolveLayout, type Layout, type LayoutOptions } from 'dsh-eng-core'
 
 /** The six kinds of document the index knows. */
 export type KbKind = 'spec' | 'adr' | 'trail' | 'plan' | 'docs' | 'code'
@@ -63,7 +64,10 @@ export interface KnowledgeBaseConfig {
         enabled: boolean
         order: number
     }
-    /** Index directory, workspace-relative (default `.dsh/kb`). */
+    /**
+     * Index directory, workspace-relative. `''` (the default) means "follow the
+     * layout root" — see {@link indexDirOf}; an explicit value always wins.
+     */
     indexDir: string
     /** Files larger than this are skipped by `stat`, never read (default 256 KiB). */
     maxFileBytes: number
@@ -185,7 +189,7 @@ export function resolveConfig(input: unknown): KnowledgeBaseConfig {
             enabled: bool(prompt['enabled'], true),
             order: num(prompt['order'], 675),
         },
-        indexDir: str(raw['indexDir'], '.dsh/kb'),
+        indexDir: str(raw['indexDir'], ''),
         // The floor is 1 KiB: a bound below that turns ordinary README files into
         // "skipped", which is a knowledge base that indexes nothing and says it
         // is working. The ceiling is 4 MiB for the same reason in reverse.
@@ -218,6 +222,35 @@ export const PROJECT_OVERRIDABLE: readonly string[] = [
     'tokenizer',
     'search',
 ]
+
+/**
+ * The workspace-relative index directory.
+ *
+ * An explicit `indexDir` always wins. Otherwise the default follows the LAYOUT
+ * ROOT, like every other plugin in the suite: the namespace directory when it
+ * exists (a migrated repository), the legacy `.dsh/` root when it does not. A
+ * literal legacy default meant a migrated repository's index was read from
+ * `.dsh/kb` while it was actually built at `.dsh/engineering-suite/kb` — the
+ * tools then reported "no index" next to a perfectly good one.
+ *
+ * This is the RELATIVE form (what reports and the prompt quote);
+ * `index-store.js`'s `indexDirOf` resolves it to an absolute path.
+ * @param cwd - workspace root.
+ * @param config - resolved plugin configuration (or the part that carries `indexDir`).
+ * @returns workspace-relative directory, POSIX separators.
+ */
+export function indexDirOf(cwd: string, config: Pick<KnowledgeBaseConfig, 'indexDir'>): string {
+    return config.indexDir !== '' ? config.indexDir : relativeRootFile(cwd, 'kb')
+}
+
+function relativeRootFile(cwd: string, name: string): string {
+    // `path.relative`, not a `slice(cwd.length + 1)`: a caller passing a trailing
+    // separator over-slices by one character and the default silently becomes a
+    // SIBLING of the workspace.
+    const layout = resolveLayout(cwd, {})
+    const relative = path.relative(cwd, layout.rootDir)
+    return relative === '' ? name : `${relative.split(path.sep).join('/')}/${name}`
+}
 
 /** One resolved configuration plus where it came from. */
 export interface EffectiveConfig {
@@ -296,7 +329,10 @@ export function resolveEffectiveConfig(
             next.indexDir = value.trim().replace(/\/+$/, '')
             applied += 1
         } else {
-            report(`${file}: indexDir 必须是不越出工作区的相对路径（不能是绝对路径、不能含 ".."），已忽略（继续使用 ${host.indexDir}）`)
+            report(
+                `${file}: indexDir 必须是不越出工作区的相对路径（不能是绝对路径、不能含 ".."），已忽略` +
+                    `（继续使用 ${host.indexDir === '' ? '布局根下的 kb/' : host.indexDir}）`,
+            )
         }
     }
 

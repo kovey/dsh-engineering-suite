@@ -4,12 +4,18 @@
 # uses the plugin's short id (`interaction-gate`) — a profile overrides parameters
 # with a top-level `- id: interaction-gate` + `config:` block.
 #
-# Where a decision is DELIVERED (which channel) and who may answer belong to the
-# target repository (`.dsh/interaction-approvers.txt`, and the overridable keys
-# in `<repo>/.dsh/interaction-gate.json`), which spec-gate's trust root keeps out
-# of the model's reach. How long a turn may wait for a human, and whether an
-# approver list is mandatory, stay host-owned: a repository that could raise the
-# timeout or clear the list would be exempting itself.
+# Where a decision is DELIVERED (which channel) and the overridable keys live in
+# `<repo>/.dsh/interaction-gate.json`, which spec-gate's trust root keeps out of
+# the model's reach. Who may answer is HOST-owned (`im.approvers` inline ids /
+# `im.approversFile`, default `~/.dsh/interaction-approvers.txt`): a repository
+# that could supply its own allowlist would be granting itself permission. How
+# long a turn may wait for a human, and whether an approver list is mandatory,
+# stay host-owned for the same reason.
+#
+# The decision ledger is NOT pinned here: it follows the layout root (`ledgerFile`
+# defaults to the empty string and is resolved per workspace), because a literal
+# `.dsh/interaction/decisions.jsonl` default made a migrated repository's
+# decisions invisible to every later turn that read the ledger back.
 - insert:
     - id: interaction-gate
       name: 'dsh-interaction-gate'
@@ -18,8 +24,6 @@
         logFile: '~/.dsh/interaction-gate.log'
         askTimeoutMs: 900000
         requireApproverList: false
-        approversFile: .dsh/interaction-approvers.txt
-        ledgerFile: .dsh/interaction/decisions.jsonl
         notifyLevels: [warn, error]
         preferredChannels: []
         maxPayloadChars: 4000

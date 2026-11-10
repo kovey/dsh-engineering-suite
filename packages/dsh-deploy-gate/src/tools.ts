@@ -60,6 +60,7 @@ import {
     describeSource,
     describeVerifyApproval,
     environmentByName,
+    ledgerFileOf,
     verifyNeedsApproval,
     type DeployGateConfig,
     type EffectiveConfig,
@@ -426,7 +427,7 @@ function relativeOf(cwd: string, file: string): string | undefined {
 
 /** The absolute path of the deployment ledger. */
 export function ledgerPathOf(cwd: string, config: DeployGateConfig): string {
-    return pathOf(cwd, config.ledgerFile)
+    return pathOf(cwd, ledgerFileOf(cwd, config))
 }
 
 /**
