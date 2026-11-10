@@ -695,7 +695,7 @@ test('a rejection records the round, asks what to change, and loops (regression)
             },
         },
     })
-    apply(fake.ctx as never, { logFile: path.join(cwd, 'spec-gate.log') })
+    apply(fake.ctx as never, { logFile: path.join(cwd, 'spec-gate.log'), reviewChannel: 'approval' })
     await fake.runTool('spec_create', DRAFT)
     const run = await fake.runTool('spec_approve', {})
     const text = runText(run)
@@ -721,7 +721,8 @@ test('a rejection records the round, asks what to change, and loops (regression)
     assert.match(text, /第 2 次/)
 
     // The next submission is round 2 and can pass.
-    const again = host({ approvalOutcome: 'allowed-once', cwd })
+    const again = createFakeHost({ cwd, approvalOutcome: 'allowed-once' })
+    apply(again.ctx as never, { logFile: path.join(cwd, 'spec-gate.log'), reviewChannel: 'approval' })
     await again.runTool('spec_create', DRAFT)
     const second = await again.runTool('spec_approve', {})
     assert.match(runText(second), /规格已审批/)
@@ -1857,4 +1858,112 @@ test('spec_create still refuses a draft that omits the criteria under BOTH spell
     assert.equal(run.isError, true, runText(run))
     assert.match(runText(run), /acceptanceCriteria/)
     assert.equal(fs.existsSync(path.join(fake.cwd, '.dsh', 'specs')), false)
+})
+
+// --- questions 评审通道：desktop / web TUI 的结构化审阅卡（2026-11-10） ------------
+
+function questionsHost(options: {
+    cwd?: string
+    answer: (request: unknown) => unknown
+    reviewChannel?: string
+    approvalOutcome?: 'allowed-once' | 'rejected'
+}) {
+    const cwd = options.cwd ?? tempWorkspace('spec-gate-questions-')
+    const asked: unknown[] = []
+    const fake = createFakeHost({
+        cwd,
+        ...(options.approvalOutcome === undefined ? {} : { approvalOutcome: options.approvalOutcome }),
+        services: {
+            userQuestions: {
+                ask: async (request: unknown) => {
+                    asked.push(request)
+                    return options.answer(request)
+                },
+            },
+        },
+    })
+    apply(fake.ctx as never, {
+        logFile: path.join(cwd, 'spec-gate.log'),
+        ...(options.reviewChannel === undefined ? {} : { reviewChannel: options.reviewChannel }),
+    })
+    return { fake, asked, cwd }
+}
+
+const answerWith = (selected: string[], custom?: string) => (request: unknown) => {
+    const id = (request as { questions: { id: string }[] }).questions[0]?.id ?? ''
+    return { answers: [{ id, selected, ...(custom === undefined ? {} : { custom }) }] }
+}
+
+test('TC-1141 the review card carries the SPEC MARKDOWN and the plan-review intent', async () => {
+    // What desktop / web TUI render: `detail` is markdown and `intent` says "this is
+    // a document under review", so the client formats it instead of showing a blob.
+    const { fake, asked } = questionsHost({ answer: answerWith(['通过']) })
+    await fake.runTool('spec_create', DRAFT)
+    await fake.runTool('spec_approve', {})
+
+    assert.equal(asked.length, 1)
+    const question = (asked[0] as { questions: Record<string, unknown>[] }).questions[0] as {
+        question?: string
+        detail?: string
+        options?: { label: string }[]
+        intent?: { kind?: string; detail?: string; approve?: string }
+    }
+    assert.match(question.question ?? '', /送审/)
+    assert.match(question.detail ?? '', /## 验收标准/, 'detail 必须是规格 markdown 本身')
+    assert.match(question.detail ?? '', /## 测试设计/, '测试设计章节也要在卡里')
+    assert.equal(question.intent?.kind, 'plan-review', '客户端据此渲染"审阅文档"卡')
+    assert.match(question.intent?.detail ?? '', /## 验收标准/)
+    assert.equal(question.intent?.approve, '通过')
+    assert.deepEqual((question.options ?? []).map((option) => option.label), ['通过', '打回'])
+})
+
+test('TC-1142 通过 → 规格审批成立（approvedAt 有值）', async () => {
+    const { fake } = questionsHost({ answer: answerWith(['通过']) })
+    await fake.runTool('spec_create', DRAFT)
+    const text = runText(await fake.runTool('spec_approve', {}))
+    assert.match(text, /规格已审批/)
+    const mission = new MissionStoreRegistry().for(fake.cwd).active('session-1')
+    assert.ok(mission?.spec?.approvedAt !== undefined, '通过之后规格必须已审批')
+})
+
+test('TC-1143 打回 + 自定义说明 → rejected，理由进台账，进入第 2 轮', async () => {
+    const { fake } = questionsHost({ answer: answerWith(['打回'], '缺 503 的用例') })
+    await fake.runTool('spec_create', DRAFT)
+    const text = runText(await fake.runTool('spec_approve', {}))
+    const mission = new MissionStoreRegistry().for(fake.cwd).active('session-1')
+    assert.equal(mission?.approval?.state, 'rejected')
+    assert.match(mission?.approval?.note ?? '', /缺 503 的用例/, '打回理由必须被记录')
+    assert.equal(mission?.spec?.approvedAt, undefined, '打回后不得有审批时间')
+    assert.match(text, /第 2 次/)
+})
+
+test('TC-1144 reviewChannel=questions 但宿主没有该接缝 → 明确报错，不静默降级', async () => {
+    const cwd = tempWorkspace('spec-gate-questions-missing-')
+    const fake = createFakeHost({ cwd })
+    apply(fake.ctx as never, { logFile: path.join(cwd, 'spec-gate.log'), reviewChannel: 'questions' })
+    await fake.runTool('spec_create', DRAFT)
+    assert.match(runText(await fake.runTool('spec_approve', {})), /user-questions/i)
+})
+
+test('TC-1145 the card is keyed to the REAL tool call id, never an invented one', async () => {
+    const { fake, asked } = questionsHost({ answer: answerWith(['通过']) })
+    await fake.runTool('spec_create', DRAFT)
+    await fake.runTool('spec_approve', {})
+    const callId = (asked[0] as { wait?: { callId?: string } }).wait?.callId
+    // The fake host's scheme is `call-<n>` and it owns the id: matching that shape
+    // proves the value was FORWARDED from the execution rather than invented here.
+    assert.match(callId ?? '', /^call-\d+$/, `必须原样转发宿主的 callId，实际是 ${String(callId)}`)
+})
+
+test('TC-1146 reviewChannel=approval 时 questions 不被调用', async () => {
+    // Allowed-once so the rejection FOLLOW-UP question (which legitimately uses the
+    // questions seam) cannot be confused with the review card.
+    const { fake, asked } = questionsHost({
+        answer: answerWith(['通过']),
+        reviewChannel: 'approval',
+        approvalOutcome: 'allowed-once',
+    })
+    await fake.runTool('spec_create', DRAFT)
+    await fake.runTool('spec_approve', {})
+    assert.equal(asked.length, 0, 'approval 通道下不得走 questions')
 })

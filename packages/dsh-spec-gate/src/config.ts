@@ -29,7 +29,7 @@ export interface SpecGateConfig {
      * input box — and falls back to the generic approval seam (headless, web,
      * CI). `tui` refuses instead of falling back; `approval` always uses the seam.
      */
-    reviewChannel: 'auto' | 'tui' | 'approval'
+    reviewChannel: 'auto' | 'tui' | 'approval' | 'questions'
     /** How long a review card waits for a verdict before giving up (fail closed). */
     reviewTimeoutMs: number
     /**
@@ -261,10 +261,7 @@ export function resolveEffectiveConfig(host: SpecGateConfig, layout: Layout, log
         requireTestDesign:
             typeof requireTestDesignRaw === 'boolean' ? requireTestDesignRaw : requireTestDesignRaw === 'auto' ? 'auto' : host.requireTestDesign,
         approval: raw['approval'] === 'seam' || raw['approval'] === 'auto' ? raw['approval'] : host.approval,
-        reviewChannel:
-            raw['reviewChannel'] === 'tui' || raw['reviewChannel'] === 'approval' || raw['reviewChannel'] === 'auto'
-                ? raw['reviewChannel']
-                : host.reviewChannel,
+        reviewChannel: reviewChannelOf(raw['reviewChannel'], host.reviewChannel),
         reviewTimeoutMs: Math.max(1_000, Math.floor(num(raw['reviewTimeoutMs'], host.reviewTimeoutMs))),
         bootstrap: mergeBootstrap(raw['bootstrap'], host.bootstrap),
         planFile: planFile ?? host.planFile,
@@ -324,6 +321,11 @@ export const DEFAULT_SHELL_TOOLS: readonly string[] = ['bash', 'pwsh']
  * @param input - the loader row's `config` value (untrusted).
  * @returns the resolved configuration with every default applied.
  */
+/** Normalise `reviewChannel` in ONE place (two hand-written enums drifted apart). */
+function reviewChannelOf(value: unknown, fallback: 'auto' | 'tui' | 'approval' | 'questions'): 'auto' | 'tui' | 'approval' | 'questions' {
+    return value === 'auto' || value === 'tui' || value === 'approval' || value === 'questions' ? value : fallback
+}
+
 export function resolveConfig(input: unknown): SpecGateConfig {
     const raw = isRecord(input) ? input : {}
     const prompt = isRecord(raw['prompt']) ? raw['prompt'] : {}
@@ -331,7 +333,7 @@ export function resolveConfig(input: unknown): SpecGateConfig {
         enabled: bool(raw['enabled'], true),
         logFile: str(raw['logFile'], '~/.dsh/spec-gate.log'),
         ...(typeof raw['logFileTemplate'] === 'string' && raw['logFileTemplate'] !== '' ? { logFileTemplate: raw['logFileTemplate'] } : {}),
-        reviewChannel: raw['reviewChannel'] === 'tui' ? 'tui' : raw['reviewChannel'] === 'approval' ? 'approval' : 'auto',
+        reviewChannel: reviewChannelOf(raw['reviewChannel'], 'auto'),
         reviewTimeoutMs: Math.max(1_000, Math.floor(num(raw['reviewTimeoutMs'], 15 * 60_000))),
         bootstrap: resolveBootstrap(raw['bootstrap']),
         layout: {

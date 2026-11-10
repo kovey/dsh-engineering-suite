@@ -1,5 +1,23 @@
 ## [未发布]
 
+### 新增 · `spec_approve` 的 user-questions 评审通道（desktop / web TUI 与 TUI 对齐）
+
+TUI 里 `spec_approve` 能弹出规格与测试用例文档；web / desktop 之前只能看到一段 `reason` 文本
+（审批卡把 `reason` 当标题渲染，没有文档区，也收不到打回理由）。
+
+现在 `spec_approve` 增加一条通道：把规格 **markdown 正文**（含 `## 验收标准`、`## 测试设计`
+与工件路径）放进 `user-questions` 的 `detail`，并把 `intent` 标成官方的 `plan-review`——客户端据此
+渲染成"审阅文档"卡并按 markdown 美化。答案仍映射回宿主审批四词（通过 → `allowed-once`，
+打回 → `rejected` + 理由入台账、轮次 +1），mandate 与写放行的判定一点没变。
+
+- `reviewChannel` 增加 `questions`：`auto` 下顺序是 TUI 卡（能打开磁盘文件）→ questions → 审批接缝；
+  显式 `questions` 而宿主没有该接缝时**明确报错**，不静默降级；
+- 卡片键控到**真实** `callId`（`spec_approve` 本身就是工具调用，不是伪造）；
+- 顺手修掉一个真缺陷：`resolveConfig` 里 `reviewChannel` 有**两处**手写枚举，其中一处漏了
+  `questions`，导致配置被静默降级成 `auto`——现在归一到一个函数。这条是新增用例暴露出来的。
+
+## [未发布]
+
 ### 修复 · IM 审批应答者会抢走 desktop / web TUI 的审批
 
 核实官方实现后的事实：`dsh-api-remotes` 把 `approval/request`（waterfall）与

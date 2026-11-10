@@ -50,7 +50,7 @@ import {
     type SpecChange,
     type SpecRecord,
 } from 'dsh-eng-core'
-import type { Logger } from 'dsh-eng-core'
+import type { Logger, MissionStore } from 'dsh-eng-core'
 import { buildIndex, checkDraft, parseDraftAnswer, renderBrief, renderDraft } from './bootstrap.js'
 import {
     BOOTSTRAP_OWNER,
@@ -201,13 +201,23 @@ interface QuestionsLike {
     ask: (request: {
         agent: AgentLike
         signal?: AbortSignal
+        /** Keys the client card to the real tool call (never a fabricated id). */
+        wait?: { callId: string; timed?: boolean }
         questions: {
             id: string
             question: string
+            /** Rendered as markdown by the client UIs (desktop / web TUI). */
             detail?: string
             header?: string
             multiSelect?: boolean
             options?: { label: string; description?: string }[]
+            /**
+             * Presentation intent. `plan-review` is the official "a document is
+             * submitted for review" card: `detail` is the document itself (markdown,
+             * which the clients beautify) and `approve` names the approving option;
+             * every other option declines it.
+             */
+            intent?: { kind: 'plan-review'; detail: string; approve: string }
         }[]
     }) => Promise<{ answers: { id: string; selected: string[]; custom?: string }[] }>
 }
@@ -1965,6 +1975,36 @@ async function requestApproval(
                 '请把 reviewChannel 改回 auto/approval，或在 TUI 里运行。（mission ' + mission.id + '）',
         )
     }
+    // Structured review card on the client UIs (desktop / web TUI). `user-questions`
+    // is the official seam those clients already render — and here it is used
+    // LEGITIMATELY: `spec_approve` is a real tool call, so the card is keyed by its
+    // own callId rather than a fabricated one. `display.detail` carries the spec
+    // markdown, which the clients format; the TUI card stays first when present
+    // because it can also open the artifacts on disk.
+    if (config.reviewChannel === 'auto' || config.reviewChannel === 'questions') {
+        const questions = deps.questions()
+        if (questions !== undefined && context.agent !== undefined) {
+            const decided = await reviewThroughQuestions({
+                questions,
+                agent: context.agent,
+                ...(context.signal === undefined ? {} : { signal: context.signal }),
+                ...(callIdOf(context) === undefined ? {} : { callId: callIdOf(context) as string }),
+                mission,
+                store: deps.stores.for(mission.cwd),
+                missionsDir,
+                round: roundForReview,
+                log: (message: string) => deps.logger.for(mission.cwd).info(`[review] ${message}`),
+            })
+            if (decided !== undefined) return decided as never
+            // `undefined` = the card produced no usable answer (no agent, empty
+            // answer): fall through to the generic seam instead of guessing.
+        } else if (config.reviewChannel === 'questions') {
+            throw new Error(
+                '规格审批未进行：reviewChannel=questions，但宿主没有可用的 user-questions 接缝（ctx.get("userQuestions")）或当前调用没有 agent。' +
+                    `请改回 auto/approval，或在 desktop / web TUI / 任何渲染提问面板的客户端里运行。（mission ${mission.id}）`,
+            )
+        }
+    }
     const approval = deps.approval()
     if (approval === undefined) {
         throw new Error(
@@ -2001,6 +2041,93 @@ async function requestApproval(
     const normalized = normalizeApprovalReply(outcome)
     if (normalized.allowed) return normalized
     return { outcome: normalized.decision, normalized } as never
+}
+
+/** The real tool call id of this execution, when the host exposes one. */
+function callIdOf(context: unknown): string | undefined {
+    const value = (context as { callId?: unknown }).callId
+    return typeof value === 'string' && value !== '' ? value : undefined
+}
+
+/** How much of the specification goes into the review card (markdown, rendered by clients). */
+const REVIEW_DETAIL_LIMIT = 24_000
+
+/**
+ * Ask for approval through the host's structured-question seam.
+ *
+ * Why this seam and not the approval one: the approval waterfall carries a single
+ * `reason` STRING, so a client can only show one blob. `user-questions` carries
+ * structured questions with markdown `detail` and an `intent`, which is what the
+ * desktop app and the web TUI render as a real review card. The decision still
+ * lands in our own ledger and mandate — the answer is mapped to the host's
+ * approval vocabulary, never treated as an authorisation by itself.
+ * @param input - seam, caller identity, mission and the reviewer-facing text.
+ * @returns the mapped decision, or `undefined` when the seam gave nothing usable.
+ */
+async function reviewThroughQuestions(input: {
+    questions: QuestionsLike
+    agent: AgentLike
+    signal?: AbortSignal
+    callId?: string
+    mission: MissionRecord
+    store: MissionStore
+    missionsDir: string
+    round: number
+    log: (message: string) => void
+}): Promise<
+    | { decision: 'allowed-once'; by: 'approval'; messageId: string; source: 'questions'; allowed: true }
+    | { outcome: 'rejected'; note?: string }
+    | { outcome: 'cancelled' }
+    | undefined
+> {
+    const { mission, store, missionsDir } = input
+    const approve = '通过'
+    const markdown = [
+        store.readSpec(mission.id).trim(),
+        '',
+        '---',
+        '',
+        `工件：${approvalArtifacts(mission, missionsDir).join('、')}`,
+        `核对命令：spec_status ${mission.id}（规格与覆盖度）· audit_report（本次会话的写前快照）`,
+    ]
+        .join('\n')
+        .trim()
+        .slice(0, REVIEW_DETAIL_LIMIT)
+    try {
+        const answer = await input.questions.ask({
+            agent: input.agent,
+            ...(input.signal === undefined ? {} : { signal: input.signal }),
+            ...(input.callId === undefined ? {} : { wait: { callId: input.callId } }),
+            questions: [
+                {
+                    id: `spec-review-${mission.id}`,
+                    header: `规格审批 · 第 ${input.round} 轮`,
+                    question: `《${mission.spec?.title ?? mission.title}》第 ${input.round} 轮送审：${approve}还是打回？`,
+                    detail: markdown,
+                    options: [
+                        { label: approve, description: '按这份规格实现，并签发 mandate（写操作放行）' },
+                        { label: '打回', description: '规格需要修改；可在下方说明要改什么' },
+                    ],
+                    intent: { kind: 'plan-review', detail: markdown, approve },
+                },
+            ],
+        })
+        const row = answer.answers[0]
+        if (row === undefined) return undefined
+        const selected = row.selected ?? []
+        if (selected.includes(approve)) {
+            input.log(`questions 通道：${mission.id} 第 ${input.round} 轮通过`)
+            return { decision: 'allowed-once', by: 'approval', messageId: '', source: 'questions', allowed: true }
+        }
+        const note = (row.custom ?? '').trim() || selected.join('、')
+        input.log(`questions 通道：${mission.id} 第 ${input.round} 轮被打回（${note || '未填理由'}）`)
+        return { outcome: 'rejected', ...(note === '' ? {} : { note }) }
+    } catch (error) {
+        const code = (error as { code?: unknown }).code
+        if (code === 'ASK_ABORTED') return { outcome: 'cancelled' }
+        input.log(`questions 通道不可用（${error instanceof Error ? error.message : String(error)}）：回落到审批接缝`)
+        return undefined
+    }
 }
 
 /** The artifacts a reviewer should be able to open before deciding. */
