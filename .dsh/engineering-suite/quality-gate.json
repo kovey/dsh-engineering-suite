@@ -1,0 +1,18 @@
+{
+  "commands": [
+    {
+      "id": "test",
+      "name": "单元测试",
+      "command": "bash scripts/verify.sh --quiet",
+      "required": true,
+      "phase": "gate"
+    },
+    {
+      "id": "lint",
+      "name": "lint",
+      "command": "bash scripts/typecheck-all.sh",
+      "required": false,
+      "phase": "lint"
+    }
+  ]
+}

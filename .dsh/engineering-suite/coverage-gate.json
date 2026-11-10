@@ -1,0 +1,5 @@
+{
+  "coverageCommand": "bash scripts/coverage.sh {reportFile}",
+  "reportFile": "coverage/lcov.info",
+  "thresholds": { "total": 70 }
+}

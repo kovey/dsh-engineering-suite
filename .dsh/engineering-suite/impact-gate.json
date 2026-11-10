@@ -1,0 +1,4 @@
+{
+  "testCommandTemplate": "node --test {files}",
+  "defaultBase": "HEAD"
+}

@@ -1,3 +1,28 @@
+## [未发布]
+
+### 修复 · shell 分析器遇管道符崩溃（含引号内的竖线）
+
+`analyzeShellCommand` 按竖线切段，但没有区分**代码载荷与引号内的竖线**：`python3 - <<'PY'` 里写
+`'|'.join(...)`、`node -e "a || b"`、甚至 `grep -E "a|b"` 都会产出垃圾"命令"，其首 token 被原样插进
+`new RegExp`，抛 `Unmatched ')'`，整条命令被拒绝（实测两次拦住我自己的命令）。
+
+现在：解释器名先做标识符校验并用 `escapeRegExp` 转义；payload 扫描只在剥离 heredoc 后的文本上分段；
+分析内部异常一律降级为 `undecidable`（fail-closed），不再抛出。
+
+### 新增 · 门禁配置脚手架覆盖每一类门禁，并修正"配置写了没人读"
+
+`scripts/project-config.sh` 新增 `--test-design / --supply-chain / --coverage / --impact / --evidence`
+（默认不写、已存在不覆盖、`--json` 只打印）；新增 `scripts/coverage.sh` 用 node 自带 lcov reporter 产出
+报告，`coverage_check` 直接可读。写入路径改为**布局根**（命名空间优先），`.gitignore` 的运行时忽略清单
+同样按布局根生成。
+
+本仓库 `.gitignore` 原来整体忽略 `.dsh/`，导致信任根里的门禁配置从未被提交（`git ls-files .dsh` 为 0）。
+
+### 已知缺口
+
+`standards-gate` 仍把默认路径解析成 `.dsh/standards.json`（不走布局根），因此写入命名空间的
+`standards.json` 读不到；需要一次独立改动让它也用 `resolveLayout`。
+
 ## [0.8.0] — 2026-11-10
 
 > **BREAKING**：本套件的产物与配置从 `<repo>/.dsh/` 收进 `<repo>/.dsh/engineering-suite/`。

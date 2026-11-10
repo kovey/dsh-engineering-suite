@@ -17,8 +17,15 @@
 #     --spec on   → {"enforce": true}（显式声明，便于 review）
 #     --spec skip → 不写 spec-gate.json（默认）
 #   --force      覆盖同名文件（默认拒绝）
-#   --interaction on|skip  → 写 .dsh/interaction-gate.json（交互层骨架）
-#   --deploy on|skip       → 写 .dsh/deploy-gate.json（环境清单骨架，默认空 = 拒绝部署）
+#   --interaction on|skip  → 写 <root>/interaction-gate.json（交互层骨架）
+#   --deploy on|skip       → 写 <root>/deploy-gate.json（环境清单骨架，默认空 = 拒绝部署）
+#   --test-design on|skip  → 写 <root>/test-design-gate.json（评审严度）
+#   --supply-chain on|skip → 写 <root>/supply-chain-gate.json（清单 + 审计命令；无锁文件时显式留空）
+#   --coverage on|skip     → 写 <root>/coverage-gate.json（调用 scripts/coverage.sh 出 lcov）
+#   --impact on|skip       → 写 <root>/impact-gate.json（最小回归命令模板）
+#   --evidence on|skip     → 写 <root>/evidence-gate.json（必填证据类型与门禁来源）
+#
+# <root> 是本套件的布局根：`.dsh/engineering-suite/`（已迁移，目录存在即用它）或 `.dsh/`。
 #   --no-gitignore        不自动补 .dsh 运行时忽略规则（见下）
 #   --json       只打印将写入的内容
 #   --print      只打印检测结果（kind=/test=/lint= 三行，不写任何文件），
@@ -39,6 +46,11 @@ SPEC="skip"
 STANDARDS="skip"
 INTERACTION="skip"
 DEPLOY="skip"
+TEST_DESIGN="skip"
+SUPPLY_CHAIN="skip"
+COVERAGE="skip"
+IMPACT="skip"
+EVIDENCE="skip"
 GITIGNORE=1
 TEST_CMD=""
 LINT_CMD=""
@@ -54,6 +66,11 @@ while [ $# -gt 0 ]; do
     --standards) STANDARDS="${2:-skip}"; shift 2 ;;
     --interaction) INTERACTION="${2:-skip}"; shift 2 ;;
     --deploy) DEPLOY="${2:-skip}"; shift 2 ;;
+    --test-design) TEST_DESIGN="${2:-skip}"; shift 2 ;;
+    --supply-chain) SUPPLY_CHAIN="${2:-skip}"; shift 2 ;;
+    --coverage) COVERAGE="${2:-skip}"; shift 2 ;;
+    --impact) IMPACT="${2:-skip}"; shift 2 ;;
+    --evidence) EVIDENCE="${2:-skip}"; shift 2 ;;
     --no-gitignore) GITIGNORE=0; shift ;;
     --test) TEST_CMD="${2:-}"; shift 2 ;;
     --lint) LINT_CMD="${2:-}"; shift 2 ;;
@@ -64,6 +81,15 @@ done
 
 [ -d "$WS" ] || { echo "workspace not found: $WS" >&2; exit 1; }
 WS="$(cd "$WS" && pwd)"
+
+# --- where does THIS suite read its config? --------------------------------
+# Since v0.8.0 the layout root is `<workspace>/.dsh/engineering-suite/` when that
+# directory exists, else `<workspace>/.dsh/`. Writing to the legacy path in a
+# migrated repository would produce files nobody reads — the config would look
+# "present" on disk and have no effect at all.
+DSH="$WS/.dsh"
+if [ -d "$DSH/engineering-suite" ]; then DSH="$DSH/engineering-suite"; fi
+DSH_REL="${DSH#"$WS"/}"
 
 # --- detect the project type ------------------------------------------------
 # One precedence list, one place: `DETECTED_TEST` and `DETECTED_KIND` are set
@@ -221,6 +247,83 @@ PY2
   *) echo "--standards 只能是 on / skip" >&2; exit 2 ;;
 esac
 
+# --- the remaining gates ----------------------------------------------------
+# A config naming a command that cannot run is worse than no config: the gate then
+# fails with a confusing error instead of saying "not configured". Each block below
+# only names what the repository can actually execute.
+TEST_DESIGN_JSON=""
+case "$TEST_DESIGN" in
+  on) TEST_DESIGN_JSON='{
+  "strict": false,
+  "minTextLength": 4,
+  "allowDanglingCase": false,
+  "requireAllScenarios": true
+}' ;;
+  skip) ;;
+  *) echo "--test-design 只能是 on / skip" >&2; exit 2 ;;
+esac
+
+SUPPLY_CHAIN_JSON=""
+case "$SUPPLY_CHAIN" in
+  on)
+    # `auditCommands` stays EMPTY on purpose: a repository with no lockfile and no
+    # runtime dependencies cannot produce an audit report. The gate then says
+    # "manifests changed but nobody audited" (WARN), which is the truth; naming a
+    # command that cannot run would be a BLOCK for no reason.
+    SUPPLY_CHAIN_JSON='{
+  "deps": {
+    "manifests": ["package.json"],
+    "auditCommands": []
+  },
+  "secretScan": { "scanWholeTree": false }
+}' ;;
+  skip) ;;
+  *) echo "--supply-chain 只能是 on / skip" >&2; exit 2 ;;
+esac
+
+COVERAGE_JSON=""
+case "$COVERAGE" in
+  on)
+    # The gate runs its command as argv (no shell), so a glob cannot be expanded
+    # by the caller: the reviewed script owns the globbing and the report path.
+    #
+    # Only `total` is declared. This repository's tests execute BUILD OUTPUT
+    # (`dist/*.js`), which is what node instruments, while a change lands in
+    # `src/*.ts` — without a sourcemap for coverage there is no honest way to map
+    # one to the other, and a `changed` threshold here would simply be unjudgeable
+    # on every change (reported as "cannot judge", never as a pass). Declaring what
+    # CAN be measured is the point of having a threshold at all.
+    COVERAGE_JSON='{
+  "coverageCommand": "bash scripts/coverage.sh {reportFile}",
+  "reportFile": "coverage/lcov.info",
+  "thresholds": { "total": 70 }
+}' ;;
+  skip) ;;
+  *) echo "--coverage 只能是 on / skip" >&2; exit 2 ;;
+esac
+
+IMPACT_JSON=""
+case "$IMPACT" in
+  on) IMPACT_JSON='{
+  "testCommandTemplate": "node --test {files}",
+  "defaultBase": "HEAD"
+}' ;;
+  skip) ;;
+  *) echo "--impact 只能是 on / skip" >&2; exit 2 ;;
+esac
+
+EVIDENCE_JSON=""
+case "$EVIDENCE" in
+  on) EVIDENCE_JSON='{
+  "requireGate": true,
+  "gateSource": "dsh-quality-gate",
+  "requiredEvidenceKinds": ["command", "test"],
+  "requireCleanTree": true
+}' ;;
+  skip) ;;
+  *) echo "--evidence 只能是 on / skip" >&2; exit 2 ;;
+esac
+
 # --- interaction / deploy (optional skeletons) ------------------------------
 INTERACTION_JSON=""
 case "$INTERACTION" in
@@ -255,26 +358,37 @@ if [ "$JSON_ONLY" = "1" ]; then
   [ -n "$STANDARDS_JSON" ] && report "standards.json" "$STANDARDS_JSON"
   [ -n "$INTERACTION_JSON" ] && report "interaction-gate.json" "$INTERACTION_JSON"
   [ -n "$DEPLOY_JSON" ] && report "deploy-gate.json" "$DEPLOY_JSON"
+  [ -n "$TEST_DESIGN_JSON" ] && report "test-design-gate.json" "$TEST_DESIGN_JSON"
+  [ -n "$SUPPLY_CHAIN_JSON" ] && report "supply-chain-gate.json" "$SUPPLY_CHAIN_JSON"
+  [ -n "$COVERAGE_JSON" ] && report "coverage-gate.json" "$COVERAGE_JSON"
+  [ -n "$IMPACT_JSON" ] && report "impact-gate.json" "$IMPACT_JSON"
+  [ -n "$EVIDENCE_JSON" ] && report "evidence-gate.json" "$EVIDENCE_JSON"
   exit 0
 fi
 
 echo "workspace : $WS"
+echo "config    : $DSH_REL"
 echo "project   : $KIND"
 echo "test      : $TEST"
 echo "lint      : ${LINT:-(无)}"
 echo "spec-gate : $SPEC"
-report "$WS/.dsh/quality-gate.json" "$QUALITY"
-[ -n "$SPEC_JSON" ] && report "$WS/.dsh/spec-gate.json" "$SPEC_JSON"
-[ -n "$STANDARDS_JSON" ] && report "$WS/.dsh/standards.json" "$STANDARDS_JSON"
-[ -n "$INTERACTION_JSON" ] && report "$WS/.dsh/interaction-gate.json" "$INTERACTION_JSON"
-[ -n "$DEPLOY_JSON" ] && report "$WS/.dsh/deploy-gate.json" "$DEPLOY_JSON"
+report "$DSH/quality-gate.json" "$QUALITY"
+[ -n "$SPEC_JSON" ] && report "$DSH/spec-gate.json" "$SPEC_JSON"
+[ -n "$STANDARDS_JSON" ] && report "$DSH/standards.json" "$STANDARDS_JSON"
+[ -n "$INTERACTION_JSON" ] && report "$DSH/interaction-gate.json" "$INTERACTION_JSON"
+[ -n "$DEPLOY_JSON" ] && report "$DSH/deploy-gate.json" "$DEPLOY_JSON"
+[ -n "$TEST_DESIGN_JSON" ] && report "$DSH/test-design-gate.json" "$TEST_DESIGN_JSON"
+[ -n "$SUPPLY_CHAIN_JSON" ] && report "$DSH/supply-chain-gate.json" "$SUPPLY_CHAIN_JSON"
+[ -n "$COVERAGE_JSON" ] && report "$DSH/coverage-gate.json" "$COVERAGE_JSON"
+[ -n "$IMPACT_JSON" ] && report "$DSH/impact-gate.json" "$IMPACT_JSON"
+[ -n "$EVIDENCE_JSON" ] && report "$DSH/evidence-gate.json" "$EVIDENCE_JSON"
 
 if [ "$WRITE" != "1" ]; then
-  printf '\n(dry-run：加 --write 才会写入 .dsh/)\n'
+  printf '\n(dry-run：加 --write 才会写入 %s/)\n' "$DSH_REL"
   exit 0
 fi
 
-mkdir -p "$WS/.dsh"
+mkdir -p "$DSH"
 write_one() {
   local target="$1" body="$2"
   if [ -f "$target" ] && [ "$FORCE" != "1" ]; then
@@ -284,11 +398,16 @@ write_one() {
   printf '%s\n' "$body" > "$target"
   echo "已写入：$target"
 }
-write_one "$WS/.dsh/quality-gate.json" "$QUALITY"
-[ -n "$SPEC_JSON" ] && write_one "$WS/.dsh/spec-gate.json" "$SPEC_JSON"
-[ -n "$STANDARDS_JSON" ] && write_one "$WS/.dsh/standards.json" "$STANDARDS_JSON"
-[ -n "$INTERACTION_JSON" ] && write_one "$WS/.dsh/interaction-gate.json" "$INTERACTION_JSON"
-[ -n "$DEPLOY_JSON" ] && write_one "$WS/.dsh/deploy-gate.json" "$DEPLOY_JSON"
+write_one "$DSH/quality-gate.json" "$QUALITY"
+[ -n "$SPEC_JSON" ] && write_one "$DSH/spec-gate.json" "$SPEC_JSON"
+[ -n "$STANDARDS_JSON" ] && write_one "$DSH/standards.json" "$STANDARDS_JSON"
+[ -n "$INTERACTION_JSON" ] && write_one "$DSH/interaction-gate.json" "$INTERACTION_JSON"
+[ -n "$DEPLOY_JSON" ] && write_one "$DSH/deploy-gate.json" "$DEPLOY_JSON"
+[ -n "$TEST_DESIGN_JSON" ] && write_one "$DSH/test-design-gate.json" "$TEST_DESIGN_JSON"
+[ -n "$SUPPLY_CHAIN_JSON" ] && write_one "$DSH/supply-chain-gate.json" "$SUPPLY_CHAIN_JSON"
+[ -n "$COVERAGE_JSON" ] && write_one "$DSH/coverage-gate.json" "$COVERAGE_JSON"
+[ -n "$IMPACT_JSON" ] && write_one "$DSH/impact-gate.json" "$IMPACT_JSON"
+[ -n "$EVIDENCE_JSON" ] && write_one "$DSH/evidence-gate.json" "$EVIDENCE_JSON"
 if [ -n "$DEPLOY_JSON" ]; then
   echo "注意：deploy-gate.json 的 environments 为空 → deploy_plan / deploy_run 会拒绝执行（fail closed）；"
   echo "      声明了环境与命令之后才可能部署，生产环境默认需要人工批准。"
@@ -297,15 +416,22 @@ fi
 # --- .gitignore：只忽略运行时台账 -------------------------------------------
 if [ "$GITIGNORE" = "1" ] && [ -d "$WS/.git" ]; then
   ADDED=()
-  for target in ".dsh/missions/" ".dsh/audit/" ".dsh/state/" ".dsh/specs/" ".dsh/kb/"; do
-    if ! git -C "$WS" check-ignore -q "$target" 2>/dev/null; then ADDED+=("$target"); fi
+  # Ignore RUNTIME paths under the root this suite actually reads ($DSH), not the
+  # legacy `.dsh/` literals: in a migrated repository `.dsh/missions/` matches
+  # nothing, so the old list silently stopped ignoring the real ledgers (and the
+  # config files, which must be committed, were the only thing left mentioned).
+  for target in "missions" "audit" "state" "kb"; do
+    if ! git -C "$WS" check-ignore -q "$DSH_REL/$target/" 2>/dev/null; then ADDED+=("$DSH_REL/$target/"); fi
   done
+  if [ "$DSH_REL" != ".dsh" ] && [ -d "$DSH" ]; then
+    if ! git -C "$WS" check-ignore -q "$DSH_REL/*.jsonl" 2>/dev/null; then ADDED+=("$DSH_REL/*.jsonl"); fi
+  fi
   # 已存在但未忽略的根级台账（只处理真实存在的文件，避免给每个仓库塞四行）
-  if [ -d "$WS/.dsh" ]; then
+  if [ -d "$DSH" ]; then
     while IFS= read -r ledger; do
       [ -n "$ledger" ] || continue
-      if ! git -C "$WS" check-ignore -q "$ledger" 2>/dev/null; then ADDED+=("$ledger"); fi
-    done < <(cd "$WS/.dsh" && ls *.jsonl 2>/dev/null | sed 's|^|.dsh/|' || true)
+      if ! git -C "$WS" check-ignore -q "$DSH_REL/$ledger" 2>/dev/null; then ADDED+=("$DSH_REL/$ledger"); fi
+    done < <(cd "$DSH" && ls *.jsonl 2>/dev/null || true)
   fi
   if [ "${#ADDED[@]}" -gt 0 ]; then
     if [ ! -f "$WS/.gitignore" ]; then printf '' > "$WS/.gitignore"; fi

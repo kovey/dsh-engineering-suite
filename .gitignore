@@ -1,5 +1,28 @@
 node_modules/
 dist/
 *.log
-.dsh/
 .tmp/
+
+# Coverage report (produced by scripts/coverage.sh, read by coverage_check).
+coverage/
+
+# --- the suite's trail ------------------------------------------------------
+# Config under `.dsh/engineering-suite/` is the TRUST ROOT: it decides what a gate
+# allows, so it must be committed and reviewed like code. Only RUNTIME state is
+# ignored — missions, gates, receipts, audit rows, session state and the kb index
+# are rewritten by every run and would otherwise make every delivery fail its
+# clean-tree check.
+#
+# (This file used to ignore `.dsh/` wholesale, which meant the gate configuration
+# itself was never committed: a fresh clone had no gate config at all, and a diff
+# could not show a tightened or loosened rule.)
+/.dsh/memory/
+/.dsh/engineering-suite/missions/
+/.dsh/engineering-suite/specs/
+/.dsh/engineering-suite/audit/
+/.dsh/engineering-suite/state/
+/.dsh/engineering-suite/kb/
+/.dsh/engineering-suite/deploy/
+/.dsh/engineering-suite/interaction/
+/.dsh/engineering-suite/coverage/
+/.dsh/engineering-suite/*.jsonl

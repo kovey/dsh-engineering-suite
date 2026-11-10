@@ -368,7 +368,15 @@ function codeFlagPayload(tokens: readonly string[], flags: readonly string[]): s
 function stdinHeredocBodies(command: string, base: string): string[] {
     // `python3 - <<'PY' … PY` / `node <<'JS' … JS`: `-` means "read the program
     // from stdin", so the heredoc body IS code, not data.
-    if (!new RegExp(`(^|[\\s|;&])${base}\\s+(-|--)\\s*<<`).test(command)) return []
+    //
+    // The base is validated and escaped before it goes into a RegExp: splitting on
+    // `|` cuts THROUGH code payloads too (a python heredoc containing `'|'.join(…)`
+    // or a regex), and the garbage "command" that produced used to be interpolated
+    // raw — `new RegExp` then threw `Unmatched ')'` and took the whole guard down
+    // for every command with a pipe inside a heredoc or a `-c` string.
+    if (!/^[A-Za-z0-9_.-]+$/.test(base)) return []
+    const escaped = escapeRegExp(base)
+    if (!new RegExp(`(^|[\\s;&])${escaped}\\s+(-|--)\\s*<<`).test(command)) return []
     const bodies: string[] = []
     const opener = /<<-?\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\1/g
     let match: RegExpExecArray | null
@@ -397,7 +405,12 @@ function interpreterPayloadFindings(
     let undecidable = false
     if (depth > 2) return { targets, undecidable, reasons }
 
-    for (const part of command.split(/\|\||&&|\||;/)) {
+    // Split on the STRIPPED command: a heredoc BODY is code, and its pipes (`|`)
+    // would otherwise be cut as if they were shell operators, producing garbage
+    // "commands" whose first token was then interpolated into a RegExp. The raw
+    // text is still needed below to find the heredoc bodies themselves.
+    const stripped = stripHeredocs(command)
+    for (const part of stripped.split(/\|\||&&|\||;/)) {
         const tokens = tokenize(part.trim())
         const head = tokens[0]
         if (head === undefined) continue

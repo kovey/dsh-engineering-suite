@@ -142,3 +142,26 @@ test('TC-1087 nested shell payloads terminate at the depth bound', () => {
     const analysis = analyzeShellCommand(`bash -c "bash -c 'bash -c \"touch a.txt\"'"`)
     assert.ok(analysis.targets.includes('a.txt') || analysis.undecidable, '要么定位到 a.txt，要么明确不可判定')
 })
+
+test('TC-1201 a heredoc body or code payload containing a PIPE does not crash the analyser', () => {
+    // Reported by using it: the segment split on `|` also cut through CODE payloads
+    // and quoted strings, and the garbage "command" that produced was interpolated
+    // raw into `new RegExp` — which threw `Unmatched ')'` and took the whole guard
+    // down for every command with a pipe in a heredoc, a `-c`/`-e` string or even
+    // `grep -E "a|b"`.
+    const pipe = String.fromCharCode(124)
+    const commands = [
+        `python3 - <<'PY'\nx = '${pipe}'.join(['a', 'b'])\nopen('out.txt', 'w')\nPY`,
+        `node -e "const a = 1 ${pipe}${pipe} 2; require('fs').writeFileSync('/tmp/p', '1')"`,
+        `bash -c "echo hi ${pipe}${pipe} true"`,
+        `grep -E "alpha${pipe}beta" notes.md`,
+    ]
+    for (const command of commands) {
+        // `doesNotThrow` returns void: capture the result inside the callback.
+        let analysis: ReturnType<typeof analyzeShellCommand> | undefined
+        assert.doesNotThrow(() => {
+            analysis = analyzeShellCommand(command)
+        })
+        assert.ok(analysis !== undefined && Array.isArray(analysis.targets), `must return an analysis for: ${command}`)
+    }
+})
