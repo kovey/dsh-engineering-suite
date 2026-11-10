@@ -1996,3 +1996,61 @@ test('TC-1152 when the bound DOES bite, the card says so and names the full docu
     assert.match(detail, /正文过长/, '截断必须显式可见')
     assert.match(detail, /\.dsh\/.*\.md|specs\//, '并且指出完整文档位置')
 })
+
+// --- 已交付/已停止的 mission 不得再放行写入（2026-11-10，"定死"） ------------------
+
+test('TC-1171 a DELIVERED mission refuses writes even inside its own file boundary', async () => {
+    // The hole: the guard checked file boundaries and the mandate, but never the
+    // mission STATUS — so a change could ride on a delivered mission and ship with
+    // no receipt (it happened, and had to be retro-fitted into a new mission).
+    const fake = host()
+    await fake.runTool('spec_create', { ...DRAFT, fileBoundaries: ['src/**'] })
+    await fake.runTool('spec_approve', {})
+    const store = new MissionStoreRegistry().for(fake.cwd)
+    const mission = store.active('session-1')
+    assert.ok(mission !== undefined)
+
+    // Deliver it (the store is the single source of truth for status).
+    store.update(mission.id, (current) => ({ ...current, status: 'delivered' }))
+
+    const reason = fake.guardReason({ name: 'write', arguments: { file_path: 'src/server.ts' }, agent: fake.agent })
+    assert.match(reason ?? '', /已交付/, `delivered mission 必须拒绝写入：${String(reason)}`)
+    assert.match(reason ?? '', /spec_create/, '拒绝理由要给出修复动作')
+})
+
+test('TC-1175 the refusal is not about the boundary: edit inside the boundary is refused too', async () => {
+    const fake = host()
+    await fake.runTool('spec_create', { ...DRAFT, fileBoundaries: ['src/**'] })
+    await fake.runTool('spec_approve', {})
+    const store = new MissionStoreRegistry().for(fake.cwd)
+    const mission = store.active('session-1')
+    store.update(mission.id as string, (current) => ({ ...current, status: 'delivered' }))
+
+    const reason = fake.guardReason({ name: 'edit', arguments: { file_path: 'src/server.ts' }, agent: fake.agent })
+    assert.match(reason ?? '', /已交付/, '边界之内也不是放行理由')
+})
+
+test('TC-1173 a BLOCKED (withdrawn) mission refuses writes and says the authorisation is gone', async () => {
+    const fake = host()
+    await fake.runTool('spec_create', { ...DRAFT, fileBoundaries: ['src/**'] })
+    await fake.runTool('spec_approve', {})
+    const store = new MissionStoreRegistry().for(fake.cwd)
+    const mission = store.active('session-1')
+    store.update(mission.id as string, (current) => ({ ...current, status: 'blocked' }))
+
+    const reason = fake.guardReason({ name: 'write', arguments: { file_path: 'src/server.ts' }, agent: fake.agent })
+    assert.match(reason ?? '', /blocked/, '必须点名 mission 已被停止/熔断')
+})
+
+test('TC-1172/1174 a fresh mission still writes, and read-only commands are never affected', async () => {
+    const fake = host()
+    await fake.runTool('spec_create', { ...DRAFT, fileBoundaries: ['src/**'] })
+    await fake.runTool('spec_approve', {})
+    const freshReason = fake.guardReason({ name: 'write', arguments: { file_path: 'src/server.ts' }, agent: fake.agent })
+    assert.equal(/已交付|blocked/.test(freshReason ?? ''), false, `新 mission 不应被状态拒绝：${String(freshReason)}`)
+    assert.equal(
+        fake.guardReason({ name: 'bash', arguments: { command: 'ls -la' }, agent: fake.agent }),
+        undefined,
+        '只读命令不受影响',
+    )
+})

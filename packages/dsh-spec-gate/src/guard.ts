@@ -96,6 +96,33 @@ function invalidMandateReason(missionId: string, reason: string): string {
     ].join('\n')
 }
 
+/**
+ * A mission that can no longer authorise writes.
+ *
+ * `delivered` means the receipt is signed and immutable: any further change would
+ * ship without one. `blocked` means the mandate was withdrawn (or the circuit
+ * breaker tripped): the authorisation is gone. Both are refused structurally —
+ * being inside the declared file boundary is NOT a reason to allow them, which is
+ * exactly the hole this closes (a change rode on a delivered mission and had to
+ * be retro-fitted into a new one).
+ */
+function finishedMissionReason(missionId: string, status: string): string | undefined {
+    if (status === 'delivered') {
+        return (
+            `spec-gate: mission ${missionId} 已交付（delivered），回执不可改写，因此不再放行写操作。\n` +
+            '这不是边界问题：文件在规格边界内也不行。要继续改动，请用 spec_create 新建 mission 并重新 spec_approve' +
+            '（新 mission 会拿到自己的回执），不要复用已交付的授权。'
+        )
+    }
+    if (status === 'blocked') {
+        return (
+            `spec-gate: mission ${missionId} 已被停止或熔断（blocked），授权已撤回，不再放行写操作。\n` +
+            '下一步：确认要继续这项工作后新建 mission（spec_create → test_design_review → spec_approve），不要沿用被撤回的授权。'
+        )
+    }
+    return undefined
+}
+
 function notApprovedReason(missionId: string, status: string): string {
     return [
         `spec-gate: 规格 ${missionId} 尚未审批（当前状态 ${status}），写操作被拒绝。`,
@@ -235,6 +262,15 @@ export function createWriteGuard(deps: WriteGuardDeps): WriteGuard {
         if (mission === undefined) {
             bump(store.layout.rootDir)
             return noMissionReason(exec.agent?.session?.header?.id)
+        }
+        // A finished mission can never authorise a write, even with a valid-looking
+        // approval: the receipt is immutable (delivered) or the mandate is gone
+        // (blocked). Checked BEFORE boundaries so "it is inside my spec" cannot
+        // become the loophole.
+        const finished = finishedMissionReason(mission.id, mission.status)
+        if (finished !== undefined) {
+            bump(store.layout.rootDir)
+            return finished
         }
         if (mission.spec === undefined || mission.spec.approvedAt === undefined) {
             bump(store.layout.rootDir)
