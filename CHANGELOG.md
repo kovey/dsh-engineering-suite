@@ -1,3 +1,32 @@
+## [0.7.3] — 2026-11-10
+
+### 修复 · 交付之后的审批不再被作废（生产部署卡住的真因）
+
+`deploy-gate` 的 go/no-go 要求 mission **已交付**，所以"部署后验证"的审批必然发生在
+`delivered` 之后；而 `interaction-gate` 的 attention 把 `delivered` 当作"结束"，按 mission
+**全量**扫掉未决提问（`supersede` 只看 mission 与 state）。于是卡片发出即作废，人点得再快也是
+`refused:superseded` —— 确定性矛盾，不是竞态，也不是通道问题。
+
+现在按"谁在问"与"怎么结束"区分：`AttentionRecord.source` 从台账行穿到派生层（原本就有，却被丢掉），
+`AttentionMission.endedBy` 区分 `delivered` 与 `withdrawn`。规则是：**门禁发起的问题**（来源非
+`interaction_ask`）在交付后仍然有效；**模型自己的提问**交付后作废；**mandate 被撤回**时一律作废；
+熔断中的 `blocked` 既不暂停也不作废。豁免按语义写（"任何门禁来源"），不写某一条 `source` 的名字 ——
+否则下一个从这条路问人的门禁会继承同一个坑。
+
+端到端用例还原了真实时间线（已交付 + 会话绑定 + IM 审批 + 白名单回答），断言决定成立且台账里
+不出现 `refused:superseded`。
+
+### 修复 · `spec_create` 在参数名被改写的宿主上完全不可用
+
+它的四个多词数组是 `required`，而参数传输层会把 camelCase 键改写成 snake_case ⇒ 校验器报
+"missing required property acceptanceCriteria"，而调用方**确实发了**（审计台账证明到达的是
+`acceptance_criteria`；同一次调用里其他单字键完好）。这个工具是唯一的规格登记入口，坏掉之后
+门禁永远无法被满足。
+
+现在"必填"判断移到处理器（`pickList`）：两种拼写都声明、任取其一；**同时存在且不一致就拒绝猜测**；
+两者皆缺仍然报错 —— 校验没有放松，只是搬到知道名字的地方。回归三条：snake_case 必须成功、
+冲突必须拒绝、两者皆缺仍然拒绝。
+
 ## [0.7.2] — 2026-11-09
 
 ### 新增 · `dependency_audit` 认识 PHP composer / Rust cargo / Ruby bundler / .NET 的报告
