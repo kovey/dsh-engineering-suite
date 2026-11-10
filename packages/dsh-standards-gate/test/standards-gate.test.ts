@@ -235,8 +235,7 @@ test('standards_bootstrap recommends target thresholds and freezes them with app
     assert.equal(fake.approvals.length, 1)
 })
 
-test('standards_status reports thresholds, the baseline and the last gate (regression)', async () => {
-    const cwd = longGoRepo()
+test('standards_status reports thresholds, the baseline and the last gate (regression)', async () => {    const cwd = longGoRepo()
     writeStandards(cwd, {
         languages: { go: { maxFileLines: 400, maxFunctionLines: 80 }, ts: { maxFileLines: 300 } },
         layers: [{ path: 'internal/domain', mayImport: [] }],
@@ -657,4 +656,41 @@ test('an unknown mission id is refused instead of silently recording nothing (re
     const run = await fake.runTool('standards_check', { missionId: 'does-not-exist' })
     assert.equal(run.isError, true)
     assert.match(runText(run), /未知 mission/)
+})
+
+// --- 默认路径跟随布局根（2026-11，与其他套件统一） --------------------------------
+
+test('TC-1221 a migrated repository reads its standards from the NAMESPACE directory', async () => {
+    // `.dsh/` is shared with other plugins; the suite moved into
+    // `.dsh/engineering-suite/`. A literal legacy default here meant the file was
+    // written where this plugin never looked: present on disk, no effect.
+    const cwd = longGoRepo()
+    const namespace = path.join(cwd, '.dsh', 'engineering-suite')
+    fs.mkdirSync(namespace, { recursive: true })
+    fs.writeFileSync(
+        path.join(namespace, 'standards.json'),
+        `${JSON.stringify({ languages: { go: { maxFileLines: 1234 }, ts: { maxFileLines: 300 } } }, null, 2)}\n`,
+    )
+    const fake = host(cwd)
+    const out = runText(await fake.runTool('standards_status', {}))
+    assert.match(out, /文件行数 ≤ 1234/, '命名空间里的阈值必须被读到')
+    assert.equal(out.includes('没有找到规范文件'), false)
+})
+
+test('TC-1222 an UN-migrated repository keeps reading the legacy root', async () => {
+    const cwd = longGoRepo()
+    writeStandards(cwd, { languages: { go: { maxFileLines: 4321 }, ts: { maxFileLines: 300 } } })
+    const fake = host(cwd)
+    const out = runText(await fake.runTool('standards_status', {}))
+    assert.match(out, /文件行数 ≤ 4321/, '未迁移仓库行为不变')
+})
+
+test('TC-1223 an EXPLICIT standardsFile still wins over the layout default', async () => {
+    const cwd = longGoRepo()
+    // Namespace exists AND an explicit path is configured: the explicit one decides.
+    fs.mkdirSync(path.join(cwd, '.dsh', 'engineering-suite'), { recursive: true })
+    writeStandards(cwd, { languages: { go: { maxFileLines: 555 }, ts: { maxFileLines: 300 } } })
+    const fake = host(cwd, { standardsFile: '.dsh/standards.json' })
+    const out = runText(await fake.runTool('standards_status', {}))
+    assert.match(out, /文件行数 ≤ 555/, '显式配置优先于布局默认')
 })

@@ -58,7 +58,7 @@ import {
 } from './rule-modes.js'
 import { runStructuralReview, selectReviewTargets } from './review.js'
 import { trendsOf } from './trends.js'
-import type { StandardsGateConfig } from './config.js'
+import { baselineFileOf, standardsFileOf, type StandardsGateConfig } from './config.js'
 
 const TEXT_OUTPUT = { type: 'string' } as const
 
@@ -336,7 +336,7 @@ function applyEvaluation(outcome: CheckOutcome, config: StandardsGateConfig): vo
 
 /** Run one measurement and compare it with the baseline. */
 function runCheck(deps: ToolDeps, cwd: string, config: StandardsGateConfig): CheckOutcome | { problem: string } {
-    const loaded = loadStandards(cwd, config.standardsFile, deps.logger)
+    const loaded = loadStandards(cwd, standardsFileOf(cwd, config), deps.logger)
     if (loaded.standards === undefined) return { problem: loaded.problem ?? `无法读取 ${loaded.path}` }
     const result = measureWorkspace({
         cwd,
@@ -345,7 +345,7 @@ function runCheck(deps: ToolDeps, cwd: string, config: StandardsGateConfig): Che
         maxFileBytes: config.maxFileBytes,
         ...(deps.logger === undefined ? {} : { logger: deps.logger }),
     })
-    const baselinePath = artifactPathOf(cwd, config.baselineFile)
+    const baselinePath = artifactPathOf(cwd, baselineFileOf(cwd, config))
     const baseline = readBaseline(baselinePath, deps.logger)
     const comparison = compareViolations(result.violations, baseline)
     const outcome: CheckOutcome = {
@@ -395,7 +395,7 @@ export function renderCheck(outcome: CheckOutcome, config: StandardsGateConfig):
         ...(outcome.problems.length === 0 ? [] : [`配置问题：${outcome.problems.join('；')}`]),
         ...(outcome.gateId === undefined ? [] : [`门禁记录：${outcome.gateId}`]),
         ...(outcome.measurementFile === undefined ? [] : [`度量明细：${outcome.measurementFile}`]),
-        ...renderObservations(outcome.observations, outcome.verdict, config.standardsFile),
+        ...renderObservations(outcome.observations, outcome.verdict, standardsFileOf(outcome.cwd, config)),
         '',
         '### 违规（按规则统计）',
         '',
@@ -738,7 +738,7 @@ export function registerTools(
                                     ? [`- …另有 ${acceptable.length - 12} 项未列出（合计 ${acceptable.length} 项）`]
                                     : []),
                                 '',
-                                `基线文件：${path.join(cwd, config.baselineFile)}`,
+                                `基线文件：${path.join(cwd, baselineFileOf(cwd, config))}`,
                                 args.note === undefined || args.note === '' ? '（未填理由）' : `理由：${args.note}`,
                             ].join('\n'),
                         )
@@ -753,7 +753,7 @@ export function registerTools(
                             ].join('\n')
                         }
                     }
-                    const baselinePath = artifactPathOf(cwd, config.baselineFile)
+                    const baselinePath = artifactPathOf(cwd, baselineFileOf(cwd, config))
                     // Only enforcing rules are frozen: an observe rule keeps its
                     // violations OUT of the baseline, in both `accepted` and
                     // `entries` (a magnitude is an acceptance too).
@@ -838,9 +838,9 @@ export function registerTools(
                         prunable.length === 0
                             ? undefined
                             : pruneBaseline(
-                                  artifactPathOf(cwd, config.baselineFile),
+                                  artifactPathOf(cwd, baselineFileOf(cwd, config)),
                                   prunable,
-                                  readBaseline(artifactPathOf(cwd, config.baselineFile), deps.logger),
+                                  readBaseline(artifactPathOf(cwd, baselineFileOf(cwd, config)), deps.logger),
                               )
                     if (pruned !== undefined) {
                         deps.logger?.for(cwd).info(`standards-gate: 基线收紧（消除 ${prunable.length} 项）`)
@@ -927,7 +927,7 @@ export function registerTools(
                 const targetCounts = countByRule(atTarget.violations)
                 const files = worst(result.files, (file) => file.lines, 10)
                 const functions = worstFunctionList(result)
-                const target = artifactPathOf(cwd, config.standardsFile)
+                const target = artifactPathOf(cwd, standardsFileOf(cwd, config))
 
                 const report = [
                     '## 规范接入（standards_bootstrap）',
@@ -1046,7 +1046,7 @@ export function registerTools(
                 const cwd = declaredCwdOf(agent)
                 const config = deps.configFor(agent)
                 if (!config.enabled) throw new Error('dsh-standards-gate 已被宿主禁用（enabled=false）')
-                const loaded = loadStandards(cwd, config.standardsFile, deps.logger)
+                const loaded = loadStandards(cwd, standardsFileOf(cwd, config), deps.logger)
                 const result = measureWorkspace({
                     cwd,
                     standards: loaded.standards ?? { languages: {} },
@@ -1116,8 +1116,8 @@ export function registerTools(
                 const agent = agentOf(exec)
                 const cwd = declaredCwdOf(agent)
                 const config = deps.configFor(agent)
-                const loaded = loadStandards(cwd, config.standardsFile, deps.logger)
-                const baselinePath = artifactPathOf(cwd, config.baselineFile)
+                const loaded = loadStandards(cwd, standardsFileOf(cwd, config), deps.logger)
+                const baselinePath = artifactPathOf(cwd, baselineFileOf(cwd, config))
                 const baselineText = readBaselineText(baselinePath)
                 const baseline = baselineText === undefined ? undefined : parseBaselineText(baselineText)
                 const store = deps.stores.for(cwd)
@@ -1205,7 +1205,7 @@ export function registerTools(
                               // is never an error.
                               ...(last.observations === undefined || last.observations.length === 0
                                   ? []
-                                  : renderObservations(last.observations, last.state, config.standardsFile).map(
+                                  : renderObservations(last.observations, last.state, standardsFileOf(cwd, config)).map(
                                         (line) => `  ${line}`,
                                     )),
                           ]),

@@ -12,7 +12,8 @@
  * @module dsh-standards-gate/config
  */
 
-import type { LayoutOptions } from 'dsh-eng-core'
+import path from 'node:path'
+import { resolveLayout, type LayoutOptions } from 'dsh-eng-core'
 
 /** How a violation affects the gate. */
 export type EnforceMode = 'gate' | 'warn' | 'off'
@@ -100,8 +101,8 @@ export function resolveConfig(input: unknown): StandardsGateConfig {
             ...(typeof layout['missionsDir'] === 'string' ? { missionsDir: layout['missionsDir'] } : {}),
             ...(typeof layout['specsDir'] === 'string' ? { specsDir: layout['specsDir'] } : {}),
         },
-        standardsFile: str(raw['standardsFile'], '.dsh/standards.json'),
-        baselineFile: str(raw['baselineFile'], '.dsh/standards-baseline.json'),
+        standardsFile: str(raw['standardsFile'], ''),
+        baselineFile: str(raw['baselineFile'], ''),
         enforce: enforce === 'warn' || enforce === 'off' || enforce === 'gate' ? enforce : 'gate',
         maxFiles: Math.max(1, Math.floor(num(raw['maxFiles'], 4_000))),
         maxFileBytes: Math.max(1_024, Math.floor(num(raw['maxFileBytes'], 256 * 1_024))),
@@ -119,3 +120,34 @@ export function resolveConfig(input: unknown): StandardsGateConfig {
 
 /** Keys a target repository may override in `<repo>/.dsh/standards-gate.json`. */
 export const PROJECT_OVERRIDABLE: readonly string[] = ['enforce', 'standardsFile', 'baselineFile', 'maxFiles', 'maxFileBytes']
+
+/**
+ * The workspace-relative path of the standards file.
+ *
+ * An explicit `standardsFile` always wins. Otherwise the default follows the LAYOUT
+ * ROOT, like every other plugin in the suite: the namespace directory when it
+ * exists (a migrated repository), the legacy root when it does not. A literal
+ * legacy default meant a migrated repository's standards file was written where
+ * this plugin never looked — present on disk, no effect at all.
+ * @param cwd - workspace root.
+ * @param config - resolved plugin configuration.
+ * @returns path relative to `cwd`, POSIX separators.
+ */
+export function standardsFileOf(cwd: string, config: StandardsGateConfig): string {
+    return config.standardsFile !== '' ? config.standardsFile : relativeRootFile(cwd, 'standards.json')
+}
+
+/** The workspace-relative path of the baseline (ratchet) file; same rules. */
+export function baselineFileOf(cwd: string, config: StandardsGateConfig): string {
+    return config.baselineFile !== '' ? config.baselineFile : relativeRootFile(cwd, 'standards-baseline.json')
+}
+
+function relativeRootFile(cwd: string, name: string): string {
+    // `path.relative`, not a `slice(cwd.length + 1)`: a caller passing a trailing
+    // separator over-sliced by one character, and the default silently became a
+    // SIBLING of the workspace (the gate then renamed its temp file onto the
+    // workspace directory itself: EISDIR).
+    const layout = resolveLayout(cwd, {})
+    const relative = path.relative(cwd, layout.rootDir)
+    return relative === '' ? name : `${relative.split(path.sep).join('/')}/${name}`
+}
