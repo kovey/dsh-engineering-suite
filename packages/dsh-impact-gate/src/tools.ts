@@ -47,6 +47,7 @@ import {
     type MissionStore,
     type MissionStoreRegistry,
     type SelectedTest,
+    resolveLayout,
 } from 'dsh-eng-core'
 import { TEMPLATE_EXAMPLES, type EffectiveConfig, type ImpactGateConfig } from './config.js'
 import {
@@ -1167,7 +1168,7 @@ export function registerTools(
                             presets: deps.presets,
                             reportDir:
                                 mission === undefined
-                                    ? path.join(cwd, '.dsh', 'impact-reviews')
+                                    ? path.join(resolveLayout(cwd).rootDir, 'impact-reviews')
                                     : store.artifactPath(mission.id, 'impact-reviews'),
                             provider: config.reviewDispatch.provider,
                             ...(config.reviewDispatch.model === undefined ? {} : { model: config.reviewDispatch.model }),

@@ -1,3 +1,24 @@
+## [未发布]
+
+### 变更 · 本套件的全部产物收进 `<repo>/.dsh/engineering-suite/`（从根上消掉"运行时文件被当成政策"）
+
+`.dsh/` 是**共用**目录：chat-interaction 在里面写 `chat-history/`、`feishu-cards/`、`feishu-*.json`、
+`chat-interaction-lease-*.json`。而信任根指纹把 `.dsh/**` 里的 `.json` 都当**政策**参与
+`policyVersion` 计算 —— 于是**每收发一条飞书消息，策略版本就变一次，所有 mission 的 mandate
+立刻 stale**。这和 deploy_verify 那个 bug 是同一类错误：把运行时状态当成规则。
+
+现在本套件的一切（specs/missions/gates/receipts/state/audit/kb/interaction/deploy/roles/各类
+`*.json` 配置与台账）都收进 `<repo>/.dsh/engineering-suite/`：
+
+- **布局解析**：命名空间目录存在就用它，不存在仍用 `.dsh/`（未迁移仓库行为不变）；
+  `layout` 同时保留 `legacyRootDir`，配置读取在新根缺失时回退旧根（迁移前照常工作）；
+- **政策版本**：新根下只有 `*.json` 与 `roles/**` 计数，运行时目录豁免；未迁移仓库额外豁免
+  `chat-history`、`chat-interaction-`、`feishu-` 前缀（文件与目录都豁免——只豁免目录会让
+  `feishu-app.json` 继续搅动版本，这一版顺手修掉）；
+- **迁移脚本** `scripts/migrate-to-engineering-suite.sh`：默认 dry-run；`--apply` 才移动；
+  只搬本套件认识的条目（**别的插件的运行时文件原地不动**，这正是关键）；目标已存在同名内容时
+  在**任何移动之前**停下；可重复执行（第二次 no-op）；打印回滚命令。
+
 ## [0.7.5] — 2026-11-10
 
 ### 安全 · shell 分析器现在能看见"脚本里的写操作"（文件边界曾可绕过）

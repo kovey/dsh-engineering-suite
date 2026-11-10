@@ -415,7 +415,7 @@ function listEntries(dir: string): { entries: string[]; missing: boolean; proble
 /** 台账候选路径：优先 trail 根，其次兄弟插件的默认位置（与 metrics 一致）。 */
 function ledgerFile(layout: Layout, name: string): string {
     const primary = path.join(layout.rootDir, `${name}.jsonl`)
-    const fallback = path.join(layout.cwd, '.dsh', `${name}.jsonl`)
+    const fallback = path.join(layout.rootDir, `${name}.jsonl`)
     if (exists(primary)) return primary
     if (primary !== fallback && exists(fallback)) return fallback
     return primary

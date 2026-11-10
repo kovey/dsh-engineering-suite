@@ -18,6 +18,9 @@ import {
     pathMatchesPattern,
     renderSpecMarkdown,
     runCommand,
+    resolveLayout,
+    loadProjectConfig,
+    policyVersion,
     appendJsonl,
     readJsonl,
     sha256,
@@ -513,4 +516,45 @@ test('appendJsonl writes exactly one line per row on a healthy file and on a new
     appendJsonl(file, { id: 'b' })
     assert.equal(fs.readFileSync(file, 'utf8'), '{"id":"a"}\n{"id":"b"}\n')
     assert.deepEqual(readJsonl<{ id: string }>(file).map((row) => row.id), ['a', 'b'])
+})
+
+// --- 命名空间迁移：.dsh/engineering-suite/ 与政策版本（2026-11-10） -----------------
+
+test('TC-1101 the layout uses .dsh/engineering-suite when it exists, else .dsh', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ns-layout-'))
+    fs.mkdirSync(path.join(dir, '.dsh'), { recursive: true })
+    assert.equal(path.basename(resolveLayout(dir).rootDir), '.dsh', '未迁移的仓库仍然用旧根')
+
+    fs.mkdirSync(path.join(dir, '.dsh', 'engineering-suite'), { recursive: true })
+    const migrated = resolveLayout(dir)
+    assert.equal(path.basename(migrated.rootDir), 'engineering-suite', '迁移后用命名空间')
+    assert.equal(path.basename(migrated.legacyRootDir), '.dsh', 'legacy 根仍可访问（配置回退与回滚都要用）')
+    assert.equal(migrated.specsDir, path.join(migrated.rootDir, 'specs'))
+})
+
+test('TC-1105 a chat/feishu runtime file does NOT change the policy version', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ns-policy-'))
+    fs.mkdirSync(path.join(dir, '.dsh'), { recursive: true })
+    fs.writeFileSync(path.join(dir, '.dsh', 'quality-gate.json'), '{"commands":[]}')
+    const before = policyVersion(dir)
+
+    fs.mkdirSync(path.join(dir, '.dsh', 'chat-history', 'feishu'), { recursive: true })
+    fs.writeFileSync(path.join(dir, '.dsh', 'chat-history', 'feishu', 'oc_x.json'), '{"m":1}')
+    fs.writeFileSync(path.join(dir, '.dsh', 'feishu-app.json'), '{"app":1}')
+    fs.writeFileSync(path.join(dir, '.dsh', 'chat-interaction-lease-feishu-1.json'), '{}')
+    assert.equal(policyVersion(dir), before, '运行时状态不是规则：版本必须不动')
+
+    fs.writeFileSync(path.join(dir, '.dsh', 'quality-gate.json'), '{"commands":["x"]}')
+    assert.notEqual(policyVersion(dir), before, '改政策文件仍然必须改变版本')
+})
+
+test('TC-1103 a migrated repo falls back to the legacy config file when the new one is absent', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ns-config-'))
+    fs.mkdirSync(path.join(dir, '.dsh', 'engineering-suite'), { recursive: true })
+    fs.writeFileSync(path.join(dir, '.dsh', 'quality-gate.json'), '{"commands":[{"id":"t","command":"true"}]}')
+    const layout = resolveLayout(dir)
+    const loaded = loadProjectConfig<Record<string, unknown>>(layout, 'quality-gate', { cache: false })
+    assert.equal(loaded.present, true, '旧根里的配置必须仍被读到')
+    assert.equal(path.basename(path.dirname(loaded.file)), '.dsh', `来源应是旧根：${loaded.file}`)
+    assert.deepEqual(loaded.value?.['commands'], [{ id: 't', command: 'true' }])
 })

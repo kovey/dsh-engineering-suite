@@ -76,6 +76,18 @@ export const MANDATE_BASIS = 'spec-approved' as const
 export const TRUST_ROOT_RUNTIME_DIRS: readonly string[] = ['missions', 'audit', 'state', 'kb', 'media', 'interaction', 'deploy']
 
 /**
+ * Directory/file-name prefixes that are runtime STATE even though they live under
+ * the trust root.
+ *
+ * These belong to other plugins (chat-interaction keeps `chat-history/`,
+ * `feishu-cards/`, `feishu-*.json`, lease files there). Counting them as policy
+ * made every incoming chat message bump `policyVersion` and stale every mandate.
+ * The namespace migration (`.dsh/engineering-suite/`) removes the situation
+ * entirely; these prefixes keep un-migrated repositories quiet in the meantime.
+ */
+export const TRUST_ROOT_RUNTIME_PREFIXES: readonly string[] = ['chat-history', 'chat-interaction-', 'feishu-']
+
+/**
  * The version of an EMPTY trust root (`sha256` of no bytes).
  *
  * A workspace without `.dsh/` is not an error and must not produce a random or
@@ -161,6 +173,14 @@ function collectPolicyFiles(rootDir: string): { absolute: string; relative: stri
         for (const entry of entries) {
             const relative = relativeDir === '' ? entry.name : `${relativeDir}/${entry.name}`
             const absolute = path.join(dir, entry.name)
+            // Name-based exemption applies to FILES AND DIRECTORIES: other plugins
+            // write both (`chat-history/` is a directory, `feishu-app.json` and
+            // `chat-interaction-lease-*.json` are files at the top level). An
+            // exemption that only covered directories let the files keep churning
+            // the policy version.
+            const foreignRuntime =
+                relativeDir === '' && TRUST_ROOT_RUNTIME_PREFIXES.some((prefix) => entry.name.startsWith(prefix))
+            if (foreignRuntime) continue
             if (entry.isDirectory()) {
                 if (relativeDir === '' && TRUST_ROOT_RUNTIME_DIRS.includes(entry.name)) continue
                 visit(absolute, relative)

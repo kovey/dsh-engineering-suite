@@ -960,7 +960,7 @@ export function checkWorkspace(options: DoctorOptions): DoctorReport {
         bytes: directorySize(layout.rootDir),
         gates: countArtifacts(missionsDir, 'gates'),
         receipts: countArtifacts(missionsDir, 'receipts'),
-        evidenceRows: countLines(path.join(layout.rootDir, '..', '.dsh', 'evidence.jsonl')),
+        evidenceRows: countLines(path.join(layout.rootDir, 'evidence.jsonl')),
         ...(stamps.length === 0 ? {} : { oldestMissionAt: Math.min(...stamps), newestMissionAt: Math.max(...stamps) }),
     }
     // Evidence lives per mission in this suite; count the files when the root

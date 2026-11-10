@@ -341,6 +341,37 @@ expect_rc 1 "wait-quiet: a moving tree times out instead of claiming quiet" bash
 wait "$writer" 2>/dev/null || true
 expect_rc 2 "wait-quiet: a missing path is a usage error" bash "$ROOT/scripts/wait-quiet.sh" 1 5 "$TMP/definitely-absent"
 
+# C15 — migrate-to-engineering-suite: dry-run must not move anything, apply must
+# be reversible and idempotent, and a conflict must stop BEFORE any move. The
+# point of the migration is that OTHER plugins' runtime files stay where they are.
+section "C15 — migrate-to-engineering-suite: dry-run, apply, idempotent, conflict-safe"
+MIG="$TMP/migrate"
+mkdir -p "$MIG/.dsh/missions" "$MIG/.dsh/specs" "$MIG/.dsh/chat-history" "$MIG/.dsh/feishu-cards"
+printf '{"commands":[]}' > "$MIG/.dsh/quality-gate.json"
+printf '{"app":1}' > "$MIG/.dsh/feishu-app.json"
+printf '{"messages":1}' > "$MIG/.dsh/chat-history/oc_x.json"
+printf 'x\n' > "$MIG/.dsh/releases.jsonl"
+printf 'spec\n' > "$MIG/.dsh/specs/m.md"
+
+expect_rc 1 "dry-run reports work to do" bash "$ROOT/scripts/migrate-to-engineering-suite.sh" --workspace "$MIG"
+test -d "$MIG/.dsh/engineering-suite" && fail "dry-run created the target directory" || pass "dry-run moved nothing"
+
+expect_rc 0 "apply migrates" bash "$ROOT/scripts/migrate-to-engineering-suite.sh" --workspace "$MIG" --apply
+test -f "$MIG/.dsh/engineering-suite/quality-gate.json" && pass "a suite config moved into the namespace" || fail "the config did not move"
+test -f "$MIG/.dsh/engineering-suite/releases.jsonl" && pass "a suite ledger moved into the namespace" || fail "the ledger did not move"
+test -f "$MIG/.dsh/chat-history/oc_x.json" && pass "another plugin's runtime file stayed put" || fail "the script moved a foreign file"
+test -f "$MIG/.dsh/feishu-app.json" && pass "a foreign top-level file stayed put" || fail "the script moved a foreign top-level file"
+
+expect_rc 0 "a second apply is a no-op" bash "$ROOT/scripts/migrate-to-engineering-suite.sh" --workspace "$MIG" --apply
+
+# Conflict: the same name on both sides must stop the run before moving anything.
+CONFLICT="$TMP/migrate-conflict"
+mkdir -p "$CONFLICT/.dsh/engineering-suite"
+printf 'old\n' > "$CONFLICT/.dsh/releases.jsonl"
+printf 'new\n' > "$CONFLICT/.dsh/engineering-suite/releases.jsonl"
+expect_rc 2 "a conflict refuses instead of overwriting" bash "$ROOT/scripts/migrate-to-engineering-suite.sh" --workspace "$CONFLICT" --apply
+[ "$(cat "$CONFLICT/.dsh/releases.jsonl")" = "old" ] && pass "the conflict left the source untouched" || fail "the conflict modified the source"
+
 section "summary"
 if [ "$FAILURES" = "0" ]; then
   printf '  \033[32mOPS SELFTEST GREEN\033[0m — every finding above is still refused.\n'

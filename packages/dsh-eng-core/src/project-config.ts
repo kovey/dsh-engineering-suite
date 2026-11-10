@@ -54,7 +54,25 @@ const cache = new Map<string, CacheEntry>()
 
 /** `<rootDir>/<pluginId>.json` — the project's override file. */
 export function projectConfigFile(layout: Layout, pluginId: string): string {
-    return path.join(layout.rootDir, `${pluginId}.json`)
+    // `configDir` is newer than the layout shape most callers build by hand
+    // (tests, plugins that only need `cwd`/`rootDir`), so fall back to
+    // `rootDir` rather than producing `path.join(undefined, …)`.
+    return path.join(layout.configDir ?? layout.rootDir, `${pluginId}.json`)
+}
+
+/**
+ * The legacy location of one plugin's project config (`<cwd>/.dsh/<id>.json`).
+ *
+ * Only meaningful for a MIGRATED repository (`rootDir` is the namespace
+ * directory): its hand-written config may still sit at the old path, and reading
+ * it is better than silently falling back to profile defaults.
+ * @param layout - the resolved layout.
+ * @param pluginId - plugin id (the file name without `.json`).
+ * @returns the legacy path.
+ */
+export function legacyProjectConfigFile(layout: Layout, pluginId: string): string {
+    const root = layout.legacyRootDir ?? path.join(layout.cwd, '.dsh')
+    return path.join(root, `${pluginId}.json`)
 }
 
 function signatureOf(file: string): string {
@@ -83,7 +101,11 @@ export function loadProjectConfig<T extends Record<string, unknown>>(
     pluginId: string,
     options: { cache?: boolean } = {},
 ): ProjectConfigFile<T> {
-    const file = projectConfigFile(layout, pluginId)
+    // New location first; a migrated repository whose file was not moved yet
+    // still reads its config from the legacy path instead of losing it.
+    const preferred = projectConfigFile(layout, pluginId)
+    const legacy = legacyProjectConfigFile(layout, pluginId)
+    const file = preferred === legacy || signatureOf(preferred) !== 'missing' ? preferred : signatureOf(legacy) !== 'missing' ? legacy : preferred
     const useCache = options.cache !== false
     const signature = signatureOf(file)
     if (useCache) {

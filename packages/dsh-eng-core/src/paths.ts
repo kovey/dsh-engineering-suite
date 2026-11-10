@@ -40,6 +40,31 @@ export function resolvePath(input: string, base: string): string {
     return path.resolve(base, expandHome(input))
 }
 
+/**
+ * The suite's own namespace inside a repository's `.dsh/`.
+ *
+ * Everything this suite writes lives here once a repository is migrated, which
+ * is what makes the trust root unambiguous: `.dsh/` also belongs to OTHER
+ * plugins (chat-interaction keeps `chat-history/`, `feishu-cards/`, lease files
+ * … there), and those files are runtime STATE, not rules. Treating them as policy
+ * made every incoming chat message change `policyVersion` and stale every
+ * mandate — the same class of mistake as letting runtime ledgers decide a gate.
+ *
+ * Resolution is additive: a repository with `<cwd>/.dsh/engineering-suite/` uses
+ * it; one without keeps today's `.dsh/` layout, so nothing breaks before the
+ * migration script runs.
+ */
+export const SUITE_NAMESPACE = 'engineering-suite'
+
+/** Whether a directory exists (layout resolution must never throw). */
+function existsDir(target: string): boolean {
+    try {
+        return fs.statSync(target).isDirectory()
+    } catch {
+        return false
+    }
+}
+
 /** Layout overrides accepted by every plugin config. */
 export interface LayoutOptions {
     /** Root directory of the engineering trail (default `.dsh`). */
@@ -61,6 +86,15 @@ export interface Layout {
     /** Workspace root the layout was resolved against. */
     cwd: string
     rootDir: string
+    /**
+     * The legacy `<cwd>/.dsh` root, kept for the migration and for config
+     * fallback: a migrated repository may still have a hand-written
+     * `.dsh/quality-gate.json` that has not been moved yet, and reading it is
+     * better than silently using profile defaults.
+     */
+    legacyRootDir: string
+    /** Where suite-owned config files are read (`<rootDir>`). */
+    configDir: string
     specsDir: string
     missionsDir: string
     auditDir: string
@@ -75,10 +109,16 @@ export interface Layout {
  * @returns absolute paths for every artifact directory.
  */
 export function resolveLayout(cwd: string, options: LayoutOptions = {}): Layout {
-    const rootDir = resolvePath(options.rootDir ?? '.dsh', cwd)
+    const legacyRootDir = resolvePath('.dsh', cwd)
+    // Explicit override wins; otherwise the namespace directory when it EXISTS
+    // (a repository that ran the migration), else the legacy root.
+    const namespaceDir = path.join(legacyRootDir, SUITE_NAMESPACE)
+    const rootDir = options.rootDir !== undefined ? resolvePath(options.rootDir, cwd) : existsDir(namespaceDir) ? namespaceDir : legacyRootDir
     return {
         cwd,
         rootDir,
+        legacyRootDir,
+        configDir: rootDir,
         specsDir: resolvePath(options.specsDir ?? path.join(rootDir, 'specs'), cwd),
         missionsDir: resolvePath(options.missionsDir ?? path.join(rootDir, 'missions'), cwd),
         auditDir: resolvePath(options.auditDir ?? path.join(rootDir, 'audit'), cwd),

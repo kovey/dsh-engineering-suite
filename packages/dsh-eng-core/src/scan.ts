@@ -35,6 +35,8 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { exists, listDir, readJson } from './io.js'
+import { resolveLayout } from './paths.js'
+import { projectConfigFile } from './project-config.js'
 import { silentLogger, type Logger } from './log.js'
 import type { SpecRecord, TestCase, TestDesign } from './types.js'
 
@@ -936,7 +938,7 @@ export function scanWorkspace(options: ScanOptions): ScanResult {
     // `.dsh` is never walked (the whole engineering trail is off-limits to a
     // code scan), but an existing rendered spec IS the strongest requirement
     // evidence there is, so `.dsh/specs/*.md` is probed directly.
-    const specsDir = path.join(cwd, '.dsh', 'specs')
+    const specsDir = resolveLayout(cwd).specsDir
     for (const name of [...listDir(specsDir)].sort(compareText)) {
         if (!name.toLowerCase().endsWith('.md')) continue
         if (filesScanned >= maxFiles) {
@@ -1066,7 +1068,7 @@ export function scanGaps(input: { scan: ScanResult; spec?: SpecRecord; testDesig
     const missingArtifacts: GapReport['missingArtifacts'] = []
     if (spec === undefined) missingArtifacts.push('spec')
     if (testDesign === undefined || cases.length === 0) missingArtifacts.push('testDesign')
-    if (scan.suggestedCommands.length === 0 && !exists(path.join(scan.cwd, '.dsh', 'quality-gate.json'))) {
+    if (scan.suggestedCommands.length === 0 && !exists(projectConfigFile(resolveLayout(scan.cwd), 'quality-gate'))) {
         missingArtifacts.push('gateCommands')
     }
 
