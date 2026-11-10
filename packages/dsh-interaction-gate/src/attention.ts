@@ -365,7 +365,17 @@ export function closureOf(
         if (row.kind !== 'superseded' && row.kind !== 'withdrawn') continue
         const matchesQuestion = row.questionId !== undefined && row.questionId === target.questionId
         const matchesMission =
-            row.kind === 'superseded' && row.questionId === undefined && row.missionId !== undefined && row.missionId === target.missionId
+            row.kind === 'superseded' &&
+            row.questionId === undefined &&
+            row.missionId !== undefined &&
+            row.missionId === target.missionId &&
+            // A mission-wide row closes the questions that were OPEN when it was
+            // written — never the ones asked afterwards. Without this comparison
+            // one row poisons that mission forever: a real deployment had a row
+            // written at 01:44:40 keeping approvals asked at 02:40 and 02:44
+            // `refused:superseded`, so every later deploy stalled even after the
+            // rule that produced the row was fixed.
+            row.at >= target.askedAt
         if (!matchesQuestion && !matchesMission) continue
         found = {
             kind: row.kind,

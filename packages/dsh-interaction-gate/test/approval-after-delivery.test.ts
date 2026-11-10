@@ -250,3 +250,36 @@ test('TC-1028 end-to-end: the reported timeline — delivered mission, IM approv
     assert.equal(ledger.includes('refused:superseded'), false, ledger)
     assert.equal(ledger.includes('approval-request'), true, '这一行必须标明来源，豁免规则才看得见它')
 })
+
+test('TC-1029 an OLD mission-wide supersede row must not close questions asked later', async () => {
+    // The reported ledger, verbatim: a mission-wide row written at 01:44:40.223
+    // while the first approval (asked 30ms earlier) was open — and then approvals
+    // asked at 02:40 and 02:44 came back `refused:superseded` too, because
+    // `closureOf` matched the mission without ever looking at the timestamps.
+    const cwd = tempWorkspace('approval-after-delivery-oldrow-')
+    const store = new MissionStoreRegistry().for(cwd)
+    store.create({ title: '已交付', cwd, id: 'M-10' })
+    store.setStatus('M-10', 'delivered')
+    fs.mkdirSync(path.join(cwd, '.dsh', 'interaction'), { recursive: true })
+    const ledger = path.join(cwd, LEDGER)
+    const attention = path.join(cwd, ATTENTION)
+
+    // (1) the question that existed when the row was written
+    askRow(ledger, { at: 1_000, questionId: 'q-first', missionId: 'M-10', source: 'approval-request' })
+    // (2) the row itself, 30ms later — the shape the old bug wrote
+    fs.writeFileSync(
+        attention,
+        `${JSON.stringify({ at: 1_030, id: 'ar-old', kind: 'superseded', missionId: 'M-10', reason: 'mission M-10 已交付（delivered）：这道提问已不再有意义' })}\n`,
+    )
+    // (3) a question asked long after the row (55 minutes later in the real case)
+    askRow(ledger, { at: 1_000 + 55 * 60_000, questionId: 'q-later', missionId: 'M-10', source: 'approval-request' })
+
+    const clock = { at: 1_000 + 60 * 60_000 }
+    const source = quietSource(cwd, clock, store)
+    const records = source.records()
+    const first = records.find((record) => record.questionId === 'q-first')
+    const later = records.find((record) => record.questionId === 'q-later')
+    assert.equal(first?.state, 'superseded', '写下该行时已存在的提问仍然被它关闭（历史语义不变）')
+    assert.equal(later?.state, 'open', '后来才问的不受老行影响')
+    assert.equal(later?.stale, undefined, '也不该被标成过期')
+})
