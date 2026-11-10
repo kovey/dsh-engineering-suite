@@ -194,10 +194,16 @@ export function parseManifest(path: string, text: string): ParsedManifest {
  * from a valid base revision — an unresolvable `base` is NOT "everything is new".
  * @param input - path, base text (optional) and current text.
  */
-export function diffManifests(input: { path: string; before?: string; after: string }): ManifestDiff {
+export function diffManifests(input: { path: string; before?: string; after: string; changed?: boolean }): ManifestDiff {
     const treatment = treatmentOf(input.path)
     const before = input.before ?? ''
-    const textChanged = before !== input.after
+    // `changed` is computed from GIT OBJECT IDS by the caller. Comparing the
+    // captured texts is unsound at scale: `runCommand` caps stdout (default
+    // 256KB, and the eng-core default 64KB), so a 397KB `composer.lock` was
+    // truncated on the base side and therefore "differed" from the working copy
+    // — a clean tree reported as an orphan lockfile change. Any file bigger than
+    // the cap (composer.lock, package-lock.json, Cargo.lock, go.sum) hit this.
+    const textChanged = input.changed ?? before !== input.after
     const format = formatOf(input.path)
     const base: Omit<ManifestDiff, 'added' | 'removed' | 'changed' | 'counts'> = {
         path: input.path,
@@ -923,7 +929,12 @@ function parseComposerAudit(record: Record<string, unknown>): AuditFinding[] {
         findings.push({
             package: pkg,
             kind: 'abandoned',
-            severity: 'unknown',
+            // NOT `unknown`: `unknown` means "the report did not tell us how bad
+            // this is", and a deployment that blocks `unknown` (to catch
+            // unparseable vulnerabilities) would then also block every
+            // deprecation — a package with no advisories at all. Abandonment is
+            // its own class: worth reporting, never a CVE.
+            severity: 'info',
             title: `包已废弃（abandoned）${replacement === undefined ? '' : `：${replacement}`}`,
         })
     }
@@ -1295,6 +1306,13 @@ export interface AuditClassification {
     /** Severities in `auditSeverities.warn` → the gate WARNs. */
     warning: AuditFinding[]
     /**
+     * `info` findings: a KNOWN advisory class (deprecations), never a
+     * vulnerability. Kept out of `unclassified` on purpose — otherwise the report
+     * would advise "add unknown to the block list" to make them block, which is
+     * exactly the trap that made 3 abandoned PHP packages block a deployment.
+     */
+    advisory: AuditFinding[]
+    /**
      * Severities in NEITHER list (including `unknown`, which is what
      * govulncheck and pip-audit reports carry). Reported and never silently
      * dropped; the report tells the host how to make them block.
@@ -1308,14 +1326,16 @@ export function classifyFindings(findings: readonly AuditFinding[], severities: 
     const warn = new Set(severities.warn.map((entry) => entry.toLowerCase()))
     const blocking: AuditFinding[] = []
     const warning: AuditFinding[] = []
+    const advisory: AuditFinding[] = []
     const unclassified: AuditFinding[] = []
     for (const finding of findings) {
         const severity = normalizeSeverity(finding.severity)
-        if (block.has(severity)) blocking.push(finding)
+        if (severity === 'info') advisory.push(finding)
+        else if (block.has(severity)) blocking.push(finding)
         else if (warn.has(severity)) warning.push(finding)
         else unclassified.push(finding)
     }
-    return { blocking, warning, unclassified }
+    return { blocking, warning, advisory, unclassified }
 }
 
 /**

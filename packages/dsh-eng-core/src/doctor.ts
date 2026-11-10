@@ -667,7 +667,7 @@ export function checkWorkspace(options: DoctorOptions): DoctorReport {
         detail:
             supply.problem ??
             (auditCount > 0 ? `${auditCount} 条审计命令（按 severity 阻断）` : '未配置：依赖漏洞只能报 WARN，永远不会阻断交付'),
-        ...(auditCount > 0 ? {} : { fix: '在 .dsh/supply-chain-gate.json 写 deps.auditCommands，例如 ["govulncheck ./..."]（无 severity 的报告可用 deps.auditSeverities.block 加 "unknown" 来阻断）' }),
+        ...(auditCount > 0 ? {} : { fix: '在 .dsh/supply-chain-gate.json 写 deps.auditCommands，例如 ["govulncheck ./..."]（报告里出现无法识别的 severity 时，可用 deps.auditSeverities.block 加 "unknown" 一并阻断；注意它也会把"包已废弃"这类 info 级条目里未归类的情况纳入——废弃包本身用 info，不受影响）' }),
     })
 
     // ---- test -------------------------------------------------------------

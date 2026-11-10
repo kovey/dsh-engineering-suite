@@ -699,8 +699,8 @@ test('composer `abandoned` entries are their own finding class, never dropped (T
     assert.equal(parsed.problem, undefined)
     assert.deepEqual(
         parsed.findings.map((finding) => `${finding.package}:${finding.kind}:${finding.severity}`),
-        ['gone/pkg:abandoned:unknown', 'old/pkg:abandoned:unknown'],
-        'an abandoned package is not a CVE: it is reported with its own kind and an unknown severity',
+        ['gone/pkg:abandoned:info', 'old/pkg:abandoned:info'],
+        'an abandoned package is not a CVE: its own kind, and `info` — NOT `unknown`, which would make a block list containing "unknown" (meant for unparseable vulnerabilities) block every deprecation',
     )
     assert.match(parsed.findings[1]?.title ?? '', /包已废弃.*no replacement/)
 })
@@ -1148,7 +1148,8 @@ test('dependency_audit: composer abandoned packages are their own class (TC-1002
     const out = runText(await fake.runTool('dependency_audit', {}))
     assert.match(out, /shape=composer-audit-json/)
     assert.match(out, /findings=1/)
-    assert.match(out, /未分类 1/)
+    assert.match(out, /advisory=1/)
+    assert.equal(out.includes('未分类 1'), false, 'deprecations are a KNOWN class, not an unparseable severity')
     // Abandoned carries no severity: reported + WARN, never silently dropped and
     // never a BLOCK unless a host puts "unknown" in the block list.
     assert.match(out, /裁决：WARN/)
@@ -1465,4 +1466,71 @@ test('entropy does not flag a slash-joined word list (regression)', () => {
     assert.equal(looksLikeWordList('AWS/GitHub/Slack/OpenAI/DeepSeek/Google'), true)
     assert.equal(looksLikeWordList('dGhpcy1pcy1hLXRlc3QtdG9rZW4tZm9yLWNvbnRleHQ'), false)
     assert.equal(looksLikeWordList('Zx9Qm2Lp7Rt4Wv1Yb8Nc3Kd6'), false)
+})
+
+// --- 大文件与废弃包：两个真实误报（2026-11-10，PHP 项目 che_mega_rip_php） ---------
+
+test('a lockfile LARGER than the output cap is not an orphan when the tree is clean', async () => {
+    // The bug: `git show base:composer.lock` was truncated at the command output
+    // cap, so a 397KB lockfile "differed" from its own unchanged working copy and
+    // the gate reported an orphan change on a clean tree. Change detection now
+    // compares git object ids, which have no size.
+    const cwd = tempWorkspace('supply-large-lock-')
+    const filler = 'x'.repeat(400 * 1024)
+    fs.writeFileSync(path.join(cwd, 'composer.json'), JSON.stringify({ require: { 'vendor/pkg': '^1.0' } }, null, 2))
+    fs.writeFileSync(path.join(cwd, 'composer.lock'), JSON.stringify({ _pad: filler, packages: [] }, null, 2))
+    git(cwd, ['init', '-q'])
+    git(cwd, ['add', '-A'])
+    git(cwd, ['commit', '-qm', 'base'])
+
+    const fake = host(cwd, {
+        deps: {
+            manifests: ['composer.json', 'composer.lock'],
+            auditCommands: [auditScript(cwd, `process.stdout.write(${JSON.stringify(JSON.stringify({ advisories: [], abandoned: [], filter: [] }))})`)],
+        },
+    })
+    const text = runText(await fake.runTool('dependency_audit', {}))
+    assert.match(text, /孤儿变更 0 个/, text)
+    assert.equal(text.includes('孤儿变更 1 个'), false, text)
+})
+
+test('the same oversized lockfile IS an orphan once it really changes', async () => {
+    const cwd = tempWorkspace('supply-large-lock-changed-')
+    const filler = 'x'.repeat(400 * 1024)
+    fs.writeFileSync(path.join(cwd, 'composer.json'), JSON.stringify({ require: { 'vendor/pkg': '^1.0' } }, null, 2))
+    fs.writeFileSync(path.join(cwd, 'composer.lock'), JSON.stringify({ _pad: filler, packages: [] }, null, 2))
+    git(cwd, ['init', '-q'])
+    git(cwd, ['add', '-A'])
+    git(cwd, ['commit', '-qm', 'base'])
+    fs.appendFileSync(path.join(cwd, 'composer.lock'), '\n')
+
+    const fake = host(cwd, {
+        deps: {
+            manifests: ['composer.json', 'composer.lock'],
+            auditCommands: [auditScript(cwd, `process.stdout.write(${JSON.stringify(JSON.stringify({ advisories: [], abandoned: [], filter: [] }))})`)],
+        },
+    })
+    const text = runText(await fake.runTool('dependency_audit', {}))
+    assert.match(text, /孤儿变更 1 个/, text)
+})
+
+test('an ABANDONED package is info: a block list containing unknown does not block it', async () => {
+    const cwd = tempWorkspace('supply-abandoned-')
+    fs.writeFileSync(path.join(cwd, 'composer.json'), JSON.stringify({ require: { 'doctrine/annotations': '^2.0' } }, null, 2))
+    fs.writeFileSync(path.join(cwd, 'composer.lock'), JSON.stringify({ packages: [] }, null, 2))
+    git(cwd, ['init', '-q'])
+    git(cwd, ['add', '-A'])
+    git(cwd, ['commit', '-qm', 'base'])
+    const report = JSON.stringify({ advisories: {}, abandoned: { 'doctrine/annotations': 'no replacement' }, filter: [] })
+    const fake = host(cwd, {
+        deps: {
+            manifests: ['composer.json', 'composer.lock'],
+            auditCommands: [auditScript(cwd, `process.stdout.write(${JSON.stringify(report)})`)],
+            auditSeverities: { block: ['high', 'critical', 'unknown'], warn: ['low', 'moderate'] },
+        },
+    })
+    const text = runText(await fake.runTool('dependency_audit', {}))
+    assert.match(text, /advisory=1/, text)
+    assert.match(text, /findings=1/, text)
+    assert.equal(/发现\s*\d+\s*条阻断/.test(text), false, text)
 })

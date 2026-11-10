@@ -835,18 +835,34 @@ export function registerTools(
                         unsupported.push(manifestPath)
                         continue
                     }
-                    const show = await runCommand({
-                        argv: ['git', 'show', `${base}:${manifestPath}`],
-                        cwd,
-                        timeoutMs: 20_000,
-                        ...(signal === undefined ? {} : { signal }),
-                    })
+                    // Did it change? Ask git for the two BLOB IDS, never for the
+                    // text: the captured-text comparison silently truncates at the
+                    // command's output cap, so any file bigger than that (a 397KB
+                    // composer.lock did) looked changed on a perfectly clean tree.
+                    const changed = await changedAgainstBase(cwd, base, manifestPath, signal)
+                    if (changed.aborted === true) return abortMessage()
+                    if (changed.problem !== undefined) {
+                        unsupported.push(`${manifestPath}（${changed.problem}）`)
+                        continue
+                    }
+                    // The base TEXT is only needed to list dependency entries, i.e.
+                    // for a `declared` manifest — lockfiles never need it.
+                    const show =
+                        treatment === 'declared'
+                            ? await runCommand({
+                                  argv: ['git', 'show', `${base}:${manifestPath}`],
+                                  cwd,
+                                  timeoutMs: 20_000,
+                                  maxOutputBytes: Math.max(config.maxManifestBytes * 2, 1_048_576),
+                                  ...(signal === undefined ? {} : { signal }),
+                              })
+                            : { aborted: false as const, exitCode: 1, stdout: '', stderr: '', argv: [], command: '', cwd, signal: null, durationMs: 0, timedOut: false }
                     if (show.aborted === true) return abortMessage()
                     // A non-zero exit here means "absent at base" (the ref itself was
                     // already verified above), i.e. a brand-new manifest whose every
                     // dependency is new.
                     const before = show.exitCode === 0 ? show.stdout : ''
-                    const diff = diffManifests({ path: manifestPath, before, after })
+                    const diff = diffManifests({ path: manifestPath, before, after, changed: changed.changed })
                     if (diff.problem !== undefined) unsupported.push(`${manifestPath}（${diff.problem}）`)
                     diffs.push(diff)
                 }
@@ -935,6 +951,7 @@ export function registerTools(
                     findings: AuditFinding[]
                     blocking: number
                     warning: number
+                    advisory: number
                     unclassified: number
                     dropped?: number
                     problem?: string
@@ -952,6 +969,7 @@ export function registerTools(
                             findings: [],
                             blocking: 0,
                             warning: 0,
+                            advisory: 0,
                             unclassified: 0,
                             problem: split.error,
                             durationMs: 0,
@@ -994,6 +1012,7 @@ export function registerTools(
                         `exit=${run.exitCode === null ? 'null' : run.exitCode}`,
                         `findings=${parsed.findings.length}`,
                         `block=${classified.blocking.length}`,
+                        `advisory=${classified.advisory.length}`,
                         `warn=${classified.warning.length}`,
                         `unclassified=${classified.unclassified.length}`,
                         ...(problem === undefined ? [] : [`problem=${problem}`]),
@@ -1008,6 +1027,7 @@ export function registerTools(
                         findings: parsed.findings,
                         blocking: classified.blocking.length,
                         warning: classified.warning.length,
+                        advisory: classified.advisory.length,
                         unclassified: classified.unclassified.length,
                         ...(parsed.dropped === undefined ? {} : { dropped: parsed.dropped }),
                         ...(problem === undefined ? {} : { problem }),
@@ -1055,6 +1075,11 @@ export function registerTools(
                     warnReasons.push('新增依赖未经人工审批（宿主关闭了 requireApprovalForNewDeps）：只报告')
                 }
                 if (problems.length > 0) warnReasons.push(`有 ${problems.length} 项未能判定（见下）`)
+                if (audits.some((audit) => (audit.advisory ?? 0) > 0)) {
+                    // Deprecations are a maintenance signal: reported, never a
+                    // block. A WARN (not PASS) so "clean" never hides them.
+                    warnReasons.push('审计报告里有 info 级提示（例如包已废弃 abandoned）：已列出，不阻断，但值得排期替换')
+                }
                 if (audits.some((audit) => audit.unclassified > 0)) {
                     warnReasons.push('审计报告里有未分类 severity 的条目：已列出但不阻断')
                 }
@@ -1269,7 +1294,7 @@ export function registerTools(
                               }`
                             : config.deps.auditCommands.map((command) => `\`${command}\``).join('、')
                     }`,
-                    `- 阻断 severity：${config.deps.auditSeverities.block.join('、') || '(空)'}；警告 severity：${config.deps.auditSeverities.warn.join('、') || '(空)'}（不在两者里的 severity 只报告，可用 "unknown" 显式纳入阻断）`,
+                    `- 阻断 severity：${config.deps.auditSeverities.block.join('、') || '(空)'}；警告 severity：${config.deps.auditSeverities.warn.join('、') || '(空)'}（不在两者里的 severity 只报告；"unknown" 代表"报告没说有多严重"，把它纳入阻断会连带影响未归类条目——废弃包（abandoned）用 info，不会被它命中）`,
                     `- 审计超时：${config.auditTimeoutMs}ms；清单上限：${config.maxManifestBytes} 字节`,
                     '',
                     '### 本次 mission 的门禁',
@@ -1371,6 +1396,46 @@ function resolveManifests(cwd: string, manifests: readonly string[], maxFiles: n
 }
 
 /** Whether a lockfile's declaring manifest differs from `base` (or is absent there). */
+/**
+ * Whether one path changed against a base revision, decided from GIT OBJECT IDS.
+ *
+ * Never compares captured text: `runCommand` bounds stdout, so a file larger than
+ * the bound arrives truncated and then "differs" from its own unchanged working
+ * copy. A 397KB `composer.lock` was reported as an orphan change on a clean tree
+ * for exactly this reason. Object ids are fixed-size, exact and cheap.
+ * @param cwd - the workspace.
+ * @param base - the base revision (already verified to resolve).
+ * @param path - the workspace-relative path.
+ * @param signal - cancellation.
+ * @returns `changed`, or a `problem` when git cannot answer (never a guess).
+ */
+async function changedAgainstBase(
+    cwd: string,
+    base: string,
+    path: string,
+    signal: AbortSignal | undefined,
+): Promise<{ changed: boolean; aborted?: boolean; problem?: string }> {
+    const baseBlob = await runCommand({
+        argv: ['git', 'rev-parse', '--verify', '--quiet', `${base}:${path}`],
+        cwd,
+        timeoutMs: 20_000,
+        ...(signal === undefined ? {} : { signal }),
+    })
+    if (baseBlob.aborted === true) return { changed: false, aborted: true }
+    if (baseBlob.exitCode !== 0) return { changed: true } // absent at base = new file
+    const workBlob = await runCommand({
+        argv: ['git', 'hash-object', '--', path],
+        cwd,
+        timeoutMs: 20_000,
+        ...(signal === undefined ? {} : { signal }),
+    })
+    if (workBlob.aborted === true) return { changed: false, aborted: true }
+    if (workBlob.exitCode !== 0) {
+        return { changed: false, problem: `无法计算工作区对象的 id（git hash-object 退出码 ${workBlob.exitCode ?? 'null'}）：无法判定是否变更` }
+    }
+    return { changed: baseBlob.stdout.trim() !== workBlob.stdout.trim() }
+}
+
 async function manifestChangedAgainstBase(
     cwd: string,
     base: string,

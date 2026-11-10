@@ -1,3 +1,26 @@
+## [未发布]
+
+### 修复 · 大锁文件在干净工作区被判"孤儿变更"（真实部署的假 BLOCK）
+
+`dependency_audit` 判断锁文件是否变更时，比的是 `git show base:<路径>` 的文本与工作区全文——
+而命令输出有上限（eng-core 默认 64KB）。一个 397KB 的 `composer.lock` 在 base 侧被截断，于是
+**它的全文与自己的截断副本"不同"**：干净工作区被判成"锁变了而 composer.json 没变"，直接 BLOCK。
+任何超过上限的文件（composer.lock / package-lock.json / Cargo.lock / go.sum）都会中招。
+
+现在变更判定改用 **git 对象 id**（`git rev-parse base:path` 与 `git hash-object path` 比较）：
+没有大小上限、不搬运内容、也不受编码/换行差异影响；真实变更照样被抓住（两条用例分别钉住
+"干净不报"与"改了必报"）。锁文件不再为了判变更去取全文。
+
+### 修复 · "包已废弃"被当成 unknown severity，被 block 列表连带阻断
+
+`composer audit` 的 `abandoned` 是**弃用通告**，不是 CVE；原来映射成 `unknown`，而一个为了
+"拦下无法识别严重度的漏洞"而写了 `block: ["high","critical","unknown"]` 的部署，会因此把三个
+废弃包当成阻断项（它们的 `advisories` 是空的）。
+
+现在 abandoned 记为 `info` 并单独成类：报告里列出、给出 WARN 理由（值得排期替换），
+**永不阻断**。doctor 与工具输出里关于 `"unknown"` 的建议文案也改准了——它指"报告没说有多严重"，
+不是"包被废弃"。
+
 ## [0.7.4] — 2026-11-10
 
 ### 修复 · 一条旧的"整 mission 作废"行会永久封杀该 mission 之后的所有提问
