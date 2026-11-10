@@ -2602,3 +2602,40 @@ test('the metrics window argument overrides the config and an unusable one is re
     const badMax = await orchestrate(fake, { action: 'metrics', maxInFlight: 1.5 })
     assert.match(badMax, /maxInFlight=1\.5 不可用（要求 1–200 的整数），已改用配置值 20/)
 })
+
+test('quality-pass: a PASS followed by a BLOCK in the same stage does not leave the stage', async () => {
+    // The fail-open this pins: the stage used to ask the store for "the newest
+    // PASS", so a passing run followed by a failing one still advanced — the last
+    // run, the one that describes the code, was ignored. The NEWEST verdict of any
+    // state must be the one that decides.
+    disposeHosts()
+    const cwd = tempWorkspace('orchestrator-pass-then-block-')
+    const stages = [
+        { id: 'impl', prompt: '实现', requiredPlugins: ['dsh-role-guard'], next: 'quality' },
+        {
+            id: 'quality',
+            prompt: '验证',
+            requiredPlugins: ['dsh-quality-gate'],
+            gate: { kind: 'quality-pass' },
+            onFail: 'impl',
+            next: 'delivery',
+        },
+        { id: 'delivery', prompt: '交付', requiredPlugins: ['dsh-evidence-gate'], gate: { kind: 'receipt' } },
+    ]
+    const fake = host({ cwd, config: { stages } })
+    const store = storeFor(cwd)
+    await orchestrate(fake, { action: 'start' })
+    const id = missionIdOf(cwd)
+    await orchestrate(fake, { action: 'advance', verdict: 'PASS' })
+
+    // PASS first…
+    await new Promise((resolve) => setTimeout(resolve, 5))
+    store.recordGate(id, { source: 'dsh-quality-gate', state: 'PASS', reason: 'first run', results: [] })
+    // …then a failing run in the same stage.
+    await new Promise((resolve) => setTimeout(resolve, 5))
+    store.recordGate(id, { source: 'dsh-quality-gate', state: 'BLOCK', reason: 'second run failed', results: [] })
+
+    const result = await orchestrate(fake, { action: 'advance', verdict: 'PASS' })
+    assert.match(result, /回退|impl|BLOCK/, `最新裁决是 BLOCK，不得晋级：${result}`)
+    assert.equal(stageFile(cwd, id, 'quality').state, 'failed', '阶段必须记为失败并回退')
+})

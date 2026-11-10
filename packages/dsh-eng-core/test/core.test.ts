@@ -18,6 +18,8 @@ import {
     pathMatchesPattern,
     renderSpecMarkdown,
     runCommand,
+    appendJsonl,
+    readJsonl,
     sha256,
     splitCommand,
     createLogger,
@@ -485,4 +487,30 @@ test('a design chapter that restates its own heading still parses (regression)',
     assert.equal(withHeading.cases.length, 1, 'the canonical form must parse')
     assert.deepEqual(withHeading.cases.map((testCase) => testCase.id), withoutHeading.cases.map((testCase) => testCase.id))
     assert.deepEqual(withHeading.cases[0]?.covers, ['AC-001'])
+})
+
+// --- appendJsonl：坏尾行不能吞掉下一条（2026-11-10 审查发现） ---------------------
+
+test('appendJsonl repairs a missing trailing newline instead of gluing the next row to it', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'io-jsonl-'))
+    const file = path.join(dir, 'ledger.jsonl')
+    // What a crash leaves behind: a partial last line, no newline.
+    fs.writeFileSync(file, '{"id":"a","ok":true}\n{"id":"b","partial":')
+    appendJsonl(file, { id: 'c', ok: true })
+
+    const rows = readJsonl<{ id: string }>(file)
+    assert.deepEqual(
+        rows.map((row) => row.id),
+        ['a', 'c'],
+        'the junk line stays isolated: the NEXT row is not swallowed with it',
+    )
+})
+
+test('appendJsonl writes exactly one line per row on a healthy file and on a new one', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'io-jsonl-ok-'))
+    const file = path.join(dir, 'ledger.jsonl')
+    appendJsonl(file, { id: 'a' })
+    appendJsonl(file, { id: 'b' })
+    assert.equal(fs.readFileSync(file, 'utf8'), '{"id":"a"}\n{"id":"b"}\n')
+    assert.deepEqual(readJsonl<{ id: string }>(file).map((row) => row.id), ['a', 'b'])
 })

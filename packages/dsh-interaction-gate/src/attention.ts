@@ -191,7 +191,26 @@ export interface AttentionRead {
 export function appendAttentionRow(file: string, row: AttentionRow): { ok: boolean; problem?: string } {
     try {
         ensureDir(path.dirname(file))
-        fs.appendFileSync(file, `${JSON.stringify(row)}\n`)
+        // Repair a missing trailing newline first: a crash leaves a partial last
+        // line and appending onto it makes BOTH rows unreadable (the reader skips
+        // malformed lines silently, so one new row disappears).
+        let prefix = ''
+        try {
+            const size = fs.statSync(file).size
+            if (size > 0) {
+                const fd = fs.openSync(file, 'r')
+                try {
+                    const last = Buffer.alloc(1)
+                    fs.readSync(fd, last, 0, 1, size - 1)
+                    if (last[0] !== 0x0a) prefix = '\n'
+                } finally {
+                    fs.closeSync(fd)
+                }
+            }
+        } catch {
+            // no file yet
+        }
+        fs.appendFileSync(file, `${prefix}${JSON.stringify(row)}\n`)
         return { ok: true }
     } catch (error) {
         return { ok: false, problem: `attention 写入失败（${file}）：${error instanceof Error ? error.message : String(error)}` }

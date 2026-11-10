@@ -19,14 +19,33 @@ function childScope(options: { withTools?: boolean; withPrompt?: boolean; reject
     const sections: { name: string; order: number; text: string | (() => string) }[] = []
     const effects: (() => void)[] = []
     let released = 0
-    const ctx: Record<string, unknown> = {
-        effect: (execute: () => (() => void) | void) => {
-            const disposer = execute()
-            if (typeof disposer === 'function') effects.push(disposer)
+    const services: Record<string, unknown> = {}
+    /**
+     * A cordis-shaped context: reading a service it did not `inject` THROWS
+     * ("cannot get property \"tools\" without inject"), and `get(name)` is the only
+     * way to read an optional one. The previous fake exposed plain properties,
+     * which is exactly why the plugin's `ctx.tools?.restrict` shipped broken:
+     * `team_delegate` failed with that very error at runtime and no test noticed.
+     */
+    const ctx = new Proxy<Record<string, unknown>>(
+        {
+            effect: (execute: () => (() => void) | void) => {
+                const disposer = execute()
+                if (typeof disposer === 'function') effects.push(disposer)
+            },
+            get: (name: string) => services[name],
         },
-    }
+        {
+            get: (target, key: string | symbol) => {
+                if (typeof key === 'string' && key in services) {
+                    throw new Error(`cannot get property "${key}" without inject`)
+                }
+                return target[key as string]
+            },
+        },
+    )
     if (options.withTools !== false) {
-        ctx['tools'] = {
+        services['tools'] = {
             restrict: (filter: unknown) => {
                 calls.push('restrict')
                 if (options.rejectRestrict !== undefined) throw options.rejectRestrict
@@ -38,7 +57,7 @@ function childScope(options: { withTools?: boolean; withPrompt?: boolean; reject
         }
     }
     if (options.withPrompt !== false) {
-        ctx['systemPrompt'] = {
+        services['systemPrompt'] = {
             section: (section: { name: string; order: number; text: string | (() => string) }) => {
                 calls.push('section')
                 sections.push(section)
@@ -91,7 +110,7 @@ test('the scope plugin enforces the filter and installs the persona in the child
 test('the scope plugin never throws on an absent capability, and never half-enforces silently (TC-803)', () => {
     // Nothing to enforce and nothing to crash: a bare composition is legal.
     assert.doesNotThrow(() => apply({}, { persona: '只读角色', allow: ['read'] }))
-    assert.doesNotThrow(() => apply({ tools: {}, systemPrompt: {} }, { persona: '只读角色', allow: ['read'] }))
+    assert.doesNotThrow(() => apply({ get: (name: string) => (name === 'tools' ? {} : name === 'systemPrompt' ? {} : undefined) }, { persona: '只读角色', allow: ['read'] }))
     assert.doesNotThrow(() => apply({}, 'not even an object'))
 
     // No filter, no section when nothing is declared.
@@ -102,7 +121,7 @@ test('the scope plugin never throws on an absent capability, and never half-enfo
 
     // A declared-but-EMPTY whitelist is not "no whitelist": the child must not
     // mount at all rather than run with everything the role excluded.
-    assert.throws(() => apply({ tools: { restrict: () => () => undefined } }, { allow: [] }), /empty tool whitelist/)
+    assert.throws(() => apply({ get: () => ({ restrict: () => () => undefined }) }, { allow: [] }), /empty tool whitelist/)
 
     // A deny-only role leans on the deny half (read-only roles do exactly this).
     const denyOnly = childScope()
@@ -112,20 +131,27 @@ test('the scope plugin never throws on an absent capability, and never half-enfo
     // A filter the host REJECTS must fail the child's start: swallowing it would
     // hand the child every tool the role excluded.
     assert.throws(
-        () => apply({ tools: { restrict: () => { throw new Error('unknown tool "nope"') } } }, { allow: ['nope'] }),
+        () => apply({ get: () => ({ restrict: () => { throw new Error('unknown tool "nope"') } }) }, { allow: ['nope'] }),
         /unknown tool "nope"/,
     )
     // …and a persona that fails to install only costs the persona (it cannot
     // widen authority), so the child still starts.
+    // `get()`-shaped on purpose: a property-shaped fake would make this pass
+    // trivially (the plugin never sees a prompt service at all), which is how the
+    // real "cannot get property without inject" failure stayed invisible.
     assert.doesNotThrow(() =>
         apply(
             {
-                tools: { restrict: () => () => undefined },
-                systemPrompt: {
-                    section: () => {
-                        throw new Error('duplicate section')
-                    },
-                },
+                get: (name: string) =>
+                    name === 'tools'
+                        ? { restrict: () => () => undefined }
+                        : name === 'systemPrompt'
+                          ? {
+                                section: () => {
+                                    throw new Error('duplicate section')
+                                },
+                            }
+                          : undefined,
             },
             { persona: '只读', allow: ['read'] },
         ),

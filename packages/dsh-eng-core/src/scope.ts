@@ -69,8 +69,17 @@ export interface ScopeConfig {
 
 /** The structural slice of the child context this plugin touches. */
 export interface ScopeContextLike {
-    tools?: { restrict?: (filter: { allow?: readonly string[]; deny?: readonly string[] }) => () => void }
-    systemPrompt?: { section?: (section: { name: string; order: number; text: string | (() => string) }) => () => void }
+    /**
+     * Read an OPTIONAL service.
+     *
+     * Property access (`ctx.tools`) is not usable here: cordis' service proxy
+     * throws for a service this plugin did not `inject`, and this plugin must not
+     * declare `inject` (a preset row whose inject cannot be satisfied stays
+     * pending forever, so the child would never mount). `get()` returns
+     * `undefined` instead — the only safe shape for "use it if the composition
+     * has it".
+     */
+    get?: (name: string) => unknown
     effect?: (execute: () => (() => void) | void) => void
 }
 
@@ -147,7 +156,16 @@ export function apply(ctx: ScopeContextLike, config: unknown = {}): void {
     // 1. Enforcement first: a whitelist that could not be applied must fail the
     //    child's start, not leave it running with the parent's tool surface.
     if (resolved.filter !== undefined) {
-        const restrict = ctx.tools?.restrict
+        // `ctx.get('tools')`, NOT `ctx.tools`: this plugin deliberately declares
+        // no `inject` (a preset row that mounts a plugin with an unsatisfiable
+        // inject stays pending forever), and cordis' service proxy THROWS on an
+        // un-injected property access — optional chaining does not help, because
+        // the getter itself throws:
+        //   role-guard-scope (dsh-eng-core/scope): cannot get property "tools" without inject
+        // That error made every role preset fail to mount, i.e. `team_delegate`
+        // unusable. `get()` is the documented way to read an optional service.
+        const tools = ctx.get?.('tools') as { restrict?: (filter: unknown) => () => void } | undefined
+        const restrict = tools?.restrict
         if (typeof restrict !== 'function') {
             warn('the child scope exposes no tools.restrict: the role tool whitelist cannot be enforced there')
         } else {
@@ -155,20 +173,23 @@ export function apply(ctx: ScopeContextLike, config: unknown = {}): void {
             // empty filters, and swallowing that would grant the child every
             // tool the rule excluded — the exact widening this plugin exists to
             // prevent.
-            disposers.push(restrict.call(ctx.tools, resolved.filter))
+            disposers.push(restrict.call(tools, resolved.filter))
         }
     }
 
     // 2. Identity second: a persona section never widens authority, so a
     //    capability-less or throwing prompt surface only costs the persona.
     if (resolved.persona !== '') {
-        const section = ctx.systemPrompt?.section
+        const prompt = ctx.get?.('systemPrompt') as
+            | { section?: (input: { name: string; order?: number; text: () => string }) => () => void }
+            | undefined
+        const section = prompt?.section
         if (typeof section !== 'function') {
             warn('the child scope exposes no systemPrompt.section: the role persona was not installed')
         } else {
             try {
                 disposers.push(
-                    section.call(ctx.systemPrompt, { name: PERSONA_SECTION, order: PERSONA_ORDER, text: () => resolved.persona }),
+                    section.call(prompt, { name: PERSONA_SECTION, order: PERSONA_ORDER, text: () => resolved.persona }),
                 )
             } catch (error) {
                 warn(`the role persona section was refused: ${error instanceof Error ? error.message : String(error)}`)

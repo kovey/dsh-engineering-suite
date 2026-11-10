@@ -51,10 +51,38 @@ export function writeJsonAtomic(file: string, value: unknown): void {
     writeTextAtomic(file, `${JSON.stringify(value, undefined, 2)}\n`)
 }
 
-/** Append one JSON object as a single JSONL line. */
+/**
+ * Append one JSON object as a single JSONL line.
+ *
+ * Repairs a missing trailing newline FIRST. A crash can leave a partial last
+ * line, and appending straight onto it glues the new row to the junk: `readJsonl`
+ * skips malformed lines *silently*, so one crash would quietly swallow the next
+ * evidence/gate/audit row as well. This ledger is what `mission_complete` reads,
+ * so a silently missing row is a delivery that fails for no visible reason (or,
+ * worse, a gate record nobody can see). The interaction outbox already did this;
+ * the shared writer now does it for every JSONL ledger in the suite.
+ * @param file - the JSONL file.
+ * @param value - the row to append.
+ */
 export function appendJsonl(file: string, value: unknown): void {
     ensureDir(path.dirname(file))
-    fs.appendFileSync(file, `${JSON.stringify(value)}\n`)
+    let prefix = ''
+    try {
+        const size = fs.statSync(file).size
+        if (size > 0) {
+            const fd = fs.openSync(file, 'r')
+            try {
+                const last = Buffer.alloc(1)
+                fs.readSync(fd, last, 0, 1, size - 1)
+                if (last[0] !== 0x0a) prefix = '\n'
+            } finally {
+                fs.closeSync(fd)
+            }
+        }
+    } catch {
+        // No file yet (or unreadable in a way the append below will report).
+    }
+    fs.appendFileSync(file, `${prefix}${JSON.stringify(value)}\n`)
 }
 
 /** Read a JSONL file into an array; malformed lines are skipped. */

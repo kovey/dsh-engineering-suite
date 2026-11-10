@@ -103,10 +103,15 @@ function evaluateFacts(gate: GateSpec, facts: GateFacts): GateOutcome {
             // `pass-or-warn` is the host's declarative conditional edge: a WARN
             // verdict may still leave the stage (docs.md §3.4 "只有非必需命令
             // 失败 = WARN：可以带风险交付"), while the default stays pass-only.
+            // The NEWEST verdict decides, not "the newest PASS anywhere in the
+            // history": searching for a PASS let a stage advance after a PASS that
+            // was followed by a BLOCK in the same round (the failing run is the
+            // one that describes the code). `lastGate` already sorts by checkedAt,
+            // so `latestRun` is the newest record of any state.
             const latestRun = facts.store.lastGate(facts.mission.id)
-            const gateRecord = facts.store.lastGate(facts.mission.id, { state: 'PASS' })
-            if (gateRecord === undefined && !(gate.verdict === 'pass-or-warn' && latestRun?.state === 'WARN')) {
-                const latest = facts.store.lastGate(facts.mission.id)
+            const gateRecord = latestRun
+            if (gateRecord === undefined || !(gateRecord.state === 'PASS' || (gate.verdict === 'pass-or-warn' && gateRecord.state === 'WARN'))) {
+                const latest = latestRun
                 return {
                     ok: false,
                     state: latest?.state ?? 'BLOCK',
@@ -117,7 +122,7 @@ function evaluateFacts(gate: GateSpec, facts: GateFacts): GateOutcome {
                     fix: '调用 quality_gate_run 执行宿主配置的确定性命令，修到 PASS，再调用 evidence_record 登记证据，然后重新调用 orchestrate。',
                 }
             }
-            const accepted = gateRecord ?? latestRun
+            const accepted = gateRecord
             if (accepted === undefined) {
                 return {
                     ok: false,

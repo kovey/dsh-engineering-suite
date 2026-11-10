@@ -1,5 +1,29 @@
 ## [未发布]
 
+### 修复 · `team_delegate` 全面不可用：scope 插件用属性访问读可选服务
+
+`dsh-eng-core/scope`（role preset 在子作用域里挂载的那个）写了 `ctx.tools?.restrict`。cordis 的
+service 代理在插件**没有 `inject`** 时会**取值即抛**（`cannot get property "tools" without inject`），
+可选链救不了它 —— 于是每个 role preset 都挂载失败，`team_delegate` 报错退出。scope 插件又**不能**
+声明 `inject`（预置行会永久 pending），唯一正确写法是 `ctx.get('tools')`。
+
+回归测试的替身也一并改了：原来是"普通属性"的假 ctx，所以这个 bug 一路绿灯；现在改为**属性访问即抛、
+只有 `get()` 可用**的代理，与真 cordis 行为一致。
+
+### 修复 · JSONL 台账的坏尾行会吞掉下一条记录
+
+`appendJsonl`（mission 证据/门禁、审计日志、部署台账、归档索引共用）直接追加，不检查末字节。
+崩溃留下的半行会把下一条新行粘在它后面，而 `readJsonl` **静默跳过**解析失败的行 —— 一次崩溃
+静默吞掉一条证据/门禁记录。现在追加前先补换行（交互 outbox 早就这么做，这次收敛到共享写入器，
+`decisions.jsonl` 与 attention sidecar 同样处理）。
+
+### 修复 · 编排的 quality-pass 取"历史里任意一条 PASS"
+
+阶段退出条件原先是"存在一条晚于进入时间的 PASS"，于是同一轮里先 PASS、后 BLOCK（最后一次才是
+描述这份代码的结果）仍然晋级。现在要求**最新一条**门禁记录本身是 PASS（`pass-or-warn` 时允许 WARN）。
+
+## [未发布]
+
 ### 修复 · 大锁文件在干净工作区被判"孤儿变更"（真实部署的假 BLOCK）
 
 `dependency_audit` 判断锁文件是否变更时，比的是 `git show base:<路径>` 的文本与工作区全文——
