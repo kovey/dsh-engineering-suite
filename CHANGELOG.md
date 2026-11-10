@@ -1,3 +1,16 @@
+## [0.8.3] — 2026-11-10
+
+### 回退 · 撤掉 v0.8.2 引入的打包改动
+
+v0.8.2 加的 `files` 白名单、`prepack`/`prepare` 钩子、`scripts/verify-package.sh` 与 OPS 自检
+C16 全部撤回，根 `package.json` 回到 v0.8.2 之前的形态（无 `files`，`scripts` 只有
+`link-deps`/`build`/`typecheck`/`test`/`verify`）。
+
+原因：这些改动是围绕"安装产物里没有 dist"做出的，但那条链在当前部署里并不成立——tui profile
+解析到的插件来自共享层软链指向的本地检出，`dist` 由本地 `scripts/build-all.sh` 提供；宿主与
+`scripts/install-into-dsh.sh` 都不会在安装时执行 `scripts.build`。加这些既没解决问题，也偏离了
+"只做被要求的事"。根因另做调查。
+
 ## [0.8.2] — 2026-11-10
 
 ### 修复 · 发布产物缺 `dist`（v0.8.1 装不起来）
