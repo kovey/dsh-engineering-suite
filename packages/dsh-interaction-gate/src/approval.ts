@@ -44,6 +44,7 @@ import { CHAT_CHANNEL_NAME } from './chat-channel.js'
 import { APPROVAL_SOURCE } from './ledger.js'
 import type { ApprovalVia } from './config.js'
 import { AskRefusal, askThroughChannels, type AskDecision, type ToolDeps } from './tools.js'
+import { approvalRoutingOf } from './workspace-mapping.js'
 
 /** The host's closed outcome vocabulary (`@deepseek-ai/dsh-user-approval`). */
 export type ApprovalOutcome = 'allowed-once' | 'rejected' | 'cancelled' | 'unavailable'
@@ -199,6 +200,39 @@ export interface ApprovalAnswererOptions {
  * @param options - the IM channel name to ask through.
  * @returns what was registered, for the log and the doctor.
  */
+/**
+ * Whether THIS workspace routed its approvals to IM.
+ *
+ * `owned` is true when the calling workspace hits an `im.approvals` entry, or when
+ * no mapping is declared at all (the P1 configuration: `im.approvalChatId` is the
+ * only target, so the IM answerer is the intended one). An un-matched workspace
+ * under `refuse`/`local` does NOT belong here: refusing would make the approval
+ * undecidable even though the native surfaces (desktop, web TUI, terminal) are
+ * perfectly able to answer it — the plugin must get out of their way instead.
+ * @param deps - tool dependencies (config, stores, logger).
+ * @param request - the approval request (its agent names the session).
+ * @returns the decision plus a human-readable reason for the log.
+ */
+function approvalOwnershipOf(deps: ToolDeps, request: ApprovalRequestLike): { owned: boolean; reason: string } {
+    const agent = (request as { agent?: AgentLike }).agent
+    const cwd = sessionCwd(agent, '')
+    if (cwd === '') return { owned: true, reason: '会话没有声明工作区：沿用 P1 行为（IM 是唯一配置目标）' }
+    try {
+        const routing = approvalRoutingOf(cwd, deps.config.im)
+        if (!routing.configured) return { owned: true, reason: `工作区未声明 im.approvals：沿用 P1 行为（im.approvalChatId=${deps.config.im.approvalChatId || '(空)'}）` }
+        if (routing.matched !== undefined) return { owned: true, reason: `工作区命中 im.approvals[${routing.matched.index}]` }
+        return {
+            owned: false,
+            reason: `工作区未命中 im.approvals 且策略为 ${routing.policy}：这个工作区的审批不走 IM`,
+        }
+    } catch (error) {
+        // Reading the routing is pure (no I/O beyond the workspace path); a throw
+        // here is a defect, and the safe direction is to stay out of the way.
+        deps.logger?.warn(`approval/request：无法判定工作区归属（${describeError(error)}）：交还原生面`)
+        return { owned: false, reason: '归属无法判定' }
+    }
+}
+
 export function installApprovalAnswerer(
     ctx: unknown,
     deps: ToolDeps,
@@ -253,6 +287,29 @@ export function installApprovalAnswerer(
         if (signal !== undefined && signal !== null && (signal as AbortSignal).aborted === true) {
             deps.logger?.info('approval/request：请求已被中止（signal.aborted），直接返回 cancelled，不发出任何卡片')
             return 'cancelled'
+        }
+
+        // --- ownership: only take over what this workspace routed to IM --------
+        //
+        // The official surfaces answer `approval/request` themselves: the TUI in
+        // the terminal, and — through `dsh-api-remotes`, which exposes the same
+        // waterfall to clients — the desktop app and the web TUI. A plugin that
+        // `prepend`s an answerer for EVERY request hijacks those: the local UI
+        // never gets to render the approval. So the takeover is scoped to the
+        // workspaces the operator routed here (`im.approvals` hit), and an
+        // un-migrated workspace with no mapping at all keeps the P1 behaviour
+        // (IM is the only configured target, so it owns the seam).
+        const ownership = approvalOwnershipOf(deps, request)
+        if (!ownership.owned) {
+            // `only` promised "IM or nobody decides": deferring to the native
+            // surfaces would break that promise just as surely as answering here
+            // would break `local`. Every other mode defers.
+            if (mode === 'only') {
+                deps.logger?.warn(`approval/request：${ownership.reason}，但 approvalVia=only（不回落）→ unavailable`)
+                return 'unavailable'
+            }
+            deps.logger?.info(`approval/request：${ownership.reason} → 交还原生面（desktop / web TUI / 本地终端）`)
+            return await relay()
         }
 
         const built = approvalQuestionOf(request)

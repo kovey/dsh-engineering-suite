@@ -950,6 +950,27 @@ unavailable`。所以本插件在 `approvalVia != off` 时用 **`{ prepend: true
 而不是偷偷用自己的排除集（这正是在这之前会产生的"永久假 stale"）。另有测试断言 `kb_status`、`scripts/kb.mjs`、
 一致性总览三处对同一状态给出一致结论，防止三个界面各说各话。
 
+### 5.27 审批与提问的"面"（surfaces）：IM / TUI / desktop / web TUI
+
+官方把**审批**与**自由文本提问**拆成两个接缝：`approval/request`（waterfall，四词结果
+`allowed-once | rejected | cancelled | unavailable`）与 `user-questions/request`（绑定官方
+`ask_user_question` 工具调用的 `callId`）。`dsh-api-remotes` 把**两者都**暴露给客户端，因此
+**desktop 与 web TUI 本身就能回答审批**；`dsh-client-ui-approval` / `dsh-client-ui-user-questions`
+是客户端的渲染侧；`dsh-sdk-jsonrpc-server`、`dsh-acp` 是另外两个应答者，都先判归属
+（`ownsAgent` / `ownedRecord`）。
+
+本套件在这张图里的位置：
+
+- **审批**：`dsh-interaction-gate` 以 `{prepend:true}` 注册应答者，但**只在工作区被路由到 IM 时接管**
+  （命中 `im.approvals`，或根本没有声明映射 = P1 行为）；未命中时一律 `next()`，把审批交还原生面。
+  这是一切的前提：一个对**所有**请求 `prepend` 的插件会抢走 desktop / web TUI / 终端的 UI。
+  `im.approvalVia=only` 是例外——它承诺"IM 或无人决定"，所以未命中时返回 `unavailable` 而不回落。
+- **自由文本提问**：`interaction_ask` 走本套件自己的通道注册表（`chat-interaction` = IM，本地通道 = TUI）。
+  我们**不**占用 `user-questions`：它的 `callId` 必须对应一次真实的 `ask_user_question` 调用，
+  拿它承载插件自己的提问等于伪造一次从未发生的工具调用。有一条源码扫描用例钉住"零引用"。
+- **新增一个面**：为它写一个通道适配器并加进 `im.channels` 顺序，调用方不用改。当前具名的面：
+  `im`（chat-interaction 通道）与 `host-approval`（原生审批面：终端 / desktop / web TUI）。
+
 ## 6. 为什么这样切分
 
 - **一个关注点一个插件**：门禁可以单独失效（例如先只上 quality-gate），不影响其它环节。

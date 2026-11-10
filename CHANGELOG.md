@@ -1,5 +1,22 @@
 ## [未发布]
 
+### 修复 · IM 审批应答者会抢走 desktop / web TUI 的审批
+
+核实官方实现后的事实：`dsh-api-remotes` 把 `approval/request`（waterfall）与
+`user-questions/request` 都暴露给客户端，所以 **desktop 与 web TUI 本来就能回答审批**；
+`dsh-sdk-jsonrpc-server`、`dsh-acp` 也是应答者，并且都先判归属。而我们的应答者 `prepend` 且
+**不看归属**——它会替所有请求作答，本地 UI 永远轮不到渲染。
+
+现在接管范围收窄到"这个工作区被路由到 IM"（命中 `im.approvals`，或压根没声明映射 = P1 行为）：
+未命中一律 `next()`，把审批交还原生面（desktop / web TUI / 终端）。`approvalVia=only` 例外——
+它承诺"IM 或无人决定"，未命中时返回 `unavailable`，不静默回落。
+
+另外明确一件事并写成源码用例：我们**不**占用 `user-questions` 接缝（它的 `callId` 必须对应真实
+的 `ask_user_question` 调用，拿它承载插件提问等于伪造工具调用）。自由文本提问仍走
+`chat-interaction`，审批才走共享接缝。新增面只需一个通道适配器 + `im.channels` 里的一个值。
+
+## [未发布]
+
 ### 变更 · 本套件的全部产物收进 `<repo>/.dsh/engineering-suite/`（从根上消掉"运行时文件被当成政策"）
 
 `.dsh/` 是**共用**目录：chat-interaction 在里面写 `chat-history/`、`feishu-cards/`、`feishu-*.json`、

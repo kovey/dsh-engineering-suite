@@ -283,3 +283,101 @@ test('TC-1029 an OLD mission-wide supersede row must not close questions asked l
     assert.equal(later?.state, 'open', '后来才问的不受老行影响')
     assert.equal(later?.stale, undefined, '也不该被标成过期')
 })
+
+test('TC-1121/1123/1125 ownership: an UN-MAPPED workspace defers to the native surfaces', async () => {
+    // desktop / web TUI answer `approval/request` themselves (dsh-api-remotes
+    // exposes the waterfall to clients), so a plugin that prepends an answerer for
+    // EVERY request hijacks their UI. The takeover is scoped to workspaces routed
+    // to IM; everything else must call next().
+    const cwd = tempWorkspace('ownership-defer-')
+    const cases: { policy: string; mode: string }[] = [
+        { policy: 'refuse', mode: 'fallback' },
+        { policy: 'local', mode: 'fallback' },
+    ]
+    for (const entry of cases) {
+        const fake = createFakeHost({ cwd: tempWorkspace('ownership-defer-') })
+        const channel = scriptedChannelOf('chat-interaction')
+        apply(fake.ctx as never, {
+            logFile: path.join(cwd, 'log.log'),
+            askTimeoutMs: 1_000,
+            im: {
+                approvalVia: entry.mode,
+                approvalChatId: APPROVAL_CHAT,
+                approvers: [ALICE],
+                approversFile: path.join(cwd, 'no-such.txt'),
+                approvals: [{ workspace: '/definitely/elsewhere', chatId: 'oc_other' }],
+                unmappedWorkspace: entry.policy,
+            },
+        })
+        const registry = (fake.ctx as { get: (n: string) => unknown }).get('interaction') as { register: (c: unknown) => () => void }
+        fake.effects.push(registry.register(channel.channel))
+
+        let delegated = 0
+        const outcome = await fake.waterfall(
+            'approval/request',
+            { agent: fake.agent, toolName: 'deploy_run', callId: 'c-1', reason: '批准部署' },
+            () => {
+                delegated += 1
+                return 'allowed-once'
+            },
+        )
+        assert.equal(outcome, 'allowed-once', `未映射工作区必须交还原生面（policy=${entry.policy}）`)
+        assert.equal(delegated, 1, 'next() 必须被调用一次')
+        assert.equal(channel.waits(), 0, 'IM 不能问（一张卡都不该发）')
+    }
+})
+
+test('TC-1121 a MAPPED workspace is owned by IM: it answers and never delegates', async () => {
+    const cwd = tempWorkspace('ownership-owned-')
+    const fake = createFakeHost({ cwd })
+    const channel = scriptedChannelOf('chat-interaction')
+    apply(fake.ctx as never, {
+        logFile: path.join(cwd, 'log.log'),
+        askTimeoutMs: 2_000,
+        im: {
+            approvalVia: 'fallback',
+            approvalChatId: APPROVAL_CHAT,
+            approvers: [ALICE],
+            approversFile: path.join(cwd, 'no-such.txt'),
+            approvals: [{ workspace: path.resolve(cwd), chatId: APPROVAL_CHAT, approvers: [ALICE] }],
+        },
+    })
+    const registry = (fake.ctx as { get: (n: string) => unknown }).get('interaction') as { register: (c: unknown) => () => void }
+    fake.effects.push(registry.register(channel.channel))
+
+    let delegated = 0
+    const running = fake.waterfall(
+        'approval/request',
+        { agent: fake.agent, toolName: 'deploy_run', callId: 'c-1', reason: '批准部署' },
+        () => {
+            delegated += 1
+            return 'rejected'
+        },
+    )
+    for (let index = 0; index < 1_000 && channel.waits() < 1; index += 1) await sleep(1)
+    assert.ok(channel.waits() >= 1, '命中的工作区应当由 IM 提问')
+    channel.answer('allowed-once', ALICE, APPROVAL_CHAT)
+
+    assert.equal(await running, 'allowed-once')
+    assert.equal(delegated, 0, 'mapped 工作区不该把问题再交给原生面（避免双问）')
+})
+
+test('TC-1126 the plugin never squats on the official user-questions seam', () => {
+    // `userQuestions.ask()` requires a `callId` that belongs to the official
+    // `ask_user_question` tool call (the session log reconstructs it). Using it for
+    // our own questions would fabricate a tool call that never happened, so the
+    // plugin must not touch that seam at all — instead of pretending we render the
+    // client question panel, we say plainly that free-form questions stay on
+    // chat-interaction and only APPROVALS use the shared seam.
+    // `node --test` runs with the PACKAGE as cwd, so resolve from this file.
+    const src = path.join(path.dirname(new URL(import.meta.url).pathname), '..', 'src')
+    const offenders: string[] = []
+    for (const entry of fs.readdirSync(src)) {
+        if (!entry.endsWith('.ts')) continue
+        const text = fs.readFileSync(path.join(src, entry), 'utf8')
+        // Comments may legitimately explain WHY we do not use it.
+        const code = text.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '')
+        if (/\buserQuestions\b/.test(code)) offenders.push(entry)
+    }
+    assert.deepEqual(offenders, [], `interaction-gate 不得引用官方 userQuestions 接缝：${offenders.join(', ')}`)
+})
