@@ -372,6 +372,20 @@ printf 'new\n' > "$CONFLICT/.dsh/engineering-suite/releases.jsonl"
 expect_rc 2 "a conflict refuses instead of overwriting" bash "$ROOT/scripts/migrate-to-engineering-suite.sh" --workspace "$CONFLICT" --apply
 [ "$(cat "$CONFLICT/.dsh/releases.jsonl")" = "old" ] && pass "the conflict left the source untouched" || fail "the conflict modified the source"
 
+section "C16 — verify-package: the tarball must carry every package's dist"
+bash "$ROOT/scripts/verify-package.sh" >/dev/null 2>&1 && pass "打包产物含 16 个包的 dist" || fail "打包产物缺 dist"
+if python3 -c '
+import json, sys, pathlib
+data = json.loads(pathlib.Path(sys.argv[1]).read_text())
+files = data.get("files") or []
+assert files, "root package.json must declare a files whitelist, or npm falls back to .gitignore and drops dist/"
+assert any(entry == "packages" or entry.startswith("packages/") for entry in files), "files must cover packages/"
+' "$ROOT/package.json"; then
+  pass "根 package.json 声明了覆盖 packages 的 files 白名单"
+else
+  fail "根 package.json 没有覆盖 packages 的 files 白名单（npm 会按 .gitignore 丢掉 dist）"
+fi
+
 section "summary"
 if [ "$FAILURES" = "0" ]; then
   printf '  \033[32mOPS SELFTEST GREEN\033[0m — every finding above is still refused.\n'

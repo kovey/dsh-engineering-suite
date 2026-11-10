@@ -14,5 +14,18 @@
     "test": "bash scripts/test-all.sh",
     "verify": "bash scripts/verify.sh"
   },
-  "license": "Apache-2.0"
+  "license": "Apache-2.0",
+  "files": [
+    "packages",
+    "scripts",
+    "docs",
+    "docs.md",
+    "CHANGELOG.md",
+    "README.md",
+    "UPGRADE.md",
+    "pnpm-workspace.yaml",
+    "!packages/*/src",
+    "!packages/*/test",
+    "!packages/*/tsconfig.json"
+  ]
 }

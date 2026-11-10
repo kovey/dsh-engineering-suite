@@ -971,6 +971,19 @@ unavailable`。所以本插件在 `approvalVia != off` 时用 **`{ prepend: true
 - **新增一个面**：为它写一个通道适配器并加进 `im.channels` 顺序，调用方不用改。当前具名的面：
   `im`（chat-interaction 通道）与 `host-approval`（原生审批面：终端 / desktop / web TUI）。
 
+### 5.28 发布产物必须带构建产物（`.gitignore` 会把 `dist/` 吃掉）
+
+npm 决定"打包带什么"的顺序是：`files` 白名单 → `.npmignore` → **`.gitignore`**。根 `package.json`
+原先没有 `files`，于是继承了 `.gitignore` 里的 `dist/`：`npm pack` 出来的 tarball 只有
+`packages/*/src`，而每个包的 `main` 是 `./dist/index.js` —— **装上去加载不了**（v0.8.1 就是这样：
+安装副本里 `packages/*/` 有 `src`、没有 `dist`）。
+
+- 根 `package.json` 的 `files` 用**目录 + 否选**（`packages` 加上 `!packages/*/src` 等）：
+  npm 的嵌套 glob（`packages/*/dist/` 这种）不会按预期匹配，这一点是实测出来的；
+- `scripts/verify-package.sh` 读 `npm pack --dry-run --json` 的清单，断言每个包的 `dist/` 里
+  至少有一个 `.js`，并断言产物里**没有** `src`/`test`（发布不该带源码与测试）；
+- OPS 自检 C16 钉住这条，避免再次发布一个"装不起来"的版本。
+
 ## 6. 为什么这样切分
 
 - **一个关注点一个插件**：门禁可以单独失效（例如先只上 quality-gate），不影响其它环节。
