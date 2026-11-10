@@ -1,3 +1,20 @@
+## [0.8.2] — 2026-11-10
+
+### 修复 · 发布产物缺 `dist`（v0.8.1 装不起来）
+
+npm 决定打包内容的三级优先级是 `files` 白名单 → `.npmignore` → **`.gitignore`**。根 `package.json`
+原先没有 `files`，于是继承了 `.gitignore` 里的 `dist/`：tarball 里只有 `packages/*/src`，而每个包的
+`main` 都是 `./dist/index.js` —— 安装副本**加载不了**，重启也修不好（那份代码根本跑不起来）。
+
+- 根 `package.json` 增加 `files`：用**目录 + 否选**（`packages` 与 `!packages/*/src` 等）。
+  npm 的嵌套 glob（`packages/*/dist/` 这种写法）**不会**按预期匹配，这一点是实测出来的；
+- 新增 `scripts/verify-package.sh`：读 `npm pack --dry-run --json` 的清单，断言每个包的 `dist/`
+  至少有一个 `.js`，并断言产物里没有 `src`/`test`；缺失时非零退出并点名；
+- OPS 自检 **C16** 钉住"产物带 dist"与"根 manifest 声明覆盖 `packages` 的 `files`"；
+- `docs/ARCHITECTURE.md §5.28` 记录这条优先级规则与 glob 陷阱。
+
+打包清单实测：**82 → 770 个文件**，含 16 个包的 `dist`（171 个 `.js`），`src`/`test` 为 0。
+
 ## [0.8.1] — 2026-11-10
 
 ### 修复 · shell 分析器遇管道符崩溃（含引号内的竖线）
