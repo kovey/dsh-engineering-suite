@@ -1,3 +1,15 @@
+## [未发布]
+
+### 修复 · 安装只拷文件不构建时仍然没有 dist
+
+`files` 白名单只能包含**打包那一刻已存在**的 `dist`。v0.8.2 的 tarball 是对的，但实际安装出来的
+副本（`~/.dsh/profiles/tui/node_modules/dsh-engineering-suite`）仍然只有 `src`、没有 `dist`，
+于是运行的还是旧代码（`standards_status` 一直在找 `.dsh/standards.json`）。
+
+根 `package.json` 增加两个 npm 生命周期钩子：`prepack`（`npm pack`/`publish` 前构建）与
+`prepare`（从目录/git 安装后构建）。`scripts/verify-package.sh` 增加断言：根 manifest 必须同时
+有覆盖 `packages` 的 `files` 与这两个钩子；并容忍 `prepack` 的构建输出出现在 pack 清单之前。
+
 ## [0.8.2] — 2026-11-10
 
 ### 修复 · 发布产物缺 `dist`（v0.8.1 装不起来）

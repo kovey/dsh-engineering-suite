@@ -32,7 +32,11 @@ process.stdin.on("end", () => {
     const path = require("node:path")
     let parsed
     try {
-        parsed = JSON.parse(raw)
+        // `prepack` runs the build before packing, and its output lands on stdout
+        // ahead of the manifest. Keep the last top-level JSON array instead of
+        // assuming the stream starts with `[`.
+        const start = raw.indexOf("\n[")
+        parsed = JSON.parse(raw.trimStart().startsWith("[") ? raw : raw.slice(start + 1))
     } catch (error) {
         console.error(`verify-package: 清单不是合法 JSON（${error.message}）`)
         process.exit(1)
@@ -52,6 +56,32 @@ process.stdin.on("end", () => {
         else present += hits.length
     }
     const sourceFiles = files.filter((file) => /^packages\/[^/]+\/(src|test)\//.test(file))
+
+    // The whitelist alone is not enough: it can only include a dist that EXISTS at
+    // pack time. An install that copies files without building therefore ships a
+    // package whose main (./dist/index.js) is missing - exactly what happened with
+    // v0.8.1, and again with the v0.8.2 install that only copied the tree. The
+    // lifecycle hooks make npm itself build: prepack before packing, prepare after
+    // installing from a folder/git dependency.
+    let manifest
+    try {
+        manifest = JSON.parse(fs.readFileSync(path.join(process.cwd(), "package.json"), "utf8"))
+    } catch (error) {
+        console.error(`verify-package: 读不到根 package.json（${error.message}）`)
+        process.exit(1)
+    }
+    const scripts = manifest.scripts || {}
+    const missingHooks = ["prepack", "prepare"].filter((hook) => typeof scripts[hook] !== "string" || !scripts[hook].includes("build-all"))
+    if (missingHooks.length > 0) {
+        console.error(`verify-package: 根 package.json 缺少构建钩子 ${missingHooks.join(" / ")}（应执行 bash scripts/build-all.sh）`)
+        console.error("后果：files 白名单只能包含打包那一刻已存在的 dist；安装只拷文件而不构建时，main 指向的 dist/index.js 不存在，装上去加载不了。")
+        process.exit(1)
+    }
+    const patterns = manifest.files || []
+    if (!patterns.some((entry) => entry === "packages" || entry.startsWith("packages/"))) {
+        console.error("verify-package: 根 package.json 的 files 没有覆盖 packages（npm 会回退到 .gitignore 并丢掉 dist）")
+        process.exit(1)
+    }
 
     if (missing.length > 0) {
         console.error(`verify-package: ${missing.length} 个包在打包产物里没有 dist（main 指向 ./dist/index.js，装上去无法加载）：`)
