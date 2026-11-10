@@ -1967,3 +1967,32 @@ test('TC-1146 reviewChannel=approval 时 questions 不被调用', async () => {
     await fake.runTool('spec_approve', {})
     assert.equal(asked.length, 0, 'approval 通道下不得走 questions')
 })
+
+test('TC-1151 a LONG specification reaches the card WHOLE (no arbitrary 24k cut)', async () => {
+    // The cap used to be 24_000 characters — my own invention, not a host limit —
+    // and it truncated silently, so a reviewer could approve a document they only
+    // partly saw. The official seam has no length limit; this asserts a 60KB spec
+    // arrives intact.
+    // 200 criteria x ~170 chars ≈ 34KB: above the OLD 24k cut, below the new bound.
+    const body = '服务在端口被占用时启动失败并以退出码 1 结束，同时把占用端口的进程号写进日志，方便运维定位。'.repeat(3)
+    const long = Array.from({ length: 200 }, (_, index) => `${index + 1} ${body}`)
+    const { fake, asked } = questionsHost({ answer: answerWith(['通过']) })
+    await fake.runTool('spec_create', { ...DRAFT, acceptanceCriteria: long })
+    await fake.runTool('spec_approve', {})
+    const detail = (asked[0] as { questions: { detail?: string }[] }).questions[0]?.detail ?? ''
+    assert.ok(detail.length > 24_000, `正文必须完整送达（实际 ${detail.length} 字符）`)
+    assert.match(detail, /200 服务在端口被占用/, '最后一条验收标准也要在卡里')
+    assert.equal(detail.includes('正文过长'), false, '未超上限时不得出现截断提示')
+})
+
+test('TC-1152 when the bound DOES bite, the card says so and names the full document', async () => {
+    // 1,600 criteria x ~170 chars ≈ 270KB: over the 200k sanity bound on purpose.
+    const body = '服务在端口被占用时启动失败并以退出码 1 结束，同时把占用端口的进程号写进日志，方便运维定位。'.repeat(3)
+    const huge = Array.from({ length: 1_600 }, (_, index) => `${index + 1} ${body}`)
+    const { fake, asked } = questionsHost({ answer: answerWith(['通过']) })
+    await fake.runTool('spec_create', { ...DRAFT, acceptanceCriteria: huge })
+    await fake.runTool('spec_approve', {})
+    const detail = (asked[0] as { questions: { detail?: string }[] }).questions[0]?.detail ?? ''
+    assert.match(detail, /正文过长/, '截断必须显式可见')
+    assert.match(detail, /\.dsh\/.*\.md|specs\//, '并且指出完整文档位置')
+})

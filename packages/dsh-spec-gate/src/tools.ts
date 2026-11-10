@@ -2049,8 +2049,23 @@ function callIdOf(context: unknown): string | undefined {
     return typeof value === 'string' && value !== '' ? value : undefined
 }
 
-/** How much of the specification goes into the review card (markdown, rendered by clients). */
-const REVIEW_DETAIL_LIMIT = 24_000
+/**
+ * Sanity bound for the review card, NOT a host limit.
+ *
+ * Verified against the installed host: `user-questions` imposes no length limit —
+ * the schema only requires that `plan-review` carries a `detail` and that
+ * `intent.approve` names one of the options (`BAD_INTENT` otherwise) — and the
+ * client renders `detail` as markdown inside a scrollable card
+ * (`max-height: min(60vh,520px)`, `overflow-y:auto`). So the number below is this
+ * plugin's own ceiling, chosen far above any real specification (the largest
+ * spec in this repository is ~13KB) purely so a pathological payload cannot wedge
+ * a client.
+ *
+ * What it must NEVER do is truncate silently: a reviewer who approves a cut-off
+ * document did not review it. When the bound does bite, the card says so, names
+ * the omitted size and points at the file.
+ */
+const REVIEW_DETAIL_LIMIT = 200_000
 
 /**
  * Ask for approval through the host's structured-question seam.
@@ -2092,7 +2107,13 @@ async function reviewThroughQuestions(input: {
     ]
         .join('\n')
         .trim()
-        .slice(0, REVIEW_DETAIL_LIMIT)
+    // Never a silent cut: if the bound bites, the card SAYS it did and where the
+    // full document lives. Approving an unread document is the failure mode this
+    // whole channel exists to prevent.
+    const detail =
+        markdown.length <= REVIEW_DETAIL_LIMIT
+            ? markdown
+            : `${markdown.slice(0, REVIEW_DETAIL_LIMIT)}\n\n> ⚠️ 正文过长（${markdown.length} 字符），上面只显示前 ${REVIEW_DETAIL_LIMIT} 字符。完整内容见 ${mission.specPath ?? '规格文件'}；**在读完之前不要点通过**。`
     try {
         const answer = await input.questions.ask({
             agent: input.agent,
@@ -2103,12 +2124,12 @@ async function reviewThroughQuestions(input: {
                     id: `spec-review-${mission.id}`,
                     header: `规格审批 · 第 ${input.round} 轮`,
                     question: `《${mission.spec?.title ?? mission.title}》第 ${input.round} 轮送审：${approve}还是打回？`,
-                    detail: markdown,
+                    detail,
                     options: [
                         { label: approve, description: '按这份规格实现，并签发 mandate（写操作放行）' },
                         { label: '打回', description: '规格需要修改；可在下方说明要改什么' },
                     ],
-                    intent: { kind: 'plan-review', detail: markdown, approve },
+                    intent: { kind: 'plan-review', detail, approve },
                 },
             ],
         })

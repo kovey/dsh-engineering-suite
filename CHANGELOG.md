@@ -1,5 +1,20 @@
 ## [未发布]
 
+### 修复 · 评审卡不再静默截断规格正文（24k 是我拍的，不是官方限制）
+
+核实：`user-questions` **没有长度限制**（schema 只要求 `plan-review` 带 `detail`、`intent.approve`
+点名选项之一），客户端把 `detail` 当 markdown 渲染在**可滚动**卡片里——不会截断。所以之前那个
+`REVIEW_DETAIL_LIMIT = 24_000` 是本插件自己拍的，而且**截断时毫无提示**：人可能批准一份只看到
+一部分的规格。
+
+现在：上限提到 200k（只为挡住病态载荷，最大规格约 13KB），且**一旦真的触到上限，卡片里明说**
+"正文过长、只显示前 N 字符、完整内容见 <spec 路径>、读完之前不要点通过"。
+
+顺带修掉一个自己埋的缺陷：`detail` 变量算出来却没被使用（请求里仍传原始 `markdown`），
+使截断逻辑成了死代码——正是新增的 TC-1152 照出来的。
+
+## [未发布]
+
 ### 新增 · `spec_approve` 的 user-questions 评审通道（desktop / web TUI 与 TUI 对齐）
 
 TUI 里 `spec_approve` 能弹出规格与测试用例文档；web / desktop 之前只能看到一段 `reason` 文本
