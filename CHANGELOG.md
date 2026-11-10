@@ -1,3 +1,15 @@
+## [未发布]
+
+### 修复 · standards-gate 的配置路径与其它门禁同源
+
+`packages/dsh-standards-gate/cordis.patch.yml` 把 `standardsFile` / `baselineFile` 写死成
+`.dsh/` 下的字面量。宿主把这个**显式配置**传给插件，而显式值永远优先于代码里的默认值——所以
+v0.8.0 的"布局根"解析对这个插件**从来没生效**（即使代码里已经实现了 `standardsFileOf()`）。
+日志里打印的 `.dsh/standards.json` 就是 patch 传进来的值，与构建新旧、安装方式都无关。
+
+现在两项从 patch 中删除，路径回到与 quality-gate / spec-gate 等相同的来源（共享布局根：
+`.dsh/engineering-suite/` 优先，未迁移仓库回退 `.dsh/`），显式配置（项目 overlay 或 profile）仍然优先。
+
 ## [0.8.3] — 2026-11-10
 
 ### 回退 · 撤掉 v0.8.2 引入的打包改动

@@ -13,7 +13,5 @@
       config:
         enabled: true
         logFile: '~/.dsh/standards-gate.log'
-        standardsFile: .dsh/standards.json
-        baselineFile: .dsh/standards-baseline.json
         enforce: gate
         requireApprovalForBaseline: true
