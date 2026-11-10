@@ -980,11 +980,6 @@ npm 决定"打包带什么"的顺序是：`files` 白名单 → `.npmignore` →
 
 - 根 `package.json` 的 `files` 用**目录 + 否选**（`packages` 加上 `!packages/*/src` 等）：
   npm 的嵌套 glob（`packages/*/dist/` 这种）不会按预期匹配，这一点是实测出来的；
-- **光有白名单不够**：`files` 只能包含"打包那一刻已存在的" `dist`。安装如果只拷文件不构建
-  （实测：`~/.dsh/profiles/tui/node_modules/dsh-engineering-suite` 里 `src` 有、`dist` 没有），
-  `main` 指向的 `dist/index.js` 就不存在，运行的是旧代码。因此根 `package.json` 还声明两个
-  生命周期钩子：`prepack`（`npm pack` / `publish` 前构建）与 `prepare`（从目录或 git 安装后构建），
-  `verify-package.sh` 断言两者都存在。
 - `scripts/verify-package.sh` 读 `npm pack --dry-run --json` 的清单，断言每个包的 `dist/` 里
   至少有一个 `.js`，并断言产物里**没有** `src`/`test`（发布不该带源码与测试）；
 - OPS 自检 C16 钉住这条，避免再次发布一个"装不起来"的版本。

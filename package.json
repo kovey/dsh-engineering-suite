@@ -10,8 +10,6 @@
   "scripts": {
     "link-deps": "bash scripts/link-deps.sh",
     "build": "bash scripts/build-all.sh",
-    "prepack": "bash scripts/build-all.sh",
-    "prepare": "bash scripts/build-all.sh",
     "typecheck": "bash scripts/typecheck-all.sh",
     "test": "bash scripts/test-all.sh",
     "verify": "bash scripts/verify.sh"
