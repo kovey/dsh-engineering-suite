@@ -29,6 +29,7 @@ import {
     appendJsonl,
     formatTime,
     readText,
+    relativeRootFile,
     resolvePath,
     type GateRecord,
     type GateState,
@@ -79,8 +80,26 @@ export interface PlanRow {
     summary: string
 }
 
-/** Default ledger location; the resolved path follows `layout.rootDir`. */
-export const DEFAULT_PLAN_FILE = '.dsh/plan.jsonl'
+/**
+ * The default plan ledger: the EMPTY string means "follow the layout root" (see
+ * {@link planFileOf}), never a literal `.dsh/…` path.
+ */
+export const DEFAULT_PLAN_FILE = ''
+
+/**
+ * The workspace-relative path of the plan ledger.
+ *
+ * An explicit `planFile` always wins. Otherwise the default follows the LAYOUT
+ * ROOT: the namespace directory of a migrated repository, the legacy `.dsh/`
+ * root of an un-migrated one. A literal default appended a migrated
+ * repository's planning rows to a ledger `plan_status` never read.
+ * @param cwd - workspace root.
+ * @param config - resolved configuration (only `planFile` is read).
+ * @returns path relative to `cwd`, POSIX separators.
+ */
+export function planFileOf(cwd: string, config: Pick<SpecGateConfig, 'planFile'> & Partial<Pick<SpecGateConfig, 'layout'>>): string {
+    return config.planFile !== '' ? config.planFile : relativeRootFile(cwd, 'plan.jsonl', config.layout ?? {})
+}
 
 /**
  * Absolute path of the plan ledger for one workspace.
@@ -93,9 +112,7 @@ export const DEFAULT_PLAN_FILE = '.dsh/plan.jsonl'
  * @param config - resolved configuration (only `planFile` is read).
  */
 export function planLedgerFile(layout: Layout, config: Pick<SpecGateConfig, 'planFile'>): string {
-    return config.planFile === DEFAULT_PLAN_FILE
-        ? path.join(layout.rootDir, 'plan.jsonl')
-        : resolvePath(config.planFile, layout.cwd)
+    return config.planFile !== '' ? resolvePath(config.planFile, layout.cwd) : path.join(layout.rootDir, 'plan.jsonl')
 }
 
 /** The ledger path as the caller sees it (workspace-relative when possible). */

@@ -38,7 +38,7 @@
 import { randomBytes } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
-import { ensureDir, formatTime, mandateState, policyVersion, readText, type MissionStore } from 'dsh-eng-core'
+import { ensureDir, formatTime, mandateState, policyVersion, readText, relativeRootFile, type MissionStore } from 'dsh-eng-core'
 import { isRefusal, readLedger, type LedgerRow } from './ledger.js'
 
 /** The only two things a person may be asked to do. */
@@ -79,8 +79,29 @@ export const ATTENTION_KINDS: readonly AttentionKind[] = ['why', 'superseded', '
 /** The kinds that end a question (recorded once, with a reason). */
 export const CLOSING_KINDS: readonly AttentionKind[] = ['superseded', 'withdrawn']
 
-/** Default sidecar path, relative to the workspace (a runtime dir the doctor ignores). */
-export const DEFAULT_ATTENTION_FILE = '.dsh/interaction/attention.jsonl'
+/**
+ * The default sidecar location: the EMPTY string means "follow the layout root"
+ * (see {@link attentionFileOf}), never a literal `.dsh/…` path.
+ *
+ * The sidecar sits next to the decision ledger it annotates, so it belongs to
+ * the same trail root; a literal default split a migrated repository's rows
+ * between the namespace ledger and the legacy sidecar.
+ */
+export const DEFAULT_ATTENTION_FILE = ''
+
+/**
+ * The workspace-relative path of the attention sidecar.
+ *
+ * An explicit `attentionFile` always wins (profile). Otherwise the default
+ * follows the LAYOUT ROOT: the namespace directory of a migrated repository, the
+ * legacy `.dsh/` root of an un-migrated one.
+ * @param cwd - workspace root.
+ * @param config - the part of the resolved configuration that names the file.
+ * @returns path relative to `cwd`, POSIX separators.
+ */
+export function attentionFileOf(cwd: string, config: { attentionFile: string }): string {
+    return config.attentionFile !== '' ? config.attentionFile : relativeRootFile(cwd, 'interaction/attention.jsonl')
+}
 
 /** Default bound after which an unanswered question is stale (24 h). */
 export const DEFAULT_ATTENTION_MAX_AGE_MS = 24 * 60 * 60 * 1_000

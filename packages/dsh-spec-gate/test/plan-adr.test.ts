@@ -14,9 +14,10 @@ import test from 'node:test'
 import { MissionStoreRegistry, resolveLayout } from 'dsh-eng-core'
 import { createFakeHost, fakeAgent, runText, tempWorkspace, type FakeHost } from 'dsh-eng-core/testing'
 import { apply } from '../dist/index.js'
-import { DEFAULT_PLAN_FILE, planLedgerFile, readPlanLedger } from '../dist/plan-ledger.js'
-import { adrIndexPath, adrSlug, listAdrRecords, recordAdr } from '../dist/adr.js'
+import { planFileOf, planLedgerFile, readPlanLedger } from '../dist/plan-ledger.js'
+import { adrDirOf, adrIndexFileOf, adrIndexPath, adrSlug, listAdrRecords, recordAdr } from '../dist/adr.js'
 import { resolveConfig } from '../dist/config.js'
+import { sectionText } from '../dist/prompt.js'
 import { milestoneProblem } from '../dist/spec.js'
 
 const TEST_DESIGN = [
@@ -68,7 +69,7 @@ function missionIdOf(cwd: string): string {
 }
 
 /** The plan ledger's rows, read back through the plugin's own reader. */
-function ledger(cwd: string, file = DEFAULT_PLAN_FILE): ReturnType<typeof readPlanLedger> {
+function ledger(cwd: string, file = planFileOf(cwd, resolveConfig({}))): ReturnType<typeof readPlanLedger> {
     return readPlanLedger(path.join(cwd, file))
 }
 
@@ -271,7 +272,7 @@ test('plan_status names the missing ledger instead of pretending everything is f
 test('reading the ledger tolerates a truncated last line', async () => {
     const fake = host()
     await fake.runTool('spec_create', { ...DRAFT, milestone: 'v1.0' })
-    fs.appendFileSync(path.join(fake.cwd, DEFAULT_PLAN_FILE), '{"at":1,"kind":"spec-created","mission\n')
+    fs.appendFileSync(path.join(fake.cwd, planFileOf(fake.cwd, resolveConfig({}))), '{"at":1,"kind":"spec-created","mission\n')
     const read = ledger(fake.cwd)
     assert.equal(read.unparsable, 1)
     const text = runText(await fake.runTool('plan_status', {}))
@@ -504,7 +505,14 @@ test('the prompt tells the model about the ledger, plan_status and ADRs', () => 
     assert.match(text, /adr_record/)
     assert.match(text, /adr_list/)
     assert.match(text, /milestone/)
-    assert.match(text, /\.dsh\/plan\.jsonl/)
+    // The section is rendered without an assembly here, so the ledger default is
+    // described rather than guessed (it follows the layout root, and the root
+    // depends on whether the repository migrated).
+    assert.match(text, /\(布局根\)\/plan\.jsonl/)
+    // With the calling workspace known, the section names the file the writes
+    // actually reach — the un-migrated fallback is byte for byte `.dsh/plan.jsonl`.
+    const rendered = sectionText(resolveConfig({}), undefined, fake.cwd)
+    assert.match(rendered, /`\.dsh\/plan\.jsonl`/)
 })
 
 test('spec_amend validates the milestone before touching the specification', async () => {
@@ -566,7 +574,50 @@ test('a project file may not relocate the ledger or the ADR records outside the 
     assert.ok(fs.existsSync(path.join(cwd, '.dsh', 'adr', 'index.jsonl')), 'the index follows the ADR directory')
     assert.ok(fs.existsSync(path.join(cwd, '.dsh', 'plan.jsonl')), 'the ledger falls back to the profile layout')
     const effective = resolveConfig({ logFile: 'x.log' })
-    assert.equal(effective.adrDir, '.dsh/adr', 'the profile value is the one in force')
+    assert.equal(effective.adrDir, '', 'the default is "follow the layout root", not a literal path')
+    assert.equal(effective.planFile, '')
+    assert.equal(adrDirOf(cwd, effective), '.dsh/adr', 'the profile default is the one in force')
+})
+
+test('TC-1314 the plan ledger and the ADR records follow the layout root', async () => {
+    // `.dsh/` is shared with other tooling; the suite moved into
+    // `.dsh/engineering-suite/`. Literal defaults appended a migrated
+    // repository's planning rows and decisions to a legacy ledger/directory that
+    // `plan_status` and `adr_list` never read.
+    const cwd = tempWorkspace('spec-plan-namespace-')
+    fs.mkdirSync(path.join(cwd, '.dsh', 'engineering-suite'), { recursive: true })
+    const config = resolveConfig({})
+    assert.equal(config.planFile, '', 'the default is "follow the layout root"')
+    assert.equal(config.adrDir, '')
+    assert.equal(config.adrIndexFile, '')
+    assert.equal(planFileOf(cwd, config), '.dsh/engineering-suite/plan.jsonl')
+    assert.equal(adrDirOf(cwd, config), '.dsh/engineering-suite/adr')
+    assert.equal(adrIndexFileOf(cwd, config), '.dsh/engineering-suite/adr/index.jsonl')
+
+    const fake = host({ cwd })
+    assert.equal((await fake.runTool('spec_create', { ...DRAFT, milestone: 'v1.0' })).isError, false)
+    assert.equal(
+        (await fake.runTool('adr_record', { title: 'Namespace first', decision: 'Records follow the trail root.' })).isError,
+        false,
+    )
+    assert.ok(fs.existsSync(path.join(cwd, '.dsh', 'engineering-suite', 'plan.jsonl')), 'the ledger follows the layout root')
+    assert.ok(
+        fs.existsSync(path.join(cwd, '.dsh', 'engineering-suite', 'adr', '0001-namespace-first.md')),
+        'the ADR follows the layout root',
+    )
+    assert.equal(fs.existsSync(path.join(cwd, '.dsh', 'plan.jsonl')), false, 'the legacy ledger must not be written')
+    assert.equal(fs.existsSync(path.join(cwd, '.dsh', 'adr')), false, 'the legacy ADR directory must not be written')
+    assert.match(runText(await fake.runTool('plan_status', {})), /\.dsh\/engineering-suite\/plan\.jsonl/, 'plan_status reads it back')
+
+    // An un-migrated repository keeps today's path byte for byte.
+    const legacy = tempWorkspace('spec-plan-legacy-')
+    assert.equal(planFileOf(legacy, config), '.dsh/plan.jsonl')
+    assert.equal(adrDirOf(legacy, config), '.dsh/adr')
+    assert.equal(adrIndexFileOf(legacy, config), '.dsh/adr/index.jsonl')
+    // An explicit project/profile value still wins.
+    const explicit = resolveConfig({ planFile: 'ops/plan.jsonl', adrDir: 'ops/adr' })
+    assert.equal(planFileOf(cwd, explicit), 'ops/plan.jsonl')
+    assert.equal(adrDirOf(cwd, explicit), 'ops/adr')
 })
 
 test('two concurrent adr_record calls with one title never lose a decision document (race, regression)', async () => {

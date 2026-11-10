@@ -48,9 +48,21 @@ import {
     type Requirement,
     type SpecRecord,
 } from 'dsh-eng-core'
-import { DEFAULT_RELEASES_DIR, DEFAULT_RELEASES_FILE, type EvidenceGateConfig } from './config.js'
+import { RELEASES_LEDGER_NAME, RELEASES_NOTES_DIR_NAME, type EvidenceGateConfig } from './config.js'
 
 // --- where the artifacts live ------------------------------------------------
+
+/**
+ * The absolute path one release artifact is resolved to.
+ *
+ * An explicit path (`profile` or project) is resolved against the workspace,
+ * exactly like every `layout` option. `''` means "follow the layout root": the
+ * ledger and the notes belong to the same trail as the missions they describe, so
+ * a host that relocates `rootDir` keeps them together.
+ */
+function releasesArtifactOf(layout: Layout, configured: string, name: string): string {
+    return configured !== '' ? resolvePath(configured, layout.cwd) : path.join(layout.rootDir, name)
+}
 
 /**
  * Absolute path of the release ledger of one workspace.
@@ -60,16 +72,12 @@ import { DEFAULT_RELEASES_DIR, DEFAULT_RELEASES_FILE, type EvidenceGateConfig } 
  * resolved against the workspace root, exactly like every `layout` option.
  */
 export function releasesFileFor(layout: Layout, config: EvidenceGateConfig): string {
-    return config.releasesFile === DEFAULT_RELEASES_FILE
-        ? path.join(layout.rootDir, 'releases.jsonl')
-        : resolvePath(config.releasesFile, layout.cwd)
+    return releasesArtifactOf(layout, config.releasesFile, RELEASES_LEDGER_NAME)
 }
 
 /** Absolute directory the generated notes land in (default `<root>/releases`). */
 export function releasesDirFor(layout: Layout, config: EvidenceGateConfig): string {
-    return config.releasesDir === DEFAULT_RELEASES_DIR
-        ? path.join(layout.rootDir, 'releases')
-        : resolvePath(config.releasesDir, layout.cwd)
+    return releasesArtifactOf(layout, config.releasesDir, RELEASES_NOTES_DIR_NAME)
 }
 
 /**

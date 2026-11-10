@@ -19,6 +19,7 @@ import {
     renderSpecMarkdown,
     runCommand,
     resolveLayout,
+    relativeRootFile,
     loadProjectConfig,
     policyVersion,
     appendJsonl,
@@ -557,4 +558,21 @@ test('TC-1103 a migrated repo falls back to the legacy config file when the new 
     assert.equal(loaded.present, true, '旧根里的配置必须仍被读到')
     assert.equal(path.basename(path.dirname(loaded.file)), '.dsh', `来源应是旧根：${loaded.file}`)
     assert.deepEqual(loaded.value?.['commands'], [{ id: 't', command: 'true' }])
+})
+
+test('TC-1307 relativeRootFile follows the layout root (namespace first, legacy .dsh fallback)', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ns-relative-'))
+    fs.mkdirSync(path.join(dir, '.dsh'), { recursive: true })
+    // Not migrated: the legacy root keeps today's behaviour byte for byte.
+    assert.equal(relativeRootFile(dir, 'standards.json'), '.dsh/standards.json')
+    assert.equal(relativeRootFile(dir, 'specs/*.md'), '.dsh/specs/*.md')
+    // An explicit host override still wins over both.
+    assert.equal(relativeRootFile(dir, 'standards.json', { rootDir: 'trail' }), 'trail/standards.json')
+
+    fs.mkdirSync(path.join(dir, '.dsh', 'engineering-suite'), { recursive: true })
+    assert.equal(relativeRootFile(dir, 'standards.json'), '.dsh/engineering-suite/standards.json')
+    assert.equal(relativeRootFile(dir, 'interaction/outbox.jsonl'), '.dsh/engineering-suite/interaction/outbox.jsonl')
+    // A caller passing a trailing separator must not over-slice the root into a
+    // SIBLING of the workspace (the EISDIR bug this helper exists to prevent).
+    assert.equal(relativeRootFile(`${dir}${path.sep}`, 'standards.json'), '.dsh/engineering-suite/standards.json')
 })

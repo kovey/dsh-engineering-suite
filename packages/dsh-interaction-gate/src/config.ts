@@ -32,9 +32,8 @@
 
 import path from 'node:path'
 import { loadProjectConfig, resolveLayout, type Layout, type LayoutOptions } from 'dsh-eng-core'
-import { DEFAULT_ATTENTION_FILE, DEFAULT_ATTENTION_MAX_AGE_MS } from './attention.js'
+import { DEFAULT_ATTENTION_MAX_AGE_MS } from './attention.js'
 import type { ImChannelMode } from './channels.js'
-import { DEFAULT_OUTBOX_FILE } from './outbox.js'
 import {
     DEFAULT_UNMAPPED_WORKSPACE_POLICY,
     resolveWorkspaceApprovals,
@@ -306,13 +305,15 @@ export interface InteractionGateConfig {
      * Append-only ask outbox, relative to the workspace: the durability layer
      * around the send (`intent` → `sent`/`send-failed`/`dropped`). A runtime
      * file next to the ledger, so the doctor's ignore list already covers it.
+     * `''` (the default) follows the layout root — see {@link outboxFileOf}.
      */
     outboxFile: string
     /**
      * Append-only attention sidecar, relative to the workspace: ONLY what a
      * ledger row cannot carry — `whyYou`, the `superseded`/`withdrawn`
      * transitions and the pause interval (`pausedFrom`/`pausedTo`). Whether a
-     * question IS an attention stays derived from the ledger.
+     * question IS an attention stays derived from the ledger. `''` (the default)
+     * follows the layout root — see {@link attentionFileOf}.
      */
     attentionFile: string
     /**
@@ -664,8 +665,8 @@ export function resolveConfig(input: unknown, warn?: (message: string) => void):
         askTimeoutMs: timeout < MIN_ASK_TIMEOUT_MS || timeout > MAX_ASK_TIMEOUT_MS ? DEFAULT_ASK_TIMEOUT_MS : timeout,
         requireApproverList: bool(raw['requireApproverList'], false),
         ledgerFile: str(raw['ledgerFile'], ''),
-        outboxFile: str(raw['outboxFile'], DEFAULT_OUTBOX_FILE),
-        attentionFile: str(raw['attentionFile'], DEFAULT_ATTENTION_FILE),
+        outboxFile: str(raw['outboxFile'], ''),
+        attentionFile: str(raw['attentionFile'], ''),
         attentionMaxAgeMs:
             maxAge < MIN_ATTENTION_MAX_AGE_MS || maxAge > MAX_ATTENTION_MAX_AGE_MS ? DEFAULT_ATTENTION_MAX_AGE_MS : maxAge,
         notifyLevels: levels ?? (NOTIFY_LEVELS.filter((level) => level !== 'info') as NotifyLevel[]),

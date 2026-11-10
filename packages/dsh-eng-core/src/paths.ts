@@ -56,6 +56,18 @@ export function resolvePath(input: string, base: string): string {
  */
 export const SUITE_NAMESPACE = 'engineering-suite'
 
+/**
+ * The legacy (pre-namespace) trail directory.
+ *
+ * Written down exactly ONCE — here — because it is the fallback the whole suite
+ * shares. Every other module that needs a trail-anchored artifact asks
+ * {@link relativeRootFile} (or the layout) instead of spelling the directory
+ * again; `scripts/audit-dsh-paths.sh` fails on a new literal so the next plugin
+ * cannot reintroduce the "the default pointed at `.dsh/` while the file lives in
+ * the namespace" defect.
+ */
+export const LEGACY_TRAIL_DIR = '.dsh'
+
 /** Whether a directory exists (layout resolution must never throw). */
 function existsDir(target: string): boolean {
     try {
@@ -125,6 +137,33 @@ export function resolveLayout(cwd: string, options: LayoutOptions = {}): Layout 
         stateDir: resolvePath(options.stateDir ?? path.join(rootDir, 'state'), cwd),
         rolesDir: resolvePath(options.rolesDir ?? path.join(rootDir, 'roles'), cwd),
     }
+}
+
+/**
+ * The workspace-relative path of one artifact under the resolved layout root.
+ *
+ * Every repo-internal data path default in the suite goes through this: a
+ * migrated repository (one with `<cwd>/.dsh/engineering-suite/`) gets the
+ * namespace directory, an un-migrated one keeps `.dsh/`, and an explicit
+ * `layout.rootDir` still wins (it is resolved by {@link resolveLayout}).
+ *
+ * Returning the RELATIVE form is deliberate: a config default is quoted in
+ * reports and prompts, and the same value is also joined onto a caller's cwd.
+ * An absolute default would leak one process's workspace into another's report.
+ *
+ * `path.relative`, not `slice(cwd.length + 1)`: a caller passing a trailing
+ * separator over-slices by one character and the default silently becomes a
+ * SIBLING of the workspace (a standards gate then renamed its temp file onto the
+ * workspace directory itself: `EISDIR`).
+ * @param cwd - workspace root (a session's `header.cwd`).
+ * @param name - file or directory under the root; may contain sub-paths/globs.
+ * @param options - layout overrides (the host's `layout` config when known).
+ * @returns path relative to `cwd`, POSIX separators.
+ */
+export function relativeRootFile(cwd: string, name: string, options: LayoutOptions = {}): string {
+    const layout = resolveLayout(cwd, options)
+    const relative = path.relative(cwd, layout.rootDir)
+    return relative === '' ? name : `${relative.split(path.sep).join('/')}/${name}`
 }
 
 /**

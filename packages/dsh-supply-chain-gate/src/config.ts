@@ -21,7 +21,7 @@
  * @module dsh-supply-chain-gate/config
  */
 
-import { loadProjectConfig, type Layout, type LayoutOptions, type Logger } from 'dsh-eng-core'
+import { loadProjectConfig, relativeRootFile, type Layout, type LayoutOptions, type Logger } from 'dsh-eng-core'
 
 /** Secret-scanning settings. */
 export interface SecretScanConfig {
@@ -31,7 +31,14 @@ export interface SecretScanConfig {
     entropyThreshold: number
     /** Files larger than this are skipped (and reported as skipped). */
     maxFileBytes: number
-    /** Repository-owned allowlist, relative to the workspace root. */
+    /**
+     * Repository-owned allowlist, relative to the workspace root.
+     *
+     * `''` (the default) means "follow the layout root" — see
+     * {@link allowlistFileOf}. A literal `.dsh/secret-allow.json` default meant a
+     * migrated repository's exemptions were never read (every accepted value
+     * blocked again) while the file itself sat in the namespace directory.
+     */
     allowlistFile: string
     /**
      * Which finding severities BLOCK; every other severity is reported and makes
@@ -206,7 +213,7 @@ export function resolveConfig(input: unknown): SupplyChainGateConfig {
             // nothing at all. Both are "configured" but neither is a net.
             entropyThreshold: Math.min(8, Math.max(1, num(secretScan['entropyThreshold'], 4.0))),
             maxFileBytes: Math.max(1_024, Math.floor(num(secretScan['maxFileBytes'], 1024 * 1024))),
-            allowlistFile: str(secretScan['allowlistFile'], '.dsh/secret-allow.json'),
+            allowlistFile: str(secretScan['allowlistFile'], ''),
             blockSeverities: readSeverities(secretScan['blockSeverities']),
             scanWholeTree: bool(secretScan['scanWholeTree'], false),
         },
@@ -266,6 +273,23 @@ const SECRET_SCAN_OVERRIDABLE: readonly string[] = [
 
 /** Fields of `deps` a project file may set. */
 const DEPS_OVERRIDABLE: readonly string[] = ['manifests', 'auditCommands', 'auditSeverities']
+
+/**
+ * The workspace-relative path of the secret allowlist.
+ *
+ * An explicit `secretScan.allowlistFile` always wins (profile or project).
+ * Otherwise the default follows the LAYOUT ROOT, like every other plugin in the
+ * suite: `<rootDir>/secret-allow.json` — the namespace directory of a migrated
+ * repository, the legacy `.dsh/` root of an un-migrated one.
+ * @param cwd - workspace root.
+ * @param config - resolved plugin configuration.
+ * @returns path relative to `cwd`, POSIX separators.
+ */
+export function allowlistFileOf(cwd: string, config: Pick<SupplyChainGateConfig, 'secretScan' | 'layout'>): string {
+    return config.secretScan.allowlistFile !== ''
+        ? config.secretScan.allowlistFile
+        : relativeRootFile(cwd, 'secret-allow.json', config.layout)
+}
 
 /** The resolved configuration plus where it came from. */
 export interface EffectiveConfig {

@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url'
 import { MissionStoreRegistry } from 'dsh-eng-core'
 import { createFakeHost, fakeAgent, runText, tempWorkspace, type FakeHost } from 'dsh-eng-core/testing'
 import { apply, inject, name } from '../dist/index.js'
-import { resolveConfig, resolveEffectiveConfig } from '../dist/config.js'
+import { resolveConfig, resolveEffectiveConfig, allowlistFileOf } from '../dist/config.js'
 import {
     ENTROPY_RULE_ID,
     SECRET_RULES,
@@ -907,6 +907,26 @@ test('secret_scan honours the repository allowlist and reports the entry that su
     assert.equal(artifact.includes(GITHUB_TOKEN), false, 'an allowlisted secret is still never written raw')
 })
 
+test('TC-1315 a migrated repository reads its secret allowlist from the NAMESPACE root', async () => {
+    // `.dsh/` is shared with other tooling; the suite moved into
+    // `.dsh/engineering-suite/`. A literal legacy default meant a migrated
+    // repository's exemptions were never read — every accepted value blocked again.
+    const cwd = tempWorkspace('scg-allow-namespace-')
+    fs.mkdirSync(path.join(cwd, '.dsh', 'engineering-suite'), { recursive: true })
+    write(cwd, 'src/keys.ts', `export const aws = "${AWS_KEY_ID}"\n`)
+    write(
+        cwd,
+        '.dsh/engineering-suite/secret-allow.json',
+        `${JSON.stringify({ entries: [{ rules: ['aws-access-key-id'], note: 'AWS 文档示例值' }] }, undefined, 2)}\n`,
+    )
+    bindMission(cwd)
+    const fake = host(cwd, {})
+    const out = runText(await fake.runTool('secret_scan', { wholeTree: true }))
+    assert.match(out, /另有 1 处匹配被 allowlist 豁免/, out)
+    assert.match(out, /engineering-suite\/secret-allow\.json/, 'the report names the file the scan read')
+    assert.equal(fs.existsSync(path.join(cwd, '.dsh', 'secret-allow.json')), false, 'the legacy allowlist is not what was read')
+})
+
 test('secret_scan is honest when the workspace is not a git repository', async () => {
     const cwd = tempWorkspace('scg-nogit-')
     write(cwd, 'a.txt', 'nothing to see')
@@ -1318,7 +1338,15 @@ test('the profile defaults are the ones the suite documents', () => {
     const config = resolveConfig({})
     assert.equal(config.secretScan.enabled, true)
     assert.equal(config.secretScan.entropyThreshold, 4.0)
-    assert.equal(config.secretScan.allowlistFile, '.dsh/secret-allow.json')
+    assert.equal(config.secretScan.allowlistFile, '', 'the default is "follow the layout root", not a literal path')
+    // …which is `<rootDir>/secret-allow.json`: `.dsh/` before the migration, the
+    // namespace directory after it.
+    const legacy = tempWorkspace('scg-allowlist-legacy-')
+    assert.equal(allowlistFileOf(legacy, config), '.dsh/secret-allow.json')
+    const migrated = tempWorkspace('scg-allowlist-namespace-')
+    fs.mkdirSync(path.join(migrated, '.dsh', 'engineering-suite'), { recursive: true })
+    assert.equal(allowlistFileOf(migrated, config), '.dsh/engineering-suite/secret-allow.json')
+    assert.equal(allowlistFileOf(migrated, resolveConfig({ secretScan: { allowlistFile: 'ops/allow.json' } })), 'ops/allow.json')
     assert.equal(config.secretScan.scanWholeTree, false)
     assert.equal(config.deps.enabled, true)
     assert.equal(config.deps.requireApprovalForNewDeps, true)

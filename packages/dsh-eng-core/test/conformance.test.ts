@@ -376,6 +376,29 @@ test('新鲜度 stale：有规范阈值却没有基线（存量违规会被当�
     assert.match(dimension.detail, /没有基线/)
 })
 
+test('TC-1308 新鲜度：迁移后的仓库从命名空间目录读规范阈值与基线', () => {
+    // `.dsh/engineering-suite/` exists, so the layout root moved. The literal
+    // `.dsh/standards.json` default made this dimension report "no standards"
+    // for a repository whose files sit exactly where the standards gate reads
+    // them (`<layout.rootDir>/standards.json`).
+    const cwd = tempWorkspace('conformance-namespace-')
+    const namespace = path.join(cwd, '.dsh', 'engineering-suite')
+    fs.mkdirSync(namespace, { recursive: true })
+    const layout = resolveLayout(cwd)
+    const fixture: Fixture = { cwd, layout, store: new MissionStore({ layout }) }
+    seedMission(fixture, 'm-ns', { status: 'spec-approved', spec: approvedSpec(NOW), mandate: mandateOf(POLICY) })
+    seedGate(fixture, 'm-ns', { id: 'GATE-01' })
+    fs.writeFileSync(path.join(namespace, 'standards.json'), '{"rules":{}}\n')
+    fs.writeFileSync(path.join(namespace, 'standards-baseline.json'), '{"version":1,"frozenAt":"x","accepted":[]}\n')
+
+    const dimension = missionConformance(contextOf(fixture), 'm-ns').dimensions.freshness
+    const facts = dimension.facts.join('\n')
+    assert.match(facts, /规范基线与阈值都在/)
+    assert.match(facts, /engineering-suite\/standards\.json/)
+    assert.match(facts, /engineering-suite\/standards-baseline\.json/)
+    assert.doesNotMatch(dimension.detail, /没有基线/, 'both artifacts were found where the standards gate reads them')
+})
+
 test('新鲜度 unknown：没有门禁指纹时声明无法核对（不是 fresh）', () => {
     const fixture = workspace()
     seedMission(fixture, 'm-unknown-fresh', { status: 'spec-approved', spec: approvedSpec(NOW), mandate: mandateOf(POLICY) })

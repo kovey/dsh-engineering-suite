@@ -33,18 +33,30 @@ import {
     formatTime,
     listDir,
     readText,
+    relativeRootFile,
     resolvePath,
     shortDigest,
     slugify,
     type Layout,
 } from 'dsh-eng-core'
 import type { SpecGateConfig } from './config.js'
+import { describePlanFile, planLedgerFile } from './plan-ledger.js'
 
-/** Default ADR directory; the resolved path follows `layout.rootDir`. */
-export const DEFAULT_ADR_DIR = '.dsh/adr'
+/**
+ * The default ADR directory: the EMPTY string means "follow the layout root"
+ * (see {@link adrDirOf}), never a literal `.dsh/…` path.
+ *
+ * A literal default wrote a migrated repository's decisions to `.dsh/adr` while
+ * `adr_list` read `.dsh/engineering-suite/adr` — the record existed on disk and
+ * was invisible to the tool that answers "what did we decide".
+ */
+export const DEFAULT_ADR_DIR = ''
 
-/** Default ADR index; the resolved path follows `layout.rootDir`. */
-export const DEFAULT_ADR_INDEX_FILE = '.dsh/adr/index.jsonl'
+/** The default ADR index file: empty means `<adrDir>/index.jsonl` (see {@link adrIndexFileOf}). */
+export const DEFAULT_ADR_INDEX_FILE = ''
+
+/** File name of the ADR index inside the resolved ADR directory. */
+export const ADR_INDEX_FILE_NAME = 'index.jsonl'
 
 /** Longest slug kept from a title. */
 export const ADR_SLUG_MAX = 48
@@ -85,21 +97,46 @@ export interface AdrRecord {
     metadataOk: boolean
 }
 
-/** The resolved ADR directory for one workspace. */
-export function adrDirectory(layout: Layout, config: Pick<SpecGateConfig, 'adrDir'>): string {
-    return config.adrDir === DEFAULT_ADR_DIR ? path.join(layout.rootDir, 'adr') : resolvePath(config.adrDir, layout.cwd)
+/**
+ * The workspace-relative ADR directory.
+ *
+ * An explicit `adrDir` always wins. Otherwise the default follows the LAYOUT
+ * ROOT, like every other plugin in the suite: the namespace directory when it
+ * exists (a migrated repository), the legacy `.dsh/` root when it does not.
+ * @param cwd - workspace root.
+ * @param config - the resolved configuration (or the part that carries `adrDir`).
+ * @returns path relative to `cwd`, POSIX separators.
+ */
+export function adrDirOf(cwd: string, config: Pick<SpecGateConfig, 'adrDir'> & Partial<Pick<SpecGateConfig, 'layout'>>): string {
+    return config.adrDir !== '' ? config.adrDir : relativeRootFile(cwd, 'adr', config.layout ?? {})
 }
 
 /**
- * The resolved ADR index file for one workspace.
+ * The workspace-relative ADR index file; the default lives INSIDE the resolved
+ * ADR directory, so overriding `adrDir` does not leave the index behind.
+ */
+export function adrIndexFileOf(
+    cwd: string,
+    config: Pick<SpecGateConfig, 'adrDir' | 'adrIndexFile'> & Partial<Pick<SpecGateConfig, 'layout'>>,
+): string {
+    return config.adrIndexFile !== '' ? config.adrIndexFile : `${adrDirOf(cwd, config)}/${ADR_INDEX_FILE_NAME}`
+}
+
+/** The resolved ADR directory for one workspace (absolute). */
+export function adrDirectory(layout: Layout, config: Pick<SpecGateConfig, 'adrDir'>): string {
+    return config.adrDir !== '' ? resolvePath(config.adrDir, layout.cwd) : path.join(layout.rootDir, 'adr')
+}
+
+/**
+ * The resolved ADR index file for one workspace (absolute).
  *
  * The default lives INSIDE the resolved ADR directory, so overriding `adrDir`
  * does not leave the index behind in the default one.
  */
 export function adrIndexPath(layout: Layout, config: Pick<SpecGateConfig, 'adrDir' | 'adrIndexFile'>): string {
-    return config.adrIndexFile === DEFAULT_ADR_INDEX_FILE
-        ? path.join(adrDirectory(layout, config), 'index.jsonl')
-        : resolvePath(config.adrIndexFile, layout.cwd)
+    return config.adrIndexFile !== ''
+        ? resolvePath(config.adrIndexFile, layout.cwd)
+        : path.join(adrDirectory(layout, config), ADR_INDEX_FILE_NAME)
 }
 
 /**
@@ -476,7 +513,9 @@ export function recordAdr(deps: AdrDeps, request: AdrRequest): AdrOutcome {
         ...(request.missionId === undefined || request.missionId === '' ? {} : { missionId: request.missionId }),
         ...(request.supersedes === undefined ? {} : { supersedes: request.supersedes }),
         at: now,
-        planFile: deps.config.planFile,
+        // The header names where the planning rows went, so it follows the
+        // layout root (the configured value is empty by default).
+        planFile: describePlanFile(deps.layout, planLedgerFile(deps.layout, deps.config)),
     })
     // The exclusive create is the write that actually decides: the existence
     // check above is only there to produce a better message, and two concurrent

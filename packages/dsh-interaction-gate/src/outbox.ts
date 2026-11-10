@@ -53,7 +53,7 @@
 import { createHash } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
-import { ensureDir, formatTime, readText } from 'dsh-eng-core'
+import { ensureDir, formatTime, readText, relativeRootFile } from 'dsh-eng-core'
 
 /** Every state a record may be in. Append-only, last-wins per id. */
 export type OutboxState = 'intent' | 'sent' | 'deferred' | 'send-failed' | 'answered' | 'timeout' | 'dropped' | 'withdrawn'
@@ -85,8 +85,30 @@ const MAX_PROBLEMS_PER_CLASS = 5
 /** The kind of every outbox record (asks are the only durable interaction today). */
 export const OUTBOX_KIND = 'ask' as const
 
-/** The default outbox path, relative to the workspace (a runtime dir the doctor already ignores). */
-export const DEFAULT_OUTBOX_FILE = '.dsh/interaction/outbox.jsonl'
+/**
+ * The default outbox location: the EMPTY string means "follow the layout root"
+ * (see {@link outboxFileOf}), never a literal `.dsh/…` path.
+ *
+ * It is a runtime file next to the decision ledger, so it belongs to the same
+ * trail root: a literal default appended a migrated repository's asks to
+ * `.dsh/interaction/outbox.jsonl` while every reader looked in the namespace
+ * directory.
+ */
+export const DEFAULT_OUTBOX_FILE = ''
+
+/**
+ * The workspace-relative path of the ask outbox.
+ *
+ * An explicit `outboxFile` always wins (profile). Otherwise the default follows
+ * the LAYOUT ROOT: the namespace directory of a migrated repository, the legacy
+ * `.dsh/` root of an un-migrated one.
+ * @param cwd - workspace root.
+ * @param config - the part of the resolved configuration that names the file.
+ * @returns path relative to `cwd`, POSIX separators.
+ */
+export function outboxFileOf(cwd: string, config: { outboxFile: string }): string {
+    return config.outboxFile !== '' ? config.outboxFile : relativeRootFile(cwd, 'interaction/outbox.jsonl')
+}
 
 /** What a channel may say about a failed send (see `ChannelSendResult.permanent`). */
 export interface OutboxDelivery {

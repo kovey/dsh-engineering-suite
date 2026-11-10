@@ -42,9 +42,9 @@ import { readJson, readText } from './io.js'
 import { mandateState, policyDifferences, policyFingerprint, readPolicySnapshot } from './mandate.js'
 import type { PolicyFingerprint } from './mandate.js'
 import { MissionStore } from './mission.js'
-import { isInside, isSafeId, missionDir, resolvePath } from './paths.js'
+import { isInside, isSafeId, missionDir } from './paths.js'
 import type { Layout } from './paths.js'
-import { loadProjectConfig } from './project-config.js'
+import { loadProjectConfig, projectArtifactOf } from './project-config.js'
 import type { EvidenceRecord, GateRecord, GitFingerprint, MissionRecord, Receipt } from './types.js'
 
 /** 五个维度的固定顺序（所有输出、计数与测试都按这个顺序）。 */
@@ -298,8 +298,6 @@ export const APPROVAL_AT_TOLERANCE_MS = 5_000
 /** 默认的证据要求（与 `dsh-evidence-gate` 的默认值一致；读不到仓库配置时使用）。 */
 const DEFAULT_GATE_SOURCE = 'dsh-quality-gate'
 const DEFAULT_REQUIRED_EVIDENCE_KINDS: readonly string[] = ['command', 'test']
-const DEFAULT_STANDARDS_FILE = '.dsh/standards.json'
-const DEFAULT_BASELINE_FILE = '.dsh/standards-baseline.json'
 
 /** 状态的机器 token（冒号前）。 */
 export function conformanceStateToken(state: string): string {
@@ -883,8 +881,11 @@ function gatesDimension(gates: readonly GateRecord[], scanBlind: readonly string
 function standardsFreshness(layout: Layout): { facts: string[]; reasons: string[]; blind: string[] } {
     const loaded = loadProjectConfig<Record<string, unknown>>(layout, 'standards-gate')
     const value = loaded.value ?? {}
-    const standardsFile = resolvePath(typeof value['standardsFile'] === 'string' ? value['standardsFile'] : DEFAULT_STANDARDS_FILE, layout.cwd)
-    const baselineFile = resolvePath(typeof value['baselineFile'] === 'string' ? value['baselineFile'] : DEFAULT_BASELINE_FILE, layout.cwd)
+    // The defaults follow the layout root (an explicit config value still wins):
+    // a literal `.dsh/standards.json` made this dimension report "no standards"
+    // for a migrated repository whose file sits exactly where the gate reads it.
+    const standardsFile = projectArtifactOf(layout, value, 'standardsFile', 'standards.json')
+    const baselineFile = projectArtifactOf(layout, value, 'baselineFile', 'standards-baseline.json')
     const facts: string[] = []
     const reasons: string[] = []
     const blind: string[] = []

@@ -20,6 +20,7 @@
  * @module dsh-knowledge-base/tools
  */
 
+import path from 'node:path'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { type AgentLike, type Logger, type MissionStoreRegistry } from 'dsh-eng-core'
 import { KB_KINDS, type EffectiveConfig, type KnowledgeBaseConfig, type KbKind } from './config.js'
@@ -174,6 +175,10 @@ export function runSearch(deps: ToolDeps, agent: AgentLike | undefined, args: Se
                 '标点与长度不足 1 的片段会被丢弃。下一步：换成有实际内容的词或 id（如 "登录"、"AC-003"、"docs/"），或由宿主调低 tokenizer.minTokenLength 后重建索引。',
         )
     }
+    // The mission filter matches the specification and mission directory by
+    // PATH, so it needs this workspace's trail root (namespace-first) rather
+    // than a literal legacy prefix.
+    const trailDir = path.relative(cwd, deps.stores.for(cwd).layout.rootDir).split(path.sep).join('/')
     const outcome = searchIndex({
         chunks: loaded.chunks,
         postings: loaded.postings,
@@ -185,6 +190,7 @@ export function runSearch(deps: ToolDeps, agent: AgentLike | undefined, args: Se
         ...(kinds === undefined ? {} : { kinds }),
         ...(typeof args.pathPrefix === 'string' && args.pathPrefix.trim() !== '' ? { pathPrefix: args.pathPrefix.trim() } : {}),
         ...(typeof args.missionId === 'string' && args.missionId.trim() !== '' ? { missionId: args.missionId.trim() } : {}),
+        trailDir,
     })
     deps.logger.for(cwd).info(`kb_search: "${query}" → ${outcome.scored} 条命中（返回 ${outcome.hits.length}）${freshness.stale ? '；索引过期' : ''}`)
     return renderSearchReport({ config, query, loaded: { ...loaded, manifest: loaded.manifest }, outcome, freshness })

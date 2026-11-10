@@ -14,9 +14,11 @@ import test from 'node:test'
 import { resolveLayout } from 'dsh-eng-core'
 import { createFakeHost, runText, tempWorkspace, type FakeHost } from 'dsh-eng-core/testing'
 import { apply, inject, name } from '../dist/index.js'
+import { attentionFileOf } from '../dist/attention.js'
 import { createInteractionRegistry } from '../dist/channels.js'
 import { DEFAULT_APPROVERS_FILE, ledgerFileOf, resolveConfig, resolveEffectiveConfig } from '../dist/config.js'
 import { appendLedgerRow, newRowId, readLedger, refusalOf, summarizeLedger } from '../dist/ledger.js'
+import { outboxFileOf } from '../dist/outbox.js'
 import { PROMPT_SECTION } from '../dist/prompt.js'
 import { PROGRESS_DEDUPE_WINDOW_MS } from '../dist/tools.js'
 
@@ -854,4 +856,37 @@ test('TC-1294 an EXPLICIT ledgerFile still wins over the layout default', () => 
     const cwd = tempWorkspace('interaction-gate-explicit-')
     fs.mkdirSync(path.join(cwd, '.dsh', 'engineering-suite'), { recursive: true })
     assert.equal(ledgerFileOf(cwd, resolveConfig({ ledgerFile: 'ops/decisions.jsonl' })), 'ops/decisions.jsonl')
+})
+
+test('TC-1311 the outbox and the attention sidecar follow the layout root too', async () => {
+    // Both are runtime files NEXT TO the ledger they belong to. A literal legacy
+    // default split a migrated repository's rows: the decision under
+    // `.dsh/engineering-suite/` and the outbox/sidecar under `.dsh/`.
+    const legacy = tempWorkspace('interaction-gate-sidecars-legacy-')
+    const config = resolveConfig({})
+    assert.equal(config.outboxFile, '', 'the default is "follow the layout root", not a literal path')
+    assert.equal(config.attentionFile, '')
+    assert.equal(outboxFileOf(legacy, config), '.dsh/interaction/outbox.jsonl')
+    assert.equal(attentionFileOf(legacy, config), '.dsh/interaction/attention.jsonl')
+
+    const migrated = tempWorkspace('interaction-gate-sidecars-namespace-')
+    fs.mkdirSync(path.join(migrated, '.dsh', 'engineering-suite'), { recursive: true })
+    assert.equal(outboxFileOf(migrated, config), '.dsh/engineering-suite/interaction/outbox.jsonl')
+    assert.equal(attentionFileOf(migrated, config), '.dsh/engineering-suite/interaction/attention.jsonl')
+    // An explicit profile path still wins over the layout default.
+    assert.equal(outboxFileOf(migrated, resolveConfig({ outboxFile: 'ops/outbox.jsonl' })), 'ops/outbox.jsonl')
+    assert.equal(attentionFileOf(migrated, resolveConfig({ attentionFile: 'ops/attention.jsonl' })), 'ops/attention.jsonl')
+
+    // …and the ask really lands there (the file the tools read is the file the
+    // send wrote, not two defaults that happen to be spelled similarly).
+    const namespaceOutbox = path.join(migrated, '.dsh', 'engineering-suite', 'interaction', 'outbox.jsonl')
+    const fake = host(migrated)
+    const im = scriptedChannel('im')
+    fake.registry.register(im.channel)
+    const running = fake.runTool('interaction_ask', { question: '放行吗？', options: ['yes', 'no'], timeoutMs: 2_000 })
+    await answerWith(im, { value: 'yes', by: 'alice' })
+    const run = await running
+    assert.equal(run.isError, false, runText(run))
+    assert.equal(fs.existsSync(namespaceOutbox), true, 'the intent row must land in the namespace outbox')
+    assert.equal(fs.existsSync(path.join(migrated, '.dsh', 'interaction', 'outbox.jsonl')), false, 'the legacy outbox must not be written')
 })

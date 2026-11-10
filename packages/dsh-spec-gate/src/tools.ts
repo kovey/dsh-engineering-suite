@@ -1876,15 +1876,21 @@ function relativePathOf(mission: MissionRecord, candidate: string): string {
 }
 
 /** Absolute paths of everything a reviewer may want to open. */
-function reviewArtifactsOf(mission: MissionRecord, missionsDir: string): ReviewArtifacts {
-    const specAbs = path.isAbsolute(mission.specPath ?? '')
-        ? (mission.specPath as string)
-        : path.join(mission.cwd, mission.specPath ?? path.join('.dsh', 'specs', `${mission.id}.md`))
+function reviewArtifactsOf(mission: MissionRecord, layout: Layout): ReviewArtifacts {
+    // The fallback follows the resolved layout: only a mission that never got a
+    // specPath needs it, and guessing the legacy `.dsh/specs` would point a
+    // migrated repository's reviewer at a file that does not exist.
+    const specAbs =
+        mission.specPath === undefined
+            ? path.join(layout.specsDir, `${mission.id}.md`)
+            : path.isAbsolute(mission.specPath)
+              ? mission.specPath
+              : path.join(layout.cwd, mission.specPath)
     return {
         specFile: specAbs,
-        designFile: path.join(missionsDir, mission.id, 'test-design-review.md'),
+        designFile: path.join(layout.missionsDir, mission.id, 'test-design-review.md'),
         specsDir: path.dirname(specAbs),
-        missionDir: path.join(missionsDir, mission.id),
+        missionDir: path.join(layout.missionsDir, mission.id),
     }
 }
 
@@ -1894,21 +1900,24 @@ function reviewArtifactsOf(mission: MissionRecord, missionsDir: string): ReviewA
  * Two directories and two files, so a reviewer can open them (a UI may render
  * the `需求文档:` / `测试用例:` lines as openable paths), the numbers that
  * matter, and what rejection means — the review is a loop, not a one-shot.
+ * @param layout - the workspace layout: both directories follow the layout root
+ *   (a migrated repository keeps its spec under `.dsh/engineering-suite/specs`).
  */
-export function renderApprovalPrompt(mission: MissionRecord, round: number, missionsDir: string, note?: string): string {
+export function renderApprovalPrompt(mission: MissionRecord, round: number, layout: Layout, note?: string): string {
     const spec = mission.spec
     const criteria = spec?.acceptanceCriteria ?? []
     const cases = mission.testDesign?.cases ?? []
     const uncovered = mission.testDesign?.uncovered ?? []
     const budgets = readSpecBudgets(spec)
-    const relativeMissions = path.relative(mission.cwd, missionsDir) || missionsDir
-    const specFile = relativePathOf(mission, mission.specPath ?? `.dsh/specs/${mission.id}.md`)
+    const relativeMissions = path.relative(layout.cwd, layout.missionsDir) || layout.missionsDir
+    const relativeSpecs = path.relative(layout.cwd, layout.specsDir).split(path.sep).join('/') || '.'
+    const specFile = relativePathOf(mission, mission.specPath ?? path.join(layout.specsDir, `${mission.id}.md`))
     const designFile = `${relativeMissions}/${mission.id}/test-design-review.md`
     const lines = [
         note === undefined ? `规格审批（第 ${round} 次送审）：${mission.title}` : `${note}（第 ${round} 次送审）`,
         `mission ${mission.id} · rev ${spec?.revision ?? '?'} · 摘要 ${(mission.specDigest ?? '').slice(0, 12) || '?'}`,
         '',
-        '需求文档目录: .dsh/specs/',
+        `需求文档目录: ${relativeSpecs}/`,
         `需求文档: ${specFile}（验收标准 ${criteria.length} 条）`,
         ...criteria.slice(0, 6).map((criterion) => `  · ${criterion.id} ${criterion.text}`),
         ...(criteria.length > 6 ? [`  · …另有 ${criteria.length - 6} 条`] : []),
@@ -1943,7 +1952,8 @@ async function requestApproval(
         return { decision: 'allowed-once', by: 'auto', messageId: '', source: 'auto', allowed: true }
     }
     const context = exec as { agent?: AgentLike; signal?: AbortSignal }
-    const missionsDir = deps.stores.for(mission.cwd).layout.missionsDir
+    const layout = deps.stores.for(mission.cwd).layout
+    const missionsDir = layout.missionsDir
     const roundForReview = deps.stores.for(mission.cwd).nextApprovalRound(mission.id)
 
     // Preferred channel: the host TUI's own card UI (nvim-tui's public ext API),
@@ -1954,8 +1964,8 @@ async function requestApproval(
             api: tui,
             ...(sessionIdOf(context.agent) === undefined ? {} : { sessionId: sessionIdOf(context.agent) as string }),
             title: `规格审批（第 ${roundForReview} 次送审）：${mission.title}`,
-            body: renderApprovalPrompt(mission, roundForReview, missionsDir, note),
-            artifacts: reviewArtifactsOf(mission, missionsDir),
+            body: renderApprovalPrompt(mission, roundForReview, layout, note),
+            artifacts: reviewArtifactsOf(mission, layout),
             cwd: mission.cwd,
             log: (message: string) => deps.logger.for(mission.cwd).info(`[review] ${message}`),
             ...(context.signal === undefined ? {} : { signal: context.signal }),
@@ -2021,7 +2031,7 @@ async function requestApproval(
         // artifacts (and open them) before deciding, not approve blind. The
         // fenced context block lets a channel render fields (mission, revision,
         // artifacts) instead of parsing this prose.
-        reason: renderApprovalContext(renderApprovalPrompt(mission, round, store.layout.missionsDir, note), {
+        reason: renderApprovalContext(renderApprovalPrompt(mission, round, store.layout, note), {
             kind: 'spec',
             missionId: mission.id,
             title: mission.spec?.title ?? mission.title,

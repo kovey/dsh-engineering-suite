@@ -242,12 +242,18 @@ export function readCapped(file: string, maxFileBytes: number, logger: Logger): 
     }
 }
 
-/** The requirement-document role of a path, or `undefined` when it is not one. */
-function requirementKindOf(rel: string): RequirementDoc['kind'] | undefined {
+/**
+ * The requirement-document role of a path, or `undefined` when it is not one.
+ * @param rel - workspace-relative path (POSIX separators).
+ * @param specsDir - the workspace-relative spec directory (follows the layout
+ *   root: `.dsh/specs` in an un-migrated repository,
+ *   `.dsh/engineering-suite/specs` in a migrated one).
+ */
+function requirementKindOf(rel: string, specsDir: string): RequirementDoc['kind'] | undefined {
     const base = path.posix.basename(rel)
     if (!base.toLowerCase().endsWith('.md')) return undefined
     const dir = path.posix.dirname(rel)
-    if (dir === '.dsh/specs') return 'spec'
+    if (dir === specsDir) return 'spec'
     if (/^readme.*\.md$/i.test(base)) return 'readme'
     if (dir === 'docs' || dir.startsWith('docs/')) return 'docs'
     if (dir === '.') return 'other'
@@ -881,13 +887,19 @@ export function scanWorkspace(options: ScanOptions): ScanResult {
     const tests: TestEvidence[] = []
     const languages: Record<string, number> = {}
     let truncated = false
+    // The spec directory follows the LAYOUT ROOT (namespace-first): a migrated
+    // repository keeps its specifications under
+    // `.dsh/engineering-suite/specs`, and the literal legacy path classified them
+    // as "not a requirement document" — a bootstrap run then reported "no
+    // specification" next to the specification it was supposed to read.
+    const specsDirRelative = relativeTo(cwd, resolveLayout(cwd).specsDir)
 
     /** Classify and parse one regular file; never throws. */
     const visit = (abs: string, rel: string): void => {
         const language = languageOf(rel)
         if (language !== undefined) languages[language] = (languages[language] ?? 0) + 1
         try {
-            const docKind = requirementKindOf(rel)
+            const docKind = requirementKindOf(rel, specsDirRelative)
             if (docKind !== undefined) {
                 const text = readCapped(abs, maxFileBytes, logger)
                 if (text !== undefined) requirements.push(parseRequirementDoc(rel, text, docKind))

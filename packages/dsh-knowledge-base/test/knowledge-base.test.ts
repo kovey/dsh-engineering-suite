@@ -6,7 +6,7 @@ import test from 'node:test'
 import { MissionStoreRegistry, sha256 } from 'dsh-eng-core'
 import { createFakeHost, runText, tempWorkspace, type FakeHost, type ToolRun } from 'dsh-eng-core/testing'
 import { apply, inject, name } from '../dist/index.js'
-import { indexDirOf as indexDirRelativeOf, resolveConfig, resolveEffectiveConfig } from '../dist/config.js'
+import { defaultSources, indexDirOf as indexDirRelativeOf, resolveConfig, resolveEffectiveConfig } from '../dist/config.js'
 import {
     CHUNKS_FILE,
     MANIFEST_FILE,
@@ -463,6 +463,17 @@ test('filters restrict kinds, path prefix and mission', () => {
     assert.equal(searchIndex({ ...base, pathPrefix: 'src/' }).hits.map((hit) => hit.chunk.path).join(), 'src/health.ts')
     assert.equal(searchIndex({ ...base, missionId: 'm1' }).hits.length, 1)
     assert.equal(searchIndex({ ...base, missionId: 'm1' }).hits[0]?.chunk.path, '.dsh/specs/m1.md')
+
+    // The mission filter matches by PATH, so it follows the layout root: in a
+    // migrated repository the specification is `.dsh/engineering-suite/specs/m1.md`
+    // and a literal legacy prefix dropped every hit the caller asked for.
+    const migrated = [
+        chunkOf('spec:.dsh/engineering-suite/specs/m1.md:1-1', 'spec', '.dsh/engineering-suite/specs/m1.md', '规格 m1', '登录失败返回 401'),
+        chunkOf('docs:docs/guide.md:1-1', 'docs', 'docs/guide.md', '部署指南', '登录失败的处理写在别处'),
+    ]
+    const namespaced = { ...base, chunks: migrated, postings: buildPostings(migrated, config.tokenizer) }
+    assert.equal(searchIndex({ ...namespaced, missionId: 'm1', trailDir: '.dsh/engineering-suite' }).hits.length, 1)
+    assert.equal(searchIndex({ ...namespaced, missionId: 'm1', trailDir: '.dsh/engineering-suite' }).hits[0]?.chunk.path, '.dsh/engineering-suite/specs/m1.md')
 })
 
 test('the limit is capped at maxLimit and the cap is reported', () => {
@@ -1509,6 +1520,43 @@ test('TC-1294 an EXPLICIT indexDir still wins over the layout default', () => {
     const config = resolveConfig({ indexDir: 'artifacts/kb' })
     assert.equal(indexDirRelativeOf(cwd, config), 'artifacts/kb')
     assert.equal(indexDirOf(cwd, config), path.join(cwd, 'artifacts', 'kb'))
+})
+
+test('TC-1313 the default index sources follow the layout root (spec/adr/trail/plan)', () => {
+    // The four trail collectors used to be literal `.dsh/...` globs: a migrated
+    // repository indexed `.dsh/specs` (empty) and reported "规格：未创建" next to
+    // the specification that lives under `.dsh/engineering-suite/specs`.
+    const legacy = tempWorkspace('kb-sources-legacy-')
+    const anchored = defaultSources()
+    assert.deepEqual(anchored.find((source) => source.id === 'spec')?.globs, ['.dsh/specs/*.md'], 'the profile row keeps the anchored form')
+    assert.deepEqual(defaultSources(legacy).find((source) => source.id === 'spec')?.globs, ['.dsh/specs/*.md'])
+    assert.deepEqual(defaultSources(legacy).find((source) => source.id === 'plan')?.globs, ['.dsh/plan.jsonl'])
+
+    const migrated = tempWorkspace('kb-sources-namespace-')
+    fs.mkdirSync(path.join(migrated, '.dsh', 'engineering-suite'), { recursive: true })
+    const resolved = defaultSources(migrated)
+    assert.deepEqual(resolved.find((source) => source.id === 'spec')?.globs, ['.dsh/engineering-suite/specs/*.md'])
+    assert.deepEqual(resolved.find((source) => source.id === 'adr')?.globs, [
+        '.dsh/engineering-suite/adr/*.md',
+        '.dsh/engineering-suite/adr/index.jsonl',
+    ])
+    assert.deepEqual(resolved.find((source) => source.id === 'trail')?.globs, [
+        '.dsh/engineering-suite/missions/**',
+        '.dsh/engineering-suite/releases.jsonl',
+    ])
+    // The EFFECTIVE row (what the manifest, kb_status and the prompt quote)
+    // names this workspace's root — and docs/code stay workspace-relative.
+    const effective = resolveEffectiveConfig(resolveConfig({}), new MissionStoreRegistry().for(migrated).layout)
+    assert.deepEqual(effective.config.sources.find((source) => source.id === 'spec')?.globs, ['.dsh/engineering-suite/specs/*.md'])
+    assert.deepEqual(effective.config.sources.find((source) => source.id === 'docs')?.globs, ['*.md', 'docs/**/*.md'])
+    // A declared glob list that differs from the built-in default is left exactly
+    // as written (only the untouched defaults are re-anchored; a declaration
+    // identical to the default is, by definition, the default).
+    const declared = resolveEffectiveConfig(
+        resolveConfig({ sources: [{ id: 'spec', globs: ['.dsh/specs/**/*.md'] }] }),
+        new MissionStoreRegistry().for(migrated).layout,
+    )
+    assert.deepEqual(declared.config.sources.find((source) => source.id === 'spec')?.globs, ['.dsh/specs/**/*.md'])
 })
 
 test('every host is disposed without a throw', () => {

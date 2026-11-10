@@ -5,8 +5,6 @@
  */
 
 import { containedPath, loadProjectConfig, type Layout, type LayoutOptions, type Logger } from 'dsh-eng-core'
-import { DEFAULT_ADR_DIR, DEFAULT_ADR_INDEX_FILE } from './adr.js'
-import { DEFAULT_PLAN_FILE } from './plan-ledger.js'
 
 /** Whether an unapproved specification blocks writes. */
 export type EnforceMode = boolean
@@ -231,7 +229,7 @@ export function resolveEffectiveConfig(host: SpecGateConfig, layout: Layout, log
         }
         const contained = containedPath(layout.cwd, value, key)
         if (!contained.ok) {
-            const problem = `${file.file}: ${contained.problem}（继续使用 profile 配置的 ${key}=${host[key]}）`
+            const problem = `${file.file}: ${contained.problem}（继续使用 profile 配置的 ${key}=${host[key] === '' ? '布局根下的默认值' : host[key]}）`
             problems.push(problem)
             logger?.warn(problem)
             refusedKeys.add(key)
@@ -351,9 +349,12 @@ export function resolveConfig(input: unknown): SpecGateConfig {
         exemptTools: strList(raw['exemptTools'], []),
         requireTestDesign:
             typeof raw['requireTestDesign'] === 'boolean' ? raw['requireTestDesign'] : 'auto',
-        planFile: str(raw['planFile'], DEFAULT_PLAN_FILE),
-        adrDir: str(raw['adrDir'], DEFAULT_ADR_DIR),
-        adrIndexFile: str(raw['adrIndexFile'], DEFAULT_ADR_INDEX_FILE),
+        // The empty string means "follow the layout root" (see planFileOf /
+        // adrDirOf / adrIndexFileOf): a literal default recorded a migrated
+        // repository's plan/ADRs where the readers never looked.
+        planFile: str(raw['planFile'], ''),
+        adrDir: str(raw['adrDir'], ''),
+        adrIndexFile: str(raw['adrIndexFile'], ''),
         milestoneRequired: bool(raw['milestoneRequired'], false),
         approval: raw['approval'] === 'auto' ? 'auto' : 'seam',
         prompt: {

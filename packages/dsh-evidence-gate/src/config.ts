@@ -14,7 +14,7 @@
  * @module dsh-evidence-gate/config
  */
 
-import { isInside, loadProjectConfig, resolvePath, type EvidenceKind, type Layout, type LayoutOptions, type Logger } from 'dsh-eng-core'
+import { isInside, loadProjectConfig, relativeRootFile, resolvePath, type EvidenceKind, type Layout, type LayoutOptions, type Logger } from 'dsh-eng-core'
 
 /** Resolved plugin configuration. */
 export interface EvidenceGateConfig {
@@ -73,13 +73,14 @@ export interface EvidenceGateConfig {
     /**
      * Append-only release ledger, resolved against the workspace root.
      *
-     * The default (`.dsh/releases.jsonl`) is exactly `<layout.rootDir>/releases.jsonl`
-     * for the default layout; a host that relocates `layout.rootDir` should
-     * relocate this with it, or the release ledger and the rest of the trail
-     * would live in two different places.
+     * `''` (the default) means "follow the layout root" — see
+     * {@link releasesFileOf}: the namespace directory of a migrated repository,
+     * the legacy `.dsh/` root of an un-migrated one, and `layout.rootDir` when a
+     * host relocates the trail. A literal default made a migrated repository's
+     * release ledger land where no later `release_status` looked.
      */
     releasesFile: string
-    /** Directory the generated release notes land in (default `.dsh/releases`). */
+    /** Directory the generated release notes land in; `''` follows the layout root (see {@link releaseNotesDirOf}). */
     releasesDir: string
     /**
      * Optional regular expression the recorded `version` must match
@@ -126,11 +127,17 @@ export const RECORDABLE_KINDS: readonly EvidenceKind[] = ['command', 'test', 'ar
 /** Kinds a delivery must carry unless the host says otherwise. */
 export const DEFAULT_REQUIRED_EVIDENCE_KINDS: readonly EvidenceKind[] = ['command', 'test']
 
-/** Default release ledger path, resolved against the workspace root. */
-export const DEFAULT_RELEASES_FILE = '.dsh/releases.jsonl'
+/**
+ * File name of the release ledger under the resolved layout root.
+ *
+ * A NAME, not a path: the path is assembled from the layout root by
+ * {@link releasesFileOf}. Writing the whole `.dsh/…` path down as a default is
+ * exactly the defect the layout root exists to prevent.
+ */
+export const RELEASES_LEDGER_NAME = 'releases.jsonl'
 
-/** Default directory the generated release notes land in. */
-export const DEFAULT_RELEASES_DIR = '.dsh/releases'
+/** Directory name of the generated release notes under the resolved layout root. */
+export const RELEASES_NOTES_DIR_NAME = 'releases'
 
 /** The plugin whose gate verdicts authorize a delivery. */
 export const DEFAULT_GATE_SOURCE = 'dsh-quality-gate'
@@ -170,6 +177,30 @@ function kindList(value: unknown, fallback: readonly EvidenceKind[]): EvidenceKi
     if (named.length === 0) return []
     const kinds = named.filter(isEvidenceKind)
     return kinds.length > 0 ? [...new Set(kinds)] : [...fallback]
+}
+
+// --- where the release artifacts live ----------------------------------------
+
+/**
+ * The workspace-relative path of the release ledger.
+ *
+ * An explicit `releasesFile` always wins (profile or project). Otherwise the
+ * default follows the LAYOUT ROOT, like every other plugin in the suite: the
+ * namespace directory when it exists (a migrated repository), the legacy `.dsh/`
+ * root when it does not. A literal legacy default meant a migrated repository's
+ * releases were appended where `release_status` never looked — recorded versions
+ * that no later read could see.
+ * @param cwd - workspace root.
+ * @param config - resolved plugin configuration.
+ * @returns path relative to `cwd`, POSIX separators.
+ */
+export function releasesFileOf(cwd: string, config: Pick<EvidenceGateConfig, 'releasesFile' | 'layout'>): string {
+    return config.releasesFile !== '' ? config.releasesFile : relativeRootFile(cwd, RELEASES_LEDGER_NAME, config.layout)
+}
+
+/** The workspace-relative directory the generated notes land in; same rules. */
+export function releaseNotesDirOf(cwd: string, config: Pick<EvidenceGateConfig, 'releasesDir' | 'layout'>): string {
+    return config.releasesDir !== '' ? config.releasesDir : relativeRootFile(cwd, RELEASES_NOTES_DIR_NAME, config.layout)
 }
 
 // --- project-level configuration (.dsh/evidence-gate.json) ------------------
@@ -546,8 +577,8 @@ export function resolveConfig(input: unknown): EvidenceGateConfig {
         requireDeliveryApproval: bool(raw['requireDeliveryApproval'], false),
         allowForceOverride: bool(raw['allowForceOverride'], false),
         maxGateAgeMinutes: maxGateAgeMinutes > 0 ? maxGateAgeMinutes : 0,
-        releasesFile: str(raw['releasesFile'], DEFAULT_RELEASES_FILE),
-        releasesDir: str(raw['releasesDir'], DEFAULT_RELEASES_DIR),
+        releasesFile: str(raw['releasesFile'], ''),
+        releasesDir: str(raw['releasesDir'], ''),
         // A profile-level pattern is taken as written: `compileVersionPattern`
         // is what refuses a pattern that does not compile, so a typo can never
         // silently disable the check the host asked for.

@@ -9,7 +9,7 @@
  * @module dsh-supply-chain-gate/prompt
  */
 
-import type { SupplyChainGateConfig } from './config.js'
+import { allowlistFileOf, type SupplyChainGateConfig } from './config.js'
 import { SECRET_RULES } from './secrets.js'
 
 /** Section name registered with `ctx.systemPrompt`. */
@@ -19,9 +19,14 @@ export const PROMPT_SECTION = 'eng:supply-chain-gate'
  * Render the section.
  * @param config - the resolved configuration (for the switches it reports).
  * @param projectFile - the repository's own config file, when it has one.
+ * @param cwd - the calling workspace, when known: the allowlist follows the
+ *   layout root, so naming it needs the workspace.
  * @returns the prompt text.
  */
-export function sectionText(config: SupplyChainGateConfig, projectFile?: string): string {
+export function sectionText(config: SupplyChainGateConfig, projectFile?: string, cwd?: string): string {
+    // The allowlist default follows the layout root (the configured value is
+    // empty by default), so the prompt quotes the file the scan will read.
+    const allowlistLabel = cwd === undefined ? (config.secretScan.allowlistFile === '' ? '(布局根)/secret-allow.json' : config.secretScan.allowlistFile) : allowlistFileOf(cwd, config)
     const lines = [
         '供应链与密钥是门禁，不是建议：',
         `- 交付前跑 \`secret_scan\`（默认只看本次**新增行**，${SECRET_RULES.length} 条规则 + 熵检测）：命中即 BLOCK。`,
@@ -34,7 +39,7 @@ export function sectionText(config: SupplyChainGateConfig, projectFile?: string)
         `- 诚实边界：规则 + 熵是**网**，不是证明。一次干净的扫描只说明"没有匹配到模式"，**不等于**"仓库里没有密钥"；`,
         '  同理 `dependency_audit` 只回答"依赖变化有没有人看过 / 配置的审计命令有没有报已知漏洞"，',
         '  **不回答**"这个依赖是否可信"；`govulncheck` / `pip-audit` 的报告里没有 severity，未分类条目只报告不阻断（要阻断就把它加进 block）。',
-        projectFile === undefined ? '' : `- 本仓库的密钥豁免在 \`${config.secretScan.allowlistFile}\`（由人维护，模型改不了 .dsh/**）：过期条目不算豁免。`,
+        projectFile === undefined ? '' : `- 本仓库的密钥豁免在 \`${allowlistLabel}\`（由人维护，模型改不了 .dsh/**）：过期条目不算豁免。`,
     ]
     return lines.filter((line) => line !== '').join('\n')
 }

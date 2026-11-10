@@ -1,5 +1,39 @@
 ## [未发布]
 
+### 修复 · 剩下的 `.dsh/` 路径默认值一次改全（eng-core / evidence / interaction / kb / spec / supply-chain）
+
+上一轮把 standards / deploy / knowledge-base / interaction 的路径默认值改成了"跟随布局根"，但仓库里还散着
+一批**字面量默认值**：`dsh-eng-core` 的 conformance 与 doctor 检查、`dsh-evidence-gate` 的发布台账与发布说明
+目录、`dsh-interaction-gate` 的 outbox 与 attention 旁路台账、`dsh-knowledge-base` 的四组默认索引源 globs、
+`dsh-spec-gate` 的 ADR 目录/索引与规划台账、`dsh-supply-chain-gate` 的密钥豁免文件（连 patch 里也钉了一份）。
+两种布局都是合法的，所以这些默认值不会让任何测试变红：迁移后的仓库把记录写到 `.dsh/` 下，而读取方去
+`.dsh/engineering-suite/` 找——报告说"未配置 / 没有记录 / 规则会拒绝运行"，盘上那份却完好无损。
+
+- 共享原语落在 `dsh-eng-core`：`LEGACY_TRAIL_DIR`（旧根名字只写一次）与
+  `relativeRootFile(cwd, name, layout?)`（命名空间优先、未迁移回退 `.dsh/`，用 `path.relative` 而不是切
+  `cwd.length + 1`——带尾部分隔符的调用会把默认值切成工作区的**兄弟目录**）；
+  `projectArtifactOf(layout, value, key, name)` 让"显式值优先、否则跟随布局根"只写一次。
+- 每个受影响的默认值改成**空串 + 解析 helper**：`releasesFileOf` / `releaseNotesDirOf`（evidence）、
+  `outboxFileOf` / `attentionFileOf`（interaction）、`defaultSources(cwd)`（knowledge-base，四组 trail globs；
+  有效配置还会按调用方工作区重新锚定，profile 行保持锚定形式）、`adrDirOf` / `adrIndexFileOf` / `planFileOf`
+  （spec-gate）、`allowlistFileOf`（supply-chain）。显式配置（profile / 项目 overlay）的语义完全不变。
+- 同一次审计里还修了三处"名字写死"的读取点：`conformance`/`doctor` 的规范文件与基线、
+  `scan` 把命名空间目录下的规格文档认成"需求文档"、知识库 `mission` 过滤按 `.dsh/specs` 前缀匹配
+  （迁移后该过滤会把命中全部丢掉），以及审批卡里的"需求文档目录"。
+- `dsh-supply-chain-gate/cordis.patch.yml` 删掉 `allowlistFile` 行：patch 传的是显式配置，一个钉死的仓库内路径
+  会让布局根解析对该插件彻底失效。
+- 宿主侧路径**不动**：`~/.dsh/*.log`、`~/.dsh/interaction-approvers.txt` 仍属于宿主机；审批人名单是授权数据，
+  仓库文件绝不能提供它。`interaction.approvers` 自检现在检查宿主路径，并把它显示成 `~/…`（不再显示成
+  `../../Users/…` 这种看不懂的相对路径）。
+- 新增可复核的审计：`bash scripts/audit-dsh-paths.sh`（`--quiet` 只报计数，`--selftest` 证明分类器两个方向都
+  认得出）。它扫 `packages/*/src/*.ts` 与 `packages/*/cordis.patch.yml`，把剩余的 `.dsh/` 字面量分成
+  `functional`（必须为 0，否则退出码 1）/ `host`（宿主路径）/ `text`（注释与提示文案；`scope`、`legacy` 单独标注
+  理由）。当前结果：`functional 0 · host 34 · text 351`。
+
+测试：每个受影响包的用例覆盖"命名空间优先 / 旧根回退 / 显式配置优先"（eng-core TC-1307/1308/1309、
+evidence TC-1310、interaction TC-1311、knowledge-base TC-1313 + mission 过滤、spec-gate TC-1314、
+supply-chain TC-1315），既有断言一条未放宽。`bash scripts/verify.sh --quiet` 两次全绿。
+
 ### 修复 · 部署台账 / 知识库索引 / 交互台账的默认路径回到布局根
 
 `dsh-deploy-gate`、`dsh-knowledge-base`、`dsh-interaction-gate` 三处仍拿 `.dsh/` 字面量当默认值，

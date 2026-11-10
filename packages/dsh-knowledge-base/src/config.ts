@@ -19,7 +19,8 @@
  */
 
 import path from 'node:path'
-import { loadProjectConfig, resolveLayout, type Layout, type LayoutOptions } from 'dsh-eng-core'
+import { LEGACY_TRAIL_DIR, loadProjectConfig, relativeRootFile, type Layout, type LayoutOptions } from 'dsh-eng-core'
+import { effectivePatterns } from './sources.js'
 
 /** The six kinds of document the index knows. */
 export type KbKind = 'spec' | 'adr' | 'trail' | 'plan' | 'docs' | 'code'
@@ -118,26 +119,54 @@ function positive(value: unknown, fallback: number): number {
 }
 
 /**
- * The six default collectors.
+ * The six default collectors, with their trail-anchored patterns resolved for
+ * one workspace.
  *
- * Each row is the answer to "which files may this index quote". `.dsh/**` is
- * never walked as a tree: the sources that live there name their own directory,
- * so the index cannot grow a chunk of its own artifact, of a log, or of the
- * audit trail by accident.
+ * Each row is the answer to "which files may this index quote". The trail
+ * (`spec`/`adr`/`trail`/`plan`) is never walked as a directory tree: each source
+ * names its own files, so the index cannot grow a chunk of its own artifact, of a
+ * log, or of the audit trail by accident.
+ *
+ * The trail patterns follow the LAYOUT ROOT — the namespace directory of a
+ * migrated repository, the legacy `.dsh/` root of an un-migrated one — because a
+ * literal `.dsh/specs/*.md` default indexed `.dsh/specs` while a migrated
+ * repository's specifications live under `.dsh/engineering-suite/specs` (the
+ * report then said "规格：未创建" next to the specification).
+ *
+ * Call it WITHOUT a workspace for the `.dsh/`-anchored form the profile row
+ * stores: one profile serves several repositories, and
+ * {@link resolveEffectiveConfig} resolves the defaults for the calling workspace
+ * (and {@link effectivePatterns} re-anchors an explicit `.dsh/`-prefixed
+ * pattern).
+ * @param cwd - the workspace to resolve the defaults for; omitted = anchored form.
+ * @returns fresh collector rows (callers may mutate their own copy).
  */
-export const DEFAULT_SOURCES: readonly KbSourceConfig[] = [
-    { id: 'spec', kind: 'spec', globs: ['.dsh/specs/*.md'], enabled: true },
-    { id: 'adr', kind: 'adr', globs: ['.dsh/adr/*.md', '.dsh/adr/index.jsonl'], enabled: true },
-    { id: 'trail', kind: 'trail', globs: ['.dsh/missions/**', '.dsh/releases.jsonl'], enabled: true },
-    { id: 'plan', kind: 'plan', globs: ['.dsh/plan.jsonl'], enabled: true },
-    { id: 'docs', kind: 'docs', globs: ['*.md', 'docs/**/*.md'], enabled: true },
-    {
-        id: 'code',
-        kind: 'code',
-        globs: ['**/*.ts', '**/*.tsx', '**/*.js', '**/*.mjs', '**/*.cjs', '**/*.go', '**/*.py'],
-        enabled: true,
-    },
-]
+export function defaultSources(cwd?: string): KbSourceConfig[] {
+    const anchored = (name: string): string => (cwd === undefined ? `${LEGACY_TRAIL_DIR}/${name}` : relativeRootFile(cwd, name))
+    return [
+        { id: 'spec', kind: 'spec', globs: [anchored('specs/*.md')], enabled: true },
+        { id: 'adr', kind: 'adr', globs: [anchored('adr/*.md'), anchored('adr/index.jsonl')], enabled: true },
+        { id: 'trail', kind: 'trail', globs: [anchored('missions/**'), anchored('releases.jsonl')], enabled: true },
+        { id: 'plan', kind: 'plan', globs: [anchored('plan.jsonl')], enabled: true },
+        { id: 'docs', kind: 'docs', globs: ['*.md', 'docs/**/*.md'], enabled: true },
+        {
+            id: 'code',
+            kind: 'code',
+            globs: ['**/*.ts', '**/*.tsx', '**/*.js', '**/*.mjs', '**/*.cjs', '**/*.go', '**/*.py'],
+            enabled: true,
+        },
+    ]
+}
+
+/**
+ * The default collectors of a profile row: the trail-anchored form.
+ *
+ * Kept as a named export because a profile row is shared by every workspace
+ * (and the CLI prints the source ids from it). Anything that knows WHERE it runs
+ * uses {@link defaultSources}`(cwd)` — or {@link resolveEffectiveConfig}, which
+ * does it for the calling workspace.
+ */
+export const DEFAULT_SOURCES: readonly KbSourceConfig[] = defaultSources()
 
 /** Resolve one declared source row onto its default (id and kind are fixed). */
 function sourceOf(value: unknown, fallback: KbSourceConfig): KbSourceConfig {
@@ -167,7 +196,10 @@ export function resolveConfig(input: unknown): KnowledgeBaseConfig {
     const boosts = isRecord(search['fieldBoosts']) ? search['fieldBoosts'] : {}
 
     const declared = Array.isArray(raw['sources']) ? raw['sources'] : []
-    const sources = DEFAULT_SOURCES.map((fallback) => sourceOf(declared.find((entry) => isRecord(entry) && entry['id'] === fallback.id), fallback))
+    // The anchored (`.dsh/`-relative) form: this row is the profile ceiling for
+    // EVERY workspace, so it cannot name one repository's layout root. The
+    // effective configuration resolves the defaults for the calling workspace.
+    const sources = defaultSources().map((fallback) => sourceOf(declared.find((entry) => isRecord(entry) && entry['id'] === fallback.id), fallback))
 
     const limit = Math.max(1, positive(search['limit'], 10))
     // `maxLimit` is the hard ceiling: when a host asks for a default above it,
@@ -243,15 +275,6 @@ export function indexDirOf(cwd: string, config: Pick<KnowledgeBaseConfig, 'index
     return config.indexDir !== '' ? config.indexDir : relativeRootFile(cwd, 'kb')
 }
 
-function relativeRootFile(cwd: string, name: string): string {
-    // `path.relative`, not a `slice(cwd.length + 1)`: a caller passing a trailing
-    // separator over-slices by one character and the default silently becomes a
-    // SIBLING of the workspace.
-    const layout = resolveLayout(cwd, {})
-    const relative = path.relative(cwd, layout.rootDir)
-    return relative === '' ? name : `${relative.split(path.sep).join('/')}/${name}`
-}
-
 /** One resolved configuration plus where it came from. */
 export interface EffectiveConfig {
     config: KnowledgeBaseConfig
@@ -267,6 +290,35 @@ function usableIndexDir(value: string): boolean {
     const segments = value.split(/[\\/]/).filter((segment) => segment !== '' && segment !== '.')
     if (segments.length === 0) return false
     return !segments.includes('..')
+}
+
+/**
+ * The profile's collectors with the BUILT-IN defaults resolved for one workspace.
+ *
+ * A profile row serves every repository at once, so its defaults are stored in
+ * the trail-anchored form (`LEGACY_TRAIL_DIR/…`); the effective row — the one a
+ * manifest, a `kb_status` table or a prompt quotes — must name the files this
+ * workspace actually has. A glob list that was declared explicitly (host or
+ * project) is left exactly as written: only the untouched defaults are rewritten.
+ *
+ * The rewrite goes through {@link effectivePatterns} with the workspace's own
+ * `layout`, so a host that relocates `layout.rootDir` is honoured too (resolving
+ * the default from `cwd` alone would name the standard root and then get
+ * re-anchored twice).
+ * @param sources - the profile's collectors.
+ * @param layout - the calling workspace's layout.
+ * @returns fresh rows (the caller's arrays are never mutated).
+ */
+function withWorkspaceDefaults(sources: readonly KbSourceConfig[], layout: Layout): KbSourceConfig[] {
+    const anchored = defaultSources()
+    return sources.map((source) => {
+        const builtIn = anchored.find((entry) => entry.id === source.id)
+        const isDefault =
+            builtIn !== undefined &&
+            source.globs.length === builtIn.globs.length &&
+            source.globs.every((glob, index) => glob === builtIn.globs[index])
+        return { ...source, globs: isDefault ? effectivePatterns(source, layout.cwd, layout) : [...source.globs] }
+    })
 }
 
 /**
@@ -292,7 +344,11 @@ export function resolveEffectiveConfig(
     const problems = [...declared.problems]
     for (const problem of problems) logger?.warn(problem)
     const raw = declared.value
-    if (raw === undefined) return { config: host, source: 'profile', file, problems }
+    // The profile's defaults are stored in the trail-anchored form (one profile
+    // serves every workspace); the EFFECTIVE row is the one the manifest, the
+    // reports and the prompt quote, so it names THIS workspace's layout root.
+    const base: KnowledgeBaseConfig = { ...host, sources: withWorkspaceDefaults(host.sources, layout) }
+    if (raw === undefined) return { config: base, source: 'profile', file, problems }
 
     const report = (message: string): void => {
         problems.push(message)
@@ -304,7 +360,7 @@ export function resolveEffectiveConfig(
 
     const next: KnowledgeBaseConfig = {
         ...host,
-        sources: host.sources.map((source) => ({ ...source, globs: [...source.globs] })),
+        sources: base.sources.map((source) => ({ ...source, globs: [...source.globs] })),
         tokenizer: { ...host.tokenizer },
         search: { ...host.search, fieldBoosts: { ...host.search.fieldBoosts } },
         prompt: { ...host.prompt },

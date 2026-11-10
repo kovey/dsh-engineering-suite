@@ -27,7 +27,7 @@ import {
 } from 'dsh-eng-core'
 import { createFakeHost, fakeAgent, runText, tempWorkspace, type FakeAgent, type FakeHost } from 'dsh-eng-core/testing'
 import { apply, inject, name } from '../dist/index.js'
-import { resolveConfig, resolveEffectiveConfig } from '../dist/config.js'
+import { releaseNotesDirOf, releasesFileOf, resolveConfig, resolveEffectiveConfig } from '../dist/config.js'
 import { captureEvidence } from '../dist/evidence.js'
 import type { ReleaseRow } from '../dist/releases.js'
 
@@ -2078,14 +2078,36 @@ test('发布相关键可在项目级覆盖（限制在工作区内），host-onl
     const escape = tempWorkspace('evidence-release-escape-')
     writeProjectConfig(escape, { releasesDir: '../../hijacked', releasesFile: '/tmp/hijacked.jsonl', rootDir: 'hijacked' })
     const effective = resolveEffectiveConfig(resolveConfig({}), new MissionStoreRegistry().for(escape).layout)
-    assert.equal(effective.config.releasesDir, '.dsh/releases')
-    assert.equal(effective.config.releasesFile, '.dsh/releases.jsonl')
+    assert.equal(effective.config.releasesDir, '', 'the default is "follow the layout root", not a literal path')
+    assert.equal(effective.config.releasesFile, '')
+    assert.equal(releaseNotesDirOf(escape, effective.config), '.dsh/releases')
+    assert.equal(releasesFileOf(escape, effective.config), '.dsh/releases.jsonl')
     assert.equal(effective.source, 'profile')
     assert.ok(
         effective.problems.some((entry) => entry.includes('releasesDir') && entry.includes('必须指向工作区内')),
         effective.problems.join('\n'),
     )
     assert.ok(effective.problems.some((entry) => entry.includes('rootDir')), effective.problems.join('\n'))
+})
+
+test('TC-1310 a migrated repository records its release under the NAMESPACE root', async (t) => {
+    // `.dsh/` is shared with other tooling; the suite moved into
+    // `.dsh/engineering-suite/`. A literal legacy default wrote the release ledger
+    // where release_status never looked — a recorded version no later read saw.
+    const cwd = gitRepo('evidence-release-namespace-')
+    if (cwd === undefined) {
+        t.skip('git is unavailable in this environment')
+        return
+    }
+    fs.mkdirSync(path.join(cwd, '.dsh', 'engineering-suite'), { recursive: true })
+    const { fake, store } = rig({ cwd, logFile: outsideLog('release') })
+    const missionId = await deliverMission(fake, store, 'M-1')
+
+    assert.match(runText(await fake.runTool('release_record', { version: 'v1.0.0', missionIds: [missionId] })), /✅ 已记录发布 v1\.0\.0/)
+    assert.equal(fs.existsSync(path.join(cwd, '.dsh', 'engineering-suite', 'releases.jsonl')), true, 'the ledger follows the layout root')
+    assert.equal(fs.existsSync(path.join(cwd, '.dsh', 'engineering-suite', 'releases', 'v1.0.0.md')), true)
+    assert.equal(fs.existsSync(path.join(cwd, '.dsh', 'releases.jsonl')), false, 'the legacy ledger must not be written')
+    assert.match(runText(await fake.runTool('release_status', {})), /v1\.0\.0/, 'release_status reads the same ledger back')
 })
 
 test('release_notes / release_status 只读：不动台账、不写任何文件 (regression)', async (t) => {

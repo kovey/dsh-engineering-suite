@@ -116,6 +116,7 @@ export function apply(ctx: Context, config: unknown = {}): void {
                             return sectionText(
                                 resolved,
                                 resolveEffectiveConfig(resolved, stores.for(cwd).layout, logger),
+                                cwd,
                             )
                         } catch (error) {
                             logger.warn('prompt section fell back to the profile config:', error)
@@ -137,7 +138,7 @@ export function apply(ctx: Context, config: unknown = {}): void {
         })
 
         logger.info(
-            `applied (tools: ${tools.registered.join(', ')}${tools.failed.length > 0 ? `; failed: ${tools.failed.join(', ')}` : ''}; requireGate=${resolved.requireGate}; gateSource=${resolved.gateSource}; required=${resolved.requiredEvidenceKinds.join('+') || 'none'}; requireCleanTree=${resolved.requireCleanTree}; releasesFile=${resolved.releasesFile}; releasesDir=${resolved.releasesDir}; requireTagFormat=${resolved.requireTagFormat ?? '(off)'}; projectConfig=.dsh/evidence-gate.json)`,
+            `applied (tools: ${tools.registered.join(', ')}${tools.failed.length > 0 ? `; failed: ${tools.failed.join(', ')}` : ''}; requireGate=${resolved.requireGate}; gateSource=${resolved.gateSource}; required=${resolved.requiredEvidenceKinds.join('+') || 'none'}; requireCleanTree=${resolved.requireCleanTree}; releasesFile=${resolved.releasesFile === '' ? '(布局根)/releases.jsonl' : resolved.releasesFile}; releasesDir=${resolved.releasesDir === '' ? '(布局根)/releases' : resolved.releasesDir}; requireTagFormat=${resolved.requireTagFormat ?? '(off)'}; projectConfig=.dsh/evidence-gate.json)`,
         )
     } catch (error) {
         logger.error('apply failed:', error)

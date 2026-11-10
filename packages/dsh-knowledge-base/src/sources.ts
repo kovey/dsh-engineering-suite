@@ -37,6 +37,7 @@ import {
     DEFAULT_MAX_FILES,
     MissionStore,
     exists,
+    LEGACY_TRAIL_DIR,
     formatTime,
     globToRegExp,
     head,
@@ -155,7 +156,7 @@ function lazy<T>(compute: () => T): () => T {
     }
 }
 
-/** The layout-relative prefix a `.dsh/`-anchored pattern resolves to. */
+/** The layout-relative prefix a trail-anchored pattern resolves to. */
 function rootPrefixOf(cwd: string, layout: Layout): string {
     const relative = relativeOf(cwd, layout.rootDir)
     return relative === '' ? '' : relative
@@ -164,16 +165,24 @@ function rootPrefixOf(cwd: string, layout: Layout): string {
 /**
  * Rewrite a configured pattern against the resolved layout.
  *
- * A pattern that starts with `.dsh/` follows `layout.rootDir`: the profile may
- * relocate the engineering trail, and an index that kept looking in the literal
- * `.dsh` directory would report "no specifications" for a repository that has
- * plenty.
+ * A pattern anchored at the legacy trail directory (`LEGACY_TRAIL_DIR/…`)
+ * follows `layout.rootDir`: the profile may relocate the engineering trail, and
+ * an index that kept looking in the literal legacy directory would report "no
+ * specifications" for a repository that has plenty. A pattern that is ALREADY
+ * under the prefix (what {@link defaultSources} emits for a workspace) is left
+ * alone — rewriting it again would append the namespace twice.
  */
 export function effectivePatterns(source: KbSourceConfig, cwd: string, layout: Layout): string[] {
     const prefix = rootPrefixOf(cwd, layout)
-    return source.globs.map((pattern) =>
-        pattern === '.dsh' ? prefix || '.' : pattern.startsWith('.dsh/') ? (prefix === '' ? pattern.slice(5) : `${prefix}/${pattern.slice(5)}`) : pattern,
-    )
+    const anchor = `${LEGACY_TRAIL_DIR}/`
+    return source.globs.map((pattern) => {
+        // Already under the resolved root (the per-workspace defaults are emitted
+        // in this form): rewriting again would append the namespace twice.
+        if (prefix !== '' && (pattern === prefix || pattern.startsWith(`${prefix}/`))) return pattern
+        if (pattern === LEGACY_TRAIL_DIR) return prefix === '' ? '.' : prefix
+        if (!pattern.startsWith(anchor)) return pattern
+        return prefix === '' ? pattern.slice(anchor.length) : `${prefix}/${pattern.slice(anchor.length)}`
+    })
 }
 
 /** Whether one workspace-relative path is inside a source's declared coverage. */

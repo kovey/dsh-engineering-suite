@@ -160,6 +160,50 @@ profile 的 loader 行 config           ← 宿主决策：是否启用、日志
 `--standards on` 会按仓库实际语言写出 `.dsh/standards.json` 骨架（目标阈值 + 生成/测试代码豁免 + 禁止循环依赖）；
 阈值最终仍应由人在会话里用 `standards_bootstrap` 确认后冻结。
 
+### 5.2.1 仓库内路径的默认值：只有一个来源（布局根），且可复核
+
+配置分层决定了"谁说了算"，路径解析决定了"东西到底在哪"。这两件事共用一个事实：
+**仓库的工程台账在哪个根目录下**。
+
+```
+<workspace>/.dsh/engineering-suite/      ← 迁移后的仓库（存在即优先）
+<workspace>/.dsh/                        ← 未迁移仓库（回退，行为与迁移前逐字相同）
+```
+
+`resolveLayout(cwd, options)` 是唯一实现（`dsh-eng-core/src/paths.ts`）：显式 `layout.rootDir` 优先，
+其次看命名空间目录是否存在，否则回退旧根。由此得到一条硬规矩：
+
+- **仓库内数据/配置路径的默认值必须经布局根解析**，而不是写字面量。写法只有两种：
+  空串默认值 + 解析 helper（`indexDirOf` / `ledgerFileOf` / `releasesFileOf` / `outboxFileOf` /
+  `planFileOf` / `adrDirOf` / `standardsFileOf` …），或直接用已解析的 `layout`（`path.join(layout.rootDir, …)`）。
+  配置层里这些键的默认值是**空串**，含义就是"跟随布局根"；显式值（profile / 项目文件）永远优先。
+- **仓库外（宿主侧）路径**不跟随布局根：`~/.dsh/*.log`、`~/.dsh/interaction-approvers.txt`。
+  它们属于宿主机而不是仓库，把它们搬进布局根等于把宿主文件写进项目里。审批人名单尤其如此：
+  它是授权数据，仓库文件绝不能提供它。
+- 旧根的名字只写一次（`LEGACY_TRAIL_DIR`）。需要"以 `.dsh/` 为锚"的模式/比较时用它拼，
+  不要再拼字面量。
+
+**为什么这件事需要审计而不是测试**：两种布局都是合法的，写死的默认值不会让任何测试变红——
+文件被写到读者不看的地方，报告说"未配置"，而盘上那份配置完好无损。缺陷是静默的，所以规则要写成
+可执行的检查：
+
+```
+bash scripts/audit-dsh-paths.sh            # 计数 + 逐条列出
+bash scripts/audit-dsh-paths.sh --quiet    # 只报计数与结论
+bash scripts/audit-dsh-paths.sh --selftest # 证明分类器两个方向都认得出
+```
+
+它扫 `packages/*/src/*.ts` 与 `packages/*/cordis.patch.yml`，把剩下的 `.dsh/` 字面量分成三类：
+
+| 类别 | 含义 | 是否允许 |
+|---|---|---|
+| `functional` | 代码里的路径默认值/路径常量 | **必须为 0**（否则退出码 1） |
+| `host` | `~/.dsh/…`：宿主路径 | 允许，且**不得**改成布局根 |
+| `text` | 注释、提示文案；其中 `scope`（`.dsh/**` 信任根排除模式——命名空间根嵌套在 `.dsh/` 之内，一个模式覆盖两种布局）与 `legacy`（`LEGACY_*` 常量，只用于报告迁移）单独标注理由 | 允许 |
+
+patch 文件（`cordis.patch.yml`）也在这条规矩里：patch 传的是**显式配置**，而显式值永远优先于代码默认值，
+所以一个钉死路径的 patch 键会让布局根解析对那个插件彻底失效——路径键不应出现在 patch 里。
+
 ## 5.3 一个进程服务多个仓库：所有"会认错项目"的地方都要按会话解析
 
 配置分层只是第一层。把整套东西盘一遍后，**必须按会话工作区解析**的有四类（否则会认错项目）：

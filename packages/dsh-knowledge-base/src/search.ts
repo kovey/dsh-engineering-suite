@@ -43,6 +43,7 @@
  * @module dsh-knowledge-base/search
  */
 
+import { LEGACY_TRAIL_DIR } from 'dsh-eng-core'
 import type { KbChunk, KbPostings } from './index-store.js'
 import type { KbFieldBoosts } from './config.js'
 
@@ -253,12 +254,20 @@ export interface SearchInput {
     kinds?: readonly string[]
     pathPrefix?: string
     missionId?: string
+    /** Workspace-relative trail root for the mission-scoped path checks. */
+    trailDir?: string
 }
 
 /** Whether a chunk belongs to one mission (spec file, mission dir, or text). */
-export function chunkBelongsToMission(chunk: KbChunk, missionId: string): boolean {
-    if (chunk.path === `.dsh/specs/${missionId}.md`) return true
-    if (chunk.path.startsWith(`.dsh/missions/${missionId}/`)) return true
+export function chunkBelongsToMission(chunk: KbChunk, missionId: string, trailDir: string = LEGACY_TRAIL_DIR): boolean {
+    // `trailDir` is the workspace-relative layout root ('' when the root IS the
+    // workspace). Following it is what makes the mission filter work in a
+    // migrated repository, where the specification lives under
+    // `.dsh/engineering-suite/specs/` — a literal legacy prefix silently dropped
+    // every hit the filter was asked for.
+    const under = (rest: string): string => (trailDir === '' || trailDir === '.' ? rest : `${trailDir}/${rest}`)
+    if (chunk.path === under(`specs/${missionId}.md`)) return true
+    if (chunk.path.startsWith(under(`missions/${missionId}/`))) return true
     if (chunk.docId.includes(missionId)) return true
     return containsId(chunk.text, missionId)
 }
@@ -279,7 +288,7 @@ export function searchIndex(input: SearchInput): SearchOutcome {
     const matches = (chunk: KbChunk): boolean => {
         if (input.kinds !== undefined && input.kinds.length > 0 && !input.kinds.includes(chunk.kind)) return false
         if (input.pathPrefix !== undefined && input.pathPrefix !== '' && !chunk.path.startsWith(input.pathPrefix)) return false
-        if (input.missionId !== undefined && input.missionId !== '' && !chunkBelongsToMission(chunk, input.missionId)) return false
+        if (input.missionId !== undefined && input.missionId !== '' && !chunkBelongsToMission(chunk, input.missionId, input.trailDir)) return false
         return true
     }
 

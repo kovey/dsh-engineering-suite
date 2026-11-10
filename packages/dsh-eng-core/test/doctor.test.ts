@@ -117,13 +117,52 @@ test('requiring the standards gate without a standards file is caught (regressio
     assert.match(check?.detail ?? '', /永远等不到/)
 })
 
+test('TC-1309 a migrated repo has its standards artifacts read from the namespace directory', () => {
+    // `.dsh/engineering-suite/` exists, so the layout root moved: the doctor must
+    // look where `standards_check` looks, not at a literal `.dsh/standards.json`.
+    const cwd = repo()
+    const namespace = path.join(cwd, '.dsh', 'engineering-suite')
+    fs.mkdirSync(namespace, { recursive: true })
+    fs.writeFileSync(path.join(namespace, 'standards.json'), JSON.stringify({ languages: { go: { maxFileLines: 400 } } }))
+    fs.writeFileSync(path.join(namespace, 'standards-baseline.json'), JSON.stringify({ version: 1, frozenAt: 'x', accepted: [] }))
+    fs.writeFileSync(
+        path.join(namespace, 'evidence-gate.json'),
+        JSON.stringify({ requiredEvidenceKinds: ['test'], requireStandardsGate: true }),
+    )
+
+    const report = checkWorkspace({ cwd, now: 0 })
+    const standards = report.checks.find((item) => item.id === 'config.standards')
+    assert.equal(standards?.state, 'ok', standards?.detail)
+    const consistency = report.checks.find((item) => item.id === 'deliver.standards-consistency')
+    assert.notEqual(consistency?.state, 'missing', `standards_check will find its files: ${consistency?.detail}`)
+
+    // And the un-migrated fallback is unchanged: the legacy root still wins.
+    const legacy = repo()
+    fs.writeFileSync(path.join(legacy, '.dsh', 'standards.json'), JSON.stringify({ rules: {} }))
+    fs.writeFileSync(path.join(legacy, '.dsh', 'standards-baseline.json'), JSON.stringify({ entries: [] }))
+    assert.equal(checkWorkspace({ cwd: legacy, now: 0 }).checks.find((item) => item.id === 'config.standards')?.state, 'ok')
+})
+
 test('a strict approver list without the file is a required blocker (regression)', () => {
     const cwd = repo()
     fs.writeFileSync(path.join(cwd, '.dsh', 'interaction-gate.json'), JSON.stringify({ requireApproverList: true }))
-    const report = checkWorkspace({ cwd, now: 0 })
-    const check = report.checks.find((item) => item.id === 'interaction.approvers')
-    assert.equal(check?.state, 'missing')
-    assert.ok(report.blockers.some((item) => item.id === 'interaction.approvers'))
+    // The approver list is HOST-side (`~/.dsh/interaction-approvers.txt`) — a
+    // repository file must never grant a permission — so this test owns HOME
+    // instead of assuming the machine running it has no approver list.
+    const home = tempWorkspace('doctor-home-')
+    const previous = process.env['HOME']
+    process.env['HOME'] = home
+    try {
+        const report = checkWorkspace({ cwd, now: 0 })
+        const check = report.checks.find((item) => item.id === 'interaction.approvers')
+        assert.equal(check?.state, 'missing')
+        assert.match(check?.detail ?? '', /~\//, 'a host-side list is reported as a home-relative path, not as a workspace path')
+        assert.ok(!(check?.detail ?? '').includes(cwd), 'the approver list must never be reported as living in the repository')
+        assert.ok(report.blockers.some((item) => item.id === 'interaction.approvers'))
+    } finally {
+        if (previous === undefined) delete process.env['HOME']
+        else process.env['HOME'] = previous
+    }
 })
 
 test('runtime facts are merged and can raise a blocker (regression)', () => {

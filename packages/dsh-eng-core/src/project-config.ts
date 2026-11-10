@@ -31,7 +31,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { readJson } from './io.js'
-import type { Layout } from './paths.js'
+import { LEGACY_TRAIL_DIR, resolvePath, type Layout } from './paths.js'
 
 /** One project configuration file. */
 export interface ProjectConfigFile<T> {
@@ -71,8 +71,36 @@ export function projectConfigFile(layout: Layout, pluginId: string): string {
  * @returns the legacy path.
  */
 export function legacyProjectConfigFile(layout: Layout, pluginId: string): string {
-    const root = layout.legacyRootDir ?? path.join(layout.cwd, '.dsh')
+    const root = layout.legacyRootDir ?? path.join(layout.cwd, LEGACY_TRAIL_DIR)
     return path.join(root, `${pluginId}.json`)
+}
+
+/**
+ * Absolute path of one repository-owned artifact named by a project config key.
+ *
+ * Two rules, in this order:
+ *
+ *  1. an explicit value in the repository's own `<rootDir>/<pluginId>.json`
+ *     always wins and is resolved against the workspace (explicit config
+ *     semantics do not change);
+ *  2. otherwise the default follows the LAYOUT ROOT: the namespace directory of
+ *     a migrated repository, the legacy `.dsh/` root of an un-migrated one.
+ *
+ * A literal default is the defect this helper exists to prevent: the reader
+ * reported "not configured" forever while the plugin that owns the artifact read
+ * a `standards.json` sitting in the namespace directory, present on disk and
+ * invisible to every report.
+ * @param layout - the resolved layout.
+ * @param value - the plugin's project config (as read; may be absent).
+ * @param key - the config key holding the path.
+ * @param name - file name under the layout root when the key is absent/empty.
+ * @returns absolute path.
+ */
+export function projectArtifactOf(layout: Layout, value: Record<string, unknown> | undefined, key: string, name: string): string {
+    const configured = value?.[key]
+    return typeof configured === 'string' && configured.trim() !== ''
+        ? resolvePath(configured.trim(), layout.cwd)
+        : path.join(layout.rootDir, name)
 }
 
 function signatureOf(file: string): string {

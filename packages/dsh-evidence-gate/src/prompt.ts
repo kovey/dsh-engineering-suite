@@ -13,7 +13,7 @@
  * @module dsh-evidence-gate/prompt
  */
 
-import type { EffectiveEvidenceGateConfig, EvidenceGateConfig } from './config.js'
+import { releaseNotesDirOf, releasesFileOf, type EffectiveEvidenceGateConfig, type EvidenceGateConfig } from './config.js'
 
 /** Section name (unique across the suite's prompt contributions). */
 export const PROMPT_SECTION = 'eng:evidence-gate'
@@ -35,8 +35,10 @@ function kindsText(config: EvidenceGateConfig): string {
  * @param config - the profile configuration (the ceiling).
  * @param effective - the calling workspace's effective configuration, when the
  *   workspace could be resolved at all.
+ * @param cwd - the calling workspace, when known: the release ledger and notes
+ *   are default-resolved through the layout root, so naming them needs it.
  */
-function effectiveLines(config: EvidenceGateConfig, effective?: EffectiveEvidenceGateConfig): string[] {
+function effectiveLines(config: EvidenceGateConfig, effective?: EffectiveEvidenceGateConfig, cwd?: string): string[] {
     const active = effective?.config ?? config
     const note =
         effective === undefined
@@ -47,12 +49,17 @@ function effectiveLines(config: EvidenceGateConfig, effective?: EffectiveEvidenc
     const cleanTree = active.requireCleanTree
         ? '交付前核对工作区指纹与门禁观测一致（比对双方都排除 `.dsh/` 台账目录）'
         : '交付前不核对工作区指纹'
+    // Without a workspace the DEFAULT cannot be resolved (it follows the layout
+    // root, and the root depends on whether the repository migrated), so it is
+    // described rather than guessed.
+    const ledger = cwd === undefined ? (active.releasesFile === '' ? '(布局根)/releases.jsonl' : active.releasesFile) : releasesFileOf(cwd, active)
+    const notesDir = cwd === undefined ? (active.releasesDir === '' ? '(布局根)/releases' : active.releasesDir) : releaseNotesDirOf(cwd, active)
     return [
         `${note}profile 只是默认值/上限，项目可用 \`.dsh/evidence-gate.json\` 细化；精确取值与来源以 \`evidence_status\` 为准。`,
         `- 必填证据类型：${kindsText(active)}——缺任何一类都会被拒绝。`,
         `- 门禁：来源 ${active.gateSource}；requireGate=${active.requireGate}；maxGateAgeMinutes=${active.maxGateAgeMinutes}。`,
         `- requireCleanTree=${active.requireCleanTree}——${cleanTree}。`,
-        `- 发布台账：${active.releasesFile}；发布说明目录：${active.releasesDir}；版本格式校验：${
+        `- 发布台账：${ledger}；发布说明目录：${notesDir}；版本格式校验：${
             active.requireTagFormat === undefined ? '未启用（requireTagFormat 关闭）' : active.requireTagFormat
         }；notesIncludeCriteria=${active.notesIncludeCriteria}。`,
     ]
@@ -66,10 +73,12 @@ function effectiveLines(config: EvidenceGateConfig, effective?: EffectiveEvidenc
  *   assembly belongs to; omitted when it could not be resolved (unknown
  *   workspace, broken project file), in which case the profile text is
  *   rendered instead.
+ * @param cwd - the calling workspace, when known (it is what the default
+ *   release paths are resolved against).
  * @returns the prompt text; empty when the plugin or the section is disabled
  *   (an empty section is dropped by the harness).
  */
-export function sectionText(config: EvidenceGateConfig, effective?: EffectiveEvidenceGateConfig): string {
+export function sectionText(config: EvidenceGateConfig, effective?: EffectiveEvidenceGateConfig, cwd?: string): string {
     if (!config.enabled || !config.prompt.enabled) return ''
     return [
         '## 证据与交付门禁（evidence-gate）',
@@ -83,7 +92,7 @@ export function sectionText(config: EvidenceGateConfig, effective?: EffectiveEvi
         '',
         '交付序列（按顺序调用）：`evidence_record → quality_gate_run → mission_complete`（先登记验证输出，再让门禁覆盖它，最后交付）。',
         '',
-        ...effectiveLines(config, effective),
+        ...effectiveLines(config, effective, cwd),
         '',
         '什么算"满足必填类型"（presence ≠ success）：`command`/`test` 行必须 `exitCode=0`、有 `command`、且捕获到真实输出；失败的运行照旧会被记录（有参考价值），但**不会**计入交付检查表，`manual` 声明永远不能顶替必填类型。',
         '',

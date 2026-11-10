@@ -115,7 +115,7 @@ export function apply(ctx: Context, config: unknown = {}): void {
                             const cwd = scope?.session?.header?.cwd
                             if (typeof cwd !== 'string' || cwd === '') return sectionText(resolved)
                             const effective = resolveEffectiveConfig(resolved, stores.for(cwd).layout, logger)
-                            return sectionText(effective.config, effective.source === 'project' ? effective.file : undefined)
+                            return sectionText(effective.config, effective.source === 'project' ? effective.file : undefined, cwd)
                         } catch {
                             return sectionText(resolved)
                         }

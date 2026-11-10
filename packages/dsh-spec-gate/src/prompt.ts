@@ -6,6 +6,7 @@
 
 import { SPEC_FORMAT_HINT } from 'dsh-eng-core'
 import type { SpecGateConfig } from './config.js'
+import { planFileOf } from './plan-ledger.js'
 
 /** Section name (unique across the suite's prompt contributions). */
 export const PROMPT_SECTION = 'eng:spec-gate'
@@ -13,10 +14,16 @@ export const PROMPT_SECTION = 'eng:spec-gate'
 /**
  * Build the section text.
  * @param config - resolved configuration.
+ * @param projectFile - the repository's own override file, when it has one.
+ * @param cwd - the calling workspace, when known: the plan ledger and the ADR
+ *   directory follow the layout root, so naming them needs it.
  * @returns the prompt text (empty when the gate is disabled, which drops the section).
  */
-export function sectionText(config: SpecGateConfig, projectFile?: string): string {
+export function sectionText(config: SpecGateConfig, projectFile?: string, cwd?: string): string {
     if (!config.enabled) return ''
+    // The plan ledger follows the layout root, so the prompt names the file the
+    // writes will actually reach (the configured value is empty by default).
+    const planLabel = cwd === undefined ? (config.planFile === '' ? '(布局根)/plan.jsonl' : config.planFile) : planFileOf(cwd, config)
     const enforcement = config.enforce
         ? `任何写类工具（${config.writeTools.join(', ')}）在没有**已审批规格**时会被直接拒绝（不可绕过）。` +
           (config.enforceBoundaries
@@ -70,7 +77,7 @@ export function sectionText(config: SpecGateConfig, projectFile?: string): strin
         '无论哪条路径，**旧审批都会失效**（人批准的是上一版文档），必须重新 `test_design_review` → `spec_approve`。',
         '',
         '**规划台账（跨 mission 追溯）**：规划不是一次性的——`spec_create` / `spec_approve` / `spec_amend` 会往',
-        `仓库级台账 \`${config.planFile}\` 追加一行（编号、里程碑、审批人）；台账写失败只在工具输出里告警，绝不阻断规格操作。`,
+        `仓库级台账 \`${planLabel}\` 追加一行（编号、里程碑、审批人）；台账写失败只在工具输出里告警，绝不阻断规格操作。`,
         '**动手规划前先 `plan_status`**（只读）：仓库里已有哪些需求（按里程碑分组，含「无里程碑」组）、哪些未交付、',
         '哪些编号已作废，以及"某个编号属于哪个 mission"的反查。同一个编号出现在两个 mission 里会作为**冲突**报出来，',
         '**不会自动合并**——先与用户确认哪个是权威，再决定改哪一边。台账只是索引（可从规格重建），规格才是权威。',

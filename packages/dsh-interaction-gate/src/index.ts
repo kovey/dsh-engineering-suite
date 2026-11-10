@@ -41,11 +41,11 @@ import path from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import { MissionStoreRegistry, createLogger, expandHome, type AgentLike } from 'dsh-eng-core'
 import { installApprovalAnswerer } from './approval.js'
-import { createAttentionSource, missionFactsOf, type AttentionSource } from './attention.js'
+import { attentionFileOf, createAttentionSource, missionFactsOf, type AttentionSource } from './attention.js'
 import { createInteractionRegistry } from './channels.js'
 import { ledgerFileOf, resolveConfig, resolveEffectiveConfig, type EffectiveConfig, type InteractionGateConfig } from './config.js'
 import { installImChannel, type ImBinding, type ImInject } from './im-binding.js'
-import { createOutbox, describeReplay, type Outbox } from './outbox.js'
+import { createOutbox, describeReplay, outboxFileOf, type Outbox } from './outbox.js'
 import { PROMPT_SECTION, sectionText } from './prompt.js'
 import { approvalRoutingOf, mappingReportOf } from './workspace-mapping.js'
 import { artifactPathOf, hostApproverReportOf, registerTools, type ToolDeps } from './tools.js'
@@ -239,7 +239,7 @@ export function apply(ctx: Context, config: unknown = {}): void {
         // payloads of questions that are being asked right now.
         const outboxes = new Map<string, Outbox>()
         const outboxFor = (cwd: string, config: InteractionGateConfig): Outbox => {
-            const file = artifactPathOf(cwd, config.outboxFile)
+            const file = artifactPathOf(cwd, outboxFileOf(cwd, config))
             const cached = outboxes.get(file)
             if (cached !== undefined) return cached
             const created = createOutbox({
@@ -260,7 +260,7 @@ export function apply(ctx: Context, config: unknown = {}): void {
         const attentionSources = new Map<string, AttentionSource>()
         const attentionFor = (cwd: string, config: InteractionGateConfig): AttentionSource => {
             const ledgerFile = artifactPathOf(cwd, ledgerFileOf(cwd, config))
-            const file = artifactPathOf(cwd, config.attentionFile)
+            const file = artifactPathOf(cwd, attentionFileOf(cwd, config))
             const key = `${ledgerFile}\u0000${file}`
             const cached = attentionSources.get(key)
             if (cached !== undefined) return cached
@@ -342,7 +342,10 @@ export function apply(ctx: Context, config: unknown = {}): void {
         // the first tool call that knows a workspace attaches it, and
         // `attentions()` honestly reports nothing until then (the doctor renders
         // that as `unknown`, never as "nobody is waiting").
-        const absoluteAttention = expandHome(resolved.attentionFile)
+        // `''` is the default and means "follow the layout root": a
+        // workspace-relative path, so there is nothing absolute to attach at
+        // apply time (the first tool call that knows a workspace attaches it).
+        const absoluteAttention = resolved.attentionFile === '' ? '' : expandHome(resolved.attentionFile)
         if (path.isAbsolute(absoluteLedger) && path.isAbsolute(absoluteAttention)) {
             try {
                 registry.attachAttention(attentionFor('', resolved))
@@ -351,7 +354,7 @@ export function apply(ctx: Context, config: unknown = {}): void {
             }
         }
 
-        const absoluteOutbox = expandHome(resolved.outboxFile)
+        const absoluteOutbox = resolved.outboxFile === '' ? '' : expandHome(resolved.outboxFile)
         if (path.isAbsolute(absoluteOutbox)) {
             void outboxFor('', { ...resolved, outboxFile: absoluteOutbox })
                 .replay('apply')
@@ -395,7 +398,7 @@ export function apply(ctx: Context, config: unknown = {}): void {
         const imFinal = imBinding.report()
         logger.info(
             `applied (tools: ${tools.registered.join(', ') || 'none'}${tools.failed.length === 0 ? '' : `; failed: ${tools.failed.join(', ')}`}; ` +
-                `service=${serviceState}; ledger=${resolved.ledgerFile === '' ? '(布局根)/interaction/decisions.jsonl' : resolved.ledgerFile}; outbox=${resolved.outboxFile}; approvers=${resolved.im.approvers.length} inline + ${resolved.im.approversFile}${resolved.requireApproverList ? '(required)' : ''}; ` +
+                `service=${serviceState}; ledger=${resolved.ledgerFile === '' ? '(布局根)/interaction/decisions.jsonl' : resolved.ledgerFile}; outbox=${resolved.outboxFile === '' ? '(布局根)/interaction/outbox.jsonl' : resolved.outboxFile}; approvers=${resolved.im.approvers.length} inline + ${resolved.im.approversFile}${resolved.requireApproverList ? '(required)' : ''}; ` +
                 `askTimeout=${resolved.askTimeoutMs}ms; notifyLevels=${resolved.notifyLevels.join(',')}; prompt=${resolved.prompt.enabled}; ` +
                 `im=${imFinal.registered ? `chat-interaction(api v${imFinal.apiVersion})` : imFinal.phase}(im.channel=${imMode}${imMode === 'required' ? `; requiredWaitMs=${resolved.im.requiredWaitMs}` : ''}; ` +
                 `approvalChatId=${resolved.im.approvalChatId === '' ? '(未配置)' : resolved.im.approvalChatId}; p2pOnly=${resolved.im.p2pOnly}; approvalVia=${approvalAnswerer.describe()})${resolved.im.approvalChatIdProblem === undefined ? '' : ' ⚠️ im.approvalChatId 不可用（见上）'}))`,

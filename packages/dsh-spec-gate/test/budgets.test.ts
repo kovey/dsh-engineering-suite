@@ -14,7 +14,8 @@ import { MissionStoreRegistry } from 'dsh-eng-core'
 import { createFakeHost, runText, tempWorkspace, type FakeHost } from 'dsh-eng-core/testing'
 import { apply } from '../dist/index.js'
 import { declareBudgets } from '../dist/budgets.js'
-import { DEFAULT_PLAN_FILE, readPlanLedger } from '../dist/plan-ledger.js'
+import { resolveConfig } from '../dist/config.js'
+import { planFileOf, readPlanLedger } from '../dist/plan-ledger.js'
 
 const TEST_DESIGN = [
     '### 正向场景',
@@ -102,7 +103,7 @@ function recordOf(cwd: string): { spec?: { budgets?: { id: string; threshold: Re
 
 /** The plan ledger's rows, read back through the plugin's own reader. */
 function ledger(cwd: string): ReturnType<typeof readPlanLedger> {
-    return readPlanLedger(path.join(cwd, DEFAULT_PLAN_FILE))
+    return readPlanLedger(path.join(cwd, planFileOf(cwd, resolveConfig({}))))
 }
 
 /** A structural snapshot of everything under a directory. */

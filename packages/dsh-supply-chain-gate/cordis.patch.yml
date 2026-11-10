@@ -8,6 +8,11 @@
 # plugin); the audit COMMANDS are not: only the host knows which auditor a
 # repository's ecosystem has installed. `auditCommands: []` therefore means
 # "audit nothing", which the tool reports as WARN — never as a clean PASS.
+#
+# The allowlist file is deliberately NOT pinned here: the code default resolves
+# `secret-allow.json` through the layout root (`.dsh/engineering-suite/` in a
+# migrated repository, `.dsh/` before the migration), and an explicit value in
+# this patch would beat that default for every repository.
 - insert:
     - id: supply-chain-gate
       name: 'dsh-supply-chain-gate'
@@ -18,7 +23,6 @@
           enabled: true
           entropyThreshold: 4.0
           maxFileBytes: 1048576
-          allowlistFile: .dsh/secret-allow.json
           scanWholeTree: false
         deps:
           enabled: true

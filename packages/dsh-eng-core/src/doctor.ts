@@ -28,21 +28,52 @@
 
 import { spawnSync } from 'node:child_process'
 import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import { readJson } from './io.js'
 import type { Logger } from './log.js'
 import { archiveFootprint } from './archive.js'
 import { mandateState, policyDifferences, policyFingerprint, readPolicySnapshot, type PolicyChange } from './mandate.js'
 import { MissionStore } from './mission.js'
-import { projectConfigFile } from './project-config.js'
+import { projectArtifactOf, projectConfigFile } from './project-config.js'
 import { recognizeTestCommand, testCommandLabel } from './test-commands.js'
-import { resolveLayout, type Layout } from './paths.js'
+import { resolveLayout, isInside, resolvePath, type Layout } from './paths.js'
 import type { MissionRecord } from './types.js'
 import { MAX_DETAIL_FINDINGS, describeFinding, writersCheck } from './writer-check.js'
 import type { WriterFinding } from './writer-check.js'
 
 /** The six phases this suite organises itself around. */
 export type PhaseName = 'plan' | 'build' | 'test' | 'interact' | 'deliver' | 'deploy'
+
+/**
+ * Where the HOST keeps its approver list (`dsh-interaction-gate`'s
+ * `im.approversFile` default).
+ *
+ * Host-side ON PURPOSE (P3.1): the list decides who may grant a permission, so it
+ * cannot live inside the repository the permission is about. It is therefore the
+ * one path in this check that does NOT follow the workspace layout root — a
+ * repository file named `<repo>/.dsh/interaction-approvers.txt` is not read by any
+ * approval path.
+ */
+const HOST_APPROVERS_FILE = '~/.dsh/interaction-approvers.txt'
+
+/**
+ * A path as a person reads it: `~` for the home directory, a relative path
+ * inside the workspace, the absolute path otherwise.
+ *
+ * The approver list lives outside the workspace, so `path.relative(cwd, …)`
+ * rendered it as `../../Users/…` — a path that looks like a leak and tells the
+ * operator less than `~/.dsh/interaction-approvers.txt` does.
+ * @param target - absolute path.
+ * @param cwd - optional workspace root for the relative form.
+ */
+function hostPathLabel(target: string, cwd?: string): string {
+    const home = os.homedir()
+    if (target === home) return '~'
+    if (target.startsWith(`${home}${path.sep}`)) return `~/${path.relative(home, target).split(path.sep).join('/')}`
+    if (cwd !== undefined && isInside(cwd, target)) return path.relative(cwd, target)
+    return target
+}
 
 /** Phase order used by every renderer. */
 export const PHASES: readonly PhaseName[] = ['plan', 'build', 'test', 'interact', 'deliver', 'deploy']
@@ -637,8 +668,9 @@ export function checkWorkspace(options: DoctorOptions): DoctorReport {
         fix: 'bash scripts/project-config.sh --workspace <repo> --write --test "<测试命令>" --lint "<lint 命令>"',
     })
 
-    const standardsFile = path.join(cwd, String(readProjectConfig(layout, 'standards-gate').value?.['standardsFile'] ?? '.dsh/standards.json'))
-    const baselineFile = path.join(cwd, String(readProjectConfig(layout, 'standards-gate').value?.['baselineFile'] ?? '.dsh/standards-baseline.json'))
+    const standardsConfig = readProjectConfig(layout, 'standards-gate')
+    const standardsFile = projectArtifactOf(layout, standardsConfig.value, 'standardsFile', 'standards.json')
+    const baselineFile = projectArtifactOf(layout, standardsConfig.value, 'baselineFile', 'standards-baseline.json')
     const hasStandards = fs.existsSync(standardsFile)
     const hasBaseline = fs.existsSync(baselineFile)
     add({
@@ -866,20 +898,26 @@ export function checkWorkspace(options: DoctorOptions): DoctorReport {
                 : '未配置：审批仍只走宿主 approval 接缝（终端可用，IM/无头场景下没有统一入口）'),
         ...(interaction.present ? {} : { fix: '部署 dsh-interaction-gate 后按需写 .dsh/interaction-gate.json（requireApproverList/askTimeoutMs 等）' }),
     })
-    const approvers = path.join(cwd, String(interaction.value?.['approversFile'] ?? '.dsh/interaction-approvers.txt'))
+    // The approver list is HOST-side (P3.1): it decides who may grant a
+    // permission, so it must not live inside the repository the permission is
+    // about. A repository file named `<repo>/.dsh/interaction-approvers.txt` is
+    // not read by any approval path, so checking it here would report a
+    // permission seam that does not exist.
+    const approvers = resolvePath(HOST_APPROVERS_FILE, cwd)
+    const approversLabel = hostPathLabel(approvers, cwd)
     const requireApprovers = interaction.value?.['requireApproverList'] === true
     add({
         id: 'interaction.approvers',
         area: 'interact',
         state: !requireApprovers ? 'ok' : fs.existsSync(approvers) ? 'ok' : 'missing',
         severity: requireApprovers ? 'required' : 'recommended',
-        label: '审批人名单（requireApproverList=true 时必填）',
+        label: '审批人名单（宿主侧；requireApproverList=true 时必填）',
         detail: requireApprovers
             ? fs.existsSync(approvers)
-                ? `已提供：${path.relative(cwd, approvers)}`
-                : 'requireApproverList=true 但名单文件不存在：所有回答都会被判为"无权限"（fail closed）'
+                ? `已提供：${approversLabel}`
+                : `requireApproverList=true 但名单文件不存在（${approversLabel}）：所有回答都会被判为"无权限"（fail closed）`
             : '未启用严格名单（该会话里任何人都可以决定）',
-        ...(requireApprovers && !fs.existsSync(approvers) ? { fix: `写入允许的审批人 id（每行一个）到 ${path.relative(cwd, approvers)}` } : {}),
+        ...(requireApprovers && !fs.existsSync(approvers) ? { fix: `写入允许的审批人 id（每行一个）到 ${approversLabel}` } : {}),
     })
 
     // ---- deliver ----------------------------------------------------------

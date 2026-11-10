@@ -47,7 +47,7 @@ import {
     type RunOutcome,
     type SubprocessLike,
 } from 'dsh-eng-core'
-import type { EffectiveConfig, SupplyChainGateConfig } from './config.js'
+import { allowlistFileOf, type EffectiveConfig, type SupplyChainGateConfig } from './config.js'
 import {
     classifyFindings,
     diffManifests,
@@ -323,7 +323,7 @@ function runScan(input: {
         full: unread === 0 && !truncated && input.coverageProblem === undefined && scannedFiles > 0,
         truncated,
         allowlist: input.allowlist,
-        allowlistFile: input.config.secretScan.allowlistFile,
+        allowlistFile: allowlistFileOf(input.cwd, input.config),
         durationMs: Date.now() - started,
     }
 }
@@ -510,7 +510,7 @@ export function registerTools(
         defineTool({
             name: 'secret_scan',
             description:
-                'Scan for committed secrets (API keys, tokens, private keys, high-entropy literals) in the lines this change ADDED, in explicit files, or in the whole bounded tree; honour a repository-owned allowlist (`.dsh/secret-allow.json`); record a PASS/BLOCK gate on the mission. Every excerpt in the report and the artifact is REDACTED (first 4 + last 2 characters + a SHA-256 fingerprint) — the raw secret is never written anywhere. A clean scan means "nothing matched", never "no secret exists".',
+                'Scan for committed secrets (API keys, tokens, private keys, high-entropy literals) in the lines this change ADDED, in explicit files, or in the whole bounded tree; honour a repository-owned allowlist (`secret-allow.json` under the resolved layout root); record a PASS/BLOCK gate on the mission. Every excerpt in the report and the artifact is REDACTED (first 4 + last 2 characters + a SHA-256 fingerprint) — the raw secret is never written anywhere. A clean scan means "nothing matched", never "no secret exists".',
             parameters: {
                 base: { type: 'string', description: 'Commit/ref to diff against (default HEAD = the working tree).' },
                 paths: {
@@ -544,10 +544,13 @@ export function registerTools(
                     ].join('\n')
                 }
 
-                const allowlistFileAbs = path.isAbsolute(scanConfig.allowlistFile)
-                    ? scanConfig.allowlistFile
-                    : path.join(cwd, scanConfig.allowlistFile)
-                const allowlist = loadAllowlist(cwd, scanConfig.allowlistFile)
+                // The allowlist follows the layout root by default (a migrated
+                // repository keeps its exemptions under the namespace directory).
+                const allowlistRelative = allowlistFileOf(cwd, config)
+                const allowlistFileAbs = path.isAbsolute(allowlistRelative)
+                    ? allowlistRelative
+                    : path.join(cwd, allowlistRelative)
+                const allowlist = loadAllowlist(cwd, allowlistRelative)
                 const explicitPaths = (args.paths ?? []).map((entry) => entry.replace(/^\.\//, '').trim()).filter((entry) => entry !== '')
                 const wholeTree = args.wholeTree ?? scanConfig.scanWholeTree
                 const base = args.base ?? 'HEAD'
@@ -677,7 +680,7 @@ export function registerTools(
                             tool: 'secret_scan',
                             rules: SECRET_RULES.map((rule) => ({ id: rule.id, severity: rule.severity })),
                             entropyThreshold: scanConfig.entropyThreshold,
-                            allowlistFile: scanConfig.allowlistFile,
+                            allowlistFile: allowlistRelative,
                             scope: outcome.scope,
                             base: outcome.base,
                             coverage: {
@@ -1247,10 +1250,11 @@ export function registerTools(
                 const store = deps.stores.for(cwd)
                 const effective: EffectiveConfig = deps.configFor(agent)
                 const config = effective.config
-                const allowlist = loadAllowlist(cwd, config.secretScan.allowlistFile)
-                const allowlistFileAbs = path.isAbsolute(config.secretScan.allowlistFile)
-                    ? config.secretScan.allowlistFile
-                    : path.join(cwd, config.secretScan.allowlistFile)
+                const allowlistRelative = allowlistFileOf(cwd, config)
+                const allowlist = loadAllowlist(cwd, allowlistRelative)
+                const allowlistFileAbs = path.isAbsolute(allowlistRelative)
+                    ? allowlistRelative
+                    : path.join(cwd, allowlistRelative)
                 // Advice only, and only when nothing is configured: the status
                 // view must not imply a command was (or should be) run.
                 const auditSuggestions =
