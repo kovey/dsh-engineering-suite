@@ -1,4 +1,4 @@
-## [未发布]
+## [0.8.1] — 2026-11-10
 
 ### 修复 · shell 分析器遇管道符崩溃（含引号内的竖线）
 
@@ -18,11 +18,15 @@
 
 本仓库 `.gitignore` 原来整体忽略 `.dsh/`，导致信任根里的门禁配置从未被提交（`git ls-files .dsh` 为 0）。
 
-### 已知缺口
+### 修复 · standards-gate 的默认路径也走布局根
 
-`standards-gate` 仍把默认路径解析成 `.dsh/standards.json`（不走布局根），因此写入命名空间的
-`standards.json` 读不到；需要一次独立改动让它也用 `resolveLayout`。
+`standards-gate` 的 `standards.json` / `standards-baseline.json` 默认位置写死成 `.dsh/` 下的字面量，
+迁移后的仓库把配置写进 `.dsh/engineering-suite/` 后它读不到（`standards_status` 一直说"没有规范文件"）。
 
+现在默认位置按**布局根**推导（命名空间优先、未迁移回退 `.dsh/`），显式配置 `standardsFile` /
+`baselineFile` 仍然优先。实现用 `path.relative` 而非 `slice(cwd.length + 1)`：带尾分隔符的 `cwd`
+会多切一个字符，默认路径退化成工作区的兄弟路径，门禁随后把临时文件 rename 到工作区目录本身（EISDIR）。
+测试 27 → 30（两个根各一条、显式配置优先一条），既有 27 条断言一条未放宽。
 ## [0.8.0] — 2026-11-10
 
 > **BREAKING**：本套件的产物与配置从 `<repo>/.dsh/` 收进 `<repo>/.dsh/engineering-suite/`。
@@ -109,7 +113,6 @@ TUI 里 `spec_approve` 能弹出规格与测试用例文档；web / desktop 之�
 - **迁移脚本** `scripts/migrate-to-engineering-suite.sh`：默认 dry-run；`--apply` 才移动；
   只搬本套件认识的条目（**别的插件的运行时文件原地不动**，这正是关键）；目标已存在同名内容时
   在**任何移动之前**停下；可重复执行（第二次 no-op）；打印回滚命令。
-
 ## [0.7.5] — 2026-11-10
 
 ### 安全 · shell 分析器现在能看见"脚本里的写操作"（文件边界曾可绕过）
@@ -172,7 +175,6 @@ service 代理在插件**没有 `inject`** 时会**取值即抛**（`cannot get 
 现在 abandoned 记为 `info` 并单独成类：报告里列出、给出 WARN 理由（值得排期替换），
 **永不阻断**。doctor 与工具输出里关于 `"unknown"` 的建议文案也改准了——它指"报告没说有多严重"，
 不是"包被废弃"。
-
 ## [0.7.4] — 2026-11-10
 
 ### 修复 · 一条旧的"整 mission 作废"行会永久封杀该 mission 之后的所有提问
@@ -184,7 +186,6 @@ service 代理在插件**没有 `inject`** 时会**取值即抛**（`cannot get 
 现在 mission 级行只能关闭**它被写下时已经存在**的提问（`row.at >= target.askedAt`）：
 写行那一刻仍开着的提问照旧被关闭（历史语义不变），之后新问的不受影响。旧台账无需手工清理，
 老行自然失去对未来的效力。
-
 ## [0.7.3] — 2026-11-10
 
 ### 修复 · 交付之后的审批不再被作废（生产部署卡住的真因）
@@ -213,7 +214,6 @@ service 代理在插件**没有 `inject`** 时会**取值即抛**（`cannot get 
 现在"必填"判断移到处理器（`pickList`）：两种拼写都声明、任取其一；**同时存在且不一致就拒绝猜测**；
 两者皆缺仍然报错 —— 校验没有放松，只是搬到知道名字的地方。回归三条：snake_case 必须成功、
 冲突必须拒绝、两者皆缺仍然拒绝。
-
 ## [0.7.2] — 2026-11-09
 
 ### 新增 · `dependency_audit` 认识 PHP composer / Rust cargo / Ruby bundler / .NET 的报告
@@ -270,7 +270,6 @@ P3.2 的默认策略是 `refuse`——未映射的工作区**一次决定也做�
 会稳定触发它，然后两分钟的验收白跑（今天发生了三次）。`wait-quiet.sh <秒> [上限] [路径…]` 在窗口内
 没有文件变动时返回 0，仍在变动则超时返回 1 并列出还在变的文件。OPS 自检 C14 覆盖"静止通过 / 仍在动超时 /
 路径不存在是用法错误"。
-
 ## [0.7.1] — 2026-11-09
 
 ### 修复 · 基线锁把"锁文件读不出内容"当成"锁已过期"
@@ -354,7 +353,6 @@ P1/P3.1 让宿主拥有**一个**审批会话和**一份**审批人名单。一�
   `dsh-suite-doctor` 59 → **62**（TC-936 ×2 + "宿主名单读不到 ≠ 为空"）。TC-937 = 两次 `bash scripts/verify.sh --quiet` 全绿。
 - **文档**：`docs/ARCHITECTURE.md` §5.18 补"为什么白名单必须宿主所有、而 deny 是项目唯一合法的杠杆"；
   `docs/KNOWN-LIMITS.md` 记录迁移（旧仓库的名单从此不生效，以及怎么搬）。
-
 ## [0.7.0] — 2026-11-09
 
 ### 修复 · IM 通道在"提供方不发可用信号"时的半坏状态
@@ -643,7 +641,6 @@ orchestrator 91 → 92 测试；`scripts/verify.sh --quiet` 连跑 3 次全绿�
 
 OPS SELFTEST 新增 **C11**（5 项）：tree 不存在时以用法错误退出且不碰闭包、dry-run 零写盘、`--apply` 收敛、
 真实目录不被链接替换、二次 `--apply` 为无操作。
-
 ## [0.6.3] — 2026-11-06
 
 ### 兼容 · harness 0.2.2-rc.1（**两处文档断言此前是错的**）
@@ -671,7 +668,6 @@ OPS SELFTEST 新增 **C11**（5 项）：tree 不存在时以用法错误退出�
 - 在 **0.2.2-rc.1**（隔离安装，581 包）上：build / typecheck / `test-all --quiet` 全部 exit 0（16/16 包）；
   `E2E GREEN` 且 **15/15 插件挂载**，日志无 `skipping` / `incompatible`。
 - semver 真值表（`includePrerelease`）：`0.2.1-rc.2` ✓、`0.2.2-rc.1` ✓、`0.2.2` ✓、`0.2.3-rc.1` ✗。
-
 ## [0.6.2] — 2026-11-06
 
 ### 新增 · 门禁 quiet 模式与更可诊断的失败输出
@@ -696,7 +692,6 @@ OPS SELFTEST 新增 **C11**（5 项）：tree 不存在时以用法错误退出�
 ### 验证
 
 - `bash scripts/verify.sh --quiet`：全绿（16 个包 + 跨包集成 + 工具自检）。
-
 ## [0.6.1] — 2026-11-05
 
 ### 修复 · shell 分析器把 heredoc 正文与比较运算符当成重定向
@@ -752,7 +747,6 @@ heredoc 正文里的"大于号加文件名"也会被当作写盘。
 - `bash scripts/verify.sh`：**1090 测试 / 1089 通过 / 0 失败 / 1 如实跳过**（含 OPS SELFTEST GREEN）。
 - 手工抽检：`vendor/bin/phpunit` → `PHP / phpunit`、`php artisan test` → `PHP / artisan`、`pest` → `PHP / pest`、
   `composer test` → `PHP / composer`；而 `php -l`、`echo pytest`、`grep phpunit` **不识别** ✓。
-
 ## [0.6.0] — 2026-11-03
 
 ### 修复 · 知识库索引新鲜度可复现（一致性总览的最后一个盲区）
@@ -792,7 +786,6 @@ heredoc 正文里的"大于号加文件名"也会被当作写盘。
 
 - `bash scripts/verify.sh`：**1011 测试 / 1010 通过 / 0 失败 / 1 如实跳过**（含 OPS SELFTEST GREEN）。
 - 包内计数：`dsh-standards-gate` 24→35、`dsh-impact-gate` 60→62。
-
 ## [0.5.0] — 2026-11-02
 
 ### 文档 · 「上下文不是授权」写成硬规矩 + 被否决的设计清单
@@ -899,7 +892,6 @@ heredoc 正文里的"大于号加文件名"也会被当作写盘。
 - `bash scripts/verify.sh`：**944 测试 / 943 通过 / 0 失败 / 1 如实跳过**（含 OPS SELFTEST GREEN）。
 - `scripts/e2e-mission.sh`：**E2E GREEN，15/15 插件**，且真机会话里确认 mandate 已落盘
   （`strength: explicit`、`scope.paths` 来自规格、`policyVersion` 为空信任根的既定值）。
-
 ## [0.4.0] — 2026-10-30
 
 ### 新增 · IM 交互通道（可选，基于 `dsh-chat-interaction` v0.3.0）
@@ -921,7 +913,6 @@ heredoc 正文里的"大于号加文件名"也会被当作写盘。
 - `bash scripts/verify.sh`：**911 测试 / 910 通过 / 0 失败 / 1 如实跳过**（含 OPS SELFTEST GREEN）。
 - 说明：IM 通道目前是**用假 `chatInteraction` 做的单元级验证**（注册条件、卡片选项映射、一次性 token、重放拒绝、
   失败关闭、脱敏）；**尚未对真实飞书/企微渠道做端到端验证**（需要凭证与真实会话）。
-
 ## [0.3.1] — 2026-10-19
 
 ### 兼容 · harness 0.2.1-rc.1 / rc.2
@@ -932,7 +923,6 @@ heredoc 正文里的"大于号加文件名"也会被当作写盘。
 - **修正文档与实现的漂移**：文档此前写 `>=0.2.0-rc.1 <0.2.1-0`，而 manifest 实际声明 `<0.2.2`——后者更松，
   且在 `includePrerelease` 下会放进**未验证的 `0.2.2-rc.1`**。现统一为 `>=0.2.0-rc.1 <0.2.2-0`：
   接受 0.2.0/0.2.1 两条线（含预发布），拒绝 0.2.2 的任何预发布。历史条目不改写，仅在新记录里标注。
-
 ## [0.3.0] — 2026-10-12
 
 ### 新增 · 项目知识库（`dsh-knowledge-base`，第 15 个插件）
@@ -1011,7 +1001,6 @@ heredoc 正文里的"大于号加文件名"也会被当作写盘。
 
 - `bash scripts/verify.sh`：**881 测试 / 880 通过 / 0 失败 / 1 如实跳过**（含 OPS SELFTEST GREEN）。
 - `scripts/e2e-mission.sh`：**E2E GREEN**，**15/15** 插件挂载并跑完一条 mission。
-
 ## [0.2.3] — 2026-09-30
 
 ### 新增 · 交付度量（`orchestrate({ action: 'metrics' })`）
@@ -1049,7 +1038,6 @@ heredoc 正文里的"大于号加文件名"也会被当作写盘。
 
 - `bash scripts/verify.sh`：**850 测试 / 849 通过 / 0 失败 / 1 如实跳过**（含 OPS SELFTEST GREEN）。
 - `scripts/e2e-mission.sh`：**E2E GREEN**，14/14 插件。
-
 ## [0.2.2] — 2026-09-30
 
 **已在 harness `0.2.0-rc.2` 上完成全量验证：零代码改动。** 这一版是"验证 + 文档"的发布，理由值得写清楚：
@@ -1074,7 +1062,6 @@ heredoc 正文里的"大于号加文件名"也会被当作写盘。
 - `docs/VERIFICATION.md` 基线 → rc.2，并新增本次适配记录（含上面的实测数据与 250/289 对比）；
 - `UPGRADE §1.8` 说明"升到 rc.2 不需要改任何声明"，以及**官方能力是可选包**——要用需显式装进 profile
   （`dsh-base` 的 patch 声明了 PTC 两行，但缺包不会自动补）。
-
 ## [0.2.1] — 2026-09-29
 
 ### 兼容与组合（官方 0.2.0 能力的采纳边界）
@@ -1102,7 +1089,6 @@ heredoc 正文里的"大于号加文件名"也会被当作写盘。
 
 - `bash scripts/verify.sh`：**830 测试 / 829 通过 / 0 失败 / 1 如实跳过**（含 OPS SELFTEST GREEN）。
 - `scripts/e2e-mission.sh`：**E2E GREEN**，14/14 插件在 `@deepseek-ai/dsh-*` **0.2.0-rc.1** 上完成一条真实 mission。
-
 ## [0.2.0] — 2026-09-29
 
 ### 兼容基线
@@ -1156,7 +1142,6 @@ heredoc 正文里的"大于号加文件名"也会被当作写盘。
 - `scripts/doctor.mjs` 的参数解析：`--json <path>` 时路径被忽略、结果报的是当前目录（看起来像"目标仓库是空的"）。
 - 目录型忽略规则必须用尾斜杠查询，文件则不能带尾斜杠（两个 bug 都是在真实仓库上抓到的，不是测试里）。
 - `.dsh/media/` 等只在对应插件被使用后才存在的运行时目录，改为"存在才要求忽略"（避免给每个仓库塞无效规则）。
-
 ## [0.1.0] — 2026-09-28
 
 首个发布（v0.1.0）：11 个插件 + 1 个共享库，`verify.sh` 全绿、真机 harness 端到端可复现（11 个插件全部挂载）。
