@@ -31,6 +31,18 @@
 #   --print      只打印检测结果（kind=/test=/lint= 三行，不写任何文件），
 #                供脚本和测试断言；检测不到测试命令时仍以 3 退出
 #
+# 结构规范检查（`scripts/standards-check.sh`）：目标仓库根存在**可执行**的该脚本时，
+# quality-gate.json 会自动多一条 required 的命令（id=standards、phase=gate、--quiet）：
+#   - 它检查什么：仓库自己声明的结构阈值（`.dsh/standards.json`：文件/函数行数、嵌套深度、
+#     if 块行数、参数个数、导出面、分层依赖、导入环），并与基线棘轮比较——只有**新增或恶化**
+#     的违规才失败（exit 1）；基线里已接受的存量债务不挡门禁；
+#   - 如何豁免：优先改代码；确有理由（生成代码、表格型代码、大 switch）由人在 `.dsh/standards.json`
+#     里加 `exempt` 或按语言/目录放宽阈值；存量债务确实要带着走，则由人在会话里执行
+#     `standards_check({ accept: true, note: "原因" })`——放宽基线需要人工批准，模型改不了 `.dsh/**`；
+#   - 为什么 required：结构债和测试失败一样会让下一次改动变贵，门禁默认要挡住它；不需要时由人把它
+#     从 quality-gate.json 里删掉（配置属于信任根）；
+#   - 脚本不存在或不可执行时**不写**这条命令：一条必然失败的命令比没有命令更糟。
+#
 # 写入时会顺带保证 `.gitignore` 忽略**运行时台账**（.dsh/missions/、audit/、state/、
 # specs/ 以及已存在的根级 *.jsonl）：不忽略的话，每次门禁运行都会改动工作区，
 # 交付时的 requireCleanTree 会报"与门禁观测的指纹不一致"（两个 diff 摘要不同）。
@@ -74,7 +86,7 @@ while [ $# -gt 0 ]; do
     --no-gitignore) GITIGNORE=0; shift ;;
     --test) TEST_CMD="${2:-}"; shift 2 ;;
     --lint) LINT_CMD="${2:-}"; shift 2 ;;
-    -h|--help) sed -n '3,31p' "$0"; exit 0 ;;
+    -h|--help) sed -n '3,/^set -euo pipefail$/p' "$0" | sed '$d'; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -175,14 +187,31 @@ if [ -z "$TEST" ]; then
   exit 3
 fi
 
+# --- 结构规范检查（可选，棘轮） ---------------------------------------------
+# 只有目标仓库真的能跑它时才装配：`bash scripts/…` 只需要读权限，可执行位是"这个仓库
+# 确实把它当作入口"的信号，两者都满足才写。一条指向不存在脚本的 required 命令会让每次
+# 交付都 BLOCK 在一个跑不起来的东西上——比不配置更糟（见 header 的同一条理由）。
+STANDARDS_CHECK=0
+if [ -x "$WS/scripts/standards-check.sh" ]; then STANDARDS_CHECK=1; fi
+
 # --- build the JSON ---------------------------------------------------------
-QUALITY="$(TEST="$TEST" LINT="$LINT" KIND="$KIND" python3 - <<'PY'
+QUALITY="$(TEST="$TEST" LINT="$LINT" KIND="$KIND" STANDARDS_CHECK="$STANDARDS_CHECK" python3 - <<'PY'
 import json, os
 commands = [{"id": "test", "name": "单元测试", "command": os.environ["TEST"], "required": True, "phase": "gate"}]
 lint = os.environ.get("LINT", "")
 if lint:
     # Non-required on purpose: a missing lint script must not block delivery.
     commands.append({"id": "lint", "name": "lint", "command": lint, "required": False, "phase": "lint"})
+# 结构规范（棘轮）：目标仓库有可执行的 scripts/standards-check.sh 才装配；required 的理由见
+# 脚本 header（结构债和测试失败一样会让下次改动变贵）。id 已存在时不重复添加。
+if os.environ.get("STANDARDS_CHECK") == "1" and not any(command["id"] == "standards" for command in commands):
+    commands.append({
+        "id": "standards",
+        "name": "结构规范（棘轮）",
+        "command": "bash scripts/standards-check.sh --quiet",
+        "phase": "gate",
+        "required": True,
+    })
 print(json.dumps({"commands": commands}, ensure_ascii=False, indent=2))
 PY
 )"
@@ -372,6 +401,11 @@ echo "project   : $KIND"
 echo "test      : $TEST"
 echo "lint      : ${LINT:-(无)}"
 echo "spec-gate : $SPEC"
+if [ "$STANDARDS_CHECK" = "1" ]; then
+  echo "standards : 已装配（新增/恶化的结构违规 → exit 1；存量债务在基线里，豁免由人改 .dsh/standards.json 的 exempt/阈值）"
+else
+  echo "standards : 跳过（scripts/standards-check.sh 不存在或不可执行）——不生成必然失败的命令"
+fi
 report "$DSH/quality-gate.json" "$QUALITY"
 [ -n "$SPEC_JSON" ] && report "$DSH/spec-gate.json" "$SPEC_JSON"
 [ -n "$STANDARDS_JSON" ] && report "$DSH/standards.json" "$STANDARDS_JSON"

@@ -86,7 +86,6 @@
     "maxDepth|packages/dsh-spec-gate/src/tools.ts|registerTools",
     "maxDepth|packages/dsh-standards-gate/src/index.ts|apply",
     "maxDepth|packages/dsh-standards-gate/src/review.ts|runStructuralReview",
-    "maxDepth|packages/dsh-standards-gate/src/tools.ts|approve",
     "maxDepth|packages/dsh-suite-doctor/src/index.ts|apply",
     "maxDepth|packages/dsh-suite-doctor/src/observe.ts|tallyObservations",
     "maxDepth|packages/dsh-suite-doctor/src/probe.ts|parseWorkspaceMapping",
@@ -436,18 +435,6 @@
     "maxIfBlockLines|packages/dsh-deploy-gate/src/plan.ts|evaluateGoNoGo#L281",
     "maxIfBlockLines|packages/dsh-deploy-gate/src/plan.ts|evaluateGoNoGo#L316",
     "maxIfBlockLines|packages/dsh-deploy-gate/src/tools.ts|registerTools",
-    "maxIfBlockLines|packages/dsh-deploy-gate/src/tools.ts|registerTools#L1684",
-    "maxIfBlockLines|packages/dsh-deploy-gate/src/tools.ts|registerTools#L1718",
-    "maxIfBlockLines|packages/dsh-deploy-gate/src/tools.ts|registerTools#L1731",
-    "maxIfBlockLines|packages/dsh-deploy-gate/src/tools.ts|registerTools#L1787",
-    "maxIfBlockLines|packages/dsh-deploy-gate/src/tools.ts|registerTools#L1831",
-    "maxIfBlockLines|packages/dsh-deploy-gate/src/tools.ts|registerTools#L2017",
-    "maxIfBlockLines|packages/dsh-deploy-gate/src/tools.ts|registerTools#L2042",
-    "maxIfBlockLines|packages/dsh-deploy-gate/src/tools.ts|registerTools#L2080",
-    "maxIfBlockLines|packages/dsh-deploy-gate/src/tools.ts|registerTools#L2093",
-    "maxIfBlockLines|packages/dsh-deploy-gate/src/tools.ts|registerTools#L2227",
-    "maxIfBlockLines|packages/dsh-deploy-gate/src/tools.ts|registerTools#L2315",
-    "maxIfBlockLines|packages/dsh-deploy-gate/src/tools.ts|registerTools#L2510",
     "maxIfBlockLines|packages/dsh-eng-core/src/conformance.ts|consistencyDimension",
     "maxIfBlockLines|packages/dsh-eng-core/src/delegation.ts|startDelegation",
     "maxIfBlockLines|packages/dsh-eng-core/src/doctor.ts|checkWorkspace",
@@ -531,14 +518,7 @@
     "maxIfBlockLines|packages/dsh-spec-gate/src/review.ts|previewArtifact",
     "maxIfBlockLines|packages/dsh-spec-gate/src/review.ts|previewArtifact#L268",
     "maxIfBlockLines|packages/dsh-spec-gate/src/tools.ts|registerTools",
-    "maxIfBlockLines|packages/dsh-spec-gate/src/tools.ts|registerTools#L1139",
-    "maxIfBlockLines|packages/dsh-spec-gate/src/tools.ts|registerTools#L1166",
-    "maxIfBlockLines|packages/dsh-spec-gate/src/tools.ts|registerTools#L1300",
-    "maxIfBlockLines|packages/dsh-spec-gate/src/tools.ts|registerTools#L885",
-    "maxIfBlockLines|packages/dsh-spec-gate/src/tools.ts|requestApproval",
     "maxIfBlockLines|packages/dsh-standards-gate/src/tools.ts|registerTools",
-    "maxIfBlockLines|packages/dsh-standards-gate/src/tools.ts|registerTools#L731",
-    "maxIfBlockLines|packages/dsh-standards-gate/src/tools.ts|registerTools#L995",
     "maxIfBlockLines|packages/dsh-suite-doctor/src/im-approval.ts|imApprovalChecks",
     "maxIfBlockLines|packages/dsh-suite-doctor/src/im-approval.ts|workspaceMappingCheckOf",
     "maxIfBlockLines|packages/dsh-suite-doctor/src/im-approval.ts|workspaceMappingCheckOf#L360",
@@ -987,11 +967,6 @@
     {
       "key": "maxDepth|packages/dsh-standards-gate/src/review.ts|runStructuralReview",
       "actual": 5,
-      "limit": 4
-    },
-    {
-      "key": "maxDepth|packages/dsh-standards-gate/src/tools.ts|approve",
-      "actual": 7,
       "limit": 4
     },
     {
@@ -2740,66 +2715,6 @@
       "limit": 20
     },
     {
-      "key": "maxIfBlockLines|packages/dsh-deploy-gate/src/tools.ts|registerTools#L1684",
-      "actual": 26,
-      "limit": 20
-    },
-    {
-      "key": "maxIfBlockLines|packages/dsh-deploy-gate/src/tools.ts|registerTools#L1718",
-      "actual": 39,
-      "limit": 20
-    },
-    {
-      "key": "maxIfBlockLines|packages/dsh-deploy-gate/src/tools.ts|registerTools#L1731",
-      "actual": 24,
-      "limit": 20
-    },
-    {
-      "key": "maxIfBlockLines|packages/dsh-deploy-gate/src/tools.ts|registerTools#L1787",
-      "actual": 28,
-      "limit": 20
-    },
-    {
-      "key": "maxIfBlockLines|packages/dsh-deploy-gate/src/tools.ts|registerTools#L1831",
-      "actual": 44,
-      "limit": 20
-    },
-    {
-      "key": "maxIfBlockLines|packages/dsh-deploy-gate/src/tools.ts|registerTools#L2017",
-      "actual": 51,
-      "limit": 20
-    },
-    {
-      "key": "maxIfBlockLines|packages/dsh-deploy-gate/src/tools.ts|registerTools#L2042",
-      "actual": 25,
-      "limit": 20
-    },
-    {
-      "key": "maxIfBlockLines|packages/dsh-deploy-gate/src/tools.ts|registerTools#L2080",
-      "actual": 52,
-      "limit": 20
-    },
-    {
-      "key": "maxIfBlockLines|packages/dsh-deploy-gate/src/tools.ts|registerTools#L2093",
-      "actual": 37,
-      "limit": 20
-    },
-    {
-      "key": "maxIfBlockLines|packages/dsh-deploy-gate/src/tools.ts|registerTools#L2227",
-      "actual": 21,
-      "limit": 20
-    },
-    {
-      "key": "maxIfBlockLines|packages/dsh-deploy-gate/src/tools.ts|registerTools#L2315",
-      "actual": 33,
-      "limit": 20
-    },
-    {
-      "key": "maxIfBlockLines|packages/dsh-deploy-gate/src/tools.ts|registerTools#L2510",
-      "actual": 33,
-      "limit": 20
-    },
-    {
       "key": "maxIfBlockLines|packages/dsh-eng-core/src/conformance.ts|consistencyDimension",
       "actual": 21,
       "limit": 20
@@ -3215,43 +3130,8 @@
       "limit": 20
     },
     {
-      "key": "maxIfBlockLines|packages/dsh-spec-gate/src/tools.ts|registerTools#L1139",
-      "actual": 122,
-      "limit": 20
-    },
-    {
-      "key": "maxIfBlockLines|packages/dsh-spec-gate/src/tools.ts|registerTools#L1166",
-      "actual": 24,
-      "limit": 20
-    },
-    {
-      "key": "maxIfBlockLines|packages/dsh-spec-gate/src/tools.ts|registerTools#L1300",
-      "actual": 23,
-      "limit": 20
-    },
-    {
-      "key": "maxIfBlockLines|packages/dsh-spec-gate/src/tools.ts|registerTools#L885",
-      "actual": 24,
-      "limit": 20
-    },
-    {
-      "key": "maxIfBlockLines|packages/dsh-spec-gate/src/tools.ts|requestApproval",
-      "actual": 24,
-      "limit": 20
-    },
-    {
       "key": "maxIfBlockLines|packages/dsh-standards-gate/src/tools.ts|registerTools",
       "actual": 102,
-      "limit": 20
-    },
-    {
-      "key": "maxIfBlockLines|packages/dsh-standards-gate/src/tools.ts|registerTools#L731",
-      "actual": 25,
-      "limit": 20
-    },
-    {
-      "key": "maxIfBlockLines|packages/dsh-standards-gate/src/tools.ts|registerTools#L995",
-      "actual": 29,
       "limit": 20
     },
     {

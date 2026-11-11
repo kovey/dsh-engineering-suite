@@ -372,6 +372,103 @@ printf 'new\n' > "$CONFLICT/.dsh/engineering-suite/releases.jsonl"
 expect_rc 2 "a conflict refuses instead of overwriting" bash "$ROOT/scripts/migrate-to-engineering-suite.sh" --workspace "$CONFLICT" --apply
 [ "$(cat "$CONFLICT/.dsh/releases.jsonl")" = "old" ] && pass "the conflict left the source untouched" || fail "the conflict modified the source"
 
+# C17 — standards-check.sh: 结构规范检查必须能被质量门禁当命令调用。它不重新实现规则，
+# 而是调 dist 里的引擎；这里钉住三个方向：脚本存在且语法正确、脚手架只在目标仓库真的
+# 能跑它时才装配、以及退出码的两个方向（无新增 → 0；新增/缺基线/缺规范 → 非 0）。
+# 夹具放在 mktemp 目录里：脚本按自身位置推导仓库根，所以一个复制品只会测那个临时树。
+section "C17 — standards-check.sh: 棘轮退出码 + project-config 的装配条件"
+STANDARDS_CHECK="$ROOT/scripts/standards-check.sh"
+if [ -f "$STANDARDS_CHECK" ]; then
+  pass "standards-check: scripts/standards-check.sh exists"
+else
+  fail "standards-check: scripts/standards-check.sh is missing"
+fi
+expect_rc 0 "standards-check: the script parses (bash -n)" bash -n "$STANDARDS_CHECK"
+if grep -q 'bash scripts/standards-check.sh --quiet' "$ROOT/scripts/project-config.sh" && \
+   grep -q '"id": "standards"' "$ROOT/scripts/project-config.sh"; then
+  pass "project-config: carries the standards command template"
+else
+  fail "project-config: the standards command template is missing"
+fi
+
+# 临时仓库：引擎通过符号链接可达（node 解析真实路径后从本仓库的 node_modules 找
+# dsh-eng-core），而 walkWorkspace 不跟随目录符号链接，所以引擎不会被当成被测代码。
+FIX="$TMP/c17"
+rm -rf "$FIX"
+mkdir -p "$FIX/scripts" "$FIX/src" "$FIX/.dsh/engineering-suite"
+cp "$STANDARDS_CHECK" "$FIX/scripts/standards-check.sh"
+chmod +x "$FIX/scripts/standards-check.sh"
+ln -s "$ROOT/packages" "$FIX/packages"
+printf '{"name":"demo","scripts":{"test":"node --test"}}\n' > "$FIX/package.json"
+printf 'export const alpha = 1\n' > "$FIX/src/small.ts"
+cat > "$FIX/.dsh/engineering-suite/standards.json" <<'JSON'
+{"languages": {"ts": {"maxFileLines": 300, "maxFunctionLines": 60, "maxDepth": 4, "maxIfBlockLines": 20, "maxParams": 5, "maxExports": 15}}}
+JSON
+printf '{"version":1,"frozenAt":"2026-11-11T00:00:00.000Z","accepted":[]}\n' > "$FIX/.dsh/engineering-suite/standards-baseline.json"
+
+expect_rc 0 "standards-check: a clean tree passes (exit 0)" bash "$FIX/scripts/standards-check.sh" --quiet
+case "$LAST_OUT" in
+  *"PASS"*) pass "standards-check: --quiet prints a PASS summary" ;;
+  *) fail "standards-check: --quiet did not report PASS — $LAST_OUT" ;;
+esac
+
+# 一行一个数组元素：只触发 maxFileLines（不额外触发导出面/函数行数），让计数可断言。
+{ printf 'export const values = [\n'; for index in $(seq 1 320); do printf '  %s,\n' "$index"; done; printf ']\n'; } > "$FIX/src/big.ts"
+expect_rc 1 "standards-check: a new violation fails (exit 1)" bash "$FIX/scripts/standards-check.sh" --quiet
+case "$LAST_OUT" in
+  *"新增 1 项"*) pass "standards-check: the failure names the new-violation count" ;;
+  *) fail "standards-check: the failure did not name the count — $LAST_OUT" ;;
+esac
+
+# observe 规则：同一个违规，规则标了 observe 就只能记录（"影子"），不得让命令失败——
+# 这是 rules 映射与插件共用的 applyRuleModes 语义，脚本不能自己发明第二种解释。
+cp "$FIX/.dsh/engineering-suite/standards.json" "$TMP/c17-standards.json"
+cat > "$FIX/.dsh/engineering-suite/standards.json" <<'JSON'
+{"languages": {"ts": {"maxFileLines": 300}}, "rules": {"maxFileLines": "observe"}}
+JSON
+expect_rc 0 "standards-check: an observe rule reports without blocking (exit 0)" bash "$FIX/scripts/standards-check.sh" --quiet
+case "$LAST_OUT" in
+  *observe*) pass "standards-check: the shadow verdict is still reported as observe" ;;
+  *) fail "standards-check: the observe rule was not reported — $LAST_OUT" ;;
+esac
+cp "$TMP/c17-standards.json" "$FIX/.dsh/engineering-suite/standards.json"
+
+rm -f "$FIX/.dsh/engineering-suite/standards-baseline.json"
+expect_rc 1 "standards-check: a missing baseline fails instead of passing silently" bash "$FIX/scripts/standards-check.sh" --quiet
+case "$LAST_OUT" in
+  *"没有基线"*) pass "standards-check: the missing baseline is stated explicitly" ;;
+  *) fail "standards-check: the missing baseline was not stated — $LAST_OUT" ;;
+esac
+
+rm -f "$FIX/.dsh/engineering-suite/standards.json"
+expect_rc 1 "standards-check: a missing standards file is a failure (exit 1)" bash "$FIX/scripts/standards-check.sh" --quiet
+case "$LAST_OUT" in
+  *standards_bootstrap*) pass "standards-check: the missing standards file names the next step" ;;
+  *) fail "standards-check: the missing standards file did not name standards_bootstrap — $LAST_OUT" ;;
+esac
+
+expect_rc 0 "project-config: scaffolding works on a repo that has the script" bash "$ROOT/scripts/project-config.sh" --workspace "$FIX" --json
+case "$LAST_OUT" in
+  *'"id": "standards"'*'"required": true'*) pass "project-config: the generated config carries id=standards + required" ;;
+  *) fail "project-config: the generated config has no standards command — $LAST_OUT" ;;
+esac
+
+NOFIX="$TMP/c17-nofix"
+rm -rf "$NOFIX"
+mkdir -p "$NOFIX"
+printf '{"name":"demo","scripts":{"test":"node --test"}}\n' > "$NOFIX/package.json"
+expect_rc 0 "project-config: a repo without the script still scaffolds" bash "$ROOT/scripts/project-config.sh" --workspace "$NOFIX" --json
+case "$LAST_OUT" in
+  *'"id": "standards"'*) fail "project-config: scaffolded a command whose script does not exist" ;;
+  *) pass "project-config: no standards command when the script is absent" ;;
+esac
+bash "$ROOT/scripts/project-config.sh" --workspace "$NOFIX" > "$TMP/c17-nofix.out" 2>&1 || true
+if grep -q 'standards : 跳过' "$TMP/c17-nofix.out"; then
+  pass "project-config: prints why the standards command was skipped"
+else
+  fail "project-config: the skip reason is missing — $(cat "$TMP/c17-nofix.out")"
+fi
+
 section "summary"
 if [ "$FAILURES" = "0" ]; then
   printf '  \033[32mOPS SELFTEST GREEN\033[0m — every finding above is still refused.\n'

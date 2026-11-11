@@ -383,6 +383,45 @@ GateRecord(source: dsh-standards-gate) → 交付侧可要求"最新一条 PASS 
 `freeze` 经人工批准写入规范文件，第一次 `standards_check({ accept: true, note: "存量债务" })` 冻结基线。
 生成代码（`*.pb.go`、`*.gen.go`、`mocks/`）与测试文件默认豁免：对生成代码执行人类阈值只会教人忽略门禁。
 
+### 5.7.1 同一条规范，两种入口：`standards_check` 工具与 `scripts/standards-check.sh`
+
+`standards_check` 是给会话里的 agent 用的；质量门禁需要的是**一条命令 + 一个退出码**。两者如果各写一套
+规则，迟早会给出不同结论——所以脚本不重新实现规则，而是调用同一次构建出来的模块：
+
+```
+bash scripts/standards-check.sh [--quiet]
+   ↓ standardsFileOf / baselineFileOf（命名空间优先）+ resolveEffectiveConfig（profile 是上限）
+   <布局根>/standards.json  +  <布局根>/standards-baseline.json
+   ↓ measureWorkspace（dsh-eng-core）
+   ↓ parseRuleModes / applyRuleModes（observe 只测量，不计入裁决）
+   ↓ readBaseline / compareViolations（棘轮：added + worsened 才失败）
+无新增/恶化 → 摘要一行，exit 0
+有新增/恶化 → 逐条列出（最多 40 条 + "另有 N 条"），exit 1
+```
+
+三条刻意写死的边界：
+
+1. **配置缺失不静默**：没有 `standards.json` 时明确指向 `standards_bootstrap`，exit 1；没有（或无法解析）
+   基线时把全部违规按新增计并明说，exit 1——"无法检查"和"没有违规"必须是两个结论，缺棘轮时静默通过
+   等于把仓库里所有违规合法化；
+2. **`enforce: warn|off` 不作用于这条命令**：仓库自己的文件不能把质量门禁里 `required` 的命令改成
+   "只报告"；要"先测量再收紧"用规则级 `observe`（见 §5.20），那条通路只报不阻断，且不会移动棘轮；
+3. **只读**：脚本不写阈值、不写基线，`.dsh/**` 仍是信任根（放宽走人工审批）。
+
+脚手架（`scripts/project-config.sh`）只在目标仓库根存在**可执行**的 `scripts/standards-check.sh` 时，把
+
+```json
+{ "id": "standards", "name": "结构规范（棘轮）", "command": "bash scripts/standards-check.sh --quiet", "phase": "gate", "required": true }
+```
+
+追加进该仓库的 quality-gate 配置（`id=standards` 已存在时不重复）：一条指向不存在脚本的 `required` 命令，
+会让每次交付 BLOCK 在一个跑不起来的东西上，比不配置更糟。
+
+**本仓库当前未启用这条命令**：`.dsh/engineering-suite/quality-gate.json` 属于信任根，模型写不了。要启用需由人
+把它加进 `commands`——注意此刻 `bash scripts/standards-check.sh` 是 exit 1（v0.8.5 引入的 35 项新增 / 13 项恶化），
+所以顺序是"先处理这批已知债务（改代码，或 `standards_check({ accept: true, note })` 经人工批准），再启用它"，
+否则门禁一装进来就是红的。
+
 ### 5.8 需求的增/改/删：编号是地址，修订即回到规格阶段
 
 需求不是写一次就固定的：补一条、改措辞、砍范围都要发生，而且必须和初稿走同一条链路。区别只在于

@@ -36,6 +36,37 @@ spec-gate 新增 TC-1344（展示后被改动 → 拒绝并要求重新送审）
 "policy=never + 可用 IM 通道仍会问人"；deploy-gate 新增"policy=never 点名策略"与"拒绝/取消/无人应答可区分"；
 interaction-gate 新增 8 条探测用例。既有断言一条未放宽，`bash scripts/verify.sh --quiet` 两次全绿。
 
+### 新增 · 结构规范检查进验收链（`scripts/standards-check.sh` + 脚手架按条件装配）
+
+结构规范过去只能通过会话里的 `standards_check` 工具问到，质量门禁没有一条能调用的命令，"可维护"这条就和
+测试、lint 断在了不同的地方。现在把**同一套引擎**（不是第二份规则）包装成确定性命令：
+
+- **`scripts/standards-check.sh`**（可执行、只读）：以脚本自身位置推导仓库根（同 `verify.sh`），按插件的
+  同一对路径读 `<布局根>/standards.json` 与 `<布局根>/standards-baseline.json`（命名空间优先，并走
+  `resolveEffectiveConfig`——profile 是上限），调用 `measureWorkspace` 测量、`parseRuleModes` +
+  `applyRuleModes` 折叠规则模式（`observe` 只报不阻断）、`readBaseline` + `compareViolations` 与基线比较。
+  无新增/恶化 → 摘要一行 exit 0；有 → 逐条列出（最多 40 条 + "另有 N 条"）exit 1；`--quiet` 只留摘要与结论
+  （质量门禁跑的就是这一种）。不新增运行时依赖：`node --input-type=module` 直接跑 `dist`。
+- **三条 fail closed**：缺 `standards.json` → 明确指向 `standards_bootstrap`，exit 1（不是"无违规"）；
+  缺（或无法解析）基线 → 全部违规按新增计并明说，exit 1（没有棘轮就分不清新债与存量债）；引擎未构建 /
+  加载失败 → 说明缺什么、怎么构建，exit 1。`enforce: warn|off` **故意不作用于这条命令**：仓库文件不能把
+  门禁里 `required` 的命令改成"只报告"；要"先测量再收紧"用规则级 `observe`（只报不阻断、不动棘轮）。
+- **脚手架按条件装配**：`scripts/project-config.sh` 只在目标仓库根存在**可执行**的
+  `scripts/standards-check.sh` 时，往 quality-gate 配置里追加
+  `{"id":"standards","name":"结构规范（棘轮）","command":"bash scripts/standards-check.sh --quiet","phase":"gate","required":true}`
+  （`id=standards` 已存在不重复；脚本不存在/不可执行则跳过并打印原因——一条指向不存在脚本的 required 命令
+  会让每次交付 BLOCK 在一个跑不起来的东西上，比不配置更糟）。帮助文本写明它检查什么、如何通过
+  `exempt` / `accept` 豁免、以及为什么它是 required。
+- **自检 C17**：断言脚本存在且 `bash -n` 通过、脚手架源码含命令模板；并在 mktemp 临时仓库里实测
+  "无违规 → 0 / 新增违规 → 1 / 缺基线 → 1 / 缺规范 → 1"与"有脚本才装配、没脚本不装配并说明原因"。
+- **本仓库未启用这条命令**：`.dsh/engineering-suite/quality-gate.json` 属于信任根，模型不可改。要启用需由人
+  把它加进 `commands`；注意此刻 `bash scripts/standards-check.sh` 是 exit 1（v0.8.5 引入的 35 项新增 /
+  13 项恶化），顺序应是"先处理这批已知债务（改代码，或 `standards_check({ accept: true, note })` 经人工批准），
+  再启用"，否则门禁一装进来就是红的。`docs/ARCHITECTURE.md` §5.7.1 记了这条命令与它的三条边界。
+
+测试：C17 覆盖退出码的两个方向与装配条件；本仓库实测 `bash scripts/standards-check.sh` exit 1 并报出
+35 项新增 / 13 项恶化；`bash scripts/verify.sh --quiet` 两次全绿。
+
 ## [0.8.4] — 2026-11-11
 
 ### 修复 · 剩下的 `.dsh/` 路径默认值一次改全（eng-core / evidence / interaction / kb / spec / supply-chain）
