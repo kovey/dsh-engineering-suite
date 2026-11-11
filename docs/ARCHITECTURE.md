@@ -386,27 +386,55 @@ GateRecord(source: dsh-standards-gate) → 交付侧可要求"最新一条 PASS 
 ### 5.7.1 同一条规范，两种入口：`standards_check` 工具与 `scripts/standards-check.sh`
 
 `standards_check` 是给会话里的 agent 用的；质量门禁需要的是**一条命令 + 一个退出码**。两者如果各写一套
-规则，迟早会给出不同结论——所以脚本不重新实现规则，而是调用同一次构建出来的模块：
+规则，迟早会给出不同结论——所以脚本不重新实现规则（也不重新实现"读规范 / 读基线 / 比较 / 计数"），
+而是调用插件自己导出的同一批函数：
 
 ```
 bash scripts/standards-check.sh [--quiet]
    ↓ standardsFileOf / baselineFileOf（命名空间优先）+ resolveEffectiveConfig（profile 是上限）
-   <布局根>/standards.json  +  <布局根>/standards-baseline.json
-   ↓ measureWorkspace（dsh-eng-core）
-   ↓ parseRuleModes / applyRuleModes（observe 只测量，不计入裁决）
+   ↓ loadStandards（dsh-standards-gate/dist/tools.js，与 standards_check 同一个函数）
+       <布局根>/standards.json：阈值归一化 + rules 模式的合法性告警都在这里
+   ↓ measureWorkspace（dsh-eng-core/dist/metrics.js）
    ↓ readBaseline / compareViolations（棘轮：added + worsened 才失败）
+   ↓ applyRuleModes / enforcingViolations（observe 只测量，不计入裁决）
 无新增/恶化 → 摘要一行，exit 0
 有新增/恶化 → 逐条列出（最多 40 条 + "另有 N 条"），exit 1
 ```
 
-三条刻意写死的边界：
+脚本自己只剩"把结论变成人读的输出 + 退出码"这一件事。**不允许有第二份判定**：脚本里再拼一个
+`standards` 对象、再定义一次违规键、再数一次 bucket，都是在给未来的分叉留位置。
+
+四条刻意写死的边界：
 
 1. **配置缺失不静默**：没有 `standards.json` 时明确指向 `standards_bootstrap`，exit 1；没有（或无法解析）
    基线时把全部违规按新增计并明说，exit 1——"无法检查"和"没有违规"必须是两个结论，缺棘轮时静默通过
    等于把仓库里所有违规合法化；
 2. **`enforce: warn|off` 不作用于这条命令**：仓库自己的文件不能把质量门禁里 `required` 的命令改成
    "只报告"；要"先测量再收紧"用规则级 `observe`（见 §5.20），那条通路只报不阻断，且不会移动棘轮；
-3. **只读**：脚本不写阈值、不写基线，`.dsh/**` 仍是信任根（放宽走人工审批）。
+3. **只读**：脚本不写阈值、不写基线，`.dsh/**` 仍是信任根（放宽走人工审批）；
+4. **判定只有一份实现**：`scripts/selftest-ops.sh` 的 C17b 用一份夹具同时跑"脚本路径"与"插件函数路径"
+   （`loadStandards → measureWorkspace → readBaseline → compareViolations`，同一份 `dist`），
+   断言三种计数（已接受 / 新增 / 恶化）**逐项相等**；任何一边单独改动，自检直接红并把两个值都点出来。
+
+#### 一次真实的分叉：574 vs 568（2026-11-11）
+
+会话里的 `standards_check` 报"基线已接受 **574**，0 新增"，同一条命令报"接受 **568**，新增 5 / 恶化 2"。
+根因不是比较逻辑写错，而是**两边跑的不是同一份引擎构建**：
+
+- 长驻的宿主进程在启动时（13:59）把 `packages/dsh-eng-core/dist/metrics.js` 读进内存；此后
+  `bash scripts/verify.sh` 在 16:29 重建了 `dist`（含 `c0d9789` 的"函数区间到配对花括号"修复），
+  但**插件的内存副本不会跟着变**。脚本每次是新进程，读到的就是新构建。
+- 证据：用 `c0d9789` 之前的构建（`2099d7f`）重测本仓库，得到 **574** 条违规，与插件当时记录的度量
+  **逐条一致**（key / actual / limit / detail 全部相同）；用 HEAD 的构建则是 **575** 条
+  （新增 5 / 恶化 2 / 4 条已消除）。因此那个 574 的基线是用旧度量冻结的，它把 `askHuman` 接受成
+  1803 行（到文件末尾）之类的假值也冻了进去。
+
+由此得到两条运维规则（比代码更常被忽略）：
+
+1. **比较两边的数字之前，先确认引擎构建相同**。插件在会话进行中被重建的 `dist` 不会热加载——
+   怀疑分叉时先重启宿主，再比对；
+2. **基线必须由"和当前构建一致"的进程冻结**。用旧构建 `standards_check({ accept: true })` 冻结出来的
+   基线，换成新构建就会冒出成批的"新增"——那些不是新债，是旧度量看不见的债。
 
 脚手架（`scripts/project-config.sh`）只在目标仓库根存在**可执行**的 `scripts/standards-check.sh` 时，把
 
@@ -417,10 +445,10 @@ bash scripts/standards-check.sh [--quiet]
 追加进该仓库的 quality-gate 配置（`id=standards` 已存在时不重复）：一条指向不存在脚本的 `required` 命令，
 会让每次交付 BLOCK 在一个跑不起来的东西上，比不配置更糟。
 
-**本仓库当前未启用这条命令**：`.dsh/engineering-suite/quality-gate.json` 属于信任根，模型写不了。要启用需由人
-把它加进 `commands`——注意此刻 `bash scripts/standards-check.sh` 是 exit 1（v0.8.5 引入的 35 项新增 / 13 项恶化），
-所以顺序是"先处理这批已知债务（改代码，或 `standards_check({ accept: true, note })` 经人工批准），再启用它"，
-否则门禁一装进来就是红的。
+**本仓库自己的状态**：`.dsh/engineering-suite/quality-gate.json` 属于信任根，模型写不了；本仓库已（由人）
+把这条命令加进 `commands`，因此它现在真的决定交付。当前它是 exit 1（新增 5 / 恶化 2）——原因是上面的
+旧构建基线还没刷新，顺序是"**先重启宿主**（让插件加载修好的引擎）→ `standards_check({ accept: true, note })`
+经人工批准重冻基线（574 → 575）→ 脚本与插件同时回到 575 / 0"，而不是去改脚本或改基线绕开它。
 
 ### 5.8 需求的增/改/删：编号是地址，修订即回到规格阶段
 

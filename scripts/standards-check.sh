@@ -3,22 +3,32 @@
 #
 # `standards_check` 工具回答的是"这次改动有没有引入结构违规"，但质量门禁需要的是
 # 一条命令 + 一个退出码。为了让两者永远不会给出不同结论，本脚本**不重新实现规则**，
-# 而是调用同一套引擎（都在 packages/*/dist，模型层不参与）：
+# 也不重新实现"读规范 / 读基线 / 比较 / 计数"——它调用插件自己导出的同一批函数
+# （都在 packages/*/dist，模型层不参与）：
 #
-#   dsh-eng-core/dist/metrics.js        measureWorkspace（确定性、有上限、不跟随符号链接）
-#   dsh-eng-core/dist/rule-mode.js      applyRuleModes（observe 规则只报不阻断）
-#   dsh-standards-gate/dist/config.js   standardsFileOf / baselineFileOf（命名空间优先）
-#   dsh-standards-gate/dist/baseline.js readBaseline / compareViolations（棘轮比较）
+#   dsh-eng-core/dist/metrics.js          measureWorkspace（确定性、有上限、不跟随符号链接）
+#   dsh-eng-core/dist/rule-mode.js        applyRuleModes（observe 规则只报不阻断）
+#   dsh-standards-gate/dist/config.js     standardsFileOf / baselineFileOf（命名空间优先）
+#   dsh-standards-gate/dist/tools.js      loadStandards（规范 + rules 模式）、artifactPathOf
+#   dsh-standards-gate/dist/baseline.js   readBaseline / compareViolations（棘轮比较）
 #   dsh-standards-gate/dist/rule-modes.js 规则模式与"哪些违规才算数"
+#
+# 为什么必须这样：**平行的第二份判定一定会分叉**。2026-11-11 的一次真实分叉里，
+# 会话里的 standards_check 与这条命令给出 574 / 568 两个"已接受"——根因不是比较逻辑
+# 写错，而是两者跑在不同构建的引擎上（长驻宿主进程缓存了旧的 dist）。共享同一个函数
+# 只能保证"同样的输入同样的结论"；输入（=引擎构建）也要同源，见 docs/ARCHITECTURE.md §5.7.1。
+# C17 用一份夹具钉住这条不变量：脚本路径与插件函数路径的三种计数必须相等。
 #
 # 流程（与 packages/dsh-standards-gate 的 standards_check 逐条对齐）：
 #   1. 以**脚本自身位置**推导仓库根（与 scripts/verify.sh 同一写法）：被测工作区就是
 #      脚本所在仓库，不存在"在别的目录里跑错了对象"这回事；
-#   2. 读 <布局根>/standards.json（`.dsh/engineering-suite/` 存在时优先）与
-#      <布局根>/standards-baseline.json——和插件读的是同一对文件；
-#   3. measureWorkspace 测量，套用 `rules` 映射（observe 规则只报不阻断）；
-#   4. 与基线比较：新增或恶化 → 逐条列出（最多 40 条 + "另有 N 条"）并 exit 1；
-#      无新增 → 打印摘要并 exit 0。
+#   2. 用插件的 loadStandards 读 <布局根>/standards.json（`.dsh/engineering-suite/`
+#      存在时优先；阈值归一化与 rules 模式的告警都只有那一份实现）；
+#   3. 用插件的 readBaseline 读 <布局根>/standards-baseline.json——和插件读的是同一对文件；
+#   4. measureWorkspace 测量，套用 `rules` 映射（observe 规则只报不阻断）；
+#   5. 用插件的 compareViolations 与基线比较：新增或恶化 → 逐条列出（最多 40 条 +
+#      "另有 N 条"）并 exit 1；无新增 → 打印摘要并 exit 0。
+#   脚本自己只负责"把三者变成人读的输出 + 退出码"，不参与任何判定。
 #
 # fail closed，绝不 fail open：
 #   - 没有 standards.json            → 明确提示先 standards_bootstrap，exit 1（不是"无违规"）；
@@ -79,7 +89,6 @@ const rel = (file) => {
   const relative = path.relative(root, file)
   return (relative === '' ? '.' : relative).split(path.sep).join('/')
 }
-const isRecord = (value) => typeof value === 'object' && value !== null && !Array.isArray(value)
 
 /**
  * "无法检查"（缺规范 / 缺基线 / 缺引擎）的失败输出。
@@ -104,6 +113,7 @@ const ENTRIES = [
   ['dsh-standards-gate', 'config.js'],
   ['dsh-standards-gate', 'baseline.js'],
   ['dsh-standards-gate', 'rule-modes.js'],
+  ['dsh-standards-gate', 'tools.js'],
   ['dsh-standards-gate', 'index.js'],
 ]
 const label = ([pkg, file]) => `packages/${pkg}/dist/${file}`
@@ -117,6 +127,7 @@ const loadEngine = async () => {
     config: await load('dsh-standards-gate', 'config.js'),
     baseline: await load('dsh-standards-gate', 'baseline.js'),
     ruleModes: await load('dsh-standards-gate', 'rule-modes.js'),
+    tools: await load('dsh-standards-gate', 'tools.js'),
     plugin: await load('dsh-standards-gate', 'index.js'),
   }
 }
@@ -157,14 +168,14 @@ async function main() {
   const { readBaseline, compareViolations } = engine.baseline
   const {
     configuredRuleIds,
-    declaredRuleIds,
     enforcingViolations,
     isObserve,
-    parseRuleModes,
     renderObservations,
     ruleModeRules,
     ruleVerdicts,
   } = engine.ruleModes
+  // 插件自己的规范读取与路径解析：阈值归一化、rules 模式、产物路径只有一份实现。
+  const { artifactPathOf, loadStandards } = engine.tools
   const { resolveEffectiveConfig } = engine.plugin
 
   // 与插件同一条配置解析路径：profile 是上限，仓库的 <布局根>/standards-gate.json
@@ -175,77 +186,55 @@ async function main() {
   })
   const config = effective.config
 
-  // --- 规范文件 ---------------------------------------------------------------
+  // --- 规范文件与规则模式（插件同源：loadStandards） --------------------------
+  // 解析、阈值归一化、`rules` 模式的合法性告警都由插件的 loadStandards 决定：脚本
+  // 不再拼第二份 standards 对象（以前那 70 行就是分叉的温床）。脚本只保留"无法检查"
+  // 的诊断文案——质量门禁的输出里必须能读出为什么不能检查，而插件的 problem 只有一句。
   const standardsRel = standardsFileOf(root, config)
-  const standardsPath = path.isAbsolute(standardsRel) ? standardsRel : path.join(root, standardsRel)
-  let standardsText
-  try {
-    standardsText = fs.readFileSync(standardsPath, 'utf8')
-  } catch {
-    unableToCheck(
-      `结构规范检查：无法检查 — 没有 ${rel(standardsPath)}（下一步：standards_bootstrap({ action: "measure" }) → freeze，需人工批准）`,
-      [
-        '## 结构规范检查（dsh-standards-gate）— 无法检查（没有规范文件）',
+  const standardsPath = artifactPathOf(root, standardsRel)
+  const loaded = loadStandards(root, standardsRel)
+  if (loaded.standards === undefined) {
+    const exists = fs.existsSync(standardsPath)
+    const incomplete = (loaded.problem ?? '').includes('languages')
+    if (!exists) {
+      unableToCheck(
+        `结构规范检查：无法检查 — 没有 ${rel(standardsPath)}（下一步：standards_bootstrap({ action: "measure" }) → freeze，需人工批准）`,
+        [
+          '## 结构规范检查（dsh-standards-gate）— 无法检查（没有规范文件）',
+          '',
+          `没有找到结构规范文件：${standardsPath}`,
+          '',
+          '规范由目标仓库自己拥有，本脚本不会替你猜阈值。下一步（任选其一）：',
+          '  1. 会话里运行 `standards_bootstrap({ action: "measure" })` 看现状与建议阈值，',
+          '     确认后 `standards_bootstrap({ action: "freeze" })` 写进仓库（需要人工批准）；',
+          '  2. 或由人手工创建（形如 { "languages": { "ts": { "maxFileLines": 300 } } }）。',
+          '',
+          '在规范出现之前，结论只能是"无法检查"，不是"没有违规"。',
+        ],
+      )
+    } else if (incomplete) {
+      unableToCheck(`结构规范检查：无法检查 — ${rel(standardsPath)} 缺少 languages 段`, [
+        '## 结构规范检查（dsh-standards-gate）— 无法检查（规范文件不完整）',
         '',
-        `没有找到结构规范文件：${standardsPath}`,
+        `${standardsPath} 缺少 languages 段（形如 { "languages": { "ts": { "maxFileLines": 300 } } }）。`,
         '',
-        '规范由目标仓库自己拥有，本脚本不会替你猜阈值。下一步（任选其一）：',
-        '  1. 会话里运行 `standards_bootstrap({ action: "measure" })` 看现状与建议阈值，',
-        '     确认后 `standards_bootstrap({ action: "freeze" })` 写进仓库（需要人工批准）；',
-        '  2. 或由人手工创建（形如 { "languages": { "ts": { "maxFileLines": 300 } } }）。',
+        '下一步：`standards_bootstrap({ action: "measure" })` 看建议值，确认后 `freeze`（需要人工批准）。',
+      ])
+    } else {
+      // 文件在、但插件读不出来（绝大多数是 JSON 坏了）：把插件的原话带出来。
+      unableToCheck(`结构规范检查：无法检查 — ${rel(standardsPath)} 不是合法 JSON`, [
+        '## 结构规范检查（dsh-standards-gate）— 无法检查（规范文件损坏）',
         '',
-        '在规范出现之前，结论只能是"无法检查"，不是"没有违规"。',
-      ],
-    )
+        `${standardsPath} 不是合法 JSON（${loaded.problem ?? '无法解析'}）。`,
+        '',
+        '修好它，或用 `standards_bootstrap({ action: "freeze" })` 重写（需要人工批准）。',
+        '在此之前，结论只能是"无法检查"，不是"没有违规"。',
+      ])
+    }
     return 1
   }
-  let raw
-  try {
-    raw = JSON.parse(standardsText)
-  } catch {
-    unableToCheck(`结构规范检查：无法检查 — ${rel(standardsPath)} 不是合法 JSON`, [
-      '## 结构规范检查（dsh-standards-gate）— 无法检查（规范文件损坏）',
-      '',
-      `${standardsPath} 不是合法 JSON。`,
-      '',
-      '修好它，或用 `standards_bootstrap({ action: "freeze" })` 重写（需要人工批准）。',
-      '在此之前，结论只能是"无法检查"，不是"没有违规"。',
-    ])
-    return 1
-  }
-  if (!isRecord(raw) || !isRecord(raw.languages)) {
-    unableToCheck(`结构规范检查：无法检查 — ${rel(standardsPath)} 缺少 languages 段`, [
-      '## 结构规范检查（dsh-standards-gate）— 无法检查（规范文件不完整）',
-      '',
-      `${standardsPath} 缺少 languages 段（形如 { "languages": { "ts": { "maxFileLines": 300 } } }）。`,
-      '',
-      '下一步：`standards_bootstrap({ action: "measure" })` 看建议值，确认后 `freeze`（需要人工批准）。',
-    ])
-    return 1
-  }
-  const layers = Array.isArray(raw.layers)
-    ? raw.layers.filter((layer) => isRecord(layer) && typeof layer.path === 'string')
-    : []
-  const standards = {
-    languages: raw.languages,
-    ...(layers.length === 0 ? {} : { layers }),
-    ...(raw.forbidCycles === true ? { forbidCycles: true } : {}),
-    ...(Array.isArray(raw.exempt)
-      ? { exempt: raw.exempt.filter((pattern) => typeof pattern === 'string') }
-      : {}),
-  }
-
-  // --- 规则模式（observe 只测量，不计入裁决） --------------------------------
-  const modes = parseRuleModes(raw.rules, standardsPath)
-  const declared = new Set(declaredRuleIds(standards))
-  for (const rule of [...modes.modes.keys()].sort()) {
-    if (declared.has(rule)) continue
-    // 与 loadStandards 同一条提示：一个没有阈值的模式什么都测不到，必须说出来。
-    modes.problems.push(
-      `${standardsPath}: rules 里把 "${rule}" 标成了 ${modes.modes.get(rule)}，但规范文件没有声明对应的阈值/开关` +
-        '（例如 maxDepth 阈值、layers、forbidCycles），这条规则不会产生任何违规',
-    )
-  }
+  const standards = loaded.standards
+  const modes = loaded.modes
 
   // --- 测量 -------------------------------------------------------------------
   const result = measureWorkspace({
@@ -256,8 +245,7 @@ async function main() {
   })
 
   // --- 基线（棘轮） -----------------------------------------------------------
-  const baselineRel = baselineFileOf(root, config)
-  const baselinePath = path.isAbsolute(baselineRel) ? baselineRel : path.join(root, baselineRel)
+  const baselinePath = artifactPathOf(root, baselineFileOf(root, config))
   const baselineExists = fs.existsSync(baselinePath)
   const baseline = baselineExists ? readBaseline(baselinePath) : undefined
   const baselineUnreadable = baselineExists && baseline === undefined
@@ -292,7 +280,7 @@ async function main() {
 
   // 两个结论方向必须由不同的条件决定，绝不由"输出是否好看"决定：
   // 有新增/恶化（enforcing）或缺基线 ⇒ 非 0；否则 0（扫描不完整也只是 WARN）。
-  const problems = [...configProblems, ...modes.problems, ...folded.problems]
+  const problems = [...configProblems, ...loaded.problems, ...folded.problems]
   for (const problem of problems) print(`配置问题：${problem}`)
 
   if (quiet) {

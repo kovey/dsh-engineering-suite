@@ -447,6 +447,107 @@ case "$LAST_OUT" in
   *) fail "standards-check: the missing standards file did not name standards_bootstrap — $LAST_OUT" ;;
 esac
 
+# C17b — 同一份夹具上，脚本的三种计数必须等于插件函数路径的三种计数。
+#
+# 为什么需要它：脚本和插件曾经给出 574 / 568 两个"已接受"（2026-11-11），那次是引擎
+# 构建不同源；但同样形状的分叉也会来自"比较逻辑只改一处"——例如脚本自己拼 standards
+# 对象、自己定义键、自己数 bucket。这里把脚本路径与插件路径（loadStandards →
+# measureWorkspace → readBaseline → compareViolations，全在同一份 dist）并排跑，
+# 任何一边单独改动都会让两种计数不等，且失败信息会把两个值都点出来。
+PARITY="$TMP/c17-parity"
+rm -rf "$PARITY"
+mkdir -p "$PARITY/scripts" "$PARITY/src" "$PARITY/.dsh/engineering-suite"
+cp "$STANDARDS_CHECK" "$PARITY/scripts/standards-check.sh"
+chmod +x "$PARITY/scripts/standards-check.sh"
+ln -s "$ROOT/packages" "$PARITY/packages"
+printf '{"name":"parity-demo"}\n' > "$PARITY/package.json"
+cat > "$PARITY/.dsh/engineering-suite/standards.json" <<'JSON'
+{"languages": {"ts": {"maxFileLines": 100}}}
+JSON
+# 三个文件各只触发 maxFileLines，让三种计数各为 1：
+#   known.ts  120 行，基线接受 130 → known（在基线的尺度以内）
+#   worse.ts  200 行，基线接受 150 → worsened（旧债变大）
+#   added.ts  150 行，基线里没有   → added（新债）
+node -e '
+  const fs = require("node:fs")
+  const dir = process.argv[1]
+  const lines = (count) =>
+    `export const values = [\n${Array.from({ length: count - 2 }, (_, index) => `  ${index},`).join("\n")}\n]\n`
+  fs.writeFileSync(`${dir}/src/known.ts`, lines(120))
+  fs.writeFileSync(`${dir}/src/worse.ts`, lines(200))
+  fs.writeFileSync(`${dir}/src/added.ts`, lines(150))
+  const key = (file) => `maxFileLines|src/${file}.ts|(file)`
+  const baseline = {
+    version: 1,
+    frozenAt: "2026-11-11T00:00:00.000Z",
+    accepted: [key("known"), key("worse")],
+    entries: [
+      { key: key("known"), actual: 130, limit: 100 },
+      { key: key("worse"), actual: 150, limit: 100 },
+    ],
+  }
+  fs.writeFileSync(`${dir}/.dsh/engineering-suite/standards-baseline.json`, `${JSON.stringify(baseline, null, 2)}\n`)
+' "$PARITY"
+
+# 插件路径：与脚本逐字对齐的一串调用（同样的 config 解析、同样四个函数）。
+plugin_counts="$(node --input-type=module - "$ROOT" "$PARITY" <<'NODE'
+import path from 'node:path'
+import { pathToFileURL } from 'node:url'
+
+const root = process.argv[2]
+const fixture = process.argv[3]
+const load = (pkg, file) => import(pathToFileURL(path.join(root, 'packages', pkg, 'dist', file)).href)
+
+const { measureWorkspace } = await load('dsh-eng-core', 'metrics.js')
+const { resolveLayout } = await load('dsh-eng-core', 'paths.js')
+const configModule = await load('dsh-standards-gate', 'config.js')
+const { readBaseline, compareViolations } = await load('dsh-standards-gate', 'baseline.js')
+const tools = await load('dsh-standards-gate', 'tools.js')
+const { resolveEffectiveConfig } = await load('dsh-standards-gate', 'index.js')
+
+const config = resolveEffectiveConfig(configModule.resolveConfig({}), resolveLayout(fixture, {}), {
+  warn: () => {},
+}).config
+const standardsRel = configModule.standardsFileOf(fixture, config)
+const loaded = tools.loadStandards(fixture, standardsRel)
+if (loaded.standards === undefined) {
+  console.error(`plugin path cannot read the fixture standards: ${loaded.problem ?? 'unknown'}`)
+  process.exit(2)
+}
+const result = measureWorkspace({
+  cwd: fixture,
+  standards: loaded.standards,
+  maxFiles: config.maxFiles,
+  maxFileBytes: config.maxFileBytes,
+})
+const baseline = readBaseline(tools.artifactPathOf(fixture, configModule.baselineFileOf(fixture, config)))
+const comparison = compareViolations(result.violations, baseline)
+process.stdout.write(`${comparison.known.length} ${comparison.added.length} ${comparison.worsened.length}\n`)
+NODE
+)"
+
+run_rc bash "$PARITY/scripts/standards-check.sh" --quiet
+PARITY_RC="$LAST_RC"
+# quiet 摘要的固定形状：`新增 A 项、恶化 W 项规范违规（基线已接受 K 项）`；
+# 重排成插件路径的 `known added worsened` 再比较。
+PARITY_SCRIPT_COUNTS="$(printf '%s\n' "$LAST_OUT" | sed -n 's/.*新增 \([0-9][0-9]*\) 项、恶化 \([0-9][0-9]*\) 项规范违规（基线已接受 \([0-9][0-9]*\) 项）.*/\3 \1 \2/p' | head -n 1)"
+
+if [ "$plugin_counts" = "1 1 1" ]; then
+  pass "standards-check parity: the fixture exercises all three buckets (1 1 1)"
+else
+  fail "standards-check parity: the fixture no longer covers accepted/added/worsened — the plugin path says [$plugin_counts], expected [1 1 1]"
+fi
+if [ "$PARITY_RC" = "1" ]; then
+  pass "standards-check parity: the script blocks on an added violation (exit 1)"
+else
+  fail "standards-check parity: expected exit 1 from the script, got $PARITY_RC — $LAST_OUT"
+fi
+if [ "$PARITY_SCRIPT_COUNTS" = "$plugin_counts" ]; then
+  pass "standards-check parity: the script and the plugin's own comparison agree ($PARITY_SCRIPT_COUNTS)"
+else
+  fail "standards-check parity: the script says [$PARITY_SCRIPT_COUNTS] but the plugin's own comparison says [$plugin_counts] — the two judgments have diverged"
+fi
+
 expect_rc 0 "project-config: scaffolding works on a repo that has the script" bash "$ROOT/scripts/project-config.sh" --workspace "$FIX" --json
 case "$LAST_OUT" in
   *'"id": "standards"'*'"required": true'*) pass "project-config: the generated config carries id=standards + required" ;;
