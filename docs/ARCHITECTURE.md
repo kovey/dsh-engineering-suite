@@ -1015,6 +1015,45 @@ unavailable`。所以本插件在 `approvalVia != off` 时用 **`{ prepend: true
 - **新增一个面**：为它写一个通道适配器并加进 `im.channels` 顺序，调用方不用改。当前具名的面：
   `im`（chat-interaction 通道）与 `host-approval`（原生审批面：终端 / desktop / web TUI）。
 
+### 5.28 门禁授权内核：一个入口 + 两种面 + 五个互不混淆的结果
+
+5.27 说的是"审批的问答可以从哪些面进来"；这一节说的是**门禁怎么用它**。此前每个门禁各写一遍，
+于是同一个"这里必须由人决定"在三处有不同语义：`spec_approve` 有自己的富审阅卡片并在最后回落到
+宿主接缝；`standards_check` 与 `deploy_run` 直接问宿主接缝。这带来两个实际故障：
+
+1. 宿主会话策略 `policy=never` 时，`dsh-user-approval` **在派发之前**就返回 `rejected`——只认接缝的
+   门禁于是"静默拒绝"了一件根本没人被问到的事；
+2. 拒绝 / 取消 / 无人应答被合并成一句"人工审批未通过（拒绝/取消/无审批通道）"，事后无法区分。
+
+所以授权语义收敛到 `dsh-eng-core` 的 `requestGateApproval()`（`gate-approval.ts`），两种呈现面：
+
+- **`rich`**（富审阅）：需要看到甚至修改材料才能决定的场景（`spec_approve`）。面适配器由**调用方**提供：
+  nvim-tui 扩展卡片（`via: 'tui-card'`）或 `userQuestions` 的 `plan-review`（`via: 'tui-approval'`）。
+  内核**不会**把富审阅降级成只能点允许/拒绝的浮窗——那等于"盲批"，这正是 ADR 0001 否决的方案。
+- **`binary`**（二元裁决）：只需要允许/拒绝的场景（基线放宽、部署、依赖批准）。先问**套件通道**
+  （IM 卡片，`via: 'im'`），只有在"连问都问不了"（卡片没发出去）时才退回**宿主接缝**
+  （`via: 'host-seam'`）。卡片已发出后超时 = 无人决定，绝不再问第二个面。
+
+四条硬语义：
+
+- **永不自动通过**：内核里没有 `auto` 分支；没有可用面就是 `no-answerer`，不可读的回复、
+  抛错的适配器、未知的决定词一律 fail closed。`policy=never` 不阻止内核请人（它只影响宿主接缝哪一步）。
+- **五个结果互不混淆**：`allowed-once` / `rejected` / `cancelled` / `no-answerer` /
+  `rejected-by-host-policy`，每个都有一句独立文案（`describeGateApproval()`），调用方**不得**再合并。
+  `rejected-by-host-policy` 只在"接缝返回 rejected **且**读到了 `policy=never`"时出现——读不到策略时
+  仍是普通 `rejected`（不猜）。
+- **批准绑定材料版本**：富审阅请求必须带被展示材料的 `digest`；批准时重读不一致 → `rejected` +
+  `digest-mismatch`（"重新送审"）。`spec_approve` 把该摘要写进 mandate（`specDigest`）。
+- **授权来源可审计**：结果带 `by` / `via` / `hostPolicy`；`spec-gate` 的 mandate 记录 `via`（哪张面）与
+  `hostPolicy`（批准时的宿主策略，只记录、不参与判定），并把 `via` 映射回 `approvalStrength` 认识的
+  强度词（`tui-card→tui`、`tui-approval→questions`、`host-seam→seam`、`im→im`），因此强度规则不变。
+
+IM 面如何被发现：`dsh-interaction-gate` 导出 `imApprovalSurface(ctx, cwd) → { available, chatId?, reason }`，
+只读 `interaction` 服务的 IM 报告与通道列表（通道必须 `canAsk`，即实现了 `wait()`）。
+它**不影响** `im.approvalVia=off|fallback|only`：那三个值决定的仍然只是"本插件是否接管宿主的
+`approval/request` 瀑布"，与"IM 卡片能不能承载一次门禁批准"是两件事。各门禁不 import 别的插件，
+而是按结构读 `ctx.get('interaction')`（与 doctor 一样）。
+
 ## 6. 为什么这样切分
 
 - **一个关注点一个插件**：门禁可以单独失效（例如先只上 quality-gate），不影响其它环节。

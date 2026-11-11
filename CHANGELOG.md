@@ -1,3 +1,41 @@
+## [0.8.5] — 2026-11-11
+
+### 变更 · 门禁授权内核 + 两种呈现面（拒绝 / 取消 / 无人应答不再合并）
+
+同一件"这里必须由人决定"此前在三个门禁里有三种实现，并因此产生两个真实故障：宿主会话策略
+`policy=never` 时 `dsh-user-approval` 在**派发之前**就返回 `rejected`，只认接缝的门禁于是静默拒绝了
+一件没人被问到的事；拒绝 / 取消 / 无人应答被合并成一句"人工审批未通过（拒绝/取消/无审批通道）"，
+事后无法区分。本次把授权语义收敛到 `dsh-eng-core` 的单一入口，保留两种呈现面。
+
+- **新增内核** `packages/dsh-eng-core/src/gate-approval.ts`（从包入口导出）：
+  `requestGateApproval(input)` 是唯一入口，面类型由调用方**声明**并自带适配器。
+  `rich` 只用自己的通道（nvim-tui 卡片 / `userQuestions` plan-review），**不**降级成二元浮窗；
+  `binary` 先问套件 IM 通道，只有卡片压根没发出去时才退回宿主接缝。内核里没有 `auto` 分支，
+  任何缺省/异常路径都 fail closed。
+- **五种结果互不混淆**：`allowed-once` / `rejected` / `cancelled` / `no-answerer` /
+  `rejected-by-host-policy`，每种一句独立文案（`describeGateApproval()`）。`rejected-by-host-policy`
+  只在"接缝返回 rejected **且**读到了 `policy=never`"时出现（`readHostApprovalPolicy()` 是唯一的
+  结构读取点；读不到就是普通 rejected，不猜）。
+- **批准绑定材料版本**：富审阅必须带被展示材料的 `digest`；批准时重读不一致 → `rejected` +
+  `digest-mismatch`，并要求重新送审。结果带 `by` / `via` / `hostPolicy`。
+- **`spec_approve` 经内核发起（`surface:'rich'`）**：保留富审阅卡片（TUI 可打开/预览工件、桌面/web
+  plan-review 可看规格 markdown），批准绑定规格摘要；mandate 新增 `via`（授权面）与 `hostPolicy`
+  （批准时的宿主策略，只记录不参与判定），并新增 `specDigest`。digest 漂移时不给审批、不留 mandate。
+- **`standards_check accept` / `standards_bootstrap freeze` 与 `deploy_run` / `deploy_verify` /
+  `deploy_rollback` 改用二元面**：先套件 IM 卡片，再宿主接缝；拒绝性文案按四种原因分别输出，
+  `no-answerer` 明确说"没有人被问到"并给出装配建议（standards）或点名 `ctx.approval` 与
+  `verifyRequiresApproval`（deploy）。
+- **`dsh-interaction-gate` 导出 `imApprovalSurface(ctx, cwd)`**：只读探测 IM 面是否可用
+  （`{available, chatId?, reason}`，通道必须 `canAsk`）；`im.approvalVia=off|fallback|only` 的既有语义
+  一条未改（它只决定是否接管宿主的 `approval/request` 瀑布）。
+- 文档：`docs/ARCHITECTURE.md` 新增 5.28（内核、两种面、五结果、digest 绑定、IM 面探测）。
+
+测试：eng-core 新增 10 条内核用例（五个原因各一条 + 永不自动通过 + digest 漂移 + 面回落顺序 + 策略读取）；
+spec-gate 新增 TC-1344（展示后被改动 → 拒绝并要求重新送审）/ TC-1342（mandate 记录 `via` + `specDigest`）
+与"policy=never 仍走富审阅面"；standards-gate 新增"四种非放行原因文案可区分、都不写基线"与
+"policy=never + 可用 IM 通道仍会问人"；deploy-gate 新增"policy=never 点名策略"与"拒绝/取消/无人应答可区分"；
+interaction-gate 新增 8 条探测用例。既有断言一条未放宽，`bash scripts/verify.sh --quiet` 两次全绿。
+
 ## [0.8.4] — 2026-11-11
 
 ### 修复 · 剩下的 `.dsh/` 路径默认值一次改全（eng-core / evidence / interaction / kb / spec / supply-chain）

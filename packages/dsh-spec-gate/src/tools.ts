@@ -11,6 +11,7 @@ import {
     approvalStrength,
     approverAllowlist,
     approverName,
+    approvalSourceOfVia,
     describeMandate,
     effectiveMandate,
     ensureDir,
@@ -19,6 +20,10 @@ import {
     type ApprovalOutcome,
     renderApprovalContext,
     type ApprovalLike,
+    readHostApprovalPolicy,
+    requestGateApproval,
+    GATE_APPROVAL_VIAS,
+    type GateSurfaceAdapter,
     parentSessionIdOf,
     mandateScopeOf,
     mandateState,
@@ -908,10 +913,41 @@ export function registerTools(
                 }
                 const decision = await requestApproval(deps, exec, mission, args.note, effective)
                 if ('outcome' in decision) {
-                    // Rejected (or cancelled): record the round, keep the human's
-                    // note when the review card already collected one, and send the
-                    // model back to `spec_create`.
-                    return await handleRejection(deps, exec, mission, decision.outcome, decision.note ?? args.note)
+                    // The reasons stay APART: "a person said no", "the question was
+                    // withdrawn", "nobody was asked" and "the host policy refused
+                    // without dispatching" need different next steps, and merging
+                    // them is what made this month's failure hard to diagnose.
+                    if (decision.outcome === 'rejected' || decision.outcome === 'cancelled') {
+                        // A digest mismatch is not a human rejection: the person
+                        // said yes to a document that then changed under them.
+                        if (decision.problemCode === 'digest-mismatch') {
+                            throw new Error(
+                                [
+                                    `规格审批失败：审阅期间规格工件被改动，本次批准作废（mission ${mission.id}）。`,
+                                    decision.problem ?? '',
+                                    '下一步：重新调用 `spec_approve`（会展示当前版本）；如果规格本身需要改，先 `spec_create` / `spec_amend`，再 `test_design_review` → `spec_approve`。',
+                                ].join('\n'),
+                            )
+                        }
+                        return await handleRejection(deps, exec, mission, decision.outcome, decision.note ?? args.note)
+                    }
+                    if (decision.outcome === 'rejected-by-host-policy') {
+                        throw new Error(
+                            [
+                                `规格审批未进行：宿主会话的审批策略 policy=${decision.hostPolicy ?? '(未能读取)'} 让审批接缝在派发之前就拒绝了这次请求，**没有问过任何人**（mission ${mission.id}）。`,
+                                '这不是审批人的拒绝，也不是"规格不合格"：规格保持原状、仍需审批。',
+                                '下一步（任选其一）：在 nvim-tui 里运行（富审阅卡片不经过宿主策略）；在 desktop / web TUI 里运行（userQuestions plan-review）；或由人把该会话的审批策略从 never 改为 ask（宿主的决定，模型改不了）。',
+                            ].join('\n'),
+                        )
+                    }
+                    // `no-answerer`: fail closed, and say exactly that nobody was asked.
+                    throw new Error(
+                        [
+                            `规格审批未进行：没有可用的审批面，**没有人被问到**（mission ${mission.id}）——这既不是拒绝，也不是取消。`,
+                            decision.problem ?? '',
+                            '下一步（任选其一）：在 nvim-tui 里运行（扩展卡片）；在 desktop / web TUI 里运行（userQuestions plan-review）；让宿主装配审批插件（ctx.approval）；或把 spec-gate 的 reviewChannel 设置为可用的通道。',
+                        ].join('\n'),
+                    )
                 }
                 // WHO approved matters: an IM click carries a user id and the card
                 // it came from, and the ledger keeps both. A terminal answerer that
@@ -937,6 +973,13 @@ export function registerTools(
                               scope: declaredScope,
                               policyVersion: policy.version,
                               approvedBy,
+                              // Where the approval came from, and the host's stance
+                              // at that moment — both are facts a later audit cannot
+                              // reconstruct (a card is gone; the policy is switchable).
+                              ...(decision.via === undefined ? {} : { via: decision.via }),
+                              ...(decision.hostPolicy === undefined ? {} : { hostPolicy: decision.hostPolicy }),
+                              // The approval is bound to the VERSION the human saw.
+                              specDigest: artifactDigest,
                               at: Date.now(),
                           }
                 // The snapshot is what lets a later revalidation NAME the
@@ -988,6 +1031,11 @@ export function registerTools(
                     `mandate：${strength.strength}（${strength.why}）；policy ${policy.version.slice(0, 12)}；${
                         existingMandate.kind === 'present' ? '沿用已记录的 mandate（不可改写，未刷新策略版本）' : '已作为不可改写记录写入 mission.json'
                     }。`,
+                    // The approval is bound to the artifact version the human read,
+                    // and the host's stance at that moment is part of the record.
+                    `本次决定的绑定：规格摘要 ${artifactDigest.slice(0, 12)}；授权面 ${
+                        decision.via ?? (decision.source === '' ? '(通道未报告)' : decision.source)
+                    }；宿主审批策略 ${decision.hostPolicy === undefined ? '(宿主未暴露，未记录)' : `policy=${decision.hostPolicy}（只记录，不参与判定）`}。`,
                     ...recordPlan(deps, store.layout, effective, approvalRows),
                     ...(strength.strength === 'inferred'
                         ? [
@@ -1941,116 +1989,243 @@ export function renderApprovalPrompt(mission: MissionRecord, round: number, layo
     return lines.join('\n')
 }
 
+/**
+ * What asking the approval kernel produced.
+ *
+ * The failure variants are kept APART on purpose: `rejected` is a person saying
+ * no, `cancelled` is a withdrawn question, `no-answerer` is "nobody was asked"
+ * and `rejected-by-host-policy` is the host's `policy=never` refusing without
+ * dispatching. Merging them was the defect this round removes.
+ */
+type ApprovalRequestResult =
+    | ApprovalOutcome
+    | {
+          outcome: 'rejected' | 'cancelled' | 'no-answerer' | 'rejected-by-host-policy'
+          note?: string
+          problem?: string
+          hostPolicy?: string
+          problemCode?: string
+      }
+
+/**
+ * Ask for the specification's approval through the gate-authorisation kernel.
+ *
+ * The surface is `rich` — a review card that can show (and, on the TUI, open)
+ * the specification and the test-design artifact. The kernel does NOT fall back
+ * to the host's binary popup for a rich decision; this caller therefore offers
+ * its own routes in order (nvim-tui card → `userQuestions` plan-review → the
+ * generic host seam, whose reason carries the FULL review sheet). Whichever one
+ * answers, the decision is bound to the digest of the artifact that was shown.
+ * @param deps - stores, seams and logger.
+ * @param exec - the tool execution (agent, call id, signal).
+ * @param mission - the mission whose specification is being approved.
+ * @param note - why the caller believes it is ready.
+ * @param config - the effective spec-gate configuration.
+ */
 async function requestApproval(
     deps: ToolDeps,
     exec: unknown,
     mission: MissionRecord,
     note: string | undefined,
     config: SpecGateConfig,
-): Promise<ApprovalOutcome | { outcome: string; note?: string; normalized?: ApprovalOutcome }> {
+): Promise<ApprovalRequestResult> {
     if (config.approval === 'auto') {
         return { decision: 'allowed-once', by: 'auto', messageId: '', source: 'auto', allowed: true }
     }
     const context = exec as { agent?: AgentLike; signal?: AbortSignal }
-    const layout = deps.stores.for(mission.cwd).layout
+    const store = deps.stores.for(mission.cwd)
+    const layout = store.layout
     const missionsDir = layout.missionsDir
-    const roundForReview = deps.stores.for(mission.cwd).nextApprovalRound(mission.id)
+    const roundForReview = store.nextApprovalRound(mission.id)
+    // What the human is shown, and what the approval is bound to. The kernel
+    // re-reads it after the answer: material that moved while the card was open
+    // is refused instead of authorising a version nobody read.
+    const shownDigest = sha256(store.readSpec(mission.id))
+    const prompt = renderApprovalPrompt(mission, roundForReview, layout, note)
+    // Multi-line on purpose: the human must be able to READ the two artifacts
+    // (and open them) before deciding, not approve blind. The fenced context
+    // block lets a channel render fields instead of parsing this prose.
+    const reason = renderApprovalContext(prompt, {
+        kind: 'spec',
+        missionId: mission.id,
+        title: mission.spec?.title ?? mission.title,
+        revision: mission.spec?.revision ?? 0,
+        artifacts: approvalArtifacts(mission, missionsDir),
+        facts: {
+            验收标准: mission.spec?.acceptanceCriteria.length ?? 0,
+            测试用例: mission.testDesign?.cases.length ?? 0,
+            未覆盖: mission.testDesign?.uncovered?.length ?? 0,
+            非功能预算: readSpecBudgets(mission.spec).budgets.length,
+            送审轮次: roundForReview,
+        },
+        channelHints: { buttons: ['通过', '打回'], requiresReason: true },
+    })
 
-    // Preferred channel: the host TUI's own card UI (nvim-tui's public ext API),
-    // which can OPEN the artifacts and take the rejection note in its input box.
-    const tui = deps.nvimTui()
-    if (config.reviewChannel !== 'approval' && tui !== undefined) {
-        const outcome = await tuiReview({
-            api: tui,
-            ...(sessionIdOf(context.agent) === undefined ? {} : { sessionId: sessionIdOf(context.agent) as string }),
-            title: `规格审批（第 ${roundForReview} 次送审）：${mission.title}`,
-            body: renderApprovalPrompt(mission, roundForReview, layout, note),
-            artifacts: reviewArtifactsOf(mission, layout),
-            cwd: mission.cwd,
-            log: (message: string) => deps.logger.for(mission.cwd).info(`[review] ${message}`),
-            ...(context.signal === undefined ? {} : { signal: context.signal }),
-            timeoutMs: config.reviewTimeoutMs,
-        })
-        if (outcome.decision === 'approved') {
-            // The TUI review card is a channel too: record it as the surface.
-            return { decision: 'allowed-once', by: 'approval', messageId: '', source: 'tui', allowed: true }
-        }
-        if (outcome.decision === 'rejected') return { outcome: 'rejected', ...(outcome.note === undefined ? {} : { note: outcome.note }) }
-        if (outcome.decision === 'cancelled') return { outcome: 'cancelled' }
-        // `unavailable`: fall through to the generic seam below.
-    }
-    if (config.reviewChannel === 'tui') {
-        throw new Error(
-            '规格审批未进行：reviewChannel=tui，但宿主没有可用的 nvim-tui 扩展 API（ctx.get("nvim-tui")）。' +
-                '请把 reviewChannel 改回 auto/approval，或在 TUI 里运行。（mission ' + mission.id + '）',
-        )
-    }
-    // Structured review card on the client UIs (desktop / web TUI). `user-questions`
-    // is the official seam those clients already render — and here it is used
-    // LEGITIMATELY: `spec_approve` is a real tool call, so the card is keyed by its
-    // own callId rather than a fabricated one. `display.detail` carries the spec
-    // markdown, which the clients format; the TUI card stays first when present
-    // because it can also open the artifacts on disk.
-    if (config.reviewChannel === 'auto' || config.reviewChannel === 'questions') {
-        const questions = deps.questions()
-        if (questions !== undefined && context.agent !== undefined) {
-            const decided = await reviewThroughQuestions({
-                questions,
-                agent: context.agent,
-                ...(context.signal === undefined ? {} : { signal: context.signal }),
-                ...(callIdOf(context) === undefined ? {} : { callId: callIdOf(context) as string }),
-                mission,
-                store: deps.stores.for(mission.cwd),
-                missionsDir,
-                round: roundForReview,
+    /**
+     * The rich surface, with this caller's three routes in preference order.
+     *
+     * A route that cannot answer hands over to the next one; a route that DID
+     * decide is final. `reviewChannel=tui` / `=questions` refuse instead of
+     * downgrading — that configuration said "this route or nothing".
+     */
+    const rich: GateSurfaceAdapter = async () => {
+        // Preferred channel: the host TUI's own card UI (nvim-tui's public ext
+        // API), which can OPEN the artifacts and take the note in an input box.
+        const tui = deps.nvimTui()
+        if (config.reviewChannel !== 'approval' && tui !== undefined) {
+            const outcome = await tuiReview({
+                api: tui,
+                ...(sessionIdOf(context.agent) === undefined ? {} : { sessionId: sessionIdOf(context.agent) as string }),
+                title: `规格审批（第 ${roundForReview} 次送审）：${mission.title}`,
+                body: prompt,
+                artifacts: reviewArtifactsOf(mission, layout),
+                cwd: mission.cwd,
                 log: (message: string) => deps.logger.for(mission.cwd).info(`[review] ${message}`),
+                ...(context.signal === undefined ? {} : { signal: context.signal }),
+                timeoutMs: config.reviewTimeoutMs,
             })
-            if (decided !== undefined) return decided as never
-            // `undefined` = the card produced no usable answer (no agent, empty
-            // answer): fall through to the generic seam instead of guessing.
-        } else if (config.reviewChannel === 'questions') {
+            if (outcome.decision === 'approved') {
+                return { kind: 'answer', decision: 'allowed-once', by: 'approval', via: 'tui-card', displayedDigest: shownDigest }
+            }
+            if (outcome.decision === 'rejected') {
+                return { kind: 'answer', decision: 'rejected', via: 'tui-card', ...(outcome.note === undefined ? {} : { note: outcome.note }) }
+            }
+            if (outcome.decision === 'cancelled') return { kind: 'answer', decision: 'cancelled', via: 'tui-card' }
+            // `unavailable`: this route cannot answer — fall through.
+        }
+        if (config.reviewChannel === 'tui') {
             throw new Error(
-                '规格审批未进行：reviewChannel=questions，但宿主没有可用的 user-questions 接缝（ctx.get("userQuestions")）或当前调用没有 agent。' +
-                    `请改回 auto/approval，或在 desktop / web TUI / 任何渲染提问面板的客户端里运行。（mission ${mission.id}）`,
+                '规格审批未进行：reviewChannel=tui，但宿主没有可用的 nvim-tui 扩展 API（ctx.get("nvim-tui")）。' +
+                    '请把 reviewChannel 改回 auto/approval，或在 TUI 里运行。（mission ' + mission.id + '）',
             )
         }
+        // Structured review card on the client UIs (desktop / web TUI).
+        // `user-questions` is the official seam those clients already render — and
+        // here it is used LEGITIMATELY: `spec_approve` is a real tool call, so the
+        // card is keyed by its own callId rather than a fabricated one.
+        if (config.reviewChannel === 'auto' || config.reviewChannel === 'questions') {
+            const questions = deps.questions()
+            if (questions !== undefined && context.agent !== undefined) {
+                const decided = await reviewThroughQuestions({
+                    questions,
+                    agent: context.agent,
+                    ...(context.signal === undefined ? {} : { signal: context.signal }),
+                    ...(callIdOf(context) === undefined ? {} : { callId: callIdOf(context) as string }),
+                    mission,
+                    store,
+                    missionsDir,
+                    round: roundForReview,
+                    log: (message: string) => deps.logger.for(mission.cwd).info(`[review] ${message}`),
+                })
+                if (decided !== undefined) {
+                    if ('decision' in decided) {
+                        return { kind: 'answer', decision: 'allowed-once', by: 'approval', via: 'tui-approval', displayedDigest: shownDigest }
+                    }
+                    if (decided.outcome === 'cancelled') return { kind: 'answer', decision: 'cancelled', via: 'tui-approval' }
+                    return {
+                        kind: 'answer',
+                        decision: 'rejected',
+                        via: 'tui-approval',
+                        ...(decided.note === undefined ? {} : { note: decided.note }),
+                    }
+                }
+                // `undefined` = the card produced no usable answer: fall through.
+            } else if (config.reviewChannel === 'questions') {
+                throw new Error(
+                    '规格审批未进行：reviewChannel=questions，但宿主没有可用的 user-questions 接缝（ctx.get("userQuestions")）或当前调用没有 agent。' +
+                        `请改回 auto/approval，或在 desktop / web TUI / 任何渲染提问面板的客户端里运行。（mission ${mission.id}）`,
+                )
+            }
+        }
+        // Last rich route: the generic host seam. Kept because a headless host
+        // has no card renderer at all, and the reason carries the whole review
+        // sheet (it is not a blind yes/no popup). The decision is still bound to
+        // the digest, and the surface is recorded as `host-seam`.
+        deps.logger
+            .for(mission.cwd)
+            .warn(
+                '规格审批：没有 nvim-tui 卡片、也没有 userQuestions 通道，退回宿主审批接缝' +
+                    '（via=host-seam；reason 内含完整审阅材料，决定仍绑定规格摘要）',
+            )
+        const approval = deps.approval()
+        if (approval === undefined) {
+            throw new Error(
+                '规格审批未通过：宿主没有装配审批通道（ctx.approval），而 spec-gate 的 approval 模式是 "seam"。' +
+                    `请让人类审批后把 approval 改为 auto，或装配审批插件。（mission ${mission.id}）`,
+            )
+        }
+        const reply = await approval.request({
+            ...(context.agent === undefined ? {} : { agent: context.agent }),
+            toolName: 'spec_approve',
+            reason,
+            ...(context.signal === undefined ? {} : { signal: context.signal }),
+        })
+        const normalized = normalizeApprovalReply(reply)
+        // An answerer may report WHICH channel decided (the interaction gate's
+        // approval answerer says `im`): keep that provenance instead of
+        // flattening every seam answer into `host-seam`.
+        const reportedVia = (GATE_APPROVAL_VIAS as readonly string[]).includes(normalized.source)
+            ? (normalized.source as (typeof GATE_APPROVAL_VIAS)[number])
+            : 'host-seam'
+        if (normalized.allowed) {
+            return {
+                kind: 'answer',
+                decision: 'allowed-once',
+                by: normalized.by,
+                ...(normalized.messageId === '' ? {} : { messageId: normalized.messageId }),
+                via: reportedVia,
+                displayedDigest: shownDigest,
+            }
+        }
+        if (normalized.decision === 'cancelled') return { kind: 'answer', decision: 'cancelled', via: reportedVia }
+        if (normalized.decision === 'rejected') return { kind: 'answer', decision: 'rejected', via: reportedVia }
+        return { kind: 'unavailable', reason: '宿主的审批接缝返回 unavailable（没有应答者）' }
     }
-    const approval = deps.approval()
-    if (approval === undefined) {
-        throw new Error(
-            '规格审批未通过：宿主没有装配审批通道（ctx.approval），而 spec-gate 的 approval 模式是 "seam"。' +
-                `请让人类审批后把 approval 改为 auto，或装配审批插件。（mission ${mission.id}）`,
-        )
-    }
-    const store = deps.stores.for(mission.cwd)
-    const round = store.nextApprovalRound(mission.id)
-    const outcome = await approval.request({
+
+    // The host policy is READ for the record (and for naming a seam rejection),
+    // never to decide whether to ask: a `policy=never` session still gets the
+    // rich review card, which is the whole point of not consulting it here.
+    const hostPolicy = readHostApprovalPolicy(deps.approval(), context.agent)
+    const verdict = await requestGateApproval({
         ...(context.agent === undefined ? {} : { agent: context.agent }),
         toolName: 'spec_approve',
-        // Multi-line on purpose: the human must be able to READ the two
-        // artifacts (and open them) before deciding, not approve blind. The
-        // fenced context block lets a channel render fields (mission, revision,
-        // artifacts) instead of parsing this prose.
-        reason: renderApprovalContext(renderApprovalPrompt(mission, round, store.layout, note), {
-            kind: 'spec',
-            missionId: mission.id,
-            title: mission.spec?.title ?? mission.title,
-            revision: mission.spec?.revision ?? 0,
-            artifacts: approvalArtifacts(mission, store.layout.missionsDir),
-            facts: {
-                验收标准: mission.spec?.acceptanceCriteria.length ?? 0,
-                测试用例: mission.testDesign?.cases.length ?? 0,
-                未覆盖: mission.testDesign?.uncovered?.length ?? 0,
-                非功能预算: readSpecBudgets(mission.spec).budgets.length,
-                送审轮次: round,
-            },
-            channelHints: { buttons: ['通过', '打回'], requiresReason: true },
-        }),
+        reason,
+        surface: 'rich',
+        digest: shownDigest,
+        readDigest: () => sha256(store.readSpec(mission.id)),
         ...(context.signal === undefined ? {} : { signal: context.signal }),
+        ...(hostPolicy === undefined ? {} : { hostPolicy }),
+        surfaces: { rich },
     })
-    const normalized = normalizeApprovalReply(outcome)
-    if (normalized.allowed) return normalized
-    return { outcome: normalized.decision, normalized } as never
+    if (verdict.outcome === 'allowed-once') {
+        return {
+            decision: 'allowed-once',
+            by: verdict.by === '' ? 'approval' : verdict.by,
+            messageId: verdict.messageId ?? '',
+            // `source` keeps the strength vocabulary (approvalStrength reads it);
+            // `via` is the presentation the mandate records.
+            source: approvalSourceOfVia(verdict.via),
+            ...(verdict.via === undefined ? {} : { via: verdict.via }),
+            allowed: true,
+            ...(verdict.hostPolicy === undefined ? {} : { hostPolicy: verdict.hostPolicy }),
+        }
+    }
+    if (verdict.outcome === 'rejected' || verdict.outcome === 'cancelled') {
+        return {
+            outcome: verdict.outcome,
+            ...(verdict.note === undefined ? {} : { note: verdict.note }),
+            ...(verdict.problem === undefined ? {} : { problem: verdict.problem }),
+            ...(verdict.hostPolicy === undefined ? {} : { hostPolicy: verdict.hostPolicy }),
+            ...(verdict.problemCode === undefined ? {} : { problemCode: verdict.problemCode }),
+        }
+    }
+    return {
+        outcome: verdict.outcome,
+        ...(verdict.note === undefined ? {} : { note: verdict.note }),
+        problem: verdict.problem ?? '没有可用的审批面（no-answerer）',
+        ...(verdict.hostPolicy === undefined ? {} : { hostPolicy: verdict.hostPolicy }),
+        ...(verdict.problemCode === undefined ? {} : { problemCode: verdict.problemCode }),
+    }
 }
 
 /** The real tool call id of this execution, when the host exposes one. */

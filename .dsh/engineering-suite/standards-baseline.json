@@ -1,0 +1,3423 @@
+{
+  "version": 1,
+  "frozenAt": "2026-11-11T03:06:20.117Z",
+  "note": "冻结既有规范债务作为基线（1024 文件 / 569 项存量违规：函数行数 180、if 块 148、文件行数 90、嵌套 89、导出面 42、参数 13、导入环 7）。这是历史代码的既有形态，基线只保证以后不更坏；后续按包逐步偿还（优先拆函数与收敛导出面）。",
+  "accepted": [
+    "cycle|packages/dsh-eng-core/src/doctor.ts|packages/dsh-eng-core/src/doctor.ts -> packages/dsh-eng-core/src/writer-check.ts",
+    "cycle|packages/dsh-interaction-gate/src/channels.ts|packages/dsh-interaction-gate/src/channels.ts -> packages/dsh-interaction-gate/src/config.ts",
+    "cycle|packages/dsh-knowledge-base/src/config.ts|packages/dsh-knowledge-base/src/config.ts -> packages/dsh-knowledge-base/src/sources.ts",
+    "cycle|packages/dsh-knowledge-base/src/index-store.ts|packages/dsh-knowledge-base/src/index-store.ts -> packages/dsh-knowledge-base/src/search.ts",
+    "cycle|packages/dsh-quality-gate/src/budget.ts|packages/dsh-quality-gate/src/budget.ts -> packages/dsh-quality-gate/src/config.ts",
+    "cycle|packages/dsh-quality-gate/src/config.ts|packages/dsh-quality-gate/src/config.ts -> packages/dsh-quality-gate/src/contract.ts",
+    "cycle|packages/dsh-role-guard/src/agent-teams.ts|packages/dsh-role-guard/src/agent-teams.ts -> packages/dsh-role-guard/src/tools.ts",
+    "maxDepth|packages/dsh-audit-trail/src/config.ts|resolveEffectiveConfig",
+    "maxDepth|packages/dsh-audit-trail/src/index.ts|apply",
+    "maxDepth|packages/dsh-audit-trail/src/snapshot.ts|applyRewind",
+    "maxDepth|packages/dsh-audit-trail/src/tools.ts|registerTools",
+    "maxDepth|packages/dsh-coverage-gate/src/coverage.ts|parseIstanbulJson",
+    "maxDepth|packages/dsh-coverage-gate/src/index.ts|apply",
+    "maxDepth|packages/dsh-coverage-gate/src/mutation.ts|mutantsInFile",
+    "maxDepth|packages/dsh-coverage-gate/src/tools.ts|registerTools",
+    "maxDepth|packages/dsh-deploy-gate/src/config.ts|resolveEffectiveConfig",
+    "maxDepth|packages/dsh-deploy-gate/src/index.ts|apply",
+    "maxDepth|packages/dsh-deploy-gate/src/ledger.ts|summarize",
+    "maxDepth|packages/dsh-deploy-gate/src/tools.ts|registerTools",
+    "maxDepth|packages/dsh-eng-core/src/archive.ts|walk",
+    "maxDepth|packages/dsh-eng-core/src/delegation.ts|startDelegation",
+    "maxDepth|packages/dsh-eng-core/src/impact.ts|changedRanges",
+    "maxDepth|packages/dsh-eng-core/src/metrics.ts|lexSource",
+    "maxDepth|packages/dsh-eng-core/src/mission.ts|MissionStore.recordApproval",
+    "maxDepth|packages/dsh-eng-core/src/paths.ts|globToRegExp",
+    "maxDepth|packages/dsh-eng-core/src/run.ts|(file)",
+    "maxDepth|packages/dsh-eng-core/src/scan.ts|visit",
+    "maxDepth|packages/dsh-eng-core/src/scope.ts|apply",
+    "maxDepth|packages/dsh-eng-core/src/testing.ts|createFakeHost",
+    "maxDepth|packages/dsh-evidence-gate/src/delivery.ts|evaluateDelivery",
+    "maxDepth|packages/dsh-evidence-gate/src/index.ts|apply",
+    "maxDepth|packages/dsh-evidence-gate/src/releases.ts|buildMissionNotes",
+    "maxDepth|packages/dsh-evidence-gate/src/tools.ts|registerTools",
+    "maxDepth|packages/dsh-impact-gate/src/config.ts|resolveEffectiveConfig",
+    "maxDepth|packages/dsh-impact-gate/src/flaky.ts|renderStatus",
+    "maxDepth|packages/dsh-impact-gate/src/index.ts|apply",
+    "maxDepth|packages/dsh-impact-gate/src/review.ts|runImpactReview",
+    "maxDepth|packages/dsh-impact-gate/src/tools.ts|registerTools",
+    "maxDepth|packages/dsh-interaction-gate/src/approval.ts|answer",
+    "maxDepth|packages/dsh-interaction-gate/src/attention.ts|createAttentionSource",
+    "maxDepth|packages/dsh-interaction-gate/src/channels.ts|createInteractionRegistry",
+    "maxDepth|packages/dsh-interaction-gate/src/chat-channel.ts|preflight",
+    "maxDepth|packages/dsh-interaction-gate/src/config.ts|resolveConfig",
+    "maxDepth|packages/dsh-interaction-gate/src/im-binding.ts|report",
+    "maxDepth|packages/dsh-interaction-gate/src/index.ts|apply",
+    "maxDepth|packages/dsh-interaction-gate/src/ledger.ts|appendLedgerRow",
+    "maxDepth|packages/dsh-interaction-gate/src/outbox.ts|createOutbox",
+    "maxDepth|packages/dsh-interaction-gate/src/tools.ts|askThroughChannels",
+    "maxDepth|packages/dsh-interaction-gate/src/workspace-mapping.ts|resolveWorkspaceApprovals",
+    "maxDepth|packages/dsh-knowledge-base/src/command.ts|runKbCommand",
+    "maxDepth|packages/dsh-knowledge-base/src/index-store.ts|chunkDocument",
+    "maxDepth|packages/dsh-knowledge-base/src/index.ts|apply",
+    "maxDepth|packages/dsh-knowledge-base/src/sources.ts|collectFiles",
+    "maxDepth|packages/dsh-knowledge-base/src/tools.ts|registerTools",
+    "maxDepth|packages/dsh-orchestrator/src/config.ts|resolveAutoDispatch",
+    "maxDepth|packages/dsh-orchestrator/src/dispatch.ts|dispatchStage",
+    "maxDepth|packages/dsh-orchestrator/src/gates.ts|evaluateFacts",
+    "maxDepth|packages/dsh-orchestrator/src/index.ts|apply",
+    "maxDepth|packages/dsh-orchestrator/src/metrics.ts|computeMetrics",
+    "maxDepth|packages/dsh-orchestrator/src/pipeline.ts|resolveStageRoute",
+    "maxDepth|packages/dsh-orchestrator/src/sequence.ts|recordAndDispatch",
+    "maxDepth|packages/dsh-quality-gate/src/budget.ts|acquireBaselineLock",
+    "maxDepth|packages/dsh-quality-gate/src/config.ts|resolveEffectiveConfig",
+    "maxDepth|packages/dsh-quality-gate/src/contract.ts|parseContract",
+    "maxDepth|packages/dsh-quality-gate/src/index.ts|apply",
+    "maxDepth|packages/dsh-quality-gate/src/tools.ts|registerTools",
+    "maxDepth|packages/dsh-role-guard/src/bindings.ts|RoleBindingStore.bindAt",
+    "maxDepth|packages/dsh-role-guard/src/index.ts|apply",
+    "maxDepth|packages/dsh-role-guard/src/route.ts|resolveRoute",
+    "maxDepth|packages/dsh-role-guard/src/service.ts|createRolePlanner",
+    "maxDepth|packages/dsh-role-guard/src/tools.ts|registerTools",
+    "maxDepth|packages/dsh-spec-gate/src/adr.ts|recordAdr",
+    "maxDepth|packages/dsh-spec-gate/src/bootstrap.ts|buildIndex",
+    "maxDepth|packages/dsh-spec-gate/src/budgets.ts|parseBudgetDeclaration",
+    "maxDepth|packages/dsh-spec-gate/src/constraints.ts|evaluateConstraints",
+    "maxDepth|packages/dsh-spec-gate/src/guard.ts|guard",
+    "maxDepth|packages/dsh-spec-gate/src/index.ts|apply",
+    "maxDepth|packages/dsh-spec-gate/src/plan-ledger.ts|buildPlanReport",
+    "maxDepth|packages/dsh-spec-gate/src/review.ts|previewArtifact",
+    "maxDepth|packages/dsh-spec-gate/src/shell.ts|analyzeShellCommandInner",
+    "maxDepth|packages/dsh-spec-gate/src/tools.ts|registerTools",
+    "maxDepth|packages/dsh-standards-gate/src/index.ts|apply",
+    "maxDepth|packages/dsh-standards-gate/src/review.ts|runStructuralReview",
+    "maxDepth|packages/dsh-standards-gate/src/tools.ts|approve",
+    "maxDepth|packages/dsh-suite-doctor/src/index.ts|apply",
+    "maxDepth|packages/dsh-suite-doctor/src/observe.ts|tallyObservations",
+    "maxDepth|packages/dsh-suite-doctor/src/probe.ts|parseWorkspaceMapping",
+    "maxDepth|packages/dsh-suite-doctor/src/tools.ts|registerTools",
+    "maxDepth|packages/dsh-supply-chain-gate/src/config.ts|resolveEffectiveConfig",
+    "maxDepth|packages/dsh-supply-chain-gate/src/deps.ts|parseDotnetVulnerable",
+    "maxDepth|packages/dsh-supply-chain-gate/src/index.ts|apply",
+    "maxDepth|packages/dsh-supply-chain-gate/src/secrets.ts|scanText",
+    "maxDepth|packages/dsh-supply-chain-gate/src/tools.ts|registerTools",
+    "maxDepth|packages/dsh-test-design-gate/src/index.ts|apply",
+    "maxDepth|packages/dsh-test-design-gate/src/tools.ts|registerTools",
+    "maxDepth|scripts/stub-llm.mjs|decide",
+    "maxExports|packages/dsh-audit-trail/src/journal.ts|(file)",
+    "maxExports|packages/dsh-coverage-gate/src/config.ts|(file)",
+    "maxExports|packages/dsh-coverage-gate/src/coverage.ts|(file)",
+    "maxExports|packages/dsh-coverage-gate/src/index.ts|(file)",
+    "maxExports|packages/dsh-coverage-gate/src/mutation.ts|(file)",
+    "maxExports|packages/dsh-deploy-gate/src/config.ts|(file)",
+    "maxExports|packages/dsh-deploy-gate/src/index.ts|(file)",
+    "maxExports|packages/dsh-deploy-gate/src/ledger.ts|(file)",
+    "maxExports|packages/dsh-deploy-gate/src/tools.ts|(file)",
+    "maxExports|packages/dsh-eng-core/src/conformance.ts|(file)",
+    "maxExports|packages/dsh-eng-core/src/delegation.ts|(file)",
+    "maxExports|packages/dsh-eng-core/src/index.ts|(file)",
+    "maxExports|packages/dsh-eng-core/src/mandate.ts|(file)",
+    "maxExports|packages/dsh-eng-core/src/paths.ts|(file)",
+    "maxExports|packages/dsh-eng-core/src/scan.ts|(file)",
+    "maxExports|packages/dsh-eng-core/src/types.ts|(file)",
+    "maxExports|packages/dsh-evidence-gate/src/releases.ts|(file)",
+    "maxExports|packages/dsh-impact-gate/src/flaky.ts|(file)",
+    "maxExports|packages/dsh-impact-gate/src/tools.ts|(file)",
+    "maxExports|packages/dsh-interaction-gate/src/attention.ts|(file)",
+    "maxExports|packages/dsh-interaction-gate/src/channels.ts|(file)",
+    "maxExports|packages/dsh-interaction-gate/src/config.ts|(file)",
+    "maxExports|packages/dsh-interaction-gate/src/index.ts|(file)",
+    "maxExports|packages/dsh-interaction-gate/src/ledger.ts|(file)",
+    "maxExports|packages/dsh-interaction-gate/src/outbox.ts|(file)",
+    "maxExports|packages/dsh-interaction-gate/src/tools.ts|(file)",
+    "maxExports|packages/dsh-interaction-gate/src/workspace-mapping.ts|(file)",
+    "maxExports|packages/dsh-knowledge-base/src/index-store.ts|(file)",
+    "maxExports|packages/dsh-knowledge-base/src/report.ts|(file)",
+    "maxExports|packages/dsh-knowledge-base/src/search.ts|(file)",
+    "maxExports|packages/dsh-orchestrator/src/metrics.ts|(file)",
+    "maxExports|packages/dsh-orchestrator/src/pipeline.ts|(file)",
+    "maxExports|packages/dsh-quality-gate/src/budget.ts|(file)",
+    "maxExports|packages/dsh-quality-gate/src/contract.ts|(file)",
+    "maxExports|packages/dsh-spec-gate/src/adr.ts|(file)",
+    "maxExports|packages/dsh-spec-gate/src/budgets.ts|(file)",
+    "maxExports|packages/dsh-spec-gate/src/plan-ledger.ts|(file)",
+    "maxExports|packages/dsh-spec-gate/src/review.ts|(file)",
+    "maxExports|packages/dsh-suite-doctor/src/index.ts|(file)",
+    "maxExports|packages/dsh-suite-doctor/src/probe.ts|(file)",
+    "maxExports|packages/dsh-supply-chain-gate/src/deps.ts|(file)",
+    "maxExports|packages/dsh-supply-chain-gate/src/secrets.ts|(file)",
+    "maxFileLines|packages/dsh-audit-trail/src/config.ts|(file)",
+    "maxFileLines|packages/dsh-audit-trail/src/index.ts|(file)",
+    "maxFileLines|packages/dsh-audit-trail/src/snapshot.ts|(file)",
+    "maxFileLines|packages/dsh-audit-trail/src/tools.ts|(file)",
+    "maxFileLines|packages/dsh-coverage-gate/src/config.ts|(file)",
+    "maxFileLines|packages/dsh-coverage-gate/src/coverage.ts|(file)",
+    "maxFileLines|packages/dsh-coverage-gate/src/flaky.ts|(file)",
+    "maxFileLines|packages/dsh-coverage-gate/src/mutation.ts|(file)",
+    "maxFileLines|packages/dsh-coverage-gate/src/tools.ts|(file)",
+    "maxFileLines|packages/dsh-deploy-gate/src/config.ts|(file)",
+    "maxFileLines|packages/dsh-deploy-gate/src/plan.ts|(file)",
+    "maxFileLines|packages/dsh-deploy-gate/src/tools.ts|(file)",
+    "maxFileLines|packages/dsh-eng-core/src/archive.ts|(file)",
+    "maxFileLines|packages/dsh-eng-core/src/conformance.ts|(file)",
+    "maxFileLines|packages/dsh-eng-core/src/delegation.ts|(file)",
+    "maxFileLines|packages/dsh-eng-core/src/doctor.ts|(file)",
+    "maxFileLines|packages/dsh-eng-core/src/impact.ts|(file)",
+    "maxFileLines|packages/dsh-eng-core/src/mandate.ts|(file)",
+    "maxFileLines|packages/dsh-eng-core/src/markdown.ts|(file)",
+    "maxFileLines|packages/dsh-eng-core/src/metrics.ts|(file)",
+    "maxFileLines|packages/dsh-eng-core/src/mission.ts|(file)",
+    "maxFileLines|packages/dsh-eng-core/src/paths.ts|(file)",
+    "maxFileLines|packages/dsh-eng-core/src/run.ts|(file)",
+    "maxFileLines|packages/dsh-eng-core/src/scan.ts|(file)",
+    "maxFileLines|packages/dsh-eng-core/src/spec-edit.ts|(file)",
+    "maxFileLines|packages/dsh-eng-core/src/testing.ts|(file)",
+    "maxFileLines|packages/dsh-eng-core/src/types.ts|(file)",
+    "maxFileLines|packages/dsh-eng-core/src/writer-check.ts|(file)",
+    "maxFileLines|packages/dsh-evidence-gate/src/config.ts|(file)",
+    "maxFileLines|packages/dsh-evidence-gate/src/delivery.ts|(file)",
+    "maxFileLines|packages/dsh-evidence-gate/src/releases.ts|(file)",
+    "maxFileLines|packages/dsh-evidence-gate/src/report.ts|(file)",
+    "maxFileLines|packages/dsh-evidence-gate/src/tools.ts|(file)",
+    "maxFileLines|packages/dsh-impact-gate/src/changes.ts|(file)",
+    "maxFileLines|packages/dsh-impact-gate/src/config.ts|(file)",
+    "maxFileLines|packages/dsh-impact-gate/src/flaky.ts|(file)",
+    "maxFileLines|packages/dsh-impact-gate/src/review.ts|(file)",
+    "maxFileLines|packages/dsh-impact-gate/src/tools.ts|(file)",
+    "maxFileLines|packages/dsh-interaction-gate/src/approval.ts|(file)",
+    "maxFileLines|packages/dsh-interaction-gate/src/attention.ts|(file)",
+    "maxFileLines|packages/dsh-interaction-gate/src/channels.ts|(file)",
+    "maxFileLines|packages/dsh-interaction-gate/src/chat-channel.ts|(file)",
+    "maxFileLines|packages/dsh-interaction-gate/src/config.ts|(file)",
+    "maxFileLines|packages/dsh-interaction-gate/src/im-binding.ts|(file)",
+    "maxFileLines|packages/dsh-interaction-gate/src/index.ts|(file)",
+    "maxFileLines|packages/dsh-interaction-gate/src/ledger.ts|(file)",
+    "maxFileLines|packages/dsh-interaction-gate/src/outbox.ts|(file)",
+    "maxFileLines|packages/dsh-interaction-gate/src/tools.ts|(file)",
+    "maxFileLines|packages/dsh-interaction-gate/src/workspace-mapping.ts|(file)",
+    "maxFileLines|packages/dsh-knowledge-base/src/command.ts|(file)",
+    "maxFileLines|packages/dsh-knowledge-base/src/config.ts|(file)",
+    "maxFileLines|packages/dsh-knowledge-base/src/index-store.ts|(file)",
+    "maxFileLines|packages/dsh-knowledge-base/src/report.ts|(file)",
+    "maxFileLines|packages/dsh-knowledge-base/src/search.ts|(file)",
+    "maxFileLines|packages/dsh-knowledge-base/src/sources.ts|(file)",
+    "maxFileLines|packages/dsh-knowledge-base/src/tools.ts|(file)",
+    "maxFileLines|packages/dsh-orchestrator/src/config.ts|(file)",
+    "maxFileLines|packages/dsh-orchestrator/src/dispatch.ts|(file)",
+    "maxFileLines|packages/dsh-orchestrator/src/gates.ts|(file)",
+    "maxFileLines|packages/dsh-orchestrator/src/metrics.ts|(file)",
+    "maxFileLines|packages/dsh-orchestrator/src/pipeline.ts|(file)",
+    "maxFileLines|packages/dsh-orchestrator/src/sequence.ts|(file)",
+    "maxFileLines|packages/dsh-quality-gate/src/budget.ts|(file)",
+    "maxFileLines|packages/dsh-quality-gate/src/config.ts|(file)",
+    "maxFileLines|packages/dsh-quality-gate/src/contract.ts|(file)",
+    "maxFileLines|packages/dsh-quality-gate/src/gate.ts|(file)",
+    "maxFileLines|packages/dsh-quality-gate/src/hooks.ts|(file)",
+    "maxFileLines|packages/dsh-quality-gate/src/tools.ts|(file)",
+    "maxFileLines|packages/dsh-role-guard/src/bindings.ts|(file)",
+    "maxFileLines|packages/dsh-role-guard/src/index.ts|(file)",
+    "maxFileLines|packages/dsh-role-guard/src/tools.ts|(file)",
+    "maxFileLines|packages/dsh-spec-gate/src/adr.ts|(file)",
+    "maxFileLines|packages/dsh-spec-gate/src/budgets.ts|(file)",
+    "maxFileLines|packages/dsh-spec-gate/src/config.ts|(file)",
+    "maxFileLines|packages/dsh-spec-gate/src/guard.ts|(file)",
+    "maxFileLines|packages/dsh-spec-gate/src/plan-ledger.ts|(file)",
+    "maxFileLines|packages/dsh-spec-gate/src/review.ts|(file)",
+    "maxFileLines|packages/dsh-spec-gate/src/shell.ts|(file)",
+    "maxFileLines|packages/dsh-spec-gate/src/spec.ts|(file)",
+    "maxFileLines|packages/dsh-spec-gate/src/tools.ts|(file)",
+    "maxFileLines|packages/dsh-standards-gate/src/tools.ts|(file)",
+    "maxFileLines|packages/dsh-suite-doctor/src/config.ts|(file)",
+    "maxFileLines|packages/dsh-suite-doctor/src/im-approval.ts|(file)",
+    "maxFileLines|packages/dsh-suite-doctor/src/probe.ts|(file)",
+    "maxFileLines|packages/dsh-supply-chain-gate/src/config.ts|(file)",
+    "maxFileLines|packages/dsh-supply-chain-gate/src/deps.ts|(file)",
+    "maxFileLines|packages/dsh-supply-chain-gate/src/secrets.ts|(file)",
+    "maxFileLines|packages/dsh-supply-chain-gate/src/tools.ts|(file)",
+    "maxFileLines|packages/dsh-test-design-gate/src/tools.ts|(file)",
+    "maxFileLines|scripts/stub-llm.mjs|(file)",
+    "maxFunctionLines|packages/dsh-audit-trail/src/config.ts|resolveEffectiveConfig",
+    "maxFunctionLines|packages/dsh-audit-trail/src/index.ts|apply",
+    "maxFunctionLines|packages/dsh-audit-trail/src/index.ts|onPreExecute",
+    "maxFunctionLines|packages/dsh-audit-trail/src/snapshot.ts|applyRewind",
+    "maxFunctionLines|packages/dsh-audit-trail/src/snapshot.ts|captureSnapshot",
+    "maxFunctionLines|packages/dsh-audit-trail/src/tools.ts|registerTools",
+    "maxFunctionLines|packages/dsh-coverage-gate/src/config.ts|parseMutationConfig",
+    "maxFunctionLines|packages/dsh-coverage-gate/src/config.ts|resolveConfig",
+    "maxFunctionLines|packages/dsh-coverage-gate/src/config.ts|resolveEffectiveConfig",
+    "maxFunctionLines|packages/dsh-coverage-gate/src/coverage.ts|incrementalCoverage",
+    "maxFunctionLines|packages/dsh-coverage-gate/src/coverage.ts|parseIstanbulJson",
+    "maxFunctionLines|packages/dsh-coverage-gate/src/coverage.ts|parseLcov",
+    "maxFunctionLines|packages/dsh-coverage-gate/src/index.ts|apply",
+    "maxFunctionLines|packages/dsh-coverage-gate/src/mutation.ts|collectSourceFiles",
+    "maxFunctionLines|packages/dsh-coverage-gate/src/mutation.ts|judgeMutation",
+    "maxFunctionLines|packages/dsh-coverage-gate/src/mutation.ts|maskLine",
+    "maxFunctionLines|packages/dsh-coverage-gate/src/mutation.ts|mutantsInFile",
+    "maxFunctionLines|packages/dsh-coverage-gate/src/mutation.ts|runMutationPlan",
+    "maxFunctionLines|packages/dsh-coverage-gate/src/prompt.ts|sectionText",
+    "maxFunctionLines|packages/dsh-coverage-gate/src/tools.ts|mutationTestCommandOf",
+    "maxFunctionLines|packages/dsh-coverage-gate/src/tools.ts|registerTools",
+    "maxFunctionLines|packages/dsh-deploy-gate/src/config.ts|parseEnvironment",
+    "maxFunctionLines|packages/dsh-deploy-gate/src/config.ts|resolveEffectiveConfig",
+    "maxFunctionLines|packages/dsh-deploy-gate/src/index.ts|apply",
+    "maxFunctionLines|packages/dsh-deploy-gate/src/plan.ts|evaluateGoNoGo",
+    "maxFunctionLines|packages/dsh-deploy-gate/src/tools.ts|askHuman",
+    "maxFunctionLines|packages/dsh-deploy-gate/src/tools.ts|pendingAsksOf",
+    "maxFunctionLines|packages/dsh-deploy-gate/src/tools.ts|registerTools",
+    "maxFunctionLines|packages/dsh-deploy-gate/src/tools.ts|renderPlan",
+    "maxFunctionLines|packages/dsh-eng-core/src/conformance.ts|authorizationDimension",
+    "maxFunctionLines|packages/dsh-eng-core/src/conformance.ts|conformanceRollup",
+    "maxFunctionLines|packages/dsh-eng-core/src/conformance.ts|consistencyDimension",
+    "maxFunctionLines|packages/dsh-eng-core/src/conformance.ts|evidenceDimension",
+    "maxFunctionLines|packages/dsh-eng-core/src/conformance.ts|freshnessDimension",
+    "maxFunctionLines|packages/dsh-eng-core/src/conformance.ts|knowledgeIndexFreshness",
+    "maxFunctionLines|packages/dsh-eng-core/src/doctor.ts|checkWorkspace",
+    "maxFunctionLines|packages/dsh-eng-core/src/doctor.ts|mandatePolicyCheck",
+    "maxFunctionLines|packages/dsh-eng-core/src/doctor.ts|withRuntime",
+    "maxFunctionLines|packages/dsh-eng-core/src/impact.ts|analyzeImpact",
+    "maxFunctionLines|packages/dsh-eng-core/src/impact.ts|changedRanges",
+    "maxFunctionLines|packages/dsh-eng-core/src/log.ts|createLogger",
+    "maxFunctionLines|packages/dsh-eng-core/src/markdown.ts|renderSpecMarkdown",
+    "maxFunctionLines|packages/dsh-eng-core/src/metrics.ts|findCycles",
+    "maxFunctionLines|packages/dsh-eng-core/src/metrics.ts|lexSource",
+    "maxFunctionLines|packages/dsh-eng-core/src/metrics.ts|measureFile",
+    "maxFunctionLines|packages/dsh-eng-core/src/metrics.ts|measureWorkspace",
+    "maxFunctionLines|packages/dsh-eng-core/src/metrics.ts|tsFunctions",
+    "maxFunctionLines|packages/dsh-eng-core/src/metrics.ts|violationsFor",
+    "maxFunctionLines|packages/dsh-eng-core/src/run.ts|runWithChildProcess",
+    "maxFunctionLines|packages/dsh-eng-core/src/scan.ts|parseRequirementDoc",
+    "maxFunctionLines|packages/dsh-eng-core/src/scan.ts|scanWorkspace",
+    "maxFunctionLines|packages/dsh-eng-core/src/scan.ts|walkWorkspace",
+    "maxFunctionLines|packages/dsh-eng-core/src/scope.ts|apply",
+    "maxFunctionLines|packages/dsh-eng-core/src/spec-edit.ts|planAmendment",
+    "maxFunctionLines|packages/dsh-eng-core/src/testing.ts|createFakeHost",
+    "maxFunctionLines|packages/dsh-eng-core/src/writer-check.ts|scanEvidence",
+    "maxFunctionLines|packages/dsh-eng-core/src/writer-check.ts|scanFingerprint",
+    "maxFunctionLines|packages/dsh-eng-core/src/writer-check.ts|writersCheck",
+    "maxFunctionLines|packages/dsh-evidence-gate/src/delivery.ts|evaluateDelivery",
+    "maxFunctionLines|packages/dsh-evidence-gate/src/index.ts|apply",
+    "maxFunctionLines|packages/dsh-evidence-gate/src/releases.ts|recordRelease",
+    "maxFunctionLines|packages/dsh-evidence-gate/src/report.ts|renderOverview",
+    "maxFunctionLines|packages/dsh-evidence-gate/src/report.ts|renderReleaseRefused",
+    "maxFunctionLines|packages/dsh-evidence-gate/src/report.ts|renderReleaseStatus",
+    "maxFunctionLines|packages/dsh-evidence-gate/src/tools.ts|registerTools",
+    "maxFunctionLines|packages/dsh-impact-gate/src/changes.ts|readFromService",
+    "maxFunctionLines|packages/dsh-impact-gate/src/config.ts|resolveConfig",
+    "maxFunctionLines|packages/dsh-impact-gate/src/config.ts|resolveEffectiveConfig",
+    "maxFunctionLines|packages/dsh-impact-gate/src/flaky.ts|buildPlan",
+    "maxFunctionLines|packages/dsh-impact-gate/src/flaky.ts|parseReport",
+    "maxFunctionLines|packages/dsh-impact-gate/src/flaky.ts|renderStatus",
+    "maxFunctionLines|packages/dsh-impact-gate/src/index.ts|apply",
+    "maxFunctionLines|packages/dsh-impact-gate/src/review.ts|runImpactReview",
+    "maxFunctionLines|packages/dsh-impact-gate/src/tools.ts|buildArtifact",
+    "maxFunctionLines|packages/dsh-impact-gate/src/tools.ts|registerTools",
+    "maxFunctionLines|packages/dsh-impact-gate/src/tools.ts|renderAnalyze",
+    "maxFunctionLines|packages/dsh-impact-gate/src/tools.ts|renderStatus",
+    "maxFunctionLines|packages/dsh-impact-gate/src/tools.ts|renderTests",
+    "maxFunctionLines|packages/dsh-interaction-gate/src/approval.ts|answer",
+    "maxFunctionLines|packages/dsh-interaction-gate/src/approval.ts|installApprovalAnswerer",
+    "maxFunctionLines|packages/dsh-interaction-gate/src/attention.ts|createAttentionSource",
+    "maxFunctionLines|packages/dsh-interaction-gate/src/attention.ts|deriveRecords",
+    "maxFunctionLines|packages/dsh-interaction-gate/src/channels.ts|createInteractionRegistry",
+    "maxFunctionLines|packages/dsh-interaction-gate/src/chat-channel.ts|createChatChannel",
+    "maxFunctionLines|packages/dsh-interaction-gate/src/chat-channel.ts|preflight",
+    "maxFunctionLines|packages/dsh-interaction-gate/src/chat-channel.ts|probeChatInteraction",
+    "maxFunctionLines|packages/dsh-interaction-gate/src/config.ts|resolveConfig",
+    "maxFunctionLines|packages/dsh-interaction-gate/src/config.ts|resolveEffectiveConfig",
+    "maxFunctionLines|packages/dsh-interaction-gate/src/im-binding.ts|installImChannel",
+    "maxFunctionLines|packages/dsh-interaction-gate/src/index.ts|apply",
+    "maxFunctionLines|packages/dsh-interaction-gate/src/ledger.ts|summarizeLedger",
+    "maxFunctionLines|packages/dsh-interaction-gate/src/outbox.ts|createOutbox",
+    "maxFunctionLines|packages/dsh-interaction-gate/src/tools.ts|askThroughChannels",
+    "maxFunctionLines|packages/dsh-interaction-gate/src/tools.ts|imAskTargetOf",
+    "maxFunctionLines|packages/dsh-interaction-gate/src/tools.ts|normalizeApprovalContextInput",
+    "maxFunctionLines|packages/dsh-interaction-gate/src/tools.ts|registerTools",
+    "maxFunctionLines|packages/dsh-interaction-gate/src/workspace-mapping.ts|resolveApprovalRouting",
+    "maxFunctionLines|packages/dsh-interaction-gate/src/workspace-mapping.ts|resolveWorkspaceApprovals",
+    "maxFunctionLines|packages/dsh-knowledge-base/src/config.ts|resolveEffectiveConfig",
+    "maxFunctionLines|packages/dsh-knowledge-base/src/index-store.ts|buildIndex",
+    "maxFunctionLines|packages/dsh-knowledge-base/src/index-store.ts|loadIndex",
+    "maxFunctionLines|packages/dsh-knowledge-base/src/index.ts|apply",
+    "maxFunctionLines|packages/dsh-knowledge-base/src/report.ts|renderIndexReport",
+    "maxFunctionLines|packages/dsh-knowledge-base/src/report.ts|renderStatusReport",
+    "maxFunctionLines|packages/dsh-knowledge-base/src/search.ts|searchIndex",
+    "maxFunctionLines|packages/dsh-knowledge-base/src/tools.ts|registerTools",
+    "maxFunctionLines|packages/dsh-knowledge-base/src/tools.ts|runSearch",
+    "maxFunctionLines|packages/dsh-orchestrator/src/dispatch.ts|dispatchStage",
+    "maxFunctionLines|packages/dsh-orchestrator/src/gates.ts|evaluateFacts",
+    "maxFunctionLines|packages/dsh-orchestrator/src/hooks.ts|evaluateAutoAdvance",
+    "maxFunctionLines|packages/dsh-orchestrator/src/index.ts|apply",
+    "maxFunctionLines|packages/dsh-orchestrator/src/metrics.ts|collectTrail",
+    "maxFunctionLines|packages/dsh-orchestrator/src/metrics.ts|computeMetrics",
+    "maxFunctionLines|packages/dsh-orchestrator/src/metrics.ts|foldDeployments",
+    "maxFunctionLines|packages/dsh-orchestrator/src/pipeline.ts|resolvePipeline",
+    "maxFunctionLines|packages/dsh-orchestrator/src/sequence.ts|advanceAction",
+    "maxFunctionLines|packages/dsh-orchestrator/src/sequence.ts|recordAndDispatch",
+    "maxFunctionLines|packages/dsh-orchestrator/src/sequence.ts|revalidateMandate",
+    "maxFunctionLines|packages/dsh-orchestrator/src/sequence.ts|rollback",
+    "maxFunctionLines|packages/dsh-orchestrator/src/sequence.ts|startAction",
+    "maxFunctionLines|packages/dsh-orchestrator/src/sequence.ts|stopAction",
+    "maxFunctionLines|packages/dsh-quality-gate/src/budget.ts|acquireBaselineLock",
+    "maxFunctionLines|packages/dsh-quality-gate/src/budget.ts|compareRegression",
+    "maxFunctionLines|packages/dsh-quality-gate/src/budget.ts|measureBudget",
+    "maxFunctionLines|packages/dsh-quality-gate/src/budget.ts|parseBudget",
+    "maxFunctionLines|packages/dsh-quality-gate/src/budget.ts|parseSpecBudgets",
+    "maxFunctionLines|packages/dsh-quality-gate/src/budget.ts|renderBudgets",
+    "maxFunctionLines|packages/dsh-quality-gate/src/budget.ts|runBudgets",
+    "maxFunctionLines|packages/dsh-quality-gate/src/config.ts|resolveConfig",
+    "maxFunctionLines|packages/dsh-quality-gate/src/config.ts|resolveEffectiveConfig",
+    "maxFunctionLines|packages/dsh-quality-gate/src/contract.ts|evaluateContract",
+    "maxFunctionLines|packages/dsh-quality-gate/src/contract.ts|parseContract",
+    "maxFunctionLines|packages/dsh-quality-gate/src/contract.ts|runContracts",
+    "maxFunctionLines|packages/dsh-quality-gate/src/gate.ts|runGate",
+    "maxFunctionLines|packages/dsh-quality-gate/src/hooks.ts|evaluateAfterWrite",
+    "maxFunctionLines|packages/dsh-quality-gate/src/hooks.ts|evaluateTurnStop",
+    "maxFunctionLines|packages/dsh-quality-gate/src/index.ts|apply",
+    "maxFunctionLines|packages/dsh-quality-gate/src/prompt.ts|sectionText",
+    "maxFunctionLines|packages/dsh-quality-gate/src/tools.ts|registerTools",
+    "maxFunctionLines|packages/dsh-role-guard/src/index.ts|apply",
+    "maxFunctionLines|packages/dsh-role-guard/src/service.ts|createRolePlanner",
+    "maxFunctionLines|packages/dsh-role-guard/src/tools.ts|registerTools",
+    "maxFunctionLines|packages/dsh-spec-gate/src/adr.ts|recordAdr",
+    "maxFunctionLines|packages/dsh-spec-gate/src/amend.ts|amendMissionSpec",
+    "maxFunctionLines|packages/dsh-spec-gate/src/budgets.ts|applyBudgetEdit",
+    "maxFunctionLines|packages/dsh-spec-gate/src/budgets.ts|parseBudgetDeclaration",
+    "maxFunctionLines|packages/dsh-spec-gate/src/budgets.ts|planAgainst",
+    "maxFunctionLines|packages/dsh-spec-gate/src/config.ts|resolveEffectiveConfig",
+    "maxFunctionLines|packages/dsh-spec-gate/src/guard.ts|createWriteGuard",
+    "maxFunctionLines|packages/dsh-spec-gate/src/guard.ts|guard",
+    "maxFunctionLines|packages/dsh-spec-gate/src/index.ts|apply",
+    "maxFunctionLines|packages/dsh-spec-gate/src/plan-ledger.ts|buildPlanReport",
+    "maxFunctionLines|packages/dsh-spec-gate/src/plan-ledger.ts|renderPlanReport",
+    "maxFunctionLines|packages/dsh-spec-gate/src/prompt.ts|sectionText",
+    "maxFunctionLines|packages/dsh-spec-gate/src/review.ts|previewArtifact",
+    "maxFunctionLines|packages/dsh-spec-gate/src/review.ts|tuiReview",
+    "maxFunctionLines|packages/dsh-spec-gate/src/shell.ts|analyzeShellCommandInner",
+    "maxFunctionLines|packages/dsh-spec-gate/src/tools.ts|registerTools",
+    "maxFunctionLines|packages/dsh-spec-gate/src/tools.ts|requestApproval",
+    "maxFunctionLines|packages/dsh-standards-gate/src/index.ts|apply",
+    "maxFunctionLines|packages/dsh-standards-gate/src/index.ts|resolveEffectiveConfig",
+    "maxFunctionLines|packages/dsh-standards-gate/src/review.ts|runStructuralReview",
+    "maxFunctionLines|packages/dsh-standards-gate/src/tools.ts|registerTools",
+    "maxFunctionLines|packages/dsh-standards-gate/src/tools.ts|renderCheck",
+    "maxFunctionLines|packages/dsh-suite-doctor/src/config.ts|resolveEffectiveConfig",
+    "maxFunctionLines|packages/dsh-suite-doctor/src/im-approval.ts|imApprovalChecks",
+    "maxFunctionLines|packages/dsh-suite-doctor/src/im-approval.ts|workspaceMappingCheckOf",
+    "maxFunctionLines|packages/dsh-suite-doctor/src/index.ts|apply",
+    "maxFunctionLines|packages/dsh-suite-doctor/src/observe.ts|tallyObservations",
+    "maxFunctionLines|packages/dsh-suite-doctor/src/probe.ts|probeInteraction",
+    "maxFunctionLines|packages/dsh-suite-doctor/src/probe.ts|probeRuntime",
+    "maxFunctionLines|packages/dsh-supply-chain-gate/src/config.ts|resolveEffectiveConfig",
+    "maxFunctionLines|packages/dsh-supply-chain-gate/src/deps.ts|genericWalk",
+    "maxFunctionLines|packages/dsh-supply-chain-gate/src/index.ts|apply",
+    "maxFunctionLines|packages/dsh-supply-chain-gate/src/secrets.ts|parseAllowlist",
+    "maxFunctionLines|packages/dsh-supply-chain-gate/src/secrets.ts|scanText",
+    "maxFunctionLines|packages/dsh-supply-chain-gate/src/tools.ts|registerTools",
+    "maxFunctionLines|packages/dsh-test-design-gate/src/review.ts|reviewTestDesign",
+    "maxFunctionLines|packages/dsh-test-design-gate/src/tools.ts|registerTools",
+    "maxFunctionLines|scripts/stub-llm.mjs|decide",
+    "maxIfBlockLines|packages/dsh-audit-trail/src/index.ts|apply",
+    "maxIfBlockLines|packages/dsh-audit-trail/src/index.ts|onPreExecute",
+    "maxIfBlockLines|packages/dsh-audit-trail/src/snapshot.ts|applyRewind",
+    "maxIfBlockLines|packages/dsh-coverage-gate/src/config.ts|parseMutationConfig",
+    "maxIfBlockLines|packages/dsh-coverage-gate/src/coverage.ts|parseIstanbulJson",
+    "maxIfBlockLines|packages/dsh-coverage-gate/src/index.ts|apply",
+    "maxIfBlockLines|packages/dsh-coverage-gate/src/mutation.ts|judgeMutation",
+    "maxIfBlockLines|packages/dsh-coverage-gate/src/mutation.ts|maskLine",
+    "maxIfBlockLines|packages/dsh-coverage-gate/src/mutation.ts|runMutationPlan",
+    "maxIfBlockLines|packages/dsh-coverage-gate/src/tools.ts|mutationTestCommandOf",
+    "maxIfBlockLines|packages/dsh-coverage-gate/src/tools.ts|registerTools",
+    "maxIfBlockLines|packages/dsh-coverage-gate/src/tools.ts|registerTools#L1568",
+    "maxIfBlockLines|packages/dsh-coverage-gate/src/tools.ts|registerTools#L1604",
+    "maxIfBlockLines|packages/dsh-coverage-gate/src/tools.ts|registerTools#L632",
+    "maxIfBlockLines|packages/dsh-coverage-gate/src/tools.ts|registerTools#L635",
+    "maxIfBlockLines|packages/dsh-coverage-gate/src/tools.ts|registerTools#L723",
+    "maxIfBlockLines|packages/dsh-coverage-gate/src/tools.ts|registerTools#L750",
+    "maxIfBlockLines|packages/dsh-deploy-gate/src/config.ts|resolveEffectiveConfig",
+    "maxIfBlockLines|packages/dsh-deploy-gate/src/config.ts|resolveEffectiveConfig#L751",
+    "maxIfBlockLines|packages/dsh-deploy-gate/src/index.ts|apply",
+    "maxIfBlockLines|packages/dsh-deploy-gate/src/plan.ts|evaluateGoNoGo",
+    "maxIfBlockLines|packages/dsh-deploy-gate/src/plan.ts|evaluateGoNoGo#L266",
+    "maxIfBlockLines|packages/dsh-deploy-gate/src/plan.ts|evaluateGoNoGo#L281",
+    "maxIfBlockLines|packages/dsh-deploy-gate/src/plan.ts|evaluateGoNoGo#L316",
+    "maxIfBlockLines|packages/dsh-deploy-gate/src/tools.ts|registerTools",
+    "maxIfBlockLines|packages/dsh-deploy-gate/src/tools.ts|registerTools#L1684",
+    "maxIfBlockLines|packages/dsh-deploy-gate/src/tools.ts|registerTools#L1718",
+    "maxIfBlockLines|packages/dsh-deploy-gate/src/tools.ts|registerTools#L1731",
+    "maxIfBlockLines|packages/dsh-deploy-gate/src/tools.ts|registerTools#L1787",
+    "maxIfBlockLines|packages/dsh-deploy-gate/src/tools.ts|registerTools#L1831",
+    "maxIfBlockLines|packages/dsh-deploy-gate/src/tools.ts|registerTools#L2017",
+    "maxIfBlockLines|packages/dsh-deploy-gate/src/tools.ts|registerTools#L2042",
+    "maxIfBlockLines|packages/dsh-deploy-gate/src/tools.ts|registerTools#L2080",
+    "maxIfBlockLines|packages/dsh-deploy-gate/src/tools.ts|registerTools#L2093",
+    "maxIfBlockLines|packages/dsh-deploy-gate/src/tools.ts|registerTools#L2227",
+    "maxIfBlockLines|packages/dsh-deploy-gate/src/tools.ts|registerTools#L2315",
+    "maxIfBlockLines|packages/dsh-deploy-gate/src/tools.ts|registerTools#L2510",
+    "maxIfBlockLines|packages/dsh-eng-core/src/conformance.ts|consistencyDimension",
+    "maxIfBlockLines|packages/dsh-eng-core/src/delegation.ts|startDelegation",
+    "maxIfBlockLines|packages/dsh-eng-core/src/doctor.ts|checkWorkspace",
+    "maxIfBlockLines|packages/dsh-eng-core/src/doctor.ts|withRuntime",
+    "maxIfBlockLines|packages/dsh-eng-core/src/impact.ts|changedRanges",
+    "maxIfBlockLines|packages/dsh-eng-core/src/metrics.ts|analyzePythonFunctions",
+    "maxIfBlockLines|packages/dsh-eng-core/src/metrics.ts|lexSource",
+    "maxIfBlockLines|packages/dsh-eng-core/src/metrics.ts|lexSource#L288",
+    "maxIfBlockLines|packages/dsh-eng-core/src/metrics.ts|measureWorkspace",
+    "maxIfBlockLines|packages/dsh-eng-core/src/scope.ts|apply",
+    "maxIfBlockLines|packages/dsh-eng-core/src/testing.ts|createFakeHost",
+    "maxIfBlockLines|packages/dsh-eng-core/src/testing.ts|createFakeHost#L258",
+    "maxIfBlockLines|packages/dsh-evidence-gate/src/delivery.ts|evaluateDelivery",
+    "maxIfBlockLines|packages/dsh-evidence-gate/src/delivery.ts|evaluateDelivery#L239",
+    "maxIfBlockLines|packages/dsh-evidence-gate/src/delivery.ts|evaluateDelivery#L299",
+    "maxIfBlockLines|packages/dsh-evidence-gate/src/delivery.ts|evaluateDelivery#L370",
+    "maxIfBlockLines|packages/dsh-evidence-gate/src/index.ts|apply",
+    "maxIfBlockLines|packages/dsh-evidence-gate/src/tools.ts|registerTools",
+    "maxIfBlockLines|packages/dsh-evidence-gate/src/tools.ts|registerTools#L580",
+    "maxIfBlockLines|packages/dsh-impact-gate/src/config.ts|resolveEffectiveConfig",
+    "maxIfBlockLines|packages/dsh-impact-gate/src/config.ts|resolveEffectiveConfig#L352",
+    "maxIfBlockLines|packages/dsh-impact-gate/src/flaky.ts|parseReport",
+    "maxIfBlockLines|packages/dsh-impact-gate/src/flaky.ts|renderStatus",
+    "maxIfBlockLines|packages/dsh-impact-gate/src/flaky.ts|renderStatus#L1015",
+    "maxIfBlockLines|packages/dsh-impact-gate/src/index.ts|apply",
+    "maxIfBlockLines|packages/dsh-impact-gate/src/tools.ts|registerTools",
+    "maxIfBlockLines|packages/dsh-impact-gate/src/tools.ts|registerTools#L1405",
+    "maxIfBlockLines|packages/dsh-impact-gate/src/tools.ts|renderStatus",
+    "maxIfBlockLines|packages/dsh-interaction-gate/src/chat-channel.ts|preflight",
+    "maxIfBlockLines|packages/dsh-interaction-gate/src/chat-channel.ts|preflight#L518",
+    "maxIfBlockLines|packages/dsh-interaction-gate/src/chat-channel.ts|targetOf",
+    "maxIfBlockLines|packages/dsh-interaction-gate/src/config.ts|resolveConfig",
+    "maxIfBlockLines|packages/dsh-interaction-gate/src/config.ts|resolveEffectiveConfig",
+    "maxIfBlockLines|packages/dsh-interaction-gate/src/config.ts|resolveEffectiveConfig#L908",
+    "maxIfBlockLines|packages/dsh-interaction-gate/src/config.ts|resolveEffectiveConfig#L912",
+    "maxIfBlockLines|packages/dsh-interaction-gate/src/im-binding.ts|installImChannel",
+    "maxIfBlockLines|packages/dsh-interaction-gate/src/tools.ts|askThroughChannels",
+    "maxIfBlockLines|packages/dsh-interaction-gate/src/tools.ts|askThroughChannels#L1329",
+    "maxIfBlockLines|packages/dsh-interaction-gate/src/tools.ts|askThroughChannels#L1474",
+    "maxIfBlockLines|packages/dsh-interaction-gate/src/tools.ts|askThroughChannels#L1546",
+    "maxIfBlockLines|packages/dsh-interaction-gate/src/tools.ts|askThroughChannels#L1549",
+    "maxIfBlockLines|packages/dsh-interaction-gate/src/tools.ts|askThroughChannels#L1574",
+    "maxIfBlockLines|packages/dsh-interaction-gate/src/tools.ts|askThroughChannels#L1637",
+    "maxIfBlockLines|packages/dsh-interaction-gate/src/tools.ts|askThroughChannels#L1639",
+    "maxIfBlockLines|packages/dsh-interaction-gate/src/tools.ts|askThroughChannels#L1669",
+    "maxIfBlockLines|packages/dsh-interaction-gate/src/tools.ts|askThroughChannels#L1734",
+    "maxIfBlockLines|packages/dsh-interaction-gate/src/tools.ts|askThroughChannels#L1782",
+    "maxIfBlockLines|packages/dsh-interaction-gate/src/tools.ts|imAskTargetOf",
+    "maxIfBlockLines|packages/dsh-interaction-gate/src/tools.ts|imAskTargetOf#L553",
+    "maxIfBlockLines|packages/dsh-knowledge-base/src/config.ts|resolveEffectiveConfig",
+    "maxIfBlockLines|packages/dsh-knowledge-base/src/index.ts|apply",
+    "maxIfBlockLines|packages/dsh-orchestrator/src/dispatch.ts|dispatchStage",
+    "maxIfBlockLines|packages/dsh-orchestrator/src/dispatch.ts|dispatchStage#L254",
+    "maxIfBlockLines|packages/dsh-orchestrator/src/sequence.ts|recordAndDispatch",
+    "maxIfBlockLines|packages/dsh-orchestrator/src/sequence.ts|revalidateMandate",
+    "maxIfBlockLines|packages/dsh-orchestrator/src/sequence.ts|stopAction",
+    "maxIfBlockLines|packages/dsh-quality-gate/src/budget.ts|acquireBaselineLock",
+    "maxIfBlockLines|packages/dsh-quality-gate/src/budget.ts|compareRegression",
+    "maxIfBlockLines|packages/dsh-quality-gate/src/budget.ts|measureBudget",
+    "maxIfBlockLines|packages/dsh-quality-gate/src/budget.ts|measureBudget#L1466",
+    "maxIfBlockLines|packages/dsh-quality-gate/src/budget.ts|measureBudget#L1505",
+    "maxIfBlockLines|packages/dsh-quality-gate/src/config.ts|resolveEffectiveConfig",
+    "maxIfBlockLines|packages/dsh-quality-gate/src/config.ts|resolveEffectiveConfig#L335",
+    "maxIfBlockLines|packages/dsh-quality-gate/src/contract.ts|evaluateContract",
+    "maxIfBlockLines|packages/dsh-quality-gate/src/contract.ts|parseContract",
+    "maxIfBlockLines|packages/dsh-quality-gate/src/contract.ts|parseContract#L321",
+    "maxIfBlockLines|packages/dsh-quality-gate/src/contract.ts|parseContract#L344",
+    "maxIfBlockLines|packages/dsh-quality-gate/src/contract.ts|parseContract#L348",
+    "maxIfBlockLines|packages/dsh-quality-gate/src/contract.ts|parseJsonPath",
+    "maxIfBlockLines|packages/dsh-quality-gate/src/gate.ts|runGate",
+    "maxIfBlockLines|packages/dsh-quality-gate/src/index.ts|apply",
+    "maxIfBlockLines|packages/dsh-role-guard/src/index.ts|apply",
+    "maxIfBlockLines|packages/dsh-role-guard/src/index.ts|apply#L281",
+    "maxIfBlockLines|packages/dsh-role-guard/src/route.ts|resolveRoute",
+    "maxIfBlockLines|packages/dsh-spec-gate/src/adr.ts|recordAdr",
+    "maxIfBlockLines|packages/dsh-spec-gate/src/budgets.ts|applyBudgetEdit",
+    "maxIfBlockLines|packages/dsh-spec-gate/src/budgets.ts|parseBudgetDeclaration",
+    "maxIfBlockLines|packages/dsh-spec-gate/src/budgets.ts|parseBudgetDeclaration#L372",
+    "maxIfBlockLines|packages/dsh-spec-gate/src/budgets.ts|parseBudgetDeclaration#L379",
+    "maxIfBlockLines|packages/dsh-spec-gate/src/index.ts|apply",
+    "maxIfBlockLines|packages/dsh-spec-gate/src/review.ts|previewArtifact",
+    "maxIfBlockLines|packages/dsh-spec-gate/src/review.ts|previewArtifact#L268",
+    "maxIfBlockLines|packages/dsh-spec-gate/src/tools.ts|registerTools",
+    "maxIfBlockLines|packages/dsh-spec-gate/src/tools.ts|registerTools#L1139",
+    "maxIfBlockLines|packages/dsh-spec-gate/src/tools.ts|registerTools#L1166",
+    "maxIfBlockLines|packages/dsh-spec-gate/src/tools.ts|registerTools#L1300",
+    "maxIfBlockLines|packages/dsh-spec-gate/src/tools.ts|registerTools#L885",
+    "maxIfBlockLines|packages/dsh-spec-gate/src/tools.ts|requestApproval",
+    "maxIfBlockLines|packages/dsh-standards-gate/src/tools.ts|registerTools",
+    "maxIfBlockLines|packages/dsh-standards-gate/src/tools.ts|registerTools#L731",
+    "maxIfBlockLines|packages/dsh-standards-gate/src/tools.ts|registerTools#L995",
+    "maxIfBlockLines|packages/dsh-suite-doctor/src/im-approval.ts|imApprovalChecks",
+    "maxIfBlockLines|packages/dsh-suite-doctor/src/im-approval.ts|workspaceMappingCheckOf",
+    "maxIfBlockLines|packages/dsh-suite-doctor/src/im-approval.ts|workspaceMappingCheckOf#L360",
+    "maxIfBlockLines|packages/dsh-suite-doctor/src/probe.ts|probeInteraction",
+    "maxIfBlockLines|packages/dsh-suite-doctor/src/probe.ts|probeInteraction#L827",
+    "maxIfBlockLines|packages/dsh-supply-chain-gate/src/config.ts|resolveEffectiveConfig",
+    "maxIfBlockLines|packages/dsh-supply-chain-gate/src/config.ts|resolveEffectiveConfig#L360",
+    "maxIfBlockLines|packages/dsh-supply-chain-gate/src/config.ts|resolveEffectiveConfig#L408",
+    "maxIfBlockLines|packages/dsh-supply-chain-gate/src/config.ts|resolveEffectiveConfig#L411",
+    "maxIfBlockLines|packages/dsh-supply-chain-gate/src/config.ts|resolveEffectiveConfig#L438",
+    "maxIfBlockLines|packages/dsh-supply-chain-gate/src/index.ts|apply",
+    "maxIfBlockLines|packages/dsh-supply-chain-gate/src/secrets.ts|scanText",
+    "maxIfBlockLines|packages/dsh-supply-chain-gate/src/tools.ts|registerTools",
+    "maxIfBlockLines|packages/dsh-supply-chain-gate/src/tools.ts|registerTools#L1106",
+    "maxIfBlockLines|packages/dsh-supply-chain-gate/src/tools.ts|registerTools#L902",
+    "maxIfBlockLines|packages/dsh-supply-chain-gate/src/tools.ts|registerTools#L905",
+    "maxIfBlockLines|packages/dsh-supply-chain-gate/src/tools.ts|registerTools#L914",
+    "maxIfBlockLines|packages/dsh-supply-chain-gate/src/tools.ts|registerTools#L968",
+    "maxIfBlockLines|packages/dsh-test-design-gate/src/index.ts|apply",
+    "maxIfBlockLines|scripts/kb.mjs|(file)",
+    "maxParams|packages/dsh-coverage-gate/src/tools.ts|checkResult",
+    "maxParams|packages/dsh-deploy-gate/src/config.ts|takeProfileNumber",
+    "maxParams|packages/dsh-eng-core/src/metrics.ts|violationOf",
+    "maxParams|packages/dsh-knowledge-base/src/sources.ts|missionSummary",
+    "maxParams|packages/dsh-orchestrator/src/sequence.ts|breakerReport",
+    "maxParams|packages/dsh-orchestrator/src/sequence.ts|enterStage",
+    "maxParams|packages/dsh-orchestrator/src/sequence.ts|entryReport",
+    "maxParams|packages/dsh-orchestrator/src/sequence.ts|recordAndDispatch",
+    "maxParams|packages/dsh-orchestrator/src/sequence.ts|recordEntered",
+    "maxParams|packages/dsh-orchestrator/src/sequence.ts|rollback",
+    "maxParams|packages/dsh-orchestrator/src/sequence.ts|stageHeader",
+    "maxParams|packages/dsh-spec-gate/src/tools.ts|planRowFor",
+    "maxParams|packages/dsh-standards-gate/src/tools.ts|recordStandardsGate"
+  ],
+  "entries": [
+    {
+      "key": "cycle|packages/dsh-eng-core/src/doctor.ts|packages/dsh-eng-core/src/doctor.ts -> packages/dsh-eng-core/src/writer-check.ts",
+      "actual": 2,
+      "limit": 0
+    },
+    {
+      "key": "cycle|packages/dsh-interaction-gate/src/channels.ts|packages/dsh-interaction-gate/src/channels.ts -> packages/dsh-interaction-gate/src/config.ts",
+      "actual": 2,
+      "limit": 0
+    },
+    {
+      "key": "cycle|packages/dsh-knowledge-base/src/config.ts|packages/dsh-knowledge-base/src/config.ts -> packages/dsh-knowledge-base/src/sources.ts",
+      "actual": 2,
+      "limit": 0
+    },
+    {
+      "key": "cycle|packages/dsh-knowledge-base/src/index-store.ts|packages/dsh-knowledge-base/src/index-store.ts -> packages/dsh-knowledge-base/src/search.ts",
+      "actual": 2,
+      "limit": 0
+    },
+    {
+      "key": "cycle|packages/dsh-quality-gate/src/budget.ts|packages/dsh-quality-gate/src/budget.ts -> packages/dsh-quality-gate/src/config.ts",
+      "actual": 2,
+      "limit": 0
+    },
+    {
+      "key": "cycle|packages/dsh-quality-gate/src/config.ts|packages/dsh-quality-gate/src/config.ts -> packages/dsh-quality-gate/src/contract.ts",
+      "actual": 2,
+      "limit": 0
+    },
+    {
+      "key": "cycle|packages/dsh-role-guard/src/agent-teams.ts|packages/dsh-role-guard/src/agent-teams.ts -> packages/dsh-role-guard/src/tools.ts",
+      "actual": 2,
+      "limit": 0
+    },
+    {
+      "key": "maxDepth|packages/dsh-audit-trail/src/config.ts|resolveEffectiveConfig",
+      "actual": 5,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-audit-trail/src/index.ts|apply",
+      "actual": 11,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-audit-trail/src/snapshot.ts|applyRewind",
+      "actual": 6,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-audit-trail/src/tools.ts|registerTools",
+      "actual": 6,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-coverage-gate/src/coverage.ts|parseIstanbulJson",
+      "actual": 6,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-coverage-gate/src/index.ts|apply",
+      "actual": 7,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-coverage-gate/src/mutation.ts|mutantsInFile",
+      "actual": 7,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-coverage-gate/src/tools.ts|registerTools",
+      "actual": 7,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-deploy-gate/src/config.ts|resolveEffectiveConfig",
+      "actual": 6,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-deploy-gate/src/index.ts|apply",
+      "actual": 7,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-deploy-gate/src/ledger.ts|summarize",
+      "actual": 5,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-deploy-gate/src/tools.ts|registerTools",
+      "actual": 12,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-eng-core/src/archive.ts|walk",
+      "actual": 5,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-eng-core/src/delegation.ts|startDelegation",
+      "actual": 5,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-eng-core/src/impact.ts|changedRanges",
+      "actual": 5,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-eng-core/src/metrics.ts|lexSource",
+      "actual": 6,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-eng-core/src/mission.ts|MissionStore.recordApproval",
+      "actual": 5,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-eng-core/src/paths.ts|globToRegExp",
+      "actual": 5,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-eng-core/src/run.ts|(file)",
+      "actual": 5,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-eng-core/src/scan.ts|visit",
+      "actual": 6,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-eng-core/src/scope.ts|apply",
+      "actual": 5,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-eng-core/src/testing.ts|createFakeHost",
+      "actual": 8,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-evidence-gate/src/delivery.ts|evaluateDelivery",
+      "actual": 5,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-evidence-gate/src/index.ts|apply",
+      "actual": 6,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-evidence-gate/src/releases.ts|buildMissionNotes",
+      "actual": 5,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-evidence-gate/src/tools.ts|registerTools",
+      "actual": 7,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-impact-gate/src/config.ts|resolveEffectiveConfig",
+      "actual": 6,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-impact-gate/src/flaky.ts|renderStatus",
+      "actual": 6,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-impact-gate/src/index.ts|apply",
+      "actual": 7,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-impact-gate/src/review.ts|runImpactReview",
+      "actual": 5,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-impact-gate/src/tools.ts|registerTools",
+      "actual": 7,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-interaction-gate/src/approval.ts|answer",
+      "actual": 5,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-interaction-gate/src/attention.ts|createAttentionSource",
+      "actual": 6,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-interaction-gate/src/channels.ts|createInteractionRegistry",
+      "actual": 8,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-interaction-gate/src/chat-channel.ts|preflight",
+      "actual": 6,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-interaction-gate/src/config.ts|resolveConfig",
+      "actual": 5,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-interaction-gate/src/im-binding.ts|report",
+      "actual": 5,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-interaction-gate/src/index.ts|apply",
+      "actual": 7,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-interaction-gate/src/ledger.ts|appendLedgerRow",
+      "actual": 5,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-interaction-gate/src/outbox.ts|createOutbox",
+      "actual": 6,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-interaction-gate/src/tools.ts|askThroughChannels",
+      "actual": 6,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-interaction-gate/src/workspace-mapping.ts|resolveWorkspaceApprovals",
+      "actual": 5,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-knowledge-base/src/command.ts|runKbCommand",
+      "actual": 6,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-knowledge-base/src/index-store.ts|chunkDocument",
+      "actual": 5,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-knowledge-base/src/index.ts|apply",
+      "actual": 7,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-knowledge-base/src/sources.ts|collectFiles",
+      "actual": 5,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-knowledge-base/src/tools.ts|registerTools",
+      "actual": 5,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-orchestrator/src/config.ts|resolveAutoDispatch",
+      "actual": 5,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-orchestrator/src/dispatch.ts|dispatchStage",
+      "actual": 8,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-orchestrator/src/gates.ts|evaluateFacts",
+      "actual": 5,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-orchestrator/src/index.ts|apply",
+      "actual": 5,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-orchestrator/src/metrics.ts|computeMetrics",
+      "actual": 5,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-orchestrator/src/pipeline.ts|resolveStageRoute",
+      "actual": 5,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-orchestrator/src/sequence.ts|recordAndDispatch",
+      "actual": 6,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-quality-gate/src/budget.ts|acquireBaselineLock",
+      "actual": 6,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-quality-gate/src/config.ts|resolveEffectiveConfig",
+      "actual": 6,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-quality-gate/src/contract.ts|parseContract",
+      "actual": 7,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-quality-gate/src/index.ts|apply",
+      "actual": 7,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-quality-gate/src/tools.ts|registerTools",
+      "actual": 6,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-role-guard/src/bindings.ts|RoleBindingStore.bindAt",
+      "actual": 5,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-role-guard/src/index.ts|apply",
+      "actual": 7,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-role-guard/src/route.ts|resolveRoute",
+      "actual": 5,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-role-guard/src/service.ts|createRolePlanner",
+      "actual": 5,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-role-guard/src/tools.ts|registerTools",
+      "actual": 6,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-spec-gate/src/adr.ts|recordAdr",
+      "actual": 5,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-spec-gate/src/bootstrap.ts|buildIndex",
+      "actual": 5,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-spec-gate/src/budgets.ts|parseBudgetDeclaration",
+      "actual": 5,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-spec-gate/src/constraints.ts|evaluateConstraints",
+      "actual": 7,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-spec-gate/src/guard.ts|guard",
+      "actual": 5,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-spec-gate/src/index.ts|apply",
+      "actual": 7,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-spec-gate/src/plan-ledger.ts|buildPlanReport",
+      "actual": 5,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-spec-gate/src/review.ts|previewArtifact",
+      "actual": 6,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-spec-gate/src/shell.ts|analyzeShellCommandInner",
+      "actual": 6,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-spec-gate/src/tools.ts|registerTools",
+      "actual": 9,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-standards-gate/src/index.ts|apply",
+      "actual": 7,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-standards-gate/src/review.ts|runStructuralReview",
+      "actual": 5,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-standards-gate/src/tools.ts|approve",
+      "actual": 7,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-suite-doctor/src/index.ts|apply",
+      "actual": 7,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-suite-doctor/src/observe.ts|tallyObservations",
+      "actual": 5,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-suite-doctor/src/probe.ts|parseWorkspaceMapping",
+      "actual": 5,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-suite-doctor/src/tools.ts|registerTools",
+      "actual": 5,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-supply-chain-gate/src/config.ts|resolveEffectiveConfig",
+      "actual": 7,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-supply-chain-gate/src/deps.ts|parseDotnetVulnerable",
+      "actual": 8,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-supply-chain-gate/src/index.ts|apply",
+      "actual": 7,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-supply-chain-gate/src/secrets.ts|scanText",
+      "actual": 7,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-supply-chain-gate/src/tools.ts|registerTools",
+      "actual": 9,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-test-design-gate/src/index.ts|apply",
+      "actual": 6,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|packages/dsh-test-design-gate/src/tools.ts|registerTools",
+      "actual": 6,
+      "limit": 4
+    },
+    {
+      "key": "maxDepth|scripts/stub-llm.mjs|decide",
+      "actual": 5,
+      "limit": 4
+    },
+    {
+      "key": "maxExports|packages/dsh-audit-trail/src/journal.ts|(file)",
+      "actual": 17,
+      "limit": 15
+    },
+    {
+      "key": "maxExports|packages/dsh-coverage-gate/src/config.ts|(file)",
+      "actual": 37,
+      "limit": 15
+    },
+    {
+      "key": "maxExports|packages/dsh-coverage-gate/src/coverage.ts|(file)",
+      "actual": 26,
+      "limit": 15
+    },
+    {
+      "key": "maxExports|packages/dsh-coverage-gate/src/index.ts|(file)",
+      "actual": 52,
+      "limit": 15
+    },
+    {
+      "key": "maxExports|packages/dsh-coverage-gate/src/mutation.ts|(file)",
+      "actual": 50,
+      "limit": 15
+    },
+    {
+      "key": "maxExports|packages/dsh-deploy-gate/src/config.ts|(file)",
+      "actual": 31,
+      "limit": 15
+    },
+    {
+      "key": "maxExports|packages/dsh-deploy-gate/src/index.ts|(file)",
+      "actual": 61,
+      "limit": 15
+    },
+    {
+      "key": "maxExports|packages/dsh-deploy-gate/src/ledger.ts|(file)",
+      "actual": 17,
+      "limit": 15
+    },
+    {
+      "key": "maxExports|packages/dsh-deploy-gate/src/tools.ts|(file)",
+      "actual": 17,
+      "limit": 15
+    },
+    {
+      "key": "maxExports|packages/dsh-eng-core/src/conformance.ts|(file)",
+      "actual": 30,
+      "limit": 15
+    },
+    {
+      "key": "maxExports|packages/dsh-eng-core/src/delegation.ts|(file)",
+      "actual": 43,
+      "limit": 15
+    },
+    {
+      "key": "maxExports|packages/dsh-eng-core/src/index.ts|(file)",
+      "actual": 26,
+      "limit": 15
+    },
+    {
+      "key": "maxExports|packages/dsh-eng-core/src/mandate.ts|(file)",
+      "actual": 33,
+      "limit": 15
+    },
+    {
+      "key": "maxExports|packages/dsh-eng-core/src/paths.ts|(file)",
+      "actual": 21,
+      "limit": 15
+    },
+    {
+      "key": "maxExports|packages/dsh-eng-core/src/scan.ts|(file)",
+      "actual": 18,
+      "limit": 15
+    },
+    {
+      "key": "maxExports|packages/dsh-eng-core/src/types.ts|(file)",
+      "actual": 25,
+      "limit": 15
+    },
+    {
+      "key": "maxExports|packages/dsh-evidence-gate/src/releases.ts|(file)",
+      "actual": 28,
+      "limit": 15
+    },
+    {
+      "key": "maxExports|packages/dsh-impact-gate/src/flaky.ts|(file)",
+      "actual": 43,
+      "limit": 15
+    },
+    {
+      "key": "maxExports|packages/dsh-impact-gate/src/tools.ts|(file)",
+      "actual": 19,
+      "limit": 15
+    },
+    {
+      "key": "maxExports|packages/dsh-interaction-gate/src/attention.ts|(file)",
+      "actual": 39,
+      "limit": 15
+    },
+    {
+      "key": "maxExports|packages/dsh-interaction-gate/src/channels.ts|(file)",
+      "actual": 27,
+      "limit": 15
+    },
+    {
+      "key": "maxExports|packages/dsh-interaction-gate/src/config.ts|(file)",
+      "actual": 33,
+      "limit": 15
+    },
+    {
+      "key": "maxExports|packages/dsh-interaction-gate/src/index.ts|(file)",
+      "actual": 92,
+      "limit": 15
+    },
+    {
+      "key": "maxExports|packages/dsh-interaction-gate/src/ledger.ts|(file)",
+      "actual": 21,
+      "limit": 15
+    },
+    {
+      "key": "maxExports|packages/dsh-interaction-gate/src/outbox.ts|(file)",
+      "actual": 39,
+      "limit": 15
+    },
+    {
+      "key": "maxExports|packages/dsh-interaction-gate/src/tools.ts|(file)",
+      "actual": 32,
+      "limit": 15
+    },
+    {
+      "key": "maxExports|packages/dsh-interaction-gate/src/workspace-mapping.ts|(file)",
+      "actual": 23,
+      "limit": 15
+    },
+    {
+      "key": "maxExports|packages/dsh-knowledge-base/src/index-store.ts|(file)",
+      "actual": 29,
+      "limit": 15
+    },
+    {
+      "key": "maxExports|packages/dsh-knowledge-base/src/report.ts|(file)",
+      "actual": 20,
+      "limit": 15
+    },
+    {
+      "key": "maxExports|packages/dsh-knowledge-base/src/search.ts|(file)",
+      "actual": 18,
+      "limit": 15
+    },
+    {
+      "key": "maxExports|packages/dsh-orchestrator/src/metrics.ts|(file)",
+      "actual": 39,
+      "limit": 15
+    },
+    {
+      "key": "maxExports|packages/dsh-orchestrator/src/pipeline.ts|(file)",
+      "actual": 23,
+      "limit": 15
+    },
+    {
+      "key": "maxExports|packages/dsh-quality-gate/src/budget.ts|(file)",
+      "actual": 47,
+      "limit": 15
+    },
+    {
+      "key": "maxExports|packages/dsh-quality-gate/src/contract.ts|(file)",
+      "actual": 20,
+      "limit": 15
+    },
+    {
+      "key": "maxExports|packages/dsh-spec-gate/src/adr.ts|(file)",
+      "actual": 24,
+      "limit": 15
+    },
+    {
+      "key": "maxExports|packages/dsh-spec-gate/src/budgets.ts|(file)",
+      "actual": 25,
+      "limit": 15
+    },
+    {
+      "key": "maxExports|packages/dsh-spec-gate/src/plan-ledger.ts|(file)",
+      "actual": 25,
+      "limit": 15
+    },
+    {
+      "key": "maxExports|packages/dsh-spec-gate/src/review.ts|(file)",
+      "actual": 18,
+      "limit": 15
+    },
+    {
+      "key": "maxExports|packages/dsh-suite-doctor/src/index.ts|(file)",
+      "actual": 35,
+      "limit": 15
+    },
+    {
+      "key": "maxExports|packages/dsh-suite-doctor/src/probe.ts|(file)",
+      "actual": 22,
+      "limit": 15
+    },
+    {
+      "key": "maxExports|packages/dsh-supply-chain-gate/src/deps.ts|(file)",
+      "actual": 22,
+      "limit": 15
+    },
+    {
+      "key": "maxExports|packages/dsh-supply-chain-gate/src/secrets.ts|(file)",
+      "actual": 26,
+      "limit": 15
+    },
+    {
+      "key": "maxFileLines|packages/dsh-audit-trail/src/config.ts|(file)",
+      "actual": 334,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-audit-trail/src/index.ts|(file)",
+      "actual": 482,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-audit-trail/src/snapshot.ts|(file)",
+      "actual": 388,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-audit-trail/src/tools.ts|(file)",
+      "actual": 556,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-coverage-gate/src/config.ts|(file)",
+      "actual": 735,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-coverage-gate/src/coverage.ts|(file)",
+      "actual": 880,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-coverage-gate/src/flaky.ts|(file)",
+      "actual": 317,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-coverage-gate/src/mutation.ts|(file)",
+      "actual": 1658,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-coverage-gate/src/tools.ts|(file)",
+      "actual": 1718,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-deploy-gate/src/config.ts|(file)",
+      "actual": 852,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-deploy-gate/src/plan.ts|(file)",
+      "actual": 406,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-deploy-gate/src/tools.ts|(file)",
+      "actual": 2562,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-eng-core/src/archive.ts|(file)",
+      "actual": 338,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-eng-core/src/conformance.ts|(file)",
+      "actual": 1518,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-eng-core/src/delegation.ts|(file)",
+      "actual": 766,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-eng-core/src/doctor.ts|(file)",
+      "actual": 1197,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-eng-core/src/impact.ts|(file)",
+      "actual": 526,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-eng-core/src/mandate.ts|(file)",
+      "actual": 693,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-eng-core/src/markdown.ts|(file)",
+      "actual": 522,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-eng-core/src/metrics.ts|(file)",
+      "actual": 2194,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-eng-core/src/mission.ts|(file)",
+      "actual": 569,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-eng-core/src/paths.ts|(file)",
+      "actual": 340,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-eng-core/src/run.ts|(file)",
+      "actual": 354,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-eng-core/src/scan.ts|(file)",
+      "actual": 1088,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-eng-core/src/spec-edit.ts|(file)",
+      "actual": 308,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-eng-core/src/testing.ts|(file)",
+      "actual": 512,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-eng-core/src/types.ts|(file)",
+      "actual": 484,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-eng-core/src/writer-check.ts|(file)",
+      "actual": 584,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-evidence-gate/src/config.ts|(file)",
+      "actual": 594,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-evidence-gate/src/delivery.ts|(file)",
+      "actual": 531,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-evidence-gate/src/releases.ts|(file)",
+      "actual": 769,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-evidence-gate/src/report.ts|(file)",
+      "actual": 600,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-evidence-gate/src/tools.ts|(file)",
+      "actual": 633,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-impact-gate/src/changes.ts|(file)",
+      "actual": 625,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-impact-gate/src/config.ts|(file)",
+      "actual": 419,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-impact-gate/src/flaky.ts|(file)",
+      "actual": 1098,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-impact-gate/src/review.ts|(file)",
+      "actual": 331,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-impact-gate/src/tools.ts|(file)",
+      "actual": 1526,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-interaction-gate/src/approval.ts|(file)",
+      "actual": 408,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-interaction-gate/src/attention.ts|(file)",
+      "actual": 1027,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-interaction-gate/src/channels.ts|(file)",
+      "actual": 1178,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-interaction-gate/src/chat-channel.ts|(file)",
+      "actual": 925,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-interaction-gate/src/config.ts|(file)",
+      "actual": 953,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-interaction-gate/src/im-binding.ts|(file)",
+      "actual": 568,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-interaction-gate/src/index.ts|(file)",
+      "actual": 409,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-interaction-gate/src/ledger.ts|(file)",
+      "actual": 373,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-interaction-gate/src/outbox.ts|(file)",
+      "actual": 900,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-interaction-gate/src/tools.ts|(file)",
+      "actual": 2532,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-interaction-gate/src/workspace-mapping.ts|(file)",
+      "actual": 652,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-knowledge-base/src/command.ts|(file)",
+      "actual": 305,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-knowledge-base/src/config.ts|(file)",
+      "actual": 525,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-knowledge-base/src/index-store.ts|(file)",
+      "actual": 878,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-knowledge-base/src/report.ts|(file)",
+      "actual": 479,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-knowledge-base/src/search.ts|(file)",
+      "actual": 445,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-knowledge-base/src/sources.ts|(file)",
+      "actual": 845,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-knowledge-base/src/tools.ts|(file)",
+      "actual": 303,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-orchestrator/src/config.ts|(file)",
+      "actual": 358,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-orchestrator/src/dispatch.ts|(file)",
+      "actual": 494,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-orchestrator/src/gates.ts|(file)",
+      "actual": 308,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-orchestrator/src/metrics.ts|(file)",
+      "actual": 1181,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-orchestrator/src/pipeline.ts|(file)",
+      "actual": 595,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-orchestrator/src/sequence.ts|(file)",
+      "actual": 1574,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-quality-gate/src/budget.ts|(file)",
+      "actual": 1871,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-quality-gate/src/config.ts|(file)",
+      "actual": 587,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-quality-gate/src/contract.ts|(file)",
+      "actual": 662,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-quality-gate/src/gate.ts|(file)",
+      "actual": 390,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-quality-gate/src/hooks.ts|(file)",
+      "actual": 432,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-quality-gate/src/tools.ts|(file)",
+      "actual": 496,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-role-guard/src/bindings.ts|(file)",
+      "actual": 317,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-role-guard/src/index.ts|(file)",
+      "actual": 372,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-role-guard/src/tools.ts|(file)",
+      "actual": 605,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-spec-gate/src/adr.ts|(file)",
+      "actual": 677,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-spec-gate/src/budgets.ts|(file)",
+      "actual": 835,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-spec-gate/src/config.ts|(file)",
+      "actual": 365,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-spec-gate/src/guard.ts|(file)",
+      "actual": 413,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-spec-gate/src/plan-ledger.ts|(file)",
+      "actual": 842,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-spec-gate/src/review.ts|(file)",
+      "actual": 718,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-spec-gate/src/shell.ts|(file)",
+      "actual": 547,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-spec-gate/src/spec.ts|(file)",
+      "actual": 317,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-spec-gate/src/tools.ts|(file)",
+      "actual": 2170,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-standards-gate/src/tools.ts|(file)",
+      "actual": 1282,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-suite-doctor/src/config.ts|(file)",
+      "actual": 333,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-suite-doctor/src/im-approval.ts|(file)",
+      "actual": 618,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-suite-doctor/src/probe.ts|(file)",
+      "actual": 1160,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-supply-chain-gate/src/config.ts|(file)",
+      "actual": 485,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-supply-chain-gate/src/deps.ts|(file)",
+      "actual": 1358,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-supply-chain-gate/src/secrets.ts|(file)",
+      "actual": 593,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-supply-chain-gate/src/tools.ts|(file)",
+      "actual": 1542,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|packages/dsh-test-design-gate/src/tools.ts|(file)",
+      "actual": 371,
+      "limit": 300
+    },
+    {
+      "key": "maxFileLines|scripts/stub-llm.mjs|(file)",
+      "actual": 516,
+      "limit": 300
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-audit-trail/src/config.ts|resolveEffectiveConfig",
+      "actual": 67,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-audit-trail/src/index.ts|apply",
+      "actual": 354,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-audit-trail/src/index.ts|onPreExecute",
+      "actual": 126,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-audit-trail/src/snapshot.ts|applyRewind",
+      "actual": 89,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-audit-trail/src/snapshot.ts|captureSnapshot",
+      "actual": 79,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-audit-trail/src/tools.ts|registerTools",
+      "actual": 345,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-coverage-gate/src/config.ts|parseMutationConfig",
+      "actual": 130,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-coverage-gate/src/config.ts|resolveConfig",
+      "actual": 67,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-coverage-gate/src/config.ts|resolveEffectiveConfig",
+      "actual": 113,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-coverage-gate/src/coverage.ts|incrementalCoverage",
+      "actual": 129,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-coverage-gate/src/coverage.ts|parseIstanbulJson",
+      "actual": 89,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-coverage-gate/src/coverage.ts|parseLcov",
+      "actual": 70,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-coverage-gate/src/index.ts|apply",
+      "actual": 87,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-coverage-gate/src/mutation.ts|collectSourceFiles",
+      "actual": 79,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-coverage-gate/src/mutation.ts|judgeMutation",
+      "actual": 81,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-coverage-gate/src/mutation.ts|maskLine",
+      "actual": 78,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-coverage-gate/src/mutation.ts|mutantsInFile",
+      "actual": 71,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-coverage-gate/src/mutation.ts|runMutationPlan",
+      "actual": 299,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-coverage-gate/src/prompt.ts|sectionText",
+      "actual": 61,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-coverage-gate/src/tools.ts|mutationTestCommandOf",
+      "actual": 75,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-coverage-gate/src/tools.ts|registerTools",
+      "actual": 1166,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-deploy-gate/src/config.ts|parseEnvironment",
+      "actual": 82,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-deploy-gate/src/config.ts|resolveEffectiveConfig",
+      "actual": 129,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-deploy-gate/src/index.ts|apply",
+      "actual": 86,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-deploy-gate/src/plan.ts|evaluateGoNoGo",
+      "actual": 219,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-deploy-gate/src/tools.ts|askHuman",
+      "actual": 1726,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-deploy-gate/src/tools.ts|pendingAsksOf",
+      "actual": 81,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-deploy-gate/src/tools.ts|registerTools",
+      "actual": 1181,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-deploy-gate/src/tools.ts|renderPlan",
+      "actual": 61,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-eng-core/src/conformance.ts|authorizationDimension",
+      "actual": 90,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-eng-core/src/conformance.ts|conformanceRollup",
+      "actual": 86,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-eng-core/src/conformance.ts|consistencyDimension",
+      "actual": 163,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-eng-core/src/conformance.ts|evidenceDimension",
+      "actual": 83,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-eng-core/src/conformance.ts|freshnessDimension",
+      "actual": 66,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-eng-core/src/conformance.ts|knowledgeIndexFreshness",
+      "actual": 77,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-eng-core/src/doctor.ts|checkWorkspace",
+      "actual": 537,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-eng-core/src/doctor.ts|mandatePolicyCheck",
+      "actual": 110,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-eng-core/src/doctor.ts|withRuntime",
+      "actual": 86,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-eng-core/src/impact.ts|analyzeImpact",
+      "actual": 202,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-eng-core/src/impact.ts|changedRanges",
+      "actual": 96,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-eng-core/src/log.ts|createLogger",
+      "actual": 64,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-eng-core/src/markdown.ts|renderSpecMarkdown",
+      "actual": 64,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-eng-core/src/metrics.ts|findCycles",
+      "actual": 102,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-eng-core/src/metrics.ts|lexSource",
+      "actual": 120,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-eng-core/src/metrics.ts|measureFile",
+      "actual": 65,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-eng-core/src/metrics.ts|measureWorkspace",
+      "actual": 110,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-eng-core/src/metrics.ts|tsFunctions",
+      "actual": 181,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-eng-core/src/metrics.ts|violationsFor",
+      "actual": 90,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-eng-core/src/run.ts|runWithChildProcess",
+      "actual": 87,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-eng-core/src/scan.ts|parseRequirementDoc",
+      "actual": 105,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-eng-core/src/scan.ts|scanWorkspace",
+      "actual": 122,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-eng-core/src/scan.ts|walkWorkspace",
+      "actual": 77,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-eng-core/src/scope.ts|apply",
+      "actual": 66,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-eng-core/src/spec-edit.ts|planAmendment",
+      "actual": 116,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-eng-core/src/testing.ts|createFakeHost",
+      "actual": 338,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-eng-core/src/writer-check.ts|scanEvidence",
+      "actual": 80,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-eng-core/src/writer-check.ts|scanFingerprint",
+      "actual": 72,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-eng-core/src/writer-check.ts|writersCheck",
+      "actual": 69,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-evidence-gate/src/delivery.ts|evaluateDelivery",
+      "actual": 277,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-evidence-gate/src/index.ts|apply",
+      "actual": 68,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-evidence-gate/src/releases.ts|recordRelease",
+      "actual": 94,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-evidence-gate/src/report.ts|renderOverview",
+      "actual": 79,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-evidence-gate/src/report.ts|renderReleaseRefused",
+      "actual": 79,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-evidence-gate/src/report.ts|renderReleaseStatus",
+      "actual": 72,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-evidence-gate/src/tools.ts|registerTools",
+      "actual": 464,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-impact-gate/src/changes.ts|readFromService",
+      "actual": 124,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-impact-gate/src/config.ts|resolveConfig",
+      "actual": 68,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-impact-gate/src/config.ts|resolveEffectiveConfig",
+      "actual": 144,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-impact-gate/src/flaky.ts|buildPlan",
+      "actual": 83,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-impact-gate/src/flaky.ts|parseReport",
+      "actual": 97,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-impact-gate/src/flaky.ts|renderStatus",
+      "actual": 111,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-impact-gate/src/index.ts|apply",
+      "actual": 123,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-impact-gate/src/review.ts|runImpactReview",
+      "actual": 151,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-impact-gate/src/tools.ts|buildArtifact",
+      "actual": 62,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-impact-gate/src/tools.ts|registerTools",
+      "actual": 421,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-impact-gate/src/tools.ts|renderAnalyze",
+      "actual": 161,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-impact-gate/src/tools.ts|renderStatus",
+      "actual": 94,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-impact-gate/src/tools.ts|renderTests",
+      "actual": 84,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-interaction-gate/src/approval.ts|answer",
+      "actual": 106,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-interaction-gate/src/approval.ts|installApprovalAnswerer",
+      "actual": 169,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-interaction-gate/src/attention.ts|createAttentionSource",
+      "actual": 221,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-interaction-gate/src/attention.ts|deriveRecords",
+      "actual": 94,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-interaction-gate/src/channels.ts|createInteractionRegistry",
+      "actual": 492,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-interaction-gate/src/chat-channel.ts|createChatChannel",
+      "actual": 605,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-interaction-gate/src/chat-channel.ts|preflight",
+      "actual": 104,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-interaction-gate/src/chat-channel.ts|probeChatInteraction",
+      "actual": 64,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-interaction-gate/src/config.ts|resolveConfig",
+      "actual": 307,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-interaction-gate/src/config.ts|resolveEffectiveConfig",
+      "actual": 130,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-interaction-gate/src/im-binding.ts|installImChannel",
+      "actual": 385,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-interaction-gate/src/index.ts|apply",
+      "actual": 270,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-interaction-gate/src/ledger.ts|summarizeLedger",
+      "actual": 72,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-interaction-gate/src/outbox.ts|createOutbox",
+      "actual": 313,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-interaction-gate/src/tools.ts|askThroughChannels",
+      "actual": 879,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-interaction-gate/src/tools.ts|imAskTargetOf",
+      "actual": 89,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-interaction-gate/src/tools.ts|normalizeApprovalContextInput",
+      "actual": 65,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-interaction-gate/src/tools.ts|registerTools",
+      "actual": 624,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-interaction-gate/src/workspace-mapping.ts|resolveApprovalRouting",
+      "actual": 85,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-interaction-gate/src/workspace-mapping.ts|resolveWorkspaceApprovals",
+      "actual": 74,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-knowledge-base/src/config.ts|resolveEffectiveConfig",
+      "actual": 189,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-knowledge-base/src/index-store.ts|buildIndex",
+      "actual": 168,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-knowledge-base/src/index-store.ts|loadIndex",
+      "actual": 82,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-knowledge-base/src/index.ts|apply",
+      "actual": 89,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-knowledge-base/src/report.ts|renderIndexReport",
+      "actual": 70,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-knowledge-base/src/report.ts|renderStatusReport",
+      "actual": 81,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-knowledge-base/src/search.ts|searchIndex",
+      "actual": 103,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-knowledge-base/src/tools.ts|registerTools",
+      "actual": 78,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-knowledge-base/src/tools.ts|runSearch",
+      "actual": 65,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-orchestrator/src/dispatch.ts|dispatchStage",
+      "actual": 296,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-orchestrator/src/gates.ts|evaluateFacts",
+      "actual": 242,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-orchestrator/src/hooks.ts|evaluateAutoAdvance",
+      "actual": 105,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-orchestrator/src/index.ts|apply",
+      "actual": 153,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-orchestrator/src/metrics.ts|collectTrail",
+      "actual": 84,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-orchestrator/src/metrics.ts|computeMetrics",
+      "actual": 130,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-orchestrator/src/metrics.ts|foldDeployments",
+      "actual": 68,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-orchestrator/src/pipeline.ts|resolvePipeline",
+      "actual": 159,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-orchestrator/src/sequence.ts|advanceAction",
+      "actual": 124,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-orchestrator/src/sequence.ts|recordAndDispatch",
+      "actual": 88,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-orchestrator/src/sequence.ts|revalidateMandate",
+      "actual": 112,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-orchestrator/src/sequence.ts|rollback",
+      "actual": 74,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-orchestrator/src/sequence.ts|startAction",
+      "actual": 97,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-orchestrator/src/sequence.ts|stopAction",
+      "actual": 65,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-quality-gate/src/budget.ts|acquireBaselineLock",
+      "actual": 130,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-quality-gate/src/budget.ts|compareRegression",
+      "actual": 63,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-quality-gate/src/budget.ts|measureBudget",
+      "actual": 157,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-quality-gate/src/budget.ts|parseBudget",
+      "actual": 67,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-quality-gate/src/budget.ts|parseSpecBudgets",
+      "actual": 130,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-quality-gate/src/budget.ts|renderBudgets",
+      "actual": 66,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-quality-gate/src/budget.ts|runBudgets",
+      "actual": 202,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-quality-gate/src/config.ts|resolveConfig",
+      "actual": 72,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-quality-gate/src/config.ts|resolveEffectiveConfig",
+      "actual": 124,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-quality-gate/src/contract.ts|evaluateContract",
+      "actual": 126,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-quality-gate/src/contract.ts|parseContract",
+      "actual": 113,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-quality-gate/src/contract.ts|runContracts",
+      "actual": 64,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-quality-gate/src/gate.ts|runGate",
+      "actual": 169,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-quality-gate/src/hooks.ts|evaluateAfterWrite",
+      "actual": 73,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-quality-gate/src/hooks.ts|evaluateTurnStop",
+      "actual": 88,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-quality-gate/src/index.ts|apply",
+      "actual": 86,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-quality-gate/src/prompt.ts|sectionText",
+      "actual": 124,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-quality-gate/src/tools.ts|registerTools",
+      "actual": 348,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-role-guard/src/index.ts|apply",
+      "actual": 262,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-role-guard/src/service.ts|createRolePlanner",
+      "actual": 93,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-role-guard/src/tools.ts|registerTools",
+      "actual": 278,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-spec-gate/src/adr.ts|recordAdr",
+      "actual": 139,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-spec-gate/src/amend.ts|amendMissionSpec",
+      "actual": 64,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-spec-gate/src/budgets.ts|applyBudgetEdit",
+      "actual": 105,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-spec-gate/src/budgets.ts|parseBudgetDeclaration",
+      "actual": 197,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-spec-gate/src/budgets.ts|planAgainst",
+      "actual": 63,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-spec-gate/src/config.ts|resolveEffectiveConfig",
+      "actual": 76,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-spec-gate/src/guard.ts|createWriteGuard",
+      "actual": 188,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-spec-gate/src/guard.ts|guard",
+      "actual": 175,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-spec-gate/src/index.ts|apply",
+      "actual": 99,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-spec-gate/src/plan-ledger.ts|buildPlanReport",
+      "actual": 172,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-spec-gate/src/plan-ledger.ts|renderPlanReport",
+      "actual": 126,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-spec-gate/src/prompt.ts|sectionText",
+      "actual": 74,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-spec-gate/src/review.ts|previewArtifact",
+      "actual": 79,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-spec-gate/src/review.ts|tuiReview",
+      "actual": 114,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-spec-gate/src/shell.ts|analyzeShellCommandInner",
+      "actual": 63,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-spec-gate/src/tools.ts|registerTools",
+      "actual": 1221,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-spec-gate/src/tools.ts|requestApproval",
+      "actual": 111,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-standards-gate/src/index.ts|apply",
+      "actual": 85,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-standards-gate/src/index.ts|resolveEffectiveConfig",
+      "actual": 71,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-standards-gate/src/review.ts|runStructuralReview",
+      "actual": 132,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-standards-gate/src/tools.ts|registerTools",
+      "actual": 577,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-standards-gate/src/tools.ts|renderCheck",
+      "actual": 98,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-suite-doctor/src/config.ts|resolveEffectiveConfig",
+      "actual": 72,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-suite-doctor/src/im-approval.ts|imApprovalChecks",
+      "actual": 118,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-suite-doctor/src/im-approval.ts|workspaceMappingCheckOf",
+      "actual": 149,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-suite-doctor/src/index.ts|apply",
+      "actual": 80,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-suite-doctor/src/observe.ts|tallyObservations",
+      "actual": 63,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-suite-doctor/src/probe.ts|probeInteraction",
+      "actual": 134,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-suite-doctor/src/probe.ts|probeRuntime",
+      "actual": 200,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-supply-chain-gate/src/config.ts|resolveEffectiveConfig",
+      "actual": 153,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-supply-chain-gate/src/deps.ts|genericWalk",
+      "actual": 75,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-supply-chain-gate/src/index.ts|apply",
+      "actual": 76,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-supply-chain-gate/src/secrets.ts|parseAllowlist",
+      "actual": 83,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-supply-chain-gate/src/secrets.ts|scanText",
+      "actual": 89,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-supply-chain-gate/src/tools.ts|registerTools",
+      "actual": 870,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-test-design-gate/src/review.ts|reviewTestDesign",
+      "actual": 83,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|packages/dsh-test-design-gate/src/tools.ts|registerTools",
+      "actual": 145,
+      "limit": 60
+    },
+    {
+      "key": "maxFunctionLines|scripts/stub-llm.mjs|decide",
+      "actual": 62,
+      "limit": 60
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-audit-trail/src/index.ts|apply",
+      "actual": 24,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-audit-trail/src/index.ts|onPreExecute",
+      "actual": 48,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-audit-trail/src/snapshot.ts|applyRewind",
+      "actual": 23,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-coverage-gate/src/config.ts|parseMutationConfig",
+      "actual": 24,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-coverage-gate/src/coverage.ts|parseIstanbulJson",
+      "actual": 37,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-coverage-gate/src/index.ts|apply",
+      "actual": 21,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-coverage-gate/src/mutation.ts|judgeMutation",
+      "actual": 24,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-coverage-gate/src/mutation.ts|maskLine",
+      "actual": 29,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-coverage-gate/src/mutation.ts|runMutationPlan",
+      "actual": 25,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-coverage-gate/src/tools.ts|mutationTestCommandOf",
+      "actual": 36,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-coverage-gate/src/tools.ts|registerTools",
+      "actual": 32,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-coverage-gate/src/tools.ts|registerTools#L1568",
+      "actual": 35,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-coverage-gate/src/tools.ts|registerTools#L1604",
+      "actual": 35,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-coverage-gate/src/tools.ts|registerTools#L632",
+      "actual": 37,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-coverage-gate/src/tools.ts|registerTools#L635",
+      "actual": 24,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-coverage-gate/src/tools.ts|registerTools#L723",
+      "actual": 27,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-coverage-gate/src/tools.ts|registerTools#L750",
+      "actual": 54,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-deploy-gate/src/config.ts|resolveEffectiveConfig",
+      "actual": 60,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-deploy-gate/src/config.ts|resolveEffectiveConfig#L751",
+      "actual": 54,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-deploy-gate/src/index.ts|apply",
+      "actual": 21,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-deploy-gate/src/plan.ts|evaluateGoNoGo",
+      "actual": 23,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-deploy-gate/src/plan.ts|evaluateGoNoGo#L266",
+      "actual": 48,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-deploy-gate/src/plan.ts|evaluateGoNoGo#L281",
+      "actual": 21,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-deploy-gate/src/plan.ts|evaluateGoNoGo#L316",
+      "actual": 35,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-deploy-gate/src/tools.ts|registerTools",
+      "actual": 29,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-deploy-gate/src/tools.ts|registerTools#L1684",
+      "actual": 26,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-deploy-gate/src/tools.ts|registerTools#L1718",
+      "actual": 39,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-deploy-gate/src/tools.ts|registerTools#L1731",
+      "actual": 24,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-deploy-gate/src/tools.ts|registerTools#L1787",
+      "actual": 28,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-deploy-gate/src/tools.ts|registerTools#L1831",
+      "actual": 44,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-deploy-gate/src/tools.ts|registerTools#L2017",
+      "actual": 51,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-deploy-gate/src/tools.ts|registerTools#L2042",
+      "actual": 25,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-deploy-gate/src/tools.ts|registerTools#L2080",
+      "actual": 52,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-deploy-gate/src/tools.ts|registerTools#L2093",
+      "actual": 37,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-deploy-gate/src/tools.ts|registerTools#L2227",
+      "actual": 21,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-deploy-gate/src/tools.ts|registerTools#L2315",
+      "actual": 33,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-deploy-gate/src/tools.ts|registerTools#L2510",
+      "actual": 33,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-eng-core/src/conformance.ts|consistencyDimension",
+      "actual": 21,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-eng-core/src/delegation.ts|startDelegation",
+      "actual": 26,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-eng-core/src/doctor.ts|checkWorkspace",
+      "actual": 22,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-eng-core/src/doctor.ts|withRuntime",
+      "actual": 27,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-eng-core/src/impact.ts|changedRanges",
+      "actual": 21,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-eng-core/src/metrics.ts|analyzePythonFunctions",
+      "actual": 26,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-eng-core/src/metrics.ts|lexSource",
+      "actual": 29,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-eng-core/src/metrics.ts|lexSource#L288",
+      "actual": 32,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-eng-core/src/metrics.ts|measureWorkspace",
+      "actual": 32,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-eng-core/src/scope.ts|apply",
+      "actual": 21,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-eng-core/src/testing.ts|createFakeHost",
+      "actual": 40,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-eng-core/src/testing.ts|createFakeHost#L258",
+      "actual": 30,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-evidence-gate/src/delivery.ts|evaluateDelivery",
+      "actual": 40,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-evidence-gate/src/delivery.ts|evaluateDelivery#L239",
+      "actual": 94,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-evidence-gate/src/delivery.ts|evaluateDelivery#L299",
+      "actual": 33,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-evidence-gate/src/delivery.ts|evaluateDelivery#L370",
+      "actual": 25,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-evidence-gate/src/index.ts|apply",
+      "actual": 28,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-evidence-gate/src/tools.ts|registerTools",
+      "actual": 48,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-evidence-gate/src/tools.ts|registerTools#L580",
+      "actual": 38,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-impact-gate/src/config.ts|resolveEffectiveConfig",
+      "actual": 68,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-impact-gate/src/config.ts|resolveEffectiveConfig#L352",
+      "actual": 63,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-impact-gate/src/flaky.ts|parseReport",
+      "actual": 41,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-impact-gate/src/flaky.ts|renderStatus",
+      "actual": 66,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-impact-gate/src/flaky.ts|renderStatus#L1015",
+      "actual": 23,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-impact-gate/src/index.ts|apply",
+      "actual": 21,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-impact-gate/src/tools.ts|registerTools",
+      "actual": 27,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-impact-gate/src/tools.ts|registerTools#L1405",
+      "actual": 36,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-impact-gate/src/tools.ts|renderStatus",
+      "actual": 21,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-interaction-gate/src/chat-channel.ts|preflight",
+      "actual": 37,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-interaction-gate/src/chat-channel.ts|preflight#L518",
+      "actual": 21,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-interaction-gate/src/chat-channel.ts|targetOf",
+      "actual": 23,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-interaction-gate/src/config.ts|resolveConfig",
+      "actual": 21,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-interaction-gate/src/config.ts|resolveEffectiveConfig",
+      "actual": 25,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-interaction-gate/src/config.ts|resolveEffectiveConfig#L908",
+      "actual": 37,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-interaction-gate/src/config.ts|resolveEffectiveConfig#L912",
+      "actual": 32,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-interaction-gate/src/im-binding.ts|installImChannel",
+      "actual": 28,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-interaction-gate/src/tools.ts|askThroughChannels",
+      "actual": 22,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-interaction-gate/src/tools.ts|askThroughChannels#L1329",
+      "actual": 22,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-interaction-gate/src/tools.ts|askThroughChannels#L1474",
+      "actual": 21,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-interaction-gate/src/tools.ts|askThroughChannels#L1546",
+      "actual": 27,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-interaction-gate/src/tools.ts|askThroughChannels#L1549",
+      "actual": 23,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-interaction-gate/src/tools.ts|askThroughChannels#L1574",
+      "actual": 54,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-interaction-gate/src/tools.ts|askThroughChannels#L1637",
+      "actual": 60,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-interaction-gate/src/tools.ts|askThroughChannels#L1639",
+      "actual": 26,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-interaction-gate/src/tools.ts|askThroughChannels#L1669",
+      "actual": 27,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-interaction-gate/src/tools.ts|askThroughChannels#L1734",
+      "actual": 21,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-interaction-gate/src/tools.ts|askThroughChannels#L1782",
+      "actual": 22,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-interaction-gate/src/tools.ts|imAskTargetOf",
+      "actual": 28,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-interaction-gate/src/tools.ts|imAskTargetOf#L553",
+      "actual": 25,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-knowledge-base/src/config.ts|resolveEffectiveConfig",
+      "actual": 21,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-knowledge-base/src/index.ts|apply",
+      "actual": 24,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-orchestrator/src/dispatch.ts|dispatchStage",
+      "actual": 57,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-orchestrator/src/dispatch.ts|dispatchStage#L254",
+      "actual": 51,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-orchestrator/src/sequence.ts|recordAndDispatch",
+      "actual": 25,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-orchestrator/src/sequence.ts|revalidateMandate",
+      "actual": 30,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-orchestrator/src/sequence.ts|stopAction",
+      "actual": 25,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-quality-gate/src/budget.ts|acquireBaselineLock",
+      "actual": 24,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-quality-gate/src/budget.ts|compareRegression",
+      "actual": 30,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-quality-gate/src/budget.ts|measureBudget",
+      "actual": 34,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-quality-gate/src/budget.ts|measureBudget#L1466",
+      "actual": 36,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-quality-gate/src/budget.ts|measureBudget#L1505",
+      "actual": 21,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-quality-gate/src/config.ts|resolveEffectiveConfig",
+      "actual": 40,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-quality-gate/src/config.ts|resolveEffectiveConfig#L335",
+      "actual": 33,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-quality-gate/src/contract.ts|evaluateContract",
+      "actual": 55,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-quality-gate/src/contract.ts|parseContract",
+      "actual": 69,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-quality-gate/src/contract.ts|parseContract#L321",
+      "actual": 65,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-quality-gate/src/contract.ts|parseContract#L344",
+      "actual": 34,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-quality-gate/src/contract.ts|parseContract#L348",
+      "actual": 29,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-quality-gate/src/contract.ts|parseJsonPath",
+      "actual": 22,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-quality-gate/src/gate.ts|runGate",
+      "actual": 34,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-quality-gate/src/index.ts|apply",
+      "actual": 21,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-role-guard/src/index.ts|apply",
+      "actual": 24,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-role-guard/src/index.ts|apply#L281",
+      "actual": 34,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-role-guard/src/route.ts|resolveRoute",
+      "actual": 37,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-spec-gate/src/adr.ts|recordAdr",
+      "actual": 21,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-spec-gate/src/budgets.ts|applyBudgetEdit",
+      "actual": 43,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-spec-gate/src/budgets.ts|parseBudgetDeclaration",
+      "actual": 32,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-spec-gate/src/budgets.ts|parseBudgetDeclaration#L372",
+      "actual": 34,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-spec-gate/src/budgets.ts|parseBudgetDeclaration#L379",
+      "actual": 26,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-spec-gate/src/index.ts|apply",
+      "actual": 22,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-spec-gate/src/review.ts|previewArtifact",
+      "actual": 24,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-spec-gate/src/review.ts|previewArtifact#L268",
+      "actual": 23,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-spec-gate/src/tools.ts|registerTools",
+      "actual": 28,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-spec-gate/src/tools.ts|registerTools#L1139",
+      "actual": 122,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-spec-gate/src/tools.ts|registerTools#L1166",
+      "actual": 24,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-spec-gate/src/tools.ts|registerTools#L1300",
+      "actual": 23,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-spec-gate/src/tools.ts|registerTools#L885",
+      "actual": 24,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-spec-gate/src/tools.ts|requestApproval",
+      "actual": 24,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-standards-gate/src/tools.ts|registerTools",
+      "actual": 102,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-standards-gate/src/tools.ts|registerTools#L731",
+      "actual": 25,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-standards-gate/src/tools.ts|registerTools#L995",
+      "actual": 29,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-suite-doctor/src/im-approval.ts|imApprovalChecks",
+      "actual": 33,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-suite-doctor/src/im-approval.ts|workspaceMappingCheckOf",
+      "actual": 39,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-suite-doctor/src/im-approval.ts|workspaceMappingCheckOf#L360",
+      "actual": 39,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-suite-doctor/src/probe.ts|probeInteraction",
+      "actual": 23,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-suite-doctor/src/probe.ts|probeInteraction#L827",
+      "actual": 22,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-supply-chain-gate/src/config.ts|resolveEffectiveConfig",
+      "actual": 50,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-supply-chain-gate/src/config.ts|resolveEffectiveConfig#L360",
+      "actual": 46,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-supply-chain-gate/src/config.ts|resolveEffectiveConfig#L408",
+      "actual": 57,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-supply-chain-gate/src/config.ts|resolveEffectiveConfig#L411",
+      "actual": 53,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-supply-chain-gate/src/config.ts|resolveEffectiveConfig#L438",
+      "actual": 25,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-supply-chain-gate/src/index.ts|apply",
+      "actual": 21,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-supply-chain-gate/src/secrets.ts|scanText",
+      "actual": 22,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-supply-chain-gate/src/tools.ts|registerTools",
+      "actual": 54,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-supply-chain-gate/src/tools.ts|registerTools#L1106",
+      "actual": 66,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-supply-chain-gate/src/tools.ts|registerTools#L902",
+      "actual": 41,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-supply-chain-gate/src/tools.ts|registerTools#L905",
+      "actual": 37,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-supply-chain-gate/src/tools.ts|registerTools#L914",
+      "actual": 27,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-supply-chain-gate/src/tools.ts|registerTools#L968",
+      "actual": 25,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|packages/dsh-test-design-gate/src/index.ts|apply",
+      "actual": 23,
+      "limit": 20
+    },
+    {
+      "key": "maxIfBlockLines|scripts/kb.mjs|(file)",
+      "actual": 36,
+      "limit": 20
+    },
+    {
+      "key": "maxParams|packages/dsh-coverage-gate/src/tools.ts|checkResult",
+      "actual": 6,
+      "limit": 5
+    },
+    {
+      "key": "maxParams|packages/dsh-deploy-gate/src/config.ts|takeProfileNumber",
+      "actual": 6,
+      "limit": 5
+    },
+    {
+      "key": "maxParams|packages/dsh-eng-core/src/metrics.ts|violationOf",
+      "actual": 7,
+      "limit": 5
+    },
+    {
+      "key": "maxParams|packages/dsh-knowledge-base/src/sources.ts|missionSummary",
+      "actual": 6,
+      "limit": 5
+    },
+    {
+      "key": "maxParams|packages/dsh-orchestrator/src/sequence.ts|breakerReport",
+      "actual": 6,
+      "limit": 5
+    },
+    {
+      "key": "maxParams|packages/dsh-orchestrator/src/sequence.ts|enterStage",
+      "actual": 6,
+      "limit": 5
+    },
+    {
+      "key": "maxParams|packages/dsh-orchestrator/src/sequence.ts|entryReport",
+      "actual": 8,
+      "limit": 5
+    },
+    {
+      "key": "maxParams|packages/dsh-orchestrator/src/sequence.ts|recordAndDispatch",
+      "actual": 7,
+      "limit": 5
+    },
+    {
+      "key": "maxParams|packages/dsh-orchestrator/src/sequence.ts|recordEntered",
+      "actual": 6,
+      "limit": 5
+    },
+    {
+      "key": "maxParams|packages/dsh-orchestrator/src/sequence.ts|rollback",
+      "actual": 9,
+      "limit": 5
+    },
+    {
+      "key": "maxParams|packages/dsh-orchestrator/src/sequence.ts|stageHeader",
+      "actual": 6,
+      "limit": 5
+    },
+    {
+      "key": "maxParams|packages/dsh-spec-gate/src/tools.ts|planRowFor",
+      "actual": 6,
+      "limit": 5
+    },
+    {
+      "key": "maxParams|packages/dsh-standards-gate/src/tools.ts|recordStandardsGate",
+      "actual": 6,
+      "limit": 5
+    }
+  ]
+}

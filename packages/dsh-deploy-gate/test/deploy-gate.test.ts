@@ -1956,3 +1956,59 @@ test('TC-1294 an EXPLICIT ledgerFile still wins over the layout default', () => 
     const absolute = path.join(cwd, 'abs.jsonl')
     assert.equal(ledgerPathOf(cwd, resolveConfig({ ledgerFile: absolute })), absolute, 'an absolute value stays absolute')
 })
+
+// --- BINARY approval surface: the reasons stay APART (AC-002 / AC-005) -------------
+
+test('a policy=never seam rejection is named as the HOST POLICY, not as a person refusing (AC-002)', async () => {
+    const { cwd, calls } = scriptRepo()
+    const h = harnessFor(cwd, { config: { environments: [productionEnvironment()] }, approvalOutcome: 'rejected' })
+    // The installed approval service exposes its policy through these two
+    // members; the gate READS the policy to explain a rejection, never to decide.
+    const seam = (h.host.ctx as unknown as { get: (name: string) => unknown }).get('approval') as Record<string, unknown>
+    seam['overrideOf'] = () => 'never'
+    seam['config'] = { policy: 'never' }
+    deliveredMission(h.stores, cwd)
+
+    const text = await h.text('deploy_run', { environment: 'production' })
+    assert.match(text, /### 未执行部署/)
+    assert.match(text, /policy=never/, '必须点名策略')
+    assert.match(text, /没有问过任何人/, '必须说清接缝没有派发')
+    assert.doesNotMatch(text, /人工审批被拒绝/, 'policy 拒绝不是"审批人拒绝"')
+    assert.match(text, /超时|没有人/, '拒绝理由必须说明没有人作出决定')
+    assert.deepEqual(callsOf(calls), [], 'nothing may run')
+})
+
+test('the two binary reasons deploy composes stay distinguishable: cancelled vs rejected vs no-answerer', async () => {
+    // 1) rejected — a person said no.
+    const rejected = scriptRepo()
+    const r = harnessFor(rejected.cwd, { config: { environments: [productionEnvironment()] }, approvalOutcome: 'rejected' })
+    deliveredMission(r.stores, rejected.cwd)
+    const rejectedText = await r.text('deploy_run', { environment: 'production' })
+    assert.match(rejectedText, /人工审批被拒绝/)
+    assert.doesNotMatch(rejectedText, /人工审批被取消|没有可用的审批面/)
+
+    // 2) cancelled — the question was withdrawn.
+    const cancelled = scriptRepo()
+    const c = harnessFor(cancelled.cwd, { config: { environments: [productionEnvironment()] }, approvalOutcome: 'cancelled' })
+    deliveredMission(c.stores, cancelled.cwd)
+    const cancelledText = await c.text('deploy_run', { environment: 'production' })
+    assert.match(cancelledText, /人工审批被取消/)
+    assert.doesNotMatch(cancelledText, /人工审批被拒绝/)
+
+    // 3) no-answerer — nobody was asked (the service is mounted but cannot ask,
+    //    and there is no host seam; the pending-ask fact stays observable so the
+    //    go/no-go check does not stop us before the approval path).
+    const orphan = scriptRepo()
+    const o = harnessFor(orphan.cwd, {
+        config: { environments: [productionEnvironment()] },
+        withApproval: false,
+        services: { interaction: healthyInteraction() },
+    })
+    deliveredMission(o.stores, orphan.cwd)
+    const orphanText = await o.text('deploy_run', { environment: 'production' })
+    assert.match(orphanText, /没有人可以批准/)
+    assert.match(orphanText, /ctx\.approval/)
+    assert.doesNotMatch(orphanText, /人工审批被拒绝|人工审批被取消/)
+    assert.deepEqual(callsOf(orphan.calls), [], 'no approval surface means no command may run')
+})
+

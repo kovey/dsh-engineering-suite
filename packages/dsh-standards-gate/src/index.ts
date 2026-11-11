@@ -175,6 +175,10 @@ export function apply(ctx: Context, config: unknown = {}): void {
             },
             stores,
             approval: () => context.get('approval') as ApprovalLike | undefined,
+            // The suite's channel registry (`dsh-interaction-gate` provides it):
+            // the BINARY approval surface's first choice is an IM card. Read
+            // structurally, exactly like the doctor does — no plugin import.
+            interaction: () => context.get('interaction'),
             subagents: () => context.get('subagents') as never,
             // The reviewer's confinement is registered as a preset on its first
             // dispatch (the seam decides whether the host can carry one at all).

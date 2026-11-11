@@ -406,3 +406,115 @@ export function installApprovalAnswerer(
 function describeError(error: unknown): string {
     return error instanceof Error ? error.message : String(error)
 }
+
+// --- the IM approval SURFACE, as a probe -------------------------------------
+//
+// The gate-authorisation kernel (`dsh-eng-core`'s `requestGateApproval`) lets a
+// gate declare a BINARY surface and hand it an adapter. This plugin is where an
+// IM card can come from, so a gate needs a way to ask "is there an IM surface
+// for THIS workspace?" without importing this plugin (plugins depend on
+// `dsh-eng-core` only) and without guessing from an empty ledger.
+//
+// The probe answers exactly that, and nothing else: it does not ask, it does not
+// write, and it has NO effect on `im.approvalVia` (`off|fallback|only`), which
+// still decides only whether this plugin takes over the HOST's
+// `approval/request` waterfall. "IM can carry an approval card" and "IM answers
+// the host seam" are two different facts; conflating them is how a probe starts
+// changing behaviour.
+
+/** What the IM approval surface can do for one workspace. */
+export interface ImApprovalSurfaceReport {
+    /** `true` only when a registered, ask-capable IM channel exists. */
+    available: boolean
+    /** The configured approval target (`im.approvalChatId`), when there is one. */
+    chatId?: string
+    /** Why — never empty, so a gate can quote it instead of saying "no IM". */
+    reason: string
+}
+
+/** The registry slice this probe reads (structural: `dsh-interaction-gate`'s service). */
+interface RegistryProbe {
+    im?: (workspace?: string) => unknown
+    list?: () => unknown
+}
+
+function isRecordValue(value: unknown): value is Record<string, unknown> {
+    return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+/**
+ * Probe whether an IM card can carry an approval for `cwd`.
+ *
+ * Reads the suite's `interaction` service: its IM report (is the channel
+ * registered, and why not) and its channel list (can that channel ASK — a
+ * channel without `wait()` can push but never receive an answer). A service
+ * that predates the IM report still gets a useful answer from the list alone.
+ * @param ctx - the cordis context (only `get('interaction')` is used).
+ * @param cwd - the workspace whose IM routing applies.
+ */
+export function imApprovalSurface(ctx: unknown, cwd: string): ImApprovalSurfaceReport {
+    const get = (ctx as { get?: unknown } | undefined)?.get
+    if (typeof get !== 'function') {
+        return { available: false, reason: '宿主 ctx 没有 get()：读不到 interaction 服务，也就没有 IM 审批面' }
+    }
+    let service: unknown
+    try {
+        service = (get as (name: string) => unknown).call(ctx, 'interaction')
+    } catch (error) {
+        return { available: false, reason: `读取 interaction 服务时抛错（${describeError(error)}）：无法确认 IM 审批面` }
+    }
+    if (!isRecordValue(service)) {
+        return { available: false, reason: '宿主没有装配 interaction 服务（ctx.get("interaction") 为空）：IM 审批面不存在' }
+    }
+    const registry = service as RegistryProbe
+    let channels: Record<string, unknown>[] = []
+    if (typeof registry.list === 'function') {
+        try {
+            const raw = registry.list()
+            channels = (Array.isArray(raw) ? raw : []).filter(isRecordValue)
+        } catch (error) {
+            return { available: false, reason: `interaction 服务列出通道时抛错（${describeError(error)}）：无法确认 IM 审批面` }
+        }
+    }
+    const report = typeof registry.im === 'function' ? registry.im(cwd) : undefined
+    const im = isRecordValue(report) ? report : undefined
+    const chatId = typeof im?.['approvalChatId'] === 'string' && im['approvalChatId'] !== '' ? im['approvalChatId'] : undefined
+    if (im !== undefined && im['registered'] !== true) {
+        const phase = typeof im['phase'] === 'string' ? im['phase'] : 'unknown'
+        const why = typeof im['reason'] === 'string' && im['reason'] !== '' ? im['reason'] : '(通道未说明原因)'
+        return {
+            available: false,
+            ...(chatId === undefined ? {} : { chatId }),
+            reason: `IM 通道未注册（phase=${phase}）：${why}`,
+        }
+    }
+    const expected = typeof im?.['name'] === 'string' && im['name'] !== '' ? im['name'] : CHAT_CHANNEL_NAME
+    const channel =
+        channels.find((entry) => entry['name'] === expected) ??
+        (im === undefined ? channels.find((entry) => entry['name'] === CHAT_CHANNEL_NAME) : undefined)
+    if (channel === undefined) {
+        return {
+            available: false,
+            ...(chatId === undefined ? {} : { chatId }),
+            reason:
+                im === undefined
+                    ? 'interaction 服务没有 IM 通道报告，也没有注册任何名为 chat-interaction 的通道：没有 IM 审批面' +
+                      '（宿主没有装配 dsh-chat-interaction，或 im.channel=off）'
+                    : `IM 通道 "${expected}" 已报告注册，但不在通道列表里：它可能刚刚被撤销，无法发卡`,
+        }
+    }
+    const canAsk = channel['canAsk'] === true
+    const why = typeof channel['reason'] === 'string' && channel['reason'] !== '' ? channel['reason'] : ''
+    if (!canAsk) {
+        return {
+            available: false,
+            ...(chatId === undefined ? {} : { chatId }),
+            reason: `IM 通道 "${expected}" 不能提问（canAsk=false${why === '' ? '' : `：${why}`}）：只能推送的通道收不到批准`,
+        }
+    }
+    return {
+        available: true,
+        ...(chatId === undefined ? {} : { chatId }),
+        reason: `IM 通道 "${expected}" 可以提问${chatId === undefined ? '（未配置 im.approvalChatId：卡片发到哪个会话由通道决定）' : `，审批目标 ${chatId}`}`,
+    }
+}

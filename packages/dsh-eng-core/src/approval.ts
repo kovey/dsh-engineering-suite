@@ -71,6 +71,19 @@ export interface ApprovalOutcome {
     source: string
     /** `true` only for `allowed-once`; kept so call sites cannot misread it. */
     allowed: boolean
+    /**
+     * The host's approval policy observed at request time (`ask` / `never`;
+     * absent when the host exposed none). Recorded next to the decision — never
+     * used to decide whether a person is asked.
+     */
+    hostPolicy?: string
+    /**
+     * The gate-authorisation surface that carried the decision (`tui-card` /
+     * `tui-approval` / `im` / `host-seam`) when the kernel reported one. `source`
+     * keeps the STRENGTH vocabulary (`tui` / `questions` / `im` / `seam`); this
+     * field is the presentation, which is what a mandate records.
+     */
+    via?: string
 }
 
 /** The fence a reason uses to carry machine-readable fields. */

@@ -694,3 +694,108 @@ test('TC-1223 an EXPLICIT standardsFile still wins over the layout default', asy
     const out = runText(await fake.runTool('standards_status', {}))
     assert.match(out, /文件行数 ≤ 555/, '显式配置优先于布局默认')
 })
+
+// --- BINARY approval surface: the four reasons must stay APART (AC-002/AC-005) ----
+
+/** The refusal block of an `accept` run (everything after the "未写入基线" marker). */
+function refusalOf(text: string): string {
+    const index = text.indexOf('### 未写入基线')
+    assert.notEqual(index, -1, `没有找到拒绝段：${text}`)
+    return text.slice(index)
+}
+
+test('the four non-allow reasons are distinguishable, and none of them writes a baseline (AC-002)', async () => {
+    const acceptableRepo = (): string => {
+        const cwd = longGoRepo()
+        writeStandards(cwd, { languages: { go: { maxFileLines: 400, maxFunctionLines: 80 } } })
+        return cwd
+    }
+
+    // 1) a PERSON said no.
+    const rejectedCwd = acceptableRepo()
+    const rejected = refusalOf(runText(await host(rejectedCwd, {}, { approvalDecision: 'rejected' }).runTool('standards_check', { accept: true, note: '想蒙过去' })))
+    assert.match(rejected, /人工审批未通过/)
+    assert.match(rejected, /审批人拒绝了这次请求/, '必须说清是"人拒绝了"')
+    assert.match(rejected, /改代码消除新增违规/, 'rejected 的下一步是改代码')
+    assert.doesNotMatch(rejected, /没有人被问到|no-answerer/, 'rejected 不得被说成"没人被问"')
+    assert.doesNotMatch(rejected, /cancelled|被取消/, 'rejected 不得被说成取消')
+    assert.equal(fs.existsSync(path.join(rejectedCwd, '.dsh', 'standards-baseline.json')), false)
+
+    // 2) the question was WITHDRAWN.
+    const cancelledCwd = acceptableRepo()
+    const cancelled = refusalOf(runText(await host(cancelledCwd, {}, { approvalDecision: 'cancelled' }).runTool('standards_check', { accept: true, note: 'x' })))
+    assert.match(cancelled, /人工审批未通过/)
+    assert.match(cancelled, /取消/, '必须说清是"被取消"')
+    assert.match(cancelled, /重新调用/, 'cancelled 的下一步是重新裁决')
+    assert.doesNotMatch(cancelled, /审批人拒绝了这次请求/, 'cancelled 不得被说成拒绝')
+    assert.doesNotMatch(cancelled, /没有人被问到|no-answerer/, 'cancelled 不得被说成"没人被问"')
+    assert.equal(fs.existsSync(path.join(cancelledCwd, '.dsh', 'standards-baseline.json')), false)
+
+    // 3) NOBODY was asked: no suite channel, no host approval seam.
+    const orphanCwd = acceptableRepo()
+    const orphanHost = createFakeHost({ cwd: orphanCwd, withApproval: false })
+    hosts.push(orphanHost)
+    apply(orphanHost.ctx as never, { logFile: path.join(orphanCwd, 'standards-gate.log') })
+    const orphan = refusalOf(runText(await orphanHost.runTool('standards_check', { accept: true, note: 'x' })))
+    assert.match(orphan, /人工审批未通过/)
+    assert.match(orphan, /no-answerer/)
+    assert.match(orphan, /没有人被问到/, '必须说清"没有人被问到"')
+    assert.match(orphan, /装配 dsh-interaction-gate/, 'no-answerer 要给出具体的装配建议')
+    assert.match(orphan, /ctx\.approval/)
+    assert.doesNotMatch(orphan, /审批人拒绝了这次请求/, 'no-answerer 不得被说成拒绝')
+    assert.doesNotMatch(orphan, /cancelled/, 'no-answerer 不得被说成取消')
+    assert.equal(fs.existsSync(path.join(orphanCwd, '.dsh', 'standards-baseline.json')), false)
+
+    // 4) the HOST POLICY refused before dispatching: not a person's answer.
+    const policyCwd = acceptableRepo()
+    const policyHost = host(policyCwd, {}, { approvalDecision: 'rejected' })
+    const seam = (policyHost.ctx as unknown as { get: (name: string) => unknown }).get('approval') as Record<string, unknown>
+    seam['overrideOf'] = () => 'never'
+    seam['config'] = { policy: 'never' }
+    const policy = refusalOf(runText(await policyHost.runTool('standards_check', { accept: true, note: 'x' })))
+    assert.match(policy, /rejected-by-host-policy/)
+    assert.match(policy, /policy=never/)
+    assert.match(policy, /没有问过任何人/)
+    assert.doesNotMatch(policy, /审批人拒绝了这次请求/, 'policy 拒绝不是审批人的拒绝')
+    assert.equal(fs.existsSync(path.join(policyCwd, '.dsh', 'standards-baseline.json')), false)
+})
+
+test('a policy=never host still ASKS when a suite channel can carry the card (never auto-reject)', async () => {
+    const cwd = longGoRepo()
+    writeStandards(cwd, { languages: { go: { maxFileLines: 400, maxFunctionLines: 80 } } })
+    // A usable interaction channel that answers "yes" — and a host seam that
+    // would reject under policy=never if it were ever reached.
+    const answered: unknown[] = []
+    const fake = host(
+        cwd,
+        {},
+        {
+            approvalDecision: 'rejected',
+            interaction: {
+                list: () => [{ name: 'chat-interaction', canAsk: true, canNotify: true }],
+                get: () => ({ wait: async () => null }),
+                arm: () => true,
+                retire: () => undefined,
+                send: async (_name: string, message: unknown) => {
+                    answered.push(message)
+                    return { ok: true }
+                },
+                awaitAnswer: async () => ({ outcome: 'answered', answer: { value: 'yes', by: 'ou_im_approver', messageId: 'om_card_9' } }),
+            },
+        },
+    )
+    const seam = (fake.ctx as unknown as { get: (name: string) => unknown }).get('approval') as Record<string, unknown>
+    seam['overrideOf'] = () => 'never'
+    seam['config'] = { policy: 'never' }
+
+    const text = runText(await fake.runTool('standards_check', { accept: true, note: '存量债务' }))
+    assert.match(text, /基线已写入/, 'IM 卡片批准后基线必须写入')
+    assert.equal(answered.length, 1, '一张卡片，一次提问')
+    const card = answered[0] as { title?: string; buttons?: { value: string }[] }
+    assert.match(card.title ?? '', /放宽基线/)
+    assert.deepEqual((card.buttons ?? []).map((button) => button.value), ['yes', 'no'])
+    const baseline = JSON.parse(fs.readFileSync(path.join(cwd, '.dsh', 'standards-baseline.json'), 'utf8')) as { accepted: string[] }
+    assert.ok(baseline.accepted.length > 0)
+    assert.equal(fake.approvals.length, 0, '套件通道可用时不得退回宿主接缝')
+})
+

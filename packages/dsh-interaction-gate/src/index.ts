@@ -81,11 +81,11 @@ export { resolveConfig, resolveEffectiveConfig, createInteractionRegistry }
 export { describeIm, imLogLine } from './channels.js'
 export { CHAT_CHANNEL_NAME, CHAT_API_MIN_VERSION, CHAT_SERVICE, createChatChannel, imRequiredHint, probeChatInteraction } from './chat-channel.js'
 export { installImChannel } from './im-binding.js'
-export { APPROVAL_OPTIONS, APPROVAL_OUTCOMES, APPROVAL_SOURCE, agentOfRequest, approvalQuestionOf, installApprovalAnswerer, outcomeOfDecision, reasonTextOf } from './approval.js'
+export { APPROVAL_OPTIONS, APPROVAL_OUTCOMES, APPROVAL_SOURCE, agentOfRequest, approvalQuestionOf, installApprovalAnswerer, outcomeOfDecision, reasonTextOf, imApprovalSurface } from './approval.js'
 export type { EffectiveConfig, InteractionGateConfig, InteractionRegistry }
 export type { ImApproverReport, ImChannelMode, ImChannelReport, ImIgnoredAttempt, ImIgnoredReport, ImPhase } from './channels.js'
 export type { ChatApiLike, ChatChannelHandle, ChatChannelOptions, ChatProbe } from './chat-channel.js'
-export type { ApprovalAnswererHandle, ApprovalAnswererOptions, ApprovalOutcome, ApprovalQuestion, ApprovalRequestLike } from './approval.js'
+export type { ApprovalAnswererHandle, ApprovalAnswererOptions, ApprovalOutcome, ApprovalQuestion, ApprovalRequestLike, ImApprovalSurfaceReport } from './approval.js'
 export type { ImBinding, ImBindingLogger, ImBindingOptions, ImInjectionContext, ImInjectionHost, ImInject, ImTimerControl } from './im-binding.js'
 export type { ImConfig } from './config.js'
 export { DEFAULT_APPROVERS_FILE, LEGACY_PROJECT_APPROVERS_FILE } from './config.js'

@@ -2054,3 +2054,108 @@ test('TC-1172/1174 a fresh mission still writes, and read-only commands are neve
         '只读命令不受影响',
     )
 })
+
+// --- 授权内核：digest 绑定与 mandate 的授权来源（AC-004 / TC-1342 / TC-1344） --------
+
+test('TC-1344 the approval is bound to the digest: an artifact edited while the card is open is refused', async () => {
+    const cwd = tempWorkspace('spec-gate-digest-')
+    const specFileOf = (): string => {
+        const id = fs.readdirSync(path.join(cwd, '.dsh', 'specs'))[0]?.replace(/\.md$/, '') ?? ''
+        return path.join(cwd, '.dsh', 'specs', `${id}.md`)
+    }
+    let tampered = false
+    const { fake } = questionsHost({
+        cwd,
+        // The human's card is open; the artifact changes underneath it. The
+        // approval is then about a version the reviewer never saw.
+        answer: (request) => {
+            const specFile = specFileOf()
+            fs.writeFileSync(specFile, `${fs.readFileSync(specFile, 'utf8')}\n<!-- edited while the card was open -->\n`)
+            tampered = true
+            const id = (request as { questions: { id: string }[] }).questions[0]?.id ?? ''
+            return { answers: [{ id, selected: ['通过'] }] }
+        },
+    })
+    await fake.runTool('spec_create', DRAFT)
+    const run = await fake.runTool('spec_approve', {})
+    assert.equal(tampered, true)
+    assert.equal(run.isError, true, runText(run))
+    const text = runText(run)
+    assert.match(text, /digest|摘要/, '必须点名摘要不一致')
+    assert.match(text, /重新送审|spec_approve/, '必须提示重新送审')
+    const mission = new MissionStoreRegistry().for(cwd).active('session-1')
+    assert.equal(mission?.spec?.approvedAt, undefined, 'digest 不一致时不得留下审批')
+    assert.equal(mission?.mandate, undefined, 'digest 不一致时不得签发 mandate')
+    assert.match(
+        fake.guardReason({ name: 'write', arguments: { file_path: 'src/server.ts' }, agent: fake.agent }) ?? '',
+        /尚未审批/,
+        '写操作保持关闭',
+    )
+})
+
+test('TC-1342 the mandate records which surface approved and the host policy, bound to the spec digest', async () => {
+    const { fake } = questionsHost({ answer: answerWith(['通过']) })
+    await fake.runTool('spec_create', DRAFT)
+    const run = await fake.runTool('spec_approve', {})
+    assert.equal(run.isError, false, runText(run))
+    const mission = new MissionStoreRegistry().for(fake.cwd).active('session-1')
+    const mandate = mission?.mandate as { approvedBy?: string; via?: string; specDigest?: string } | undefined
+    assert.equal(mandate?.approvedBy, 'approval')
+    assert.equal(mandate?.via, 'tui-approval', '桌面/web 的 plan-review 卡片就是授权面')
+    assert.match(mandate?.specDigest ?? '', /^[0-9a-f]{64}$/, 'mandate 必须绑定规格摘要')
+    assert.match(runText(run), /本次决定的绑定：规格摘要 [0-9a-f]{12}；授权面 tui-approval/)
+
+    // The nvim-tui popup is a DIFFERENT surface and must be recorded as such.
+    const cwd = tempWorkspace('spec-gate-mandate-tui-')
+    const tui = fakeTui(cwd)
+    const viaTui = createFakeHost({ cwd, services: { 'nvim-tui': tui.api } })
+    apply(viaTui.ctx as never, { logFile: path.join(cwd, 'spec-gate.log'), approval: 'seam' })
+    await viaTui.runTool('spec_create', DRAFT)
+    tui.queue('spec:approve')
+    assert.equal((await viaTui.runTool('spec_approve', {})).isError, false)
+    const tuiMission = new MissionStoreRegistry().for(cwd).active('session-1')
+    assert.equal((tuiMission?.mandate as { via?: string } | undefined)?.via, 'tui-card')
+    assert.equal((tuiMission?.spec as { approvedSource?: string } | undefined)?.approvedSource, 'tui')
+})
+
+test('the host policy is recorded but never decides: policy=never still asks the rich surface', async () => {
+    const { fake } = questionsHost({ answer: answerWith(['通过']) })
+    // A host service that exposes its policy the way the installed approval
+    // service does (`overrideOf` + `config.policy`).
+    const seam = (fake.ctx as unknown as { get: (name: string) => unknown }).get('approval') as Record<string, unknown>
+    seam['overrideOf'] = () => 'never'
+    seam['config'] = { policy: 'never' }
+    await fake.runTool('spec_create', DRAFT)
+    const text = runText(await fake.runTool('spec_approve', {}))
+    assert.match(text, /规格已审批/, 'policy=never 不等于"自动拒绝"：富审阅面照样问人')
+    const mission = new MissionStoreRegistry().for(fake.cwd).active('session-1')
+    assert.equal((mission?.mandate as { hostPolicy?: string } | undefined)?.hostPolicy, 'never')
+})
+
+test('a policy=never seam rejection says exactly that, and does not record a human rejection (AC-002)', async () => {
+    const cwd = tempWorkspace('spec-gate-host-policy-')
+    // reviewChannel=approval forces the generic seam; the fake seam rejects (as
+    // the real one does under policy=never) and exposes that policy.
+    const fake = createFakeHost({ cwd, approvalOutcome: 'rejected' })
+    const seam = (fake.ctx as unknown as { get: (name: string) => unknown }).get('approval') as Record<string, unknown>
+    seam['overrideOf'] = () => 'never'
+    seam['config'] = { policy: 'never' }
+    apply(fake.ctx as never, { logFile: path.join(cwd, 'spec-gate.log'), reviewChannel: 'approval' })
+    await fake.runTool('spec_create', DRAFT)
+    const run = await fake.runTool('spec_approve', {})
+    assert.equal(run.isError, true, runText(run))
+    const text = runText(run)
+    assert.match(text, /policy=never/, '必须点名策略')
+    assert.match(text, /没有问过任何人/, '必须说清接缝没有派发')
+    assert.doesNotMatch(text, /人工打回/, 'policy 拒绝不是审批人的拒绝')
+
+    const mission = new MissionStoreRegistry().for(cwd).active('session-1')
+    assert.equal(mission?.approval, undefined, '不得记为一次人工打回')
+    assert.equal(mission?.spec?.approvedAt, undefined, '规格仍未审批')
+    assert.match(
+        fake.guardReason({ name: 'write', arguments: { file_path: 'src/server.ts' }, agent: fake.agent }) ?? '',
+        /尚未审批/,
+        '写操作保持关闭',
+    )
+})
+

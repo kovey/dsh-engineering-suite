@@ -16,12 +16,17 @@
  */
 
 import path from 'node:path'
+import { randomBytes } from 'node:crypto'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import {
     applyRuleModes,
+    describeGateApproval,
     ensureDir,
     formatTime,
+    gateDecisionOfWord,
     normalizeApprovalReply,
+    readHostApprovalPolicy,
+    requestGateApproval,
     type ApprovalLike,
     gitFingerprint,
     measureWorkspace,
@@ -33,7 +38,9 @@ import {
     type DelegationPresets,
     type DelegationServices,
     type FileMetrics,
+    type GateApprovalResult,
     type GateObservation,
+    type GateSurfaceAnswer,
     type LayerRule,
     type Logger,
     type MetricsResult,
@@ -80,6 +87,14 @@ export interface ToolDeps {
     configFor: (agent: AgentLike | undefined) => StandardsGateConfig
     stores: MissionStoreRegistry
     approval: () => ApprovalLike | undefined
+    /**
+     * `ctx.get('interaction')` — the suite's channel registry (`dsh-interaction-gate`).
+     *
+     * Read structurally (this plugin never imports another plugin) and used for
+     * the BINARY approval surface's first choice: an IM card. Absent = the host
+     * has no suite channel, so the approval falls back to the host seam.
+     */
+    interaction?: () => unknown
     /** `ctx.get('subagents')`, for the read-only structural reviewer. */
     subagents: () => DelegationServices | undefined
     /**
@@ -164,6 +179,256 @@ function agentOf(exec: unknown): AgentLike | undefined {
 
 function signalOf(exec: unknown): AbortSignal | undefined {
     return (exec as { signal?: AbortSignal }).signal
+}
+
+// --- the binary approval surface (AC-005) -----------------------------------
+//
+// Loosening the ratchet ("accept these violations", "write these thresholds")
+// is an allow/deny decision: a person does not need to edit a document to make
+// it. It therefore goes through the gate-authorisation kernel's `binary`
+// surface — the suite's IM card first, the host's approval popup only when no
+// suite channel can carry the question. Whether a person is asked is decided by
+// the surface, never by the host's `policy=never`: a hard gate must still ask.
+
+/**
+ * Ceiling for one binary approval card.
+ *
+ * This plugin has no configuration of its own for it: a repository must not be
+ * able to stretch (or shorten) how long a standards turn waits on a human. Five
+ * minutes is long enough for a phone and short enough that a headless run ends.
+ */
+const BINARY_APPROVAL_TIMEOUT_MS = 300_000
+
+/** Structural view of the interaction registry (`dsh-interaction-gate` provides it). */
+interface InteractionRegistryLike {
+    list?: () => unknown
+    describeAll?: () => unknown
+    get?: (name: string) => unknown
+    arm?: (questionId: string) => unknown
+    retire?: (questionId: string) => void
+    send?: (name: string, message: unknown) => Promise<unknown>
+    awaitAnswer?: (questionId: string, timeoutMs: number, options?: unknown) => Promise<unknown>
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+    return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+/**
+ * Ask through one registered interaction channel (an IM card).
+ *
+ * The protocol is the one `dsh-interaction-gate` documents: a fresh one-shot
+ * token, `arm()` it, `send()` the card, `awaitAnswer()` the token. Every failure
+ * mode is `unavailable` — a channel that could not deliver a card, timed out or
+ * went away asked NOBODY, which is not a rejection.
+ * @param registry - the interaction registry (untrusted shape).
+ * @param input - the question and the deadline.
+ */
+async function askThroughRegistry(
+    registry: InteractionRegistryLike,
+    input: { title: string; body: string; toolName: string; signal?: AbortSignal },
+): Promise<GateSurfaceAnswer> {
+    const list = registry.list ?? registry.describeAll
+    if (list === undefined || typeof registry.arm !== 'function' || typeof registry.send !== 'function' || typeof registry.awaitAnswer !== 'function') {
+        return {
+            kind: 'unavailable',
+            reason: 'interaction 服务没有提供 list/arm/send/awaitAnswer：无法发卡并等一个对得上令牌的答案（fail closed）',
+        }
+    }
+    let raw: unknown
+    try {
+        raw = list.call(registry)
+    } catch (error) {
+        return { kind: 'unavailable', reason: `interaction 服务列出通道时抛错（${describeError(error)}）` }
+    }
+    const channels = (Array.isArray(raw) ? raw : []).filter(isRecord)
+    const usable = channels.filter((entry) => entry['canAsk'] === true && typeof entry['name'] === 'string' && entry['name'] !== '')
+    if (usable.length === 0) {
+        return {
+            kind: 'unavailable',
+            reason:
+                `interaction 服务注册了 ${channels.length} 个通道，但没有一个能提问（canAsk=false；通道必须实现 wait() 才收得到答案）` +
+                (channels.length === 0 ? '——一个通道都没有注册' : `：${channels.map((entry) => String(entry['name'] ?? '(无名)')).join('、')}`),
+        }
+    }
+    const failures: string[] = []
+    for (const channel of usable) {
+        const name = channel['name'] as string
+        // Unpredictable 128-bit token: an answer can only ever belong to the
+        // question it claims (never derived from a clock or a counter).
+        const questionId = `q-${randomBytes(16).toString('hex')}`
+        let armed: unknown = false
+        try {
+            armed = (registry.arm as (id: string) => unknown).call(registry, questionId)
+        } catch (error) {
+            failures.push(`${name}: arm() 抛错（${describeError(error)}）`)
+            continue
+        }
+        if (armed !== true) {
+            failures.push(`${name}: 一次性令牌无法登记（arm() 返回 ${JSON.stringify(armed)}）`)
+            continue
+        }
+        let sent: unknown
+        try {
+            sent = await (registry.send as (channel: string, message: unknown) => Promise<unknown>).call(registry, name, {
+                kind: 'ask',
+                title: input.title,
+                body: input.body,
+                questionId,
+                buttons: [
+                    { value: 'yes', label: input.toolName === 'standards_bootstrap' ? '批准写入' : '接受并写入基线' },
+                    { value: 'no', label: '拒绝' },
+                ],
+            })
+        } catch (error) {
+            sent = { ok: false, error: describeError(error) }
+        }
+        if (!isRecord(sent) || sent['ok'] !== true) {
+            if (typeof registry.retire === 'function') registry.retire(questionId)
+            failures.push(`${name}: 卡片发不出去（${isRecord(sent) && typeof sent['error'] === 'string' ? sent['error'] : '通道未说明原因'}）`)
+            continue
+        }
+        const implementation = typeof registry.get === 'function' ? registry.get(name) : undefined
+        const wait =
+            isRecord(implementation) && typeof implementation['wait'] === 'function'
+                ? (implementation['wait'] as (id: string, ms: number, signal?: AbortSignal) => Promise<unknown>).bind(implementation)
+                : undefined
+        let awaited: unknown
+        try {
+            awaited = await (registry.awaitAnswer as (id: string, ms: number, options?: unknown) => Promise<unknown>).call(
+                registry,
+                questionId,
+                BINARY_APPROVAL_TIMEOUT_MS,
+                { ...(wait === undefined ? {} : { wait }), ...(input.signal === undefined ? {} : { signal: input.signal }) },
+            )
+        } catch (error) {
+            awaited = { outcome: 'unreadable', error: describeError(error) }
+        }
+        const outcome = isRecord(awaited) && typeof awaited['outcome'] === 'string' ? awaited['outcome'] : 'unreadable'
+        if (outcome === 'answered') {
+            const answer = isRecord(awaited) ? awaited['answer'] : undefined
+            const decision = isRecord(answer) ? gateDecisionOfWord(answer['value']) : undefined
+            if (isRecord(answer) && typeof answer['value'] === 'string' && decision !== undefined) {
+                return {
+                    kind: 'answer',
+                    decision,
+                    via: 'im',
+                    ...(typeof answer['by'] === 'string' ? { by: answer['by'] } : {}),
+                    ...(typeof answer['messageId'] === 'string' ? { messageId: answer['messageId'] } : {}),
+                }
+            }
+            // A card was answered with something that is not a decision: that is
+            // NOT a rejection (nobody said no) — keep looking, then fail closed.
+            failures.push(`${name}: 通道报告已回答，但答案不是一个决定（${JSON.stringify(isRecord(answer) ? answer['value'] : answer)}）`)
+            continue
+        }
+        if (outcome === 'cancelled') return { kind: 'answer', decision: 'cancelled', via: 'im' }
+        if (outcome === 'timeout') {
+            return {
+                kind: 'unavailable',
+                reason: `等待审批卡的截止时间（${BINARY_APPROVAL_TIMEOUT_MS}ms）到了：通道 "${name}" 没有给出答案。超时不是拒绝，也不是同意`,
+                cardAttempted: true,
+            }
+        }
+        failures.push(`${name}: ${outcome === 'unknown-token' ? '一次性令牌在等待期间失效' : `等待结果读不出来（outcome=${outcome}）`}`)
+    }
+    return { kind: 'unavailable', reason: `没有一个通道完成这次提问：${failures.join('；')}` }
+}
+
+function describeError(error: unknown): string {
+    return error instanceof Error ? error.message : String(error)
+}
+
+/**
+ * Ask a person through the gate-authorisation kernel's BINARY surface.
+ * @param deps - seams and logger.
+ * @param input - what is being permitted, why, and in which workspace.
+ * @returns the kernel's verdict; callers must report its reason verbatim
+ *   ({@link describeGateApproval}) instead of merging the outcomes.
+ */
+async function requestBinaryApproval(
+    deps: ToolDeps,
+    input: { agent?: AgentLike; toolName: string; reason: string; cwd: string; signal?: AbortSignal; title: string },
+): Promise<GateApprovalResult> {
+    const approval = deps.approval()
+    return await requestGateApproval({
+        ...(input.agent === undefined ? {} : { agent: input.agent }),
+        toolName: input.toolName,
+        reason: input.reason,
+        surface: 'binary',
+        ...(input.signal === undefined ? {} : { signal: input.signal }),
+        hostPolicy: readHostApprovalPolicy(approval, input.agent),
+        surfaces: {
+            // The suite channel: the ONLY surface this plugin can add. It is a
+            // declared adapter (not a host policy read): the kernel decides whether
+            // a person is asked, and this adapter says whether IM can carry it.
+            binary: async (ask) => {
+                const interaction = deps.interaction?.()
+                if (interaction === undefined) {
+                    return { kind: 'unavailable', reason: '宿主没有装配 interaction 服务（ctx.get("interaction")）：没有套件通道可以发审批卡' }
+                }
+                return await askThroughRegistry(interaction as InteractionRegistryLike, {
+                    title: input.title,
+                    body: ask.reason,
+                    toolName: input.toolName,
+                    ...(input.signal === undefined ? {} : { signal: input.signal }),
+                })
+            },
+            ...(approval === undefined
+                ? {}
+                : {
+                      // The host's own popup, only reachable through the kernel's
+                      // binary surface — and a policy=never rejection is reported as
+                      // `rejected-by-host-policy` there, not as a person's answer.
+                      hostSeam: async (ask): Promise<GateSurfaceAnswer> => {
+                          const normalized = normalizeApprovalReply(
+                              await approval.request({
+                                  ...(input.agent === undefined ? {} : { agent: input.agent }),
+                                  toolName: input.toolName,
+                                  reason: ask.reason,
+                                  ...(input.signal === undefined ? {} : { signal: input.signal }),
+                              }),
+                          )
+                          if (normalized.decision === 'unavailable') {
+                              return { kind: 'unavailable', reason: '宿主审批接缝返回 unavailable（没有应答者）' }
+                          }
+                          return {
+                              kind: 'answer',
+                              decision: normalized.decision,
+                              by: normalized.by,
+                              ...(normalized.messageId === '' ? {} : { messageId: normalized.messageId }),
+                              via: 'host-seam',
+                          }
+                      },
+                  }),
+        },
+    })
+}
+
+/** The distinct refusal block for a binary approval that did not grant anything. */
+function renderApprovalRefusal(result: GateApprovalResult): string[] {
+    const nextSteps: string[] =
+        result.outcome === 'rejected'
+            ? ['下一步：改代码消除新增违规；或按语言/目录放宽阈值、把确有理由的路径写进 `exempt`——这两者改的是仓库里的规范文件，需要人来做。']
+            : result.outcome === 'cancelled'
+              ? ['下一步：重新调用同样的工具，让审批人重新裁决；一次取消不改变基线，也不放宽任何阈值。']
+              : result.outcome === 'rejected-by-host-policy'
+                ? [
+                      '下一步（任选其一）：由人把该会话的审批策略从 `never` 改为 `ask`（宿主的决定，模型改不了）；或改代码消除新增违规。',
+                      '注意：policy=never 时宿主接缝不会派发，所以这条路径**永远**不会自动放行——这正是它 fail closed 的方式。',
+                  ]
+                : [
+                      '下一步（任选其一）：装配 dsh-interaction-gate 的 IM 通道并完成 `im.*` 配置（审批卡需要能收到答案）；让宿主装配审批插件（`ctx.approval`）；或改代码消除新增违规 / 由人改规范文件。',
+                  ]
+    return [
+        // `人工审批未通过` stays the shared headline (existing reports and readers
+        // know it), but the REASON below is never merged: rejected / cancelled /
+        // no-answerer / host-policy are four different facts with four different
+        // next steps.
+        `人工审批未通过：${describeGateApproval(result)}`,
+        ...(result.outcome === 'no-answerer' ? [`面的情况：${result.problem ?? '(未报告)'}`] : []),
+        ...nextSteps,
+    ]
 }
 
 /** The workspace of the calling agent, refusing an unknown one. */
@@ -704,19 +969,10 @@ export function registerTools(
                 const shadowOnlyWorsened = outcome.shadow.worsened
                 const shadowOnly = shadowOnlyAdded.length + shadowOnlyWorsened.length
                 if (args.accept === true && acceptable.length > 0) {
-                    const approve = async (reason: string): Promise<boolean> => {
-                        const seam = deps.approval()
-                        if (seam === undefined) return false
-                        const decision = normalizeApprovalReply(
-                            await seam.request({
-                                ...(agent === undefined ? {} : { agent }),
-                                toolName: 'standards_check',
-                                reason,
-                                ...(signalOf(exec) === undefined ? {} : { signal: signalOf(exec) }),
-                            }),
-                        )
-                        return decision.allowed
-                    }
+                    // Provenance of the grant, recorded with the gate verdict: "who
+                    // widened the ratchet, on which surface" is what a later review
+                    // asks, and a gate record without it cannot answer.
+                    let approvalProvenance = ''
                     if (args.dryRun === true) {
                         return [
                             renderCheck(outcome, config),
@@ -729,8 +985,14 @@ export function registerTools(
                         ].join('\n')
                     }
                     if (config.requireApprovalForBaseline) {
-                        const allowed = await approve(
-                            [
+                        // BINARY surface: the ratchet is an allow/deny decision, and
+                        // the kernel keeps "rejected" / "cancelled" / "no-answerer" /
+                        // "rejected-by-host-policy" apart instead of one merged line.
+                        const verdict = await requestBinaryApproval(deps, {
+                            ...(agent === undefined ? {} : { agent }),
+                            toolName: 'standards_check',
+                            title: '规范检查：放宽基线',
+                            reason: [
                                 `规范检查要求放宽基线：把 ${acceptable.length} 项**新增**违规记为"已接受"。`,
                                 '',
                                 ...acceptable.slice(0, 12).map((violation) => `- ${violation.detail}`),
@@ -741,17 +1003,21 @@ export function registerTools(
                                 `基线文件：${path.join(cwd, baselineFileOf(cwd, config))}`,
                                 args.note === undefined || args.note === '' ? '（未填理由）' : `理由：${args.note}`,
                             ].join('\n'),
-                        )
-                        if (!allowed) {
+                            cwd,
+                            ...(signalOf(exec) === undefined ? {} : { signal: signalOf(exec) }),
+                        })
+                        if (!verdict.allowed) {
                             return [
                                 renderCheck(outcome, config),
                                 '',
                                 '### 未写入基线',
                                 '',
-                                '人工审批未通过（拒绝/取消/无审批通道）。基线保持不变，本次结论仍为 BLOCK。',
-                                '下一步：改代码消除新增违规；或按语言/目录放宽阈值、把确有理由的路径写进 `exempt`——这两者改的是仓库里的规范文件，需要人来做。',
+                                '基线保持不变，本次结论仍为 BLOCK。',
+                                '',
+                                ...renderApprovalRefusal(verdict),
                             ].join('\n')
                         }
+                        approvalProvenance = `，by ${verdict.by === '' ? '(通道未报告)' : verdict.by}${verdict.via === undefined ? '' : ` via ${verdict.via}`}`
                     }
                     const baselinePath = artifactPathOf(cwd, baselineFileOf(cwd, config))
                     // Only enforcing rules are frozen: an observe rule keeps its
@@ -777,7 +1043,7 @@ export function registerTools(
                         present: true,
                     }
                     applyEvaluation(outcome, config)
-                    outcome.reason = `基线已更新：接受 ${accepted.accepted.length} 项违规（人工批准，只含 enforce 规则）${shadowNoteOf(outcome.observations)}`
+                    outcome.reason = `基线已更新：接受 ${accepted.accepted.length} 项违规（人工批准${approvalProvenance}，只含 enforce 规则）${shadowNoteOf(outcome.observations)}`
                     // The report says PASS, so the LEDGER must say PASS too: a
                     // version that returned here without recording left the old
                     // BLOCK in place while the tool printed a pass (an audit
@@ -977,7 +1243,6 @@ export function registerTools(
 
                 if (action === 'measure') return report
 
-                const seam = deps.approval()
                 const merged = mergeThresholds(recommended, args.thresholds)
                 // Freezing thresholds must not silently drop the rule MODES an
                 // operator committed: a rule they marked `observe` would become
@@ -993,15 +1258,13 @@ export function registerTools(
                     ...(args.note === undefined || args.note === '' ? {} : { note: args.note }),
                 }
                 if (config.requireApprovalForBaseline) {
-                    if (seam === undefined) {
-                        throw new Error(
-                            '宿主没有装配审批通道（ctx.approval）：写入仓库级规范需要人工批准，按 fail closed 拒绝。' +
-                                '下一步：让宿主装配审批插件（或人工把上面的 JSON 写进 ' + target + '）。',
-                        )
-                    }
-                    const decided = normalizeApprovalReply(await seam.request({
+                    // Same BINARY surface as `accept`: writing the thresholds is a
+                    // ratchet change, and it needs a person — never an auto-pass,
+                    // even when the host's session policy is `never`.
+                    const verdict = await requestBinaryApproval(deps, {
                         ...(agent === undefined ? {} : { agent }),
                         toolName: 'standards_bootstrap',
+                        title: '规范门禁：写入阈值',
                         reason: [
                             `为 ${cwd} 写入代码规范阈值（${target}）。之后每次 standards_check 都会用它门禁新增违规。`,
                             '',
@@ -1009,16 +1272,11 @@ export function registerTools(
                             JSON.stringify(merged, null, 2),
                             '```',
                         ].join('\n'),
+                        cwd,
                         ...(signalOf(exec) === undefined ? {} : { signal: signalOf(exec) }),
-                    }))
-                    if (!decided.allowed) {
-                        return [
-                            report,
-                            '',
-                            '### 未写入',
-                            '',
-                            `人工审批未通过（${decided.decision}${decided.by === '' ? '' : `，by ${decided.by}`}${decided.source === '' ? '' : ` via ${decided.source}`}）：规范文件保持不变。`,
-                        ].join('\n')
+                    })
+                    if (!verdict.allowed) {
+                        return [report, '', '### 未写入', '', '规范文件保持不变。', '', ...renderApprovalRefusal(verdict)].join('\n')
                     }
                 }
                 ensureDir(path.dirname(target))

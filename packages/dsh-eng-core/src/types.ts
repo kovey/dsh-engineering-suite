@@ -402,6 +402,23 @@ export interface Mandate {
     policyVersion: string
     /** Recorded approver (`approval` when the channel named nobody). */
     approvedBy: string
+    /**
+     * Which presentation carried the approval (`tui-card` / `tui-approval` /
+     * `im` / `host-seam`). Recorded because "who approved" without "on which
+     * surface" cannot answer "did the human see the document?".
+     */
+    via?: string
+    /**
+     * The host's approval policy observed at approval time (`ask` / `never`;
+     * absent when the host exposed none). Recorded so a later report can say
+     * under which stance the approval happened — it never gates a decision.
+     */
+    hostPolicy?: string
+    /**
+     * Digest of the specification the human approved. The mandate is bound to
+     * that version: an approval of a document nobody saw is not an authorisation.
+     */
+    specDigest?: string
     /** Approval time (epoch ms). */
     at: number
     /** A person's stop. Absent while the authorisation stands. */
