@@ -6,13 +6,14 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import path from 'node:path'
 import test from 'node:test'
-import { MissionStoreRegistry, specReviewDigest } from 'dsh-eng-core'
+import { MissionStoreRegistry, resolveLayout, specReviewDigest } from 'dsh-eng-core'
 import { createFakeHost, fakeAgent, runText, tempWorkspace, type FakeHost } from 'dsh-eng-core/testing'
 
 function fakeAgentFor(cwd: string, id: string, sessionId: string) {
     return fakeAgent(cwd, id, sessionId)
 }
 import { apply, inject, name } from '../dist/index.js'
+import { resolveConfig, resolveEffectiveConfig } from '../dist/config.js'
 import { parseConstraints } from '../dist/constraints.js'
 
 const TEST_DESIGN = [
@@ -154,6 +155,26 @@ test('a rejected approval leaves the mission unwritable (fail closed)', async ()
     assert.match(fake.guardReason({ name: 'write', arguments: { file_path: 'src/server.ts' }, agent: fake.agent }) ?? '', /尚未审批/)
 })
 
+test('TC-1471 approval:"auto" is refused at load and names the removal (regression)', () => {
+    // The removed value let a CONFIG SWITCH be the approver: whoever edited
+    // .dsh/spec-gate.json could let the model approve its own specification
+    // (the mandate recorded `by: "auto"`, not a person). It must now be refused
+    // where the configuration is READ, with the migration spelled out — never
+    // silently approved and never silently ignored.
+    assert.throws(() => resolveConfig({ approval: 'auto' }), /approval="auto" 已移除/)
+    assert.throws(() => resolveConfig({ approval: 'auto' }), /approval="seam"/)
+    assert.equal(resolveConfig({ approval: 'seam' }).approval, 'seam')
+    assert.equal(resolveConfig({}).approval, 'seam')
+
+    // The project-level overlay is the second reader of the same key: it must
+    // refuse `auto` too (otherwise a repository file could re-open the hole).
+    const cwd = tempWorkspace('spec-gate-auto-')
+    fs.mkdirSync(path.join(cwd, '.dsh'), { recursive: true })
+    fs.writeFileSync(path.join(cwd, '.dsh', 'spec-gate.json'), JSON.stringify({ approval: 'auto' }))
+    const layout = resolveLayout(cwd)
+    assert.throws(() => resolveEffectiveConfig(resolveConfig({ logFile: 'x.log' }), layout), /approval="auto" 已移除/)
+})
+
 test('requireTestDesign blocks approval until the design is reviewed', async () => {
     const cwd = tempWorkspace('spec-gate-design-')
     const fake = createFakeHost({ cwd })
@@ -165,7 +186,7 @@ test('requireTestDesign blocks approval until the design is reviewed', async () 
         parameters: {},
         execute: async () => 'ok',
     })
-    apply(fake.ctx as never, { logFile: path.join(cwd, 'spec-gate.log'), approval: 'auto' })
+    apply(fake.ctx as never, { logFile: path.join(cwd, 'spec-gate.log'), approval: 'seam' })
     await fake.runTool('spec_create', { ...DRAFT, testDesign: '' })
     const run = await fake.runTool('spec_approve', {})
     assert.equal(run.isError, true)
@@ -293,7 +314,7 @@ test('writes outside the declared file boundaries are denied (regression)', asyn
 test('boundary enforcement can be switched off by the host', async () => {
     const cwd = tempWorkspace('spec-gate-noboundary-')
     const fake = createFakeHost({ cwd, approvalOutcome: 'allowed-once' })
-    apply(fake.ctx as never, { logFile: path.join(cwd, 'spec-gate.log'), approval: 'auto', enforceBoundaries: false })
+    apply(fake.ctx as never, { logFile: path.join(cwd, 'spec-gate.log'), approval: 'seam', enforceBoundaries: false })
     await fake.runTool('spec_create', DRAFT)
     await fake.runTool('spec_approve', {})
     assert.equal(fake.guardReason({ name: 'write', arguments: { file_path: 'README.md' }, agent: fake.agent }), undefined)
@@ -359,12 +380,12 @@ test('an unparseable design table is rejected instead of being silently dropped 
 test('approval and status never fall back to another session\'s mission (regression)', async () => {
     const cwd = tempWorkspace('spec-gate-strict-')
     const owner = createFakeHost({ cwd, approvalOutcome: 'allowed-once' })
-    apply(owner.ctx as never, { logFile: path.join(cwd, 'spec-gate.log'), approval: 'auto' })
+    apply(owner.ctx as never, { logFile: path.join(cwd, 'spec-gate.log'), approval: 'seam' })
     await owner.runTool('spec_create', DRAFT)
 
     // A second session in the same workspace has no binding of its own.
     const intruder = createFakeHost({ cwd, agent: fakeAgentFor(cwd, 'agent-2', 'session-2'), approvalOutcome: 'allowed-once' })
-    apply(intruder.ctx as never, { logFile: path.join(cwd, 'spec-gate-2.log'), approval: 'auto' })
+    apply(intruder.ctx as never, { logFile: path.join(cwd, 'spec-gate-2.log'), approval: 'seam' })
     const approve = await intruder.runTool('spec_approve', {})
     assert.equal(approve.isError, true)
     assert.match(String(approve.content), /没有绑定任何 mission/)
@@ -419,7 +440,7 @@ test('spec_create with an unknown explicit missionId refuses instead of creating
 test('shell writes are boundary-checked like write-tool calls (regression)', async () => {
     const cwd = tempWorkspace('spec-gate-shell-')
     const fake = createFakeHost({ cwd, approvalOutcome: 'allowed-once' })
-    apply(fake.ctx as never, { logFile: path.join(cwd, 'spec-gate.log'), approval: 'auto' })
+    apply(fake.ctx as never, { logFile: path.join(cwd, 'spec-gate.log'), approval: 'seam' })
     await fake.runTool('spec_create', DRAFT)
     await fake.runTool('spec_approve', {})
     const shell = (command: string) => fake.guardReason({ name: 'bash', arguments: { command }, agent: fake.agent })
@@ -441,7 +462,7 @@ test('shell writes are boundary-checked like write-tool calls (regression)', asy
 test('shellPolicy=strict refuses commands whose targets cannot be attributed (regression)', async () => {
     const cwd = tempWorkspace('spec-gate-shellstrict-')
     const fake = createFakeHost({ cwd, approvalOutcome: 'allowed-once' })
-    apply(fake.ctx as never, { logFile: path.join(cwd, 'spec-gate.log'), approval: 'auto', shellPolicy: 'strict' })
+    apply(fake.ctx as never, { logFile: path.join(cwd, 'spec-gate.log'), approval: 'seam', shellPolicy: 'strict' })
     await fake.runTool('spec_create', DRAFT)
     await fake.runTool('spec_approve', {})
     const shell = (command: string) => fake.guardReason({ name: 'bash', arguments: { command }, agent: fake.agent })
@@ -452,7 +473,7 @@ test('shellPolicy=strict refuses commands whose targets cannot be attributed (re
 
     // shellPolicy=off skips shell analysis entirely.
     const off = createFakeHost({ cwd: tempWorkspace('spec-gate-shelloff-'), approvalOutcome: 'allowed-once' })
-    apply(off.ctx as never, { logFile: path.join(cwd, 'off.log'), approval: 'auto', shellPolicy: 'off' })
+    apply(off.ctx as never, { logFile: path.join(cwd, 'off.log'), approval: 'seam', shellPolicy: 'off' })
     await off.runTool('spec_create', DRAFT)
     await off.runTool('spec_approve', {})
     assert.equal(off.guardReason({ name: 'bash', arguments: { command: 'echo x > README.md' }, agent: off.agent }), undefined)
@@ -461,7 +482,7 @@ test('shellPolicy=strict refuses commands whose targets cannot be attributed (re
 test('declarative negative constraints are enforced on every gated call (regression)', async () => {
     const cwd = tempWorkspace('spec-gate-constraints-')
     const fake = createFakeHost({ cwd, approvalOutcome: 'allowed-once' })
-    apply(fake.ctx as never, { logFile: path.join(cwd, 'spec-gate.log'), approval: 'auto' })
+    apply(fake.ctx as never, { logFile: path.join(cwd, 'spec-gate.log'), approval: 'seam' })
     await fake.runTool('spec_create', {
         ...DRAFT,
         negativeConstraints: [
@@ -515,7 +536,7 @@ test('constraint parsing fails open to advisory, never to a crash (regression)',
 test('reads are never blocked by write-scoped rules (regression)', async () => {
     const cwd = tempWorkspace('spec-gate-reads-')
     const fake = createFakeHost({ cwd, approvalOutcome: 'allowed-once' })
-    apply(fake.ctx as never, { logFile: path.join(cwd, 'spec-gate.log'), approval: 'auto' })
+    apply(fake.ctx as never, { logFile: path.join(cwd, 'spec-gate.log'), approval: 'seam' })
     await fake.runTool('spec_create', { ...DRAFT, negativeConstraints: ['path:src/core/**', '不得修改 dsh 核心代码'] })
     await fake.runTool('spec_approve', {})
     // A read tool names a file, but it modifies nothing: the trust root and the
@@ -530,7 +551,7 @@ test('reads are never blocked by write-scoped rules (regression)', async () => {
 test('read-only shell stays usable before approval, writes do not (regression)', async () => {
     const cwd = tempWorkspace('spec-gate-shellpre-')
     const fake = createFakeHost({ cwd, approvalOutcome: 'allowed-once' })
-    apply(fake.ctx as never, { logFile: path.join(cwd, 'spec-gate.log'), approval: 'auto' })
+    apply(fake.ctx as never, { logFile: path.join(cwd, 'spec-gate.log'), approval: 'seam' })
     await fake.runTool('spec_create', DRAFT)  // mission exists, NOT approved
     const shell = (command: string) => fake.guardReason({ name: 'bash', arguments: { command }, agent: fake.agent })
 

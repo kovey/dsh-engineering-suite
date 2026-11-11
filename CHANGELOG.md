@@ -20,6 +20,26 @@ TypeScript 编译器 API 逐函数核对：0 差异；245 个文件括号配平�
 
 ## [未发布] — 2026-11-11
 
+### 变更（不兼容）· 移除 `approval: "auto"`：门禁批准不再能由配置自动放行
+
+`dsh-spec-gate` 的 `approval` 只剩 `"seam"`。写 `"auto"` 的配置**加载期报错**并说明原因，不再静默降级。
+此前的 `auto` 短路发生在 `spec_approve` 的调用方（`requestApproval()`），**绕过**了门禁授权内核：
+它不问任何人就返回 `allowed-once`，并把 `by: "auto"` 写进 mandate——等于谁改了 `.dsh/spec-gate.json`，
+谁就能让模型批准自己的规格，而"批准人"一栏写的是一个配置开关。
+
+- **迁移**：`approval: "auto"` → `approval: "seam"`（或删掉该键，`seam` 就是默认值），并确认部署里有一条能回答的
+  审批面（宿主接缝 / nvim-tui 扩展卡片 / `userQuestions` / 套件 IM 通道）。没有面时的结果是 `no-answerer`
+  （失败关闭、点名"没有人被问到"），**不是**自动通过。
+- **历史记录照读**：旧 mandate 里的 `by: "auto"`（或 `automatic: true`）仍可读取，强度规则对它们逐字不变
+  （依旧永不 `explicit`）；`automatic` 现在恒为 `false`，因为已没有产生 `true` 的来源。
+- **测试面**：`spec-gate` 的 10 处改用 `seam` + 脚本化应答者（夹具的 `approvalOutcome: 'allowed-once'`）；
+  `test/integration.test.ts`（1 处）与 `dsh-evidence-gate` 测试（3 处，本就不是它的配置键，属被忽略的多余键）
+  同步改/删。断言未改、用例数未减：spec-gate **148**、evidence-gate **60**、integration **3**，全绿。
+- **结构违规清偿**：`config.ts` 382 → **277** 行（值解析器与 `bootstrap` 段拆到 `config-values.ts` /
+  `config-bootstrap.ts`，各 78 行）；`tools.ts` 中 `rich` 的两个 >20 行 `if` 块（34 / 26 行）拆成
+  `answerThroughQuestions()`（43 行，内部 `if` 块最长 7 行）。`bash scripts/standards-check.sh` exit 0
+  （无新增/恶化；基线里 `#L` 行号敏感条目未漂移）。
+
 ### 重构 · 偿清结构规范剩余 7 项（五个插件，行为不变）
 
 `bash scripts/standards-check.sh` 的"新增 5 / 恶化 2"逐项清零（`--quiet` 退出码 0，已接受 568 → **558**）：
@@ -1138,7 +1158,8 @@ heredoc 正文里的"大于号加文件名"也会被当作写盘。
 外加 write-once 的 `missions/<id>/policy-fingerprint.json`（批准时刻的信任根逐文件摘要）。
 
 - **强度是算出来的**：子代理一律 `inferred`（即使在白名单里）；配了白名单 ⇒ 只有名单内的人算 `explicit`（IM 途径同样适用）；
-  没配白名单 ⇒ 仅本地/终端来源且非子代理算 `explicit`，未知来源按远端处理；`approval: auto` 只有**没有**白名单时才算 `explicit`。
+  没配白名单 ⇒ 仅本地/终端来源且非子代理算 `explicit`，未知来源按远端处理；`approval: auto` 只有**没有**白名单时才算 `explicit`
+  （该取值已在后续版本移除，见「未发布」的"移除 approval: auto"；历史记录仍按此规则读取）。
   白名单以只读方式取自信任根 `.dsh/role-guard.json`（`approvers`/`allowlist`）与交互层的 `approversFile`。
 - **`inferred` 今天失败关闭**：被记录并被点名，但不满足强制门禁——需要"已批准规格"的写操作仍被拒绝，理由点名 `inferred`。
 - **不可变**：再次批准不覆盖旧记录；**要更宽的范围必须开新 mission**（会被拒绝并说明）。

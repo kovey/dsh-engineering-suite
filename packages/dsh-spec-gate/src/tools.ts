@@ -23,7 +23,7 @@ import {
     readHostApprovalPolicy,
     requestGateApproval,
     GATE_APPROVAL_VIAS,
-    type GateSurfaceAdapter,
+    type GateSurfaceAdapter, type GateSurfaceAnswer,
     parentSessionIdOf,
     mandateScopeOf,
     mandateState,
@@ -960,7 +960,7 @@ export function registerTools(
                     ...(decision.source === '' ? {} : { source: decision.source }),
                     ...(agent === undefined ? {} : { agent }),
                     allowlist: approverAllowlist(mission.cwd, { rootDir: store.layout.rootDir }),
-                    automatic: effective.approval === 'auto',
+                    automatic: false,
                 })
                 const policy = policyFingerprint(mission.cwd, { rootDir: store.layout.rootDir })
                 const mandateToWrite: Mandate | undefined =
@@ -2008,6 +2008,62 @@ type ApprovalRequestResult =
       }
 
 /**
+ * The `userQuestions` route of the rich surface: a structured review card on the
+ * client UIs (desktop / web TUI).
+ *
+ * `user-questions` is the official seam those clients already render — and here
+ * it is used LEGITIMATELY: `spec_approve` is a real tool call, so the card is
+ * keyed by its own callId rather than a fabricated one. A route that cannot
+ * answer hands over to the next one; `reviewChannel=questions` refuses instead
+ * of downgrading (that configuration said "this route or nothing").
+ * @param input - the seam, the mission, and the digest the card displays.
+ * @returns the mapped answer, or `undefined` when this route cannot answer.
+ */
+async function answerThroughQuestions(input: {
+    deps: ToolDeps
+    config: SpecGateConfig
+    mission: MissionRecord
+    store: MissionStore
+    missionsDir: string
+    round: number
+    shownDigest: string
+    context: { agent?: AgentLike; signal?: AbortSignal; callId?: unknown }
+}): Promise<GateSurfaceAnswer | undefined> {
+    const { config, context, mission, deps } = input
+    if (config.reviewChannel !== 'auto' && config.reviewChannel !== 'questions') return undefined
+    const questions = deps.questions()
+    if (questions === undefined || context.agent === undefined) {
+        if (config.reviewChannel !== 'questions') return undefined
+        throw new Error(
+            '规格审批未进行：reviewChannel=questions，但宿主没有可用的 user-questions 接缝（ctx.get("userQuestions")）或当前调用没有 agent。' +
+                `请改回 auto/approval，或在 desktop / web TUI / 任何渲染提问面板的客户端里运行。（mission ${mission.id}）`,
+        )
+    }
+    const decided = await reviewThroughQuestions({
+        questions,
+        agent: context.agent,
+        ...(context.signal === undefined ? {} : { signal: context.signal }),
+        ...(callIdOf(context) === undefined ? {} : { callId: callIdOf(context) as string }),
+        mission,
+        store: input.store,
+        missionsDir: input.missionsDir,
+        round: input.round,
+        log: (message: string) => deps.logger.for(mission.cwd).info(`[review] ${message}`),
+    })
+    if (decided === undefined) return undefined
+    if ('decision' in decided) {
+        return { kind: 'answer', decision: 'allowed-once', by: 'approval', via: 'tui-approval', displayedDigest: input.shownDigest }
+    }
+    if (decided.outcome === 'cancelled') return { kind: 'answer', decision: 'cancelled', via: 'tui-approval' }
+    return {
+        kind: 'answer',
+        decision: 'rejected',
+        via: 'tui-approval',
+        ...(decided.note === undefined ? {} : { note: decided.note }),
+    }
+}
+
+/**
  * Ask for the specification's approval through the gate-authorisation kernel.
  *
  * The surface is `rich` — a review card that can show (and, on the TUI, open)
@@ -2029,9 +2085,6 @@ async function requestApproval(
     note: string | undefined,
     config: SpecGateConfig,
 ): Promise<ApprovalRequestResult> {
-    if (config.approval === 'auto') {
-        return { decision: 'allowed-once', by: 'auto', messageId: '', source: 'auto', allowed: true }
-    }
     const context = exec as { agent?: AgentLike; signal?: AbortSignal }
     const store = deps.stores.for(mission.cwd)
     const layout = store.layout
@@ -2099,44 +2152,20 @@ async function requestApproval(
                     '请把 reviewChannel 改回 auto/approval，或在 TUI 里运行。（mission ' + mission.id + '）',
             )
         }
-        // Structured review card on the client UIs (desktop / web TUI).
-        // `user-questions` is the official seam those clients already render — and
-        // here it is used LEGITIMATELY: `spec_approve` is a real tool call, so the
-        // card is keyed by its own callId rather than a fabricated one.
-        if (config.reviewChannel === 'auto' || config.reviewChannel === 'questions') {
-            const questions = deps.questions()
-            if (questions !== undefined && context.agent !== undefined) {
-                const decided = await reviewThroughQuestions({
-                    questions,
-                    agent: context.agent,
-                    ...(context.signal === undefined ? {} : { signal: context.signal }),
-                    ...(callIdOf(context) === undefined ? {} : { callId: callIdOf(context) as string }),
-                    mission,
-                    store,
-                    missionsDir,
-                    round: roundForReview,
-                    log: (message: string) => deps.logger.for(mission.cwd).info(`[review] ${message}`),
-                })
-                if (decided !== undefined) {
-                    if ('decision' in decided) {
-                        return { kind: 'answer', decision: 'allowed-once', by: 'approval', via: 'tui-approval', displayedDigest: shownDigest }
-                    }
-                    if (decided.outcome === 'cancelled') return { kind: 'answer', decision: 'cancelled', via: 'tui-approval' }
-                    return {
-                        kind: 'answer',
-                        decision: 'rejected',
-                        via: 'tui-approval',
-                        ...(decided.note === undefined ? {} : { note: decided.note }),
-                    }
-                }
-                // `undefined` = the card produced no usable answer: fall through.
-            } else if (config.reviewChannel === 'questions') {
-                throw new Error(
-                    '规格审批未进行：reviewChannel=questions，但宿主没有可用的 user-questions 接缝（ctx.get("userQuestions")）或当前调用没有 agent。' +
-                        `请改回 auto/approval，或在 desktop / web TUI / 任何渲染提问面板的客户端里运行。（mission ${mission.id}）`,
-                )
-            }
-        }
+        // Structured review card on the client UIs (desktop / web TUI). The whole
+        // route — including the `reviewChannel=questions` refusal — lives in
+        // `answerThroughQuestions`, so neither branch becomes an unreadable `if`.
+        const viaQuestions = await answerThroughQuestions({
+            deps,
+            config,
+            mission,
+            store,
+            missionsDir,
+            round: roundForReview,
+            shownDigest,
+            context,
+        })
+        if (viaQuestions !== undefined) return viaQuestions
         // Last rich route: the generic host seam. Kept because a headless host
         // has no card renderer at all, and the reason carries the whole review
         // sheet (it is not a blind yes/no popup). The decision is still bound to
@@ -2151,7 +2180,7 @@ async function requestApproval(
         if (approval === undefined) {
             throw new Error(
                 '规格审批未通过：宿主没有装配审批通道（ctx.approval），而 spec-gate 的 approval 模式是 "seam"。' +
-                    `请让人类审批后把 approval 改为 auto，或装配审批插件。（mission ${mission.id}）`,
+                    `approval="auto" 已移除（不会再有任何自动批准路径），请装配审批插件或在有审批通道的客户端里运行。（mission ${mission.id}）`,
             )
         }
         const reply = await approval.request({

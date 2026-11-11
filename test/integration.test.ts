@@ -266,7 +266,7 @@ test('a turn that ends on a red gate is steered back instead of closing', async 
     for (const toolName of ['read', 'write', 'edit']) {
         fake.tools.set(toolName, { name: toolName, description: 'stub', parameters: {}, execute: async () => 'ok' })
     }
-    applySpecGate(fake.ctx as never, { logFile: path.join(cwd, 'spec.log'), approval: 'auto' })
+    applySpecGate(fake.ctx as never, { logFile: path.join(cwd, 'spec.log'), approval: 'seam' })
     applyQuality(fake.ctx as never, {
         logFile: path.join(cwd, 'quality.log'),
         commands: [{ id: 'test', name: '单元测试', command: 'node -e "process.exit(1)"', required: true }],

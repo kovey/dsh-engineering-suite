@@ -1461,7 +1461,7 @@ test('an adopted standards gate must pass for this round of the code (regression
     // SEPARATE axis from the quality gate — structural debt does not fail a build.
     const cwd = tempWorkspace('evidence-standards-')
     const fake = createFakeHost({ cwd })
-    apply(fake.ctx as never, { logFile: path.join(cwd, 'evidence-gate.log'), approval: 'auto', requireStandardsGate: true })
+    apply(fake.ctx as never, { logFile: path.join(cwd, 'evidence-gate.log'), requireStandardsGate: true })
     const store = new MissionStoreRegistry().for(cwd)
     const mission = store.create({ title: '规范门禁', cwd, sessionId: 'session-1' })
     store.bindSession('session-1', mission.id, 'implement')
@@ -1519,7 +1519,7 @@ test('a hand-written standards gate is treated as a forgery (regression)', async
     // gates/*.json. Same trick, same refusal.
     const cwd = tempWorkspace('evidence-standards-forge-')
     const fake = createFakeHost({ cwd })
-    apply(fake.ctx as never, { logFile: path.join(cwd, 'evidence-gate.log'), approval: 'auto', requireStandardsGate: true })
+    apply(fake.ctx as never, { logFile: path.join(cwd, 'evidence-gate.log'), requireStandardsGate: true })
     const store = new MissionStoreRegistry().for(cwd)
     const mission = store.create({ title: '伪造规范门禁', cwd, sessionId: 'session-1' })
     store.bindSession('session-1', mission.id, 'implement')
@@ -1566,7 +1566,7 @@ test('a project that sets the standards keys is reported as the source (regressi
         JSON.stringify({ requireStandardsGate: true, standardsGateSource: 'dsh-standards-gate' }),
     )
     const fake = createFakeHost({ cwd })
-    apply(fake.ctx as never, { logFile: path.join(cwd, 'evidence-gate.log'), approval: 'auto' })
+    apply(fake.ctx as never, { logFile: path.join(cwd, 'evidence-gate.log') })
     const store = new MissionStoreRegistry().for(cwd)
     const mission = store.create({ title: '溯源', cwd, sessionId: 'session-1' })
     store.bindSession('session-1', mission.id, 'implement')

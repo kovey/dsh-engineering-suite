@@ -877,7 +877,9 @@ unavailable`。所以本插件在 `approvalVia != off` 时用 **`{ prepend: true
 1. **不可变**：再次批准不覆盖旧 mandate；**要更宽的范围就开新 mission**（拒绝并说明）。否则"批准"会变成一个可以被悄悄放宽的字段。
 2. **强度是算出来的，不是声称的**：子代理会话一律 `inferred`（即使在白名单里）；配了白名单 ⇒ 只有名单内的 `approvedBy` 才 `explicit`
    （IM 途径同样适用）；没配白名单 ⇒ 仅"本地/终端这类来源且非子代理"算 `explicit`，未知来源一律按远端处理；
-   `approval: auto` 只有在**没有**白名单时才算 `explicit`（有白名单时它等于"没人真的批过"）。
+   自动批准（`by: "auto"`，或历史记录里的 `automatic` 标记）**永远不是** `explicit`——一个配置开关不是人。
+   这个取值本身已被移除（见 §5.29）：新配置写 `approval: "auto"` 会在加载期被拒绝，而历史 mandate 里的
+   `by: "auto"` 仍可读取，强度规则对它们逐字不变（依旧永不 `explicit`）。
 3. **只有人的 stop 才能撤销**：新增 `orchestrate({ action: 'stop' })` 记录 `withdrawn:{at,by,reason}`；
    `mission_complete`（交付完成）**不**撤销任何东西——交付是"做完"，不是"收回授权"。
 4. **恢复前重校验**：`orchestrate({ action: 'unblock' })` 先校验 policyVersion、批准人是否仍在名单、是否已撤销、mandate 是否损坏；
@@ -1121,6 +1123,34 @@ IM 面如何被发现：`dsh-interaction-gate` 导出 `imApprovalSurface(ctx, cw
 它**不影响** `im.approvalVia=off|fallback|only`：那三个值决定的仍然只是"本插件是否接管宿主的
 `approval/request` 瀑布"，与"IM 卡片能不能承载一次门禁批准"是两件事。各门禁不 import 别的插件，
 而是按结构读 `ctx.get('interaction')`（与 doctor 一样）。
+
+### 5.29 移除 `approval: "auto"`：门禁批准不能由配置自动放行
+
+`approval` 以前有两个取值：`seam`（走审批接缝问人）与 `auto`（**不问任何人**，直接返回
+`allowed-once`，并把 `by: "auto"` 写进 mandate）。后者是一个授权洞，而且它不在 5.28 的内核里：
+内核始终没有 `auto` 分支，这个短路分支长在 `spec_approve` 的调用方，绕过了整个 `requestGateApproval()`。
+门禁批准是"谁、依据哪一版规则、允许这项工作开展"的授权记录，`auto` 却把**一个配置开关**写成了批准人——
+谁改了 `.dsh/spec-gate.json`，谁就能让模型批准自己的规格，"批准人"一栏写的是 `auto` 而不是人。
+
+改动（都在 `dsh-spec-gate`）：
+
+- **只有一个取值**：`ApprovalMode` 只剩 `'seam'`；`approvalModeOf()` 是唯一的解析点，`resolveConfig()` 与
+  项目级覆盖都走它。配置里写 `"auto"` 时**加载期抛错**并说明原因（改成 `seam`、确保有审批通道、
+  历史记录仍可读），不再静默批准，也不再静默忽略——静默忽略会让人以为配置生效了。
+- **没有自动批准路径**：`requestApproval()` 里的 `approval === 'auto'` 短路删除。拿到 `allowed-once` 只有
+  一条路：经 `requestGateApproval()` 的某个面（nvim-tui 卡片 / `userQuestions` / 宿主接缝 / 套件 IM 卡片）
+  真的得到答复，且决定绑定**被展示材料**的摘要（`digest`）。
+- **历史记录照读**：`approvalStrength({ automatic })` 那条规则保留的是历史语义——旧 mandate 里的
+  `by: "auto"`（或 `automatic: true`）仍然按"永不 `explicit`"计算，一个都不会因为这次移除而变成 `explicit`。
+  `automatic` 现在恒为 `false`，因为它没有能产生 `true` 的来源了。
+
+**迁移**：把 `approval: "auto"` 改成 `approval: "seam"`（或删掉该键，`seam` 是默认值），并确认部署里有一条
+能回答的审批面：宿主接缝（`ctx.approval`）、nvim-tui 扩展卡片、`userQuestions` 接缝，或套件 IM 通道。
+一个面都没有时的结果是 `no-answerer`（失败关闭，点明"没有人被问到"），**不是**自动通过。
+
+**测试面**：原先依赖 `auto` 的用例改为 `seam` + 脚本化应答者（夹具的 `host({ approvalOutcome: 'allowed-once' })`），
+断言语义与用例数量不变；`dsh-evidence-gate` 测试里那些 `approval: 'auto'` 本就不是它的配置键（被忽略的多余键），
+直接删掉即可——断言未动。
 
 ## 6. 为什么这样切分
 

@@ -1,16 +1,30 @@
 /**
  * Plugin configuration (docs.md §9: the deterministic half of a gate always
  * comes from the host, never from the model).
+ *
+ * The value parsers, the two enum normalisers and the `bootstrap` section live
+ * in `config-values.ts` / `config-bootstrap.ts`: this module only assembles the
+ * resolved object, so a reader can see every default on one screen.
  * @module dsh-spec-gate/config
  */
 
 import { containedPath, loadProjectConfig, type Layout, type LayoutOptions, type Logger } from 'dsh-eng-core'
+import {
+    approvalModeOf,
+    bool,
+    isRecord,
+    num,
+    reviewChannelOf,
+    shellAllowOf,
+    str,
+    strList,
+    type ApprovalMode,
+    type ReviewChannel,
+} from './config-values.js'
+import { mergeBootstrap, resolveBootstrap, type BootstrapConfig } from './config-bootstrap.js'
 
 /** Whether an unapproved specification blocks writes. */
 export type EnforceMode = boolean
-
-/** How the approval of a specification is obtained. */
-export type ApprovalMode = 'seam' | 'auto'
 
 /** Resolved plugin configuration. */
 export interface SpecGateConfig {
@@ -27,42 +41,11 @@ export interface SpecGateConfig {
      * input box — and falls back to the generic approval seam (headless, web,
      * CI). `tui` refuses instead of falling back; `approval` always uses the seam.
      */
-    reviewChannel: 'auto' | 'tui' | 'approval' | 'questions'
+    reviewChannel: ReviewChannel
     /** How long a review card waits for a verdict before giving up (fail closed). */
     reviewTimeoutMs: number
-    /**
-     * Drafting specifications for repositories that already exist
-     * (`spec_bootstrap`): the scan is deterministic, the model only writes the
-     * missing prose, and nothing it returns is approved automatically.
-     */
-    bootstrap: {
-        /** `false` disables the tool entirely. */
-        enabled: boolean
-        /** `ctx.subagents` provider used for the read-only drafting child. */
-        provider: string
-        /** Tools the drafting child may use — read-only by construction. */
-        readTools: readonly string[]
-        /**
-         * Model route for the drafting child (`provider/model` or a bare model id).
-         *
-         * Reading a repository is exactly the work a cheap model can do, so a host
-         * can point drafting somewhere cheaper than the session's model without
-         * changing anything else. Omitted = the session's own model.
-         */
-        model?: string
-        /** Adapter-owned reasoning effort for the drafting child. */
-        reasoningEffort?: string
-        /** Output-token cap for the drafting child. */
-        maxTokens?: number
-        /** Deadline for one drafting child. */
-        timeoutMs: number
-        /** Bound on how many index entries the brief lists. */
-        maxIndexEntries: number
-        /** Bound on the cases a draft may contain. */
-        maxCases: number
-        /** Minimum length of a case's steps/expected before `check` complains. */
-        minTextLength: number
-    }
+    /** Drafting specifications for repositories that already exist (`spec_bootstrap`). */
+    bootstrap: BootstrapConfig
     layout: LayoutOptions
     /** Deny write-class tools while the session's mission has no approved spec. */
     enforce: EnforceMode
@@ -114,33 +97,12 @@ export interface SpecGateConfig {
      * useful for a product repo and noise for a one-off script.
      */
     milestoneRequired: boolean
-    /** `seam` asks the human through `ctx.approval`; `auto` approves on record. */
+    /** Only `seam`: a specification approval must come from a person through the seam. */
     approval: ApprovalMode
     prompt: {
         enabled: boolean
         order: number
     }
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-    return typeof value === 'object' && value !== null && !Array.isArray(value)
-}
-
-function str(value: unknown, fallback: string): string {
-    return typeof value === 'string' && value !== '' ? value : fallback
-}
-
-function bool(value: unknown, fallback: boolean): boolean {
-    return typeof value === 'boolean' ? value : fallback
-}
-
-function num(value: unknown, fallback: number): number {
-    return typeof value === 'number' && Number.isFinite(value) ? value : fallback
-}
-
-function strList(value: unknown, fallback: readonly string[]): string[] {
-    if (!Array.isArray(value)) return [...fallback]
-    return value.filter((entry): entry is string => typeof entry === 'string' && entry !== '')
 }
 
 /**
@@ -154,16 +116,6 @@ function strList(value: unknown, fallback: readonly string[]): string[] {
  * in the trust root, so the model cannot rewrite it
  * with the write tools (only the derived `specs/*.md` is writable there).
  */
-export /** Host-only glob list; a value of the wrong shape keeps the host's list. */
-function shellAllowOf(raw: unknown, fallback: readonly string[]): readonly string[] {
-    if (!Array.isArray(raw)) return fallback
-    const kept: string[] = []
-    for (const entry of raw) {
-        if (typeof entry === 'string' && entry.trim() !== '') kept.push(entry.trim())
-    }
-    return kept
-}
-
 const PROJECT_OVERRIDABLE_KEYS: readonly string[] = [
     'enforce',
     'enforceBoundaries',
@@ -258,7 +210,7 @@ export function resolveEffectiveConfig(host: SpecGateConfig, layout: Layout, log
         boundaryExemptPaths: strList(raw['boundaryExemptPaths'], host.boundaryExemptPaths ?? []),
         requireTestDesign:
             typeof requireTestDesignRaw === 'boolean' ? requireTestDesignRaw : requireTestDesignRaw === 'auto' ? 'auto' : host.requireTestDesign,
-        approval: raw['approval'] === 'seam' || raw['approval'] === 'auto' ? raw['approval'] : host.approval,
+        approval: approvalModeOf(raw['approval'], host.approval),
         reviewChannel: reviewChannelOf(raw['reviewChannel'], host.reviewChannel),
         reviewTimeoutMs: Math.max(1_000, Math.floor(num(raw['reviewTimeoutMs'], host.reviewTimeoutMs))),
         bootstrap: mergeBootstrap(raw['bootstrap'], host.bootstrap),
@@ -276,41 +228,6 @@ export function resolveEffectiveConfig(host: SpecGateConfig, layout: Layout, log
 /** The write-class tools the harness ships. */
 export const DEFAULT_WRITE_TOOLS: readonly string[] = ['write', 'edit']
 
-/**
- * Parse the `bootstrap` section.
- *
- * A model route is optional: when it is omitted the drafter asks the host's
- * `agentDefaultModel`, so the common case needs no configuration at all.
- */
-/** The read-only tool set a drafting child gets (no write/edit/bash by design). */
-export const DEFAULT_BOOTSTRAP_READ_TOOLS: readonly string[] = ['read', 'grep', 'glob']
-
-export function resolveBootstrap(value: unknown): SpecGateConfig['bootstrap'] {
-    const raw = isRecord(value) ? value : {}
-    return {
-        enabled: bool(raw['enabled'], true),
-        provider: str(raw['provider'], 'spawn'),
-        readTools: strList(raw['readTools'], DEFAULT_BOOTSTRAP_READ_TOOLS),
-        ...(typeof raw['model'] === 'string' && raw['model'] !== '' ? { model: raw['model'] } : {}),
-        ...(typeof raw['reasoningEffort'] === 'string' && raw['reasoningEffort'] !== ''
-            ? { reasoningEffort: raw['reasoningEffort'] }
-            : {}),
-        ...(typeof raw['maxTokens'] === 'number' && raw['maxTokens'] > 0
-            ? { maxTokens: Math.floor(raw['maxTokens']) }
-            : {}),
-        timeoutMs: Math.max(10_000, Math.floor(num(raw['timeoutMs'], 10 * 60_000))),
-        maxIndexEntries: Math.max(5, Math.floor(num(raw['maxIndexEntries'], 40))),
-        maxCases: Math.max(1, Math.floor(num(raw['maxCases'], 80))),
-        minTextLength: Math.max(1, Math.floor(num(raw['minTextLength'], 12))),
-    }
-}
-
-/** Overlay one project-level `bootstrap` object onto the host's. */
-function mergeBootstrap(value: unknown, host: SpecGateConfig['bootstrap']): SpecGateConfig['bootstrap'] {
-    if (!isRecord(value)) return host
-    return resolveBootstrap({ ...host, ...value })
-}
-
 /** Shell tools inspected for write targets (see `shell.ts`). */
 export const DEFAULT_SHELL_TOOLS: readonly string[] = ['bash', 'pwsh']
 
@@ -319,11 +236,6 @@ export const DEFAULT_SHELL_TOOLS: readonly string[] = ['bash', 'pwsh']
  * @param input - the loader row's `config` value (untrusted).
  * @returns the resolved configuration with every default applied.
  */
-/** Normalise `reviewChannel` in ONE place (two hand-written enums drifted apart). */
-function reviewChannelOf(value: unknown, fallback: 'auto' | 'tui' | 'approval' | 'questions'): 'auto' | 'tui' | 'approval' | 'questions' {
-    return value === 'auto' || value === 'tui' || value === 'approval' || value === 'questions' ? value : fallback
-}
-
 export function resolveConfig(input: unknown): SpecGateConfig {
     const raw = isRecord(input) ? input : {}
     const prompt = isRecord(raw['prompt']) ? raw['prompt'] : {}
@@ -356,7 +268,7 @@ export function resolveConfig(input: unknown): SpecGateConfig {
         adrDir: str(raw['adrDir'], ''),
         adrIndexFile: str(raw['adrIndexFile'], ''),
         milestoneRequired: bool(raw['milestoneRequired'], false),
-        approval: raw['approval'] === 'auto' ? 'auto' : 'seam',
+        approval: approvalModeOf(raw['approval'], 'seam'),
         prompt: {
             enabled: bool(prompt['enabled'], true),
             order: num(prompt['order'], 620),

@@ -302,7 +302,7 @@ profile 是上限，每个仓库可以用 `.dsh/spec-gate.json` 决定**自己**
 > `../`、绝对路径、指向外面的符号链接都会被拒绝并报为问题（继续使用 profile 的值）——台账与决策记录是本仓库的工件，
 > 挪到工作区外等于让审阅它的人看不到，而且会写进别的目录。profile（宿主）不受这条限制。
 | `milestoneRequired` | `false` | `true` 时 `spec_create` 必须带 `milestone`，否则拒绝并给出下一步 |
-| `approval` | `'seam'` | `seam` 走人工审批；`auto` 记录即通过（CI 用） |
+| `approval` | `'seam'` | **只有** `seam`：批准必须来自一个真实审批面（宿主接缝 / nvim-tui 卡片 / `userQuestions` / IM 卡片）。`auto`（记录即通过）已移除——写它会在加载期报错并说明迁移方式；历史 `by: "auto"` 的 mandate 仍可读取，但不会再产生新的 |
 | `rootDir` / `specsDir` / `missionsDir` | `.dsh` … | 工件布局 |
 | `prompt.enabled` / `prompt.order` | `true` / `620` | 系统提示段 |
 
