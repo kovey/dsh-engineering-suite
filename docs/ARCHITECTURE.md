@@ -1064,7 +1064,8 @@ unavailable`。所以本插件在 `approvalVia != off` 时用 **`{ prepend: true
    门禁于是"静默拒绝"了一件根本没人被问到的事；
 2. 拒绝 / 取消 / 无人应答被合并成一句"人工审批未通过（拒绝/取消/无审批通道）"，事后无法区分。
 
-所以授权语义收敛到 `dsh-eng-core` 的 `requestGateApproval()`（`gate-approval.ts`），两种呈现面：
+所以授权语义收敛到 `dsh-eng-core` 的 `requestGateApproval()`（`gate-approval/`：`decide.ts` 是唯一入口，
+`types.ts` / `words.ts` / `policy.ts` / `text.ts` / `verdict.ts` 分别承载词表、策略读取、文案与裁决），两种呈现面：
 
 - **`rich`**（富审阅）：需要看到甚至修改材料才能决定的场景（`spec_approve`）。面适配器由**调用方**提供：
   nvim-tui 扩展卡片（`via: 'tui-card'`）或 `userQuestions` 的 `plan-review`（`via: 'tui-approval'`）。

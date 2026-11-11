@@ -2226,18 +2226,36 @@ function metricRow(text: string, label: string): string {
     return text.split('\n').find((line) => line.startsWith(`| ${label}`)) ?? ''
 }
 
-/** Content hash of every file under `.dsh` (the read-only assertion). */
-function snapshotDsh(cwd: string): Record<string, string> {
-    const root = path.join(cwd, '.dsh')
+/**
+ * Content hash of ONLY the paths one fixture owns.
+ *
+ * The whole `.dsh` tree is not ours to watch: the suite's runtime state (and a
+ * parallel run of another package) can land under it at any moment, and a
+ * snapshot taken mid-write accuses `metrics` of a write it did not do. So a test
+ * declares the paths it seeded — its mission directories and the ledgers it
+ * appended — and asserts THOSE are byte-identical. Directories are walked, so a
+ * file ADDED inside an owned mission directory is still caught.
+ * @param cwd - the workspace root.
+ * @param owned - workspace-relative paths (files or directories) the test seeded.
+ */
+function snapshotOwned(cwd: string, owned: readonly string[]): Record<string, string> {
     const files: Record<string, string> = {}
+    const hash = (file: string): void => {
+        files[path.relative(cwd, file)] = createHash('sha256').update(fs.readFileSync(file)).digest('hex')
+    }
     const walk = (dir: string): void => {
         for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
             const full = path.join(dir, entry.name)
             if (entry.isDirectory()) walk(full)
-            else files[path.relative(cwd, full)] = createHash('sha256').update(fs.readFileSync(full)).digest('hex')
+            else hash(full)
         }
     }
-    if (fs.existsSync(root)) walk(root)
+    for (const relative of owned) {
+        const full = path.join(cwd, relative)
+        if (!fs.existsSync(full)) continue
+        if (fs.statSync(full).isDirectory()) walk(full)
+        else hash(full)
+    }
     return files
 }
 
@@ -2469,14 +2487,7 @@ test('metrics bounds the in-flight list oldest first and reports how many are hi
 })
 
 
-/** Byte-identical snapshot comparison (keys and contents). */
-function sameSnapshot(a: Record<string, string>, b: Record<string, string>): boolean {
-    const keys = Object.keys(a)
-    if (keys.length !== Object.keys(b).length) return false
-    return keys.every((key) => b[key] === a[key])
-}
-
-test('metrics is read-only: the .dsh snapshot is byte-identical before and after', async () => {
+test('metrics is read-only: the mission trail and ledgers it reads are byte-identical before and after', async () => {
     disposeHosts()
     const cwd = tempWorkspace('orchestrator-metrics-readonly-')
     const fake = host({ cwd })
@@ -2494,41 +2505,30 @@ test('metrics is read-only: the .dsh snapshot is byte-identical before and after
     seedMission(store, cwd, { id: 'm-done', createdAt: now - 40 * DAY_MS, approvedAt: now - 39 * DAY_MS, gates: [{ source: 'dsh-quality-gate', state: 'PASS', checkedAt: now - 38 * DAY_MS }], receipts: [now - 36 * DAY_MS] })
     appendLedger(cwd, 'deployments', [deployRow(now - DAY_MS, 'DPL-1', 'prod', 'r1', 'deployed')])
     appendLedger(cwd, 'releases', [{ at: now - DAY_MS, version: 'v2.0.0', missionIds: ['m-done'], receiptIds: ['RCP-01'] }])
-    // Settle BEFORE taking the baseline. `apply()` and the store writes are
-    // synchronous today, but this test measures "metrics wrote nothing" — if any
-    // setup work ever lands a tick later, it must land on the baseline side, not
-    // between the two snapshots (that is a false accusation, not a finding).
-    // Wait for `.dsh` to go QUIET instead of guessing a settle delay: under a full
-    // parallel run something can still be landing here, and a snapshot taken mid-write
-    // makes `metrics` look guilty of a write it did not do. Two consecutive identical
-    // snapshots mean the tree stopped moving; the deadline only bounds the wait.
-    const settleDeadline = Date.now() + 3000
-    let before = snapshotDsh(cwd)
-    for (;;) {
-        await new Promise((resolve) => setTimeout(resolve, 25))
-        const again = snapshotDsh(cwd)
-        if (sameSnapshot(before, again) || Date.now() > settleDeadline) {
-            before = again
-            break
-        }
-        before = again
-    }
+    // Snapshot ONLY what this fixture owns: its two mission directories (the
+    // `mission.json` / `gates/` / `stages/` / `receipts/` files `seedMission`
+    // wrote) and the two ledgers it appended. That narrower scope is not a weaker
+    // assertion — it is the only scope in which "byte-identical" means "metrics
+    // wrote nothing" instead of "nothing else in the process happened to write
+    // while we were looking". A metrics that wrote into a mission directory or a
+    // ledger it read is still caught, byte for byte; added files included.
+    const owned = ['.dsh/missions/m-live', '.dsh/missions/m-done', '.dsh/deployments.jsonl', '.dsh/releases.jsonl']
+    const before = snapshotOwned(cwd, owned)
     assert.ok(Object.keys(before).length > 5, 'the fixture has a trail to protect')
     const liveBefore = store.read('m-live')
 
     const report = await orchestrate(fake, { action: 'metrics' })
     assert.match(report, /## 交付度量/)
-    // Name the difference instead of printing two opaque snapshots: this test has
-    // failed only under a full parallel run, and "expected values to be strictly
-    // equal" told us nothing about WHICH file moved.
-    const after = snapshotDsh(cwd)
+    // Name the difference instead of printing two opaque snapshots: "expected
+    // values to be strictly equal" would not say WHICH owned file moved.
+    const after = snapshotOwned(cwd, owned)
     const added = Object.keys(after).filter((key) => !(key in before))
     const removed = Object.keys(before).filter((key) => !(key in after))
     const changed = Object.keys(before).filter((key) => key in after && after[key] !== before[key])
     assert.deepEqual(
         { added, removed, changed },
         { added: [], removed: [], changed: [] },
-        'metrics must not write, append or touch anything under .dsh',
+        "metrics must not write, append or touch the mission trail or ledgers it read",
     )
     assert.deepEqual(store.read('m-live'), liveBefore, 'no mission mutation')
     // 门禁/回执/阶段计数不变：读两次的报告也必须一致（没有副作用累积）。
