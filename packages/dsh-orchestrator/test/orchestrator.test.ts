@@ -2468,6 +2468,14 @@ test('metrics bounds the in-flight list oldest first and reports how many are hi
     assert.equal(report.includes('m-10'), false, 'the bound hides the newest one, not the oldest')
 })
 
+
+/** Byte-identical snapshot comparison (keys and contents). */
+function sameSnapshot(a: Record<string, string>, b: Record<string, string>): boolean {
+    const keys = Object.keys(a)
+    if (keys.length !== Object.keys(b).length) return false
+    return keys.every((key) => b[key] === a[key])
+}
+
 test('metrics is read-only: the .dsh snapshot is byte-identical before and after', async () => {
     disposeHosts()
     const cwd = tempWorkspace('orchestrator-metrics-readonly-')
@@ -2490,8 +2498,21 @@ test('metrics is read-only: the .dsh snapshot is byte-identical before and after
     // synchronous today, but this test measures "metrics wrote nothing" — if any
     // setup work ever lands a tick later, it must land on the baseline side, not
     // between the two snapshots (that is a false accusation, not a finding).
-    await new Promise((resolve) => setTimeout(resolve, 25))
-    const before = snapshotDsh(cwd)
+    // Wait for `.dsh` to go QUIET instead of guessing a settle delay: under a full
+    // parallel run something can still be landing here, and a snapshot taken mid-write
+    // makes `metrics` look guilty of a write it did not do. Two consecutive identical
+    // snapshots mean the tree stopped moving; the deadline only bounds the wait.
+    const settleDeadline = Date.now() + 3000
+    let before = snapshotDsh(cwd)
+    for (;;) {
+        await new Promise((resolve) => setTimeout(resolve, 25))
+        const again = snapshotDsh(cwd)
+        if (sameSnapshot(before, again) || Date.now() > settleDeadline) {
+            before = again
+            break
+        }
+        before = again
+    }
     assert.ok(Object.keys(before).length > 5, 'the fixture has a trail to protect')
     const liveBefore = store.read('m-live')
 
