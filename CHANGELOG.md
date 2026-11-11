@@ -20,6 +20,30 @@ TypeScript 编译器 API 逐函数核对：0 差异；245 个文件括号配平�
 
 ## [未发布] — 2026-11-11
 
+### 重构 · 偿清结构规范剩余 7 项（五个插件，行为不变）
+
+`bash scripts/standards-check.sh` 的"新增 5 / 恶化 2"逐项清零（`--quiet` 退出码 0，已接受 568 → **558**）：
+
+- **deploy-gate**：`askHuman` 嵌套 8 → **4**、`driveChannels` 122 行 → 从 `askHuman` 的闭包里移出成为
+  `driveRegistryChannels` / `driveOneChannel` / `driveOutcomeOf` / `noUsableChannelDrive`（每个 ≤ 60 行，
+  嵌套 ≤ 4）；`interaction.ask()` 的卡片载荷成为 `askRequestOf`、宿主审批接缝成为 `hostSeamAnswer`；
+  导出 18 → **15**（`MAX_REPORTED_ASKS` / `ACCEPT_VALUES` / `REJECT_VALUES` 只在本文件内使用，
+  `index.ts` 与测试导入清单里都没有它们）。
+- **spec-gate**：`reviewThroughQuestions` 71 → 47 行，送审卡片的组成搬到 `review-card.ts`（`reviewCardOf`）。
+- **impact-gate**：`parseNamedTests` 嵌套 5 → **3**（`namesOnLine`）；`flaky_status` 的渲染整段移出到
+  `flaky-status.ts`（`renderStatus` 111 行拆成 6 个函数），`parseReport` 的逐次运行读取成为 `observedRunOf`。
+- **quality-gate**：`measureBudget` 嵌套 6 → **3**（`failedEvaluation` / `judgedEvaluation` / `unmeasurable`），
+  同一文件里 `resolveTarget`、`readLockRecord`、`parseSpecBudgets` 的嵌套一并对齐到 ≤ 4。
+- **suite-doctor**：`imApprovalChecks` 165 → 47 行（按分支拆成 `noServiceChecks` / `unreadableModeChecks` /
+  `offModeChecks` / `configuredChecks` / `missingCheckOf` / `okCheckOf` / `p2pAdviceCheck`），
+  `workspaceMappingCheckOf` 149 行拆到 `im-approval-workspace.ts`，词表（常量与事实类型）拆到
+  `im-approval-contract.ts` 并由 `im-approval.ts` 重新导出——公开 API 与 15 个导出一个不少。
+
+行为不变由各包自己的用例证明（deploy 79、spec 148、impact 64、quality 97、suite-doctor 72，全绿；
+断言未改动、未跳过、未加 exempt/accept；`.dsh/**` 未改）。基线里的 `#L<行号>` 是位置敏感的，
+因此 deploy-gate 的改动保持文件行数 2681 → **2681**：`registerTools` 里 12 条已接受的
+`maxIfBlockLines|…#L<行号>` 一条都没有漂移。
+
 ### 修复 · 结构规范检查：脚本只做输出，判定与插件共用同一份实现（并钉住分叉）
 
 会话里的 `standards_check` 与质量门禁的 `bash scripts/standards-check.sh` 对同一份基线给出两个结论：

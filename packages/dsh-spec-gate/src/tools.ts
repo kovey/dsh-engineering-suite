@@ -1,11 +1,11 @@
 /**
- * The model-facing tool surface: `spec_create`, `spec_approve`, `spec_status`,
- * `spec_bootstrap`.
+ * The model-facing tool surface: `spec_create`, `spec_approve`, `spec_status`, `spec_bootstrap`.
  * @module dsh-spec-gate/tools
  */
 
 import path from 'node:path'
 import { tuiReview, type NvimTuiLike, type ReviewArtifacts } from './review.js'
+import { APPROVE_LABEL, reviewCardOf } from './review-card.js'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import {
     approvalStrength,
@@ -48,6 +48,7 @@ import {
     type DelegationServices,
     type GapReport,
     type Layout,
+    type Logger, type MissionStore,
     type Mandate,
     type MissionRecord,
     type MissionStoreRegistry,
@@ -55,7 +56,6 @@ import {
     type SpecChange,
     type SpecRecord,
 } from 'dsh-eng-core'
-import type { Logger, MissionStore } from 'dsh-eng-core'
 import { buildIndex, checkDraft, parseDraftAnswer, renderBrief, renderDraft } from './bootstrap.js'
 import {
     BOOTSTRAP_OWNER,
@@ -2235,24 +2235,6 @@ function callIdOf(context: unknown): string | undefined {
 }
 
 /**
- * Sanity bound for the review card, NOT a host limit.
- *
- * Verified against the installed host: `user-questions` imposes no length limit —
- * the schema only requires that `plan-review` carries a `detail` and that
- * `intent.approve` names one of the options (`BAD_INTENT` otherwise) — and the
- * client renders `detail` as markdown inside a scrollable card
- * (`max-height: min(60vh,520px)`, `overflow-y:auto`). So the number below is this
- * plugin's own ceiling, chosen far above any real specification (the largest
- * spec in this repository is ~13KB) purely so a pathological payload cannot wedge
- * a client.
- *
- * What it must NEVER do is truncate silently: a reviewer who approves a cut-off
- * document did not review it. When the bound does bite, the card says so, names
- * the omitted size and points at the file.
- */
-const REVIEW_DETAIL_LIMIT = 200_000
-
-/**
  * Ask for approval through the host's structured-question seam.
  *
  * Why this seam and not the approval one: the approval waterfall carries a single
@@ -2280,53 +2262,29 @@ async function reviewThroughQuestions(input: {
     | { outcome: 'cancelled' }
     | undefined
 > {
-    const { mission, store, missionsDir } = input
-    const approve = '通过'
-    const markdown = [
-        store.readSpec(mission.id).trim(),
-        '',
-        '---',
-        '',
-        `工件：${approvalArtifacts(mission, missionsDir).join('、')}`,
-        `核对命令：spec_status ${mission.id}（规格与覆盖度）· audit_report（本次会话的写前快照）`,
-    ]
-        .join('\n')
-        .trim()
-    // Never a silent cut: if the bound bites, the card SAYS it did and where the
-    // full document lives. Approving an unread document is the failure mode this
-    // whole channel exists to prevent.
-    const detail =
-        markdown.length <= REVIEW_DETAIL_LIMIT
-            ? markdown
-            : `${markdown.slice(0, REVIEW_DETAIL_LIMIT)}\n\n> ⚠️ 正文过长（${markdown.length} 字符），上面只显示前 ${REVIEW_DETAIL_LIMIT} 字符。完整内容见 ${mission.specPath ?? '规格文件'}；**在读完之前不要点通过**。`
+    const { mission, round } = input
+    const question = reviewCardOf({
+        mission,
+        store: input.store,
+        artifacts: approvalArtifacts(mission, input.missionsDir),
+        round,
+    })
     try {
         const answer = await input.questions.ask({
             agent: input.agent,
             ...(input.signal === undefined ? {} : { signal: input.signal }),
             ...(input.callId === undefined ? {} : { wait: { callId: input.callId } }),
-            questions: [
-                {
-                    id: `spec-review-${mission.id}`,
-                    header: `规格审批 · 第 ${input.round} 轮`,
-                    question: `《${mission.spec?.title ?? mission.title}》第 ${input.round} 轮送审：${approve}还是打回？`,
-                    detail,
-                    options: [
-                        { label: approve, description: '按这份规格实现，并签发 mandate（写操作放行）' },
-                        { label: '打回', description: '规格需要修改；可在下方说明要改什么' },
-                    ],
-                    intent: { kind: 'plan-review', detail, approve },
-                },
-            ],
+            questions: [question],
         })
         const row = answer.answers[0]
         if (row === undefined) return undefined
         const selected = row.selected ?? []
-        if (selected.includes(approve)) {
-            input.log(`questions 通道：${mission.id} 第 ${input.round} 轮通过`)
+        if (selected.includes(APPROVE_LABEL)) {
+            input.log(`questions 通道：${mission.id} 第 ${round} 轮通过`)
             return { decision: 'allowed-once', by: 'approval', messageId: '', source: 'questions', allowed: true }
         }
         const note = (row.custom ?? '').trim() || selected.join('、')
-        input.log(`questions 通道：${mission.id} 第 ${input.round} 轮被打回（${note || '未填理由'}）`)
+        input.log(`questions 通道：${mission.id} 第 ${round} 轮被打回（${note || '未填理由'}）`)
         return { outcome: 'rejected', ...(note === '' ? {} : { note }) }
     } catch (error) {
         const code = (error as { code?: unknown }).code

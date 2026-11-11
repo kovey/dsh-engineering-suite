@@ -68,11 +68,11 @@ import {
     readQuarantine,
     readReport,
     renderPlan,
-    renderStatus as renderFlakyStatus,
     repeatCommand,
     tallyRuns,
     type FlakyPlan,
 } from './flaky.js'
+import { renderStatus as renderFlakyStatus } from './flaky-status.js'
 import { runImpactReview, selectReviewTargets, type ReviewOutcome } from './review.js'
 
 const TEXT_OUTPUT = { type: 'string' } as const

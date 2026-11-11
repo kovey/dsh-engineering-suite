@@ -46,6 +46,7 @@ import {
     type ApprovalLike,
     type ApprovalOutcome,
     type GateApprovalVia,
+    type GateApprovalSurfaces,
     type GateCommandResult,
     type GateRecord,
     type GateScope,
@@ -164,13 +165,13 @@ export interface InteractionLike {
 }
 
 /** Most asks a channel's bare count is allowed to stand for in one report. */
-export const MAX_REPORTED_ASKS = 1_000
+const MAX_REPORTED_ASKS = 1_000
 
 /** Values that mean "yes" when a channel answers with a word instead of a decision. */
-export const ACCEPT_VALUES: readonly string[] = ['yes', 'y', 'ok', 'allow', 'approved', 'approve', 'allowed-once']
+const ACCEPT_VALUES: readonly string[] = ['yes', 'y', 'ok', 'allow', 'approved', 'approve', 'allowed-once']
 
 /** Values that mean "no". Everything else is `unavailable` (fail closed). */
-export const REJECT_VALUES: readonly string[] = ['no', 'n', 'deny', 'denied', 'reject', 'rejected', 'cancel', 'cancelled']
+const REJECT_VALUES: readonly string[] = ['no', 'n', 'deny', 'denied', 'reject', 'rejected', 'cancel', 'cancelled']
 
 /**
  * An unpredictable one-shot token for a question asked through a channel.
@@ -946,136 +947,16 @@ async function askHuman(input: {
     const titleOf = (): string =>
         input.action === 'deploy' ? `部署到 ${environment.name}` : input.action === 'rollback' ? `回滚 ${environment.name}` : `验证 ${environment.name}`
 
-    /**
-     * Drive the channel registry the interaction layer actually provides.
-     *
-     * Returns either a real decision or the refusal text this gate would show
-     * for "nobody answered" — the caller composes the final message, because
-     * only it knows what the approval was for.
-     * @returns the drive result, or `undefined` when the service exposes no registry.
-     */
-    const driveChannels = async (service: InteractionLike): Promise<RegistryDrive | undefined> => {
-        const list = service.list ?? service.describeAll
-        if (list === undefined) return undefined
-        if (typeof service.arm !== 'function' || typeof service.send !== 'function' || typeof service.awaitAnswer !== 'function') {
-            return {
-                refusal:
-                    'interaction 服务暴露了通道列表，却没有提供提问所需的 arm/send/awaitAnswer：无法把卡片发出去并等一个对得上令牌的答案（fail closed）。' +
-                    '下一步：升级/修正该 interaction 服务（`dsh-interaction-gate` 提供 register/send/arm/awaitAnswer），或让宿主装配审批通道。',
-            }
-        }
-        let raw: unknown
-        try {
-            raw = list.call(service)
-        } catch (error) {
-            return {
-                refusal: `interaction 服务列出通道时抛错（${error instanceof Error ? error.message : String(error)}）：无法知道有哪些通道，按 fail closed 拒绝。`,
-            }
-        }
-        const channels = (Array.isArray(raw) ? raw : []).filter(isRecord)
-        const usable = channels.filter((entry) => entry['canAsk'] === true && typeof entry['name'] === 'string' && entry['name'] !== '')
-        if (usable.length === 0) {
-            return {
-                refusal: [
-                    `interaction 服务注册了 ${channels.length} 个通道，但没有一个能提问（canAsk=false）：通道必须实现 wait() 才收得到答案。`,
-                    ...(channels.length === 0
-                        ? ['（一个通道都没有注册：让宿主/IM 插件向 interaction 服务注册一个通道）']
-                        : channels.map((entry) => `  - ${String(entry['name'] ?? '(无名)')}：canAsk=false${typeof entry['reason'] === 'string' && entry['reason'] !== '' ? `（${entry['reason']}）` : ''}`)),
-                    `下一步（任选其一）：让该通道实现 wait()（收不到答案的通道不能用来批准${approvalSubjectLabel(input.action)}）；换一个能提问的通道；或由人把该环境的 ${approvalKeyOf(input.action)} 设为 false（宿主的决定，模型改不了 \`.dsh/**\` 里的配置）。`,
-                ].join('\n'),
-            }
-        }
-        const failures: string[] = []
-        for (const candidate of usable) {
-            const name = candidate['name'] as string
-            const questionId = newQuestionToken()
-            let armed: unknown = false
-            try {
-                armed = (service.arm as (id: string) => unknown).call(service, questionId)
-            } catch (error) {
-                failures.push(`- ${name}：arm() 抛错（${error instanceof Error ? error.message : String(error)}）`)
-                continue
-            }
-            if (armed !== true) {
-                failures.push(`- ${name}：一次性令牌无法登记（arm() 返回 ${JSON.stringify(armed)}）`)
-                continue
-            }
-            let sent: unknown
-            try {
-                sent = await (service.send as (channel: string, message: unknown) => Promise<unknown>).call(service, name, {
-                    kind: 'ask',
-                    title: titleOf(),
-                    body: reason,
-                    questionId,
-                    buttons: [
-                        {
-                            value: 'yes',
-                            label: input.action === 'deploy' ? '批准部署' : input.action === 'rollback' ? '批准回滚' : '批准验证',
-                        },
-                        { value: 'no', label: '拒绝' },
-                    ],
-                })
-            } catch (error) {
-                sent = { ok: false, error: error instanceof Error ? error.message : String(error) }
-            }
-            if (!isRecord(sent) || sent['ok'] !== true) {
-                if (typeof service.retire === 'function') (service.retire as (id: string) => void).call(service, questionId)
-                failures.push(`- ${name}：卡片发不出去（${isRecord(sent) && typeof sent['error'] === 'string' ? sent['error'] : '通道未说明原因'}）`)
-                continue
-            }
-            const implementation = typeof service.get === 'function' ? service.get(name) : undefined
-            const wait =
-                isRecord(implementation) && typeof implementation['wait'] === 'function'
-                    ? (implementation['wait'] as (id: string, ms: number, signal?: AbortSignal) => Promise<unknown>).bind(implementation)
-                    : undefined
-            let awaited: unknown
-            try {
-                awaited = await (service.awaitAnswer as (id: string, ms: number, options?: unknown) => Promise<unknown>).call(service, questionId, timeoutMs, {
-                    ...(wait === undefined ? {} : { wait }),
-                    ...(input.signal === undefined ? {} : { signal: input.signal }),
-                })
-            } catch (error) {
-                awaited = { outcome: 'unreadable', error: error instanceof Error ? error.message : String(error) }
-            }
-            const outcome = isRecord(awaited) && typeof awaited['outcome'] === 'string' ? awaited['outcome'] : 'unreadable'
-            if (outcome === 'answered') {
-                const answer = isRecord(awaited) ? awaited['answer'] : undefined
-                if (!isRecord(answer) || typeof answer['value'] !== 'string') {
-                    // A card that WAS answered is a card that left the process: a
-                    // second prompt in another surface must not follow it.
-                    return {
-                        refusal: `通道 "${name}" 报告已回答，但答案读不出来（没有 value）：按"没有决定"处理（fail closed），本次不执行任何命令。`,
-                        cardAttempted: true,
-                    }
-                }
-                return {
-                    outcome: normalizeInteractionReply({
-                        value: answer['value'],
-                        ...(typeof answer['by'] === 'string' ? { by: answer['by'] } : {}),
-                        ...(typeof answer['messageId'] === 'string' ? { messageId: answer['messageId'] } : {}),
-                        source: name,
-                    }),
-                }
-            }
-            if (outcome === 'timeout') {
-                return {
-                    refusal:
-                        `等待人工批准的截止时间（${timeoutMs}ms，配置 approvalTimeoutMs）到了：通道 "${name}" 没有在期限内给出答案。` +
-                        '超时**不是**拒绝、也**不是**同意——没有人作出决定，本次不执行任何命令。',
-                    cardAttempted: true,
-                }
-            }
-            if (outcome === 'cancelled') {
-                return { outcome: { decision: 'cancelled', by: '', messageId: '', source: name, allowed: false } }
-            }
-            failures.push(
-                `- ${name}：${outcome === 'unknown-token' ? '一次性令牌在等待期间失效（同一令牌只能被回答一次）' : `等待结果读不出来（outcome=${outcome}）`}`,
-            )
-        }
-        return {
-            refusal: [`interaction 服务的通道都没能完成这次提问（${failures.length} 个）：`, ...failures].join('\n'),
-        }
+    // The registry drive is module-level (`driveRegistryChannels`): it needs no
+    // state from this closure beyond the four values below.
+    const driveContext: RegistryDriveContext = {
+        title: titleOf(),
+        reason,
+        timeoutMs,
+        action: input.action,
+        ...(input.signal === undefined ? {} : { signal: input.signal }),
     }
+    const driveChannels = async (service: InteractionLike): Promise<RegistryDrive | undefined> => driveRegistryChannels(service, driveContext)
 
     /**
      * The suite channel, as the kernel's BINARY surface sees it.
@@ -1089,24 +970,11 @@ async function askHuman(input: {
         const interaction = deps.interaction()
         if (interaction !== undefined && typeof interaction.ask === 'function') {
             try {
-                const reply = await interaction.ask({
-                    title: titleOf(),
-                    question: reason,
-                    options: [
-                        { value: 'yes', label: input.action === 'deploy' ? '批准部署' : input.action === 'rollback' ? '批准回滚' : '批准验证' },
-                        { value: 'no', label: '拒绝' },
-                    ],
-                    ...(input.agent === undefined ? {} : { agent: input.agent }),
-                    toolName: input.toolName,
-                    ...(input.signal === undefined ? {} : { signal: input.signal }),
-                })
+                const reply = await interaction.ask(askRequestOf(titleOf(), reason, input.action, input))
                 return surfaceAnswerOf(normalizeInteractionReply(reply), 'im')
             } catch (error) {
-                suiteRefusal = {
-                    reason: `interaction 服务存在，但提问失败（${error instanceof Error ? error.message : String(error)}）：没有人作出决定，按 fail closed 拒绝。`,
-                    cardAttempted: false,
-                }
-                return { kind: 'unavailable', reason: suiteRefusal.reason }
+                suiteRefusal = suiteRefusalOf(`interaction 服务存在，但提问失败（${error instanceof Error ? error.message : String(error)}）：没有人作出决定，按 fail closed 拒绝。`, false)
+                return unavailableAnswer(suiteRefusal.reason)
             }
         }
         // The suite's own interaction layer provides a CHANNEL REGISTRY, not
@@ -1117,18 +985,11 @@ async function askHuman(input: {
             const driven = await driveChannels(interaction)
             if (driven !== undefined) {
                 if (driven.outcome !== undefined) return surfaceAnswerOf(driven.outcome, 'im')
-                suiteRefusal = { reason: driven.refusal ?? '通道没有给出答案', cardAttempted: driven.cardAttempted === true }
-                return {
-                    kind: 'unavailable',
-                    reason: suiteRefusal.reason,
-                    ...(driven.cardAttempted === true ? { cardAttempted: true } : {}),
-                }
+                suiteRefusal = suiteRefusalOf(driven.refusal ?? '通道没有给出答案', driven.cardAttempted === true)
+                return unavailableAnswer(suiteRefusal.reason, driven.cardAttempted === true)
             }
         }
-        return {
-            kind: 'unavailable',
-            reason: 'interaction 服务没有提供提问接口（ask() 或 list()/send()/awaitAnswer()）：审批卡发不出去',
-        }
+        return unavailableAnswer('interaction 服务没有提供提问接口（ask() 或 list()/send()/awaitAnswer()）：审批卡发不出去')
     }
 
     // The kernel decides the OUTCOME semantics (rejected / cancelled /
@@ -1136,6 +997,8 @@ async function askHuman(input: {
     // itself; nothing auto-approves). This gate only composes the sentences for
     // the action it is about, and enforces the environment's approver list.
     const seam = deps.approval()
+    const hostSeam = seam === undefined ? undefined : (ask: { reason: string }): Promise<GateSurfaceAnswer> => hostSeamAnswer(seam, ask, input)
+    const surfaces: GateApprovalSurfaces = { binary: suiteSurface, ...(hostSeam === undefined ? {} : { hostSeam }) }
     const verdict = await requestGateApproval({
         ...(input.agent === undefined ? {} : { agent: input.agent }),
         toolName: input.toolName,
@@ -1143,30 +1006,7 @@ async function askHuman(input: {
         surface: 'binary',
         ...(input.signal === undefined ? {} : { signal: input.signal }),
         hostPolicy: readHostApprovalPolicy(seam, input.agent),
-        surfaces: {
-            binary: suiteSurface,
-            ...(seam === undefined
-                ? {}
-                : {
-                      hostSeam: async (ask): Promise<GateSurfaceAnswer> => {
-                          try {
-                              const reply = await seam.request({
-                                  ...(input.agent === undefined ? {} : { agent: input.agent }),
-                                  toolName: input.toolName,
-                                  reason: ask.reason,
-                                  ...(input.signal === undefined ? {} : { signal: input.signal }),
-                              })
-                              return surfaceAnswerOf(normalizeApprovalReply(reply), 'host-seam')
-                          } catch (error) {
-                              // The kernel turns a throwing adapter into
-                              // `no-answerer`; the message it carries names the cause.
-                              throw new Error(
-                                  `审批通道调用失败（${error instanceof Error ? error.message : String(error)}）：没有人作出决定，按 fail closed 拒绝。`,
-                              )
-                          }
-                      },
-                  }),
-        },
+        surfaces,
     })
 
     if (verdict.outcome === 'allowed-once' || verdict.outcome === 'rejected' || verdict.outcome === 'cancelled') {
@@ -1220,6 +1060,166 @@ async function askHuman(input: {
             verdict.problem ?? '',
             `下一步（任选其一）：装配能收答案的交互通道（IM 通道必须实现 wait()）；或由人把该环境的 ${approvalKeyOf(input.action)} 设为 false（宿主的决定）。`,
         ].join('\n'),
+    }
+}
+
+
+
+
+/** The card one `interaction.ask()` call sends (the suite's own `ask` surface). */
+function askRequestOf(
+    title: string,
+    question: string,
+    action: 'deploy' | 'rollback' | 'verify',
+    input: { toolName: 'deploy_run' | 'deploy_rollback' | 'deploy_verify'; agent?: AgentLike; signal?: AbortSignal },
+): InteractionAsk {
+    return {
+        title,
+        question,
+        options: [
+            { value: 'yes', label: action === 'deploy' ? '批准部署' : action === 'rollback' ? '批准回滚' : '批准验证' },
+            { value: 'no', label: '拒绝' },
+        ],
+        ...(input.agent === undefined ? {} : { agent: input.agent }),
+        toolName: input.toolName,
+        ...(input.signal === undefined ? {} : { signal: input.signal }),
+    }
+}
+
+/** An `unavailable` surface answer (optionally flagged as "a card may have left"). */
+function unavailableAnswer(reason: string, cardAttempted = false): GateSurfaceAnswer {
+    return { kind: 'unavailable', reason, ...(cardAttempted ? { cardAttempted: true } : {}) }
+}
+
+/** The refusal a surface records for the caller's "nobody answered" report. */
+function suiteRefusalOf(reason: string, cardAttempted: boolean): { reason: string; cardAttempted: boolean } {
+    return { reason, cardAttempted }
+}
+
+/** What one channel-registry drive needs from the caller. */
+interface RegistryDriveContext {
+    title: string
+    reason: string
+    timeoutMs: number
+    action: 'deploy' | 'rollback' | 'verify'
+    signal?: AbortSignal
+}
+
+/** The refusal for a registry whose channels can send a card but never receive the answer. */
+function noUsableChannelDrive(channels: readonly Record<string, unknown>[], action: 'deploy' | 'rollback' | 'verify'): RegistryDrive {
+    const lines = [
+        `interaction 服务注册了 ${channels.length} 个通道，但没有一个能提问（canAsk=false）：通道必须实现 wait() 才收得到答案。`,
+        ...(channels.length === 0
+            ? ['（一个通道都没有注册：让宿主/IM 插件向 interaction 服务注册一个通道）']
+            : channels.map((entry) => `  - ${String(entry['name'] ?? '(无名)')}：canAsk=false${typeof entry['reason'] === 'string' && entry['reason'] !== '' ? `（${entry['reason']}）` : ''}`)),
+        `下一步（任选其一）：让该通道实现 wait()（收不到答案的通道不能用来批准${approvalSubjectLabel(action)}）；换一个能提问的通道；或由人把该环境的 ${approvalKeyOf(action)} 设为 false（宿主的决定，模型改不了 \`.dsh/**\` 里的配置）。`,
+    ]
+    return { refusal: lines.join('\n') }
+}
+
+/** Read one awaited answer into a drive result (or one channel's failure line). */
+function driveOutcomeOf(name: string, awaited: unknown, timeoutMs: number): RegistryDrive | { failure: string } {
+    const outcome = isRecord(awaited) && typeof awaited['outcome'] === 'string' ? awaited['outcome'] : 'unreadable'
+    if (outcome === 'answered') {
+        const answer = isRecord(awaited) ? awaited['answer'] : undefined
+        if (!isRecord(answer) || typeof answer['value'] !== 'string') {
+            // A card that WAS answered left the process: a second prompt in another surface must not follow it.
+            return { refusal: `通道 "${name}" 报告已回答，但答案读不出来（没有 value）：按"没有决定"处理（fail closed），本次不执行任何命令。`, cardAttempted: true }
+        }
+        const reply = { value: answer['value'], ...(typeof answer['by'] === 'string' ? { by: answer['by'] } : {}), ...(typeof answer['messageId'] === 'string' ? { messageId: answer['messageId'] } : {}) }
+        return { outcome: normalizeInteractionReply({ ...reply, source: name }) }
+    }
+    if (outcome === 'timeout') {
+        return {
+            refusal:
+                `等待人工批准的截止时间（${timeoutMs}ms，配置 approvalTimeoutMs）到了：通道 "${name}" 没有在期限内给出答案。` +
+                '超时**不是**拒绝、也**不是**同意——没有人作出决定，本次不执行任何命令。',
+            cardAttempted: true,
+        }
+    }
+    if (outcome === 'cancelled') return { outcome: { decision: 'cancelled', by: '', messageId: '', source: name, allowed: false } }
+    return { failure: `- ${name}：${outcome === 'unknown-token' ? '一次性令牌在等待期间失效（同一令牌只能被回答一次）' : `等待结果读不出来（outcome=${outcome}）`}` }
+}
+
+/** Ask ONE channel: arm a fresh one-shot token, send the card, wait on that token. */
+async function driveOneChannel(service: InteractionLike, name: string, context: RegistryDriveContext): Promise<RegistryDrive | { failure: string }> {
+    const questionId = newQuestionToken()
+    let armed: unknown = false
+    try {
+        armed = (service.arm as (id: string) => unknown).call(service, questionId)
+    } catch (error) {
+        return { failure: `- ${name}：arm() 抛错（${error instanceof Error ? error.message : String(error)}）` }
+    }
+    if (armed !== true) return { failure: `- ${name}：一次性令牌无法登记（arm() 返回 ${JSON.stringify(armed)}）` }
+    let sent: unknown
+    try {
+        sent = await (service.send as (channel: string, message: unknown) => Promise<unknown>).call(service, name, {
+            kind: 'ask',
+            title: context.title,
+            body: context.reason,
+            questionId,
+            buttons: [{ value: 'yes', label: context.action === 'deploy' ? '批准部署' : context.action === 'rollback' ? '批准回滚' : '批准验证' }, { value: 'no', label: '拒绝' }],
+        })
+    } catch (error) {
+        sent = { ok: false, error: error instanceof Error ? error.message : String(error) }
+    }
+    if (!isRecord(sent) || sent['ok'] !== true) {
+        if (typeof service.retire === 'function') (service.retire as (id: string) => void).call(service, questionId)
+        return { failure: `- ${name}：卡片发不出去（${isRecord(sent) && typeof sent['error'] === 'string' ? sent['error'] : '通道未说明原因'}）` }
+    }
+    const implementation = typeof service.get === 'function' ? service.get(name) : undefined
+    const wait = isRecord(implementation) && typeof implementation['wait'] === 'function' ? (implementation['wait'] as (id: string, ms: number, signal?: AbortSignal) => Promise<unknown>).bind(implementation) : undefined
+    let awaited: unknown
+    try {
+        awaited = await (service.awaitAnswer as (id: string, ms: number, options?: unknown) => Promise<unknown>).call(service, questionId, context.timeoutMs, {
+            ...(wait === undefined ? {} : { wait }),
+            ...(context.signal === undefined ? {} : { signal: context.signal }),
+        })
+    } catch (error) {
+        awaited = { outcome: 'unreadable', error: error instanceof Error ? error.message : String(error) }
+    }
+    return driveOutcomeOf(name, awaited, context.timeoutMs)
+}
+
+/** Drive the channel registry the interaction layer actually provides (a decision, or a refusal). */
+async function driveRegistryChannels(service: InteractionLike, context: RegistryDriveContext): Promise<RegistryDrive | undefined> {
+    const list = service.list ?? service.describeAll
+    if (list === undefined) return undefined
+    if (typeof service.arm !== 'function' || typeof service.send !== 'function' || typeof service.awaitAnswer !== 'function') {
+        const refusal =
+            'interaction 服务暴露了通道列表，却没有提供提问所需的 arm/send/awaitAnswer：无法把卡片发出去并等一个对得上令牌的答案（fail closed）。' +
+            '下一步：升级/修正该 interaction 服务（`dsh-interaction-gate` 提供 register/send/arm/awaitAnswer），或让宿主装配审批通道。'
+        return { refusal }
+    }
+    let raw: unknown
+    try {
+        raw = list.call(service)
+    } catch (error) {
+        return { refusal: `interaction 服务列出通道时抛错（${error instanceof Error ? error.message : String(error)}）：无法知道有哪些通道，按 fail closed 拒绝。` }
+    }
+    const channels = (Array.isArray(raw) ? raw : []).filter(isRecord)
+    const usable = channels.filter((entry) => entry['canAsk'] === true && typeof entry['name'] === 'string' && entry['name'] !== '')
+    if (usable.length === 0) return noUsableChannelDrive(channels, context.action)
+    const failures: string[] = []
+    for (const candidate of usable) {
+        const driven = await driveOneChannel(service, candidate['name'] as string, context)
+        if ('failure' in driven) {
+            failures.push(driven.failure)
+            continue
+        }
+        return driven
+    }
+    return { refusal: [`interaction 服务的通道都没能完成这次提问（${failures.length} 个）：`, ...failures].join('\n') }
+}
+
+/** Ask the host's own approval seam (the surface the kernel falls back to). */
+async function hostSeamAnswer(seam: ApprovalLike, ask: { reason: string }, input: { agent?: AgentLike; toolName: 'deploy_run' | 'deploy_rollback' | 'deploy_verify'; signal?: AbortSignal }): Promise<GateSurfaceAnswer> {
+    try {
+        const reply = await seam.request({ ...(input.agent === undefined ? {} : { agent: input.agent }), toolName: input.toolName, reason: ask.reason, ...(input.signal === undefined ? {} : { signal: input.signal }) })
+        return surfaceAnswerOf(normalizeApprovalReply(reply), 'host-seam')
+    } catch (error) {
+        // The kernel turns a throwing adapter into `no-answerer`, and names this message's cause.
+        throw new Error(`审批通道调用失败（${error instanceof Error ? error.message : String(error)}）：没有人作出决定，按 fail closed 拒绝。`)
     }
 }
 

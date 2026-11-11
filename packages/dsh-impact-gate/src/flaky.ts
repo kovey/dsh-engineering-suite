@@ -297,6 +297,25 @@ function normalizeName(name: string): string {
 }
 
 /**
+ * Every name one line declares through `patterns`, in pattern order.
+ *
+ * A line may match more than one shape (the lists overlap on purpose), and the
+ * caller keeps every hit, so this returns all of them rather than the first.
+ * @param line - one line of a run's output.
+ * @param patterns - the shapes that name a case for this outcome.
+ */
+function namesOnLine(line: string, patterns: readonly RegExp[]): string[] {
+    const names: string[] = []
+    for (const pattern of patterns) {
+        const match = pattern.exec(line)
+        if (match?.[1] === undefined) continue
+        const name = normalizeName(match[1])
+        if (name !== '') names.push(name)
+    }
+    return names
+}
+
+/**
  * Read the test names one run's output declared.
  *
  * Deliberately a small, fixed set of the shapes the common runners print: this
@@ -308,20 +327,8 @@ function normalizeName(name: string): string {
 export function parseNamedTests(output: string): { name: string; ok: boolean }[] {
     const named: { name: string; ok: boolean }[] = []
     for (const line of output.split('\n')) {
-        for (const pattern of PASS_PATTERNS) {
-            const match = pattern.exec(line)
-            if (match?.[1] !== undefined) {
-                const name = normalizeName(match[1])
-                if (name !== '') named.push({ name, ok: true })
-            }
-        }
-        for (const pattern of FAIL_PATTERNS) {
-            const match = pattern.exec(line)
-            if (match?.[1] !== undefined) {
-                const name = normalizeName(match[1])
-                if (name !== '') named.push({ name, ok: false })
-            }
-        }
+        for (const name of namesOnLine(line, PASS_PATTERNS)) named.push({ name, ok: true })
+        for (const name of namesOnLine(line, FAIL_PATTERNS)) named.push({ name, ok: false })
     }
     return named
 }
@@ -375,6 +382,30 @@ export interface ParsedReport {
     tallies: TestTally[]
     runs: ObservedRun[]
     notes: string[]
+}
+
+/**
+ * A refusal shaped the way the report readers return one.
+ * @param problem - what is wrong with the document.
+ */
+function problemOf(problem: string): { problem: string } {
+    return { problem }
+}
+
+/**
+ * One run a report listed by exit code only (no per-case names).
+ * @param entry - the report's run object.
+ * @param index - its position (`index + 1` when the report names none).
+ */
+function observedRunOf(entry: Record<string, unknown>, index: number): ObservedRun {
+    const outcome = entry['outcome'] === 'pass' || entry['outcome'] === 'fail' ? entry['outcome'] : entry['exitCode'] === 0 ? 'pass' : 'fail'
+    return {
+        index: positiveInt(entry['index']) ?? index + 1,
+        exitCode: typeof entry['exitCode'] === 'number' ? entry['exitCode'] : null,
+        outcome,
+        timedOut: entry['timedOut'] === true,
+        named: [],
+    }
 }
 
 /**
@@ -446,7 +477,7 @@ export function parseReport(value: unknown): ParsedReport | { problem: string } 
             if (!Array.isArray(list)) return { problem: `报告的 "${key}" 必须是数组` }
             found += list.length
             for (const entry of list) {
-                if (!isRecord(entry)) return { problem: `报告的 "${key}" 里存在非对象项：无法解析成用例计数` }
+                if (!isRecord(entry)) return problemOf(`报告的 "${key}" 里存在非对象项：无法解析成用例计数`)
                 push(entry, bucket)
             }
         }
@@ -460,14 +491,7 @@ export function parseReport(value: unknown): ParsedReport | { problem: string } 
         if (Array.isArray(value['runs'])) {
             for (const [index, entry] of value['runs'].entries()) {
                 if (!isRecord(entry)) continue
-                const outcome = entry['outcome'] === 'pass' || entry['outcome'] === 'fail' ? (entry['outcome'] as 'pass' | 'fail') : entry['exitCode'] === 0 ? 'pass' : 'fail'
-                runs.push({
-                    index: positiveInt(entry['index']) ?? index + 1,
-                    exitCode: typeof entry['exitCode'] === 'number' ? entry['exitCode'] : null,
-                    outcome,
-                    timedOut: entry['timedOut'] === true,
-                    named: [],
-                })
+                runs.push(observedRunOf(entry, index))
             }
             notes.push('报告只带运行级结果（每次运行的退出码），没有逐用例的点名结果：无法判定"某条被隔离的用例最近有没有出现"')
         }
@@ -930,119 +954,6 @@ export interface StatusInput {
     missionId?: string
     /** The command own-run mode would repeat, when the host configured one. */
     flakyCommand?: string
-}
-
-/** Render the read-only `flaky_status` report. */
-export function renderStatus(input: StatusInput): string {
-    const lines: string[] = []
-    lines.push('🧪 flaky 状态（只读）')
-    lines.push(
-        `策略：owner=${input.settings.owner ?? '(未配置 — 隔离会被拒绝)'}，隔离最长 ${input.settings.quarantineMaxDays} 天，` +
-            `"最近 ${input.settings.unseenRunsBeforeWarn} 次运行没出现"告警；签名 ${input.settings.signatures.length} 条`,
-    )
-    lines.push(`台账：${input.quarantineFile}（${input.quarantined.length} 条生效中的隔离）`)
-    lines.push(
-        `重复运行的命令：${input.flakyCommand === undefined ? '(未配置 fullTestCommand —— flaky_plan 只能用 report 模式)' : `\`${input.flakyCommand}\``}`,
-    )
-    if (input.quarantined.length === 0) {
-        lines.push('', '当前没有任何隔离条目。')
-    } else {
-        lines.push('', '| 用例 | owner | 到期 | 理由 | 证据 |', '|------|-------|------|------|------|')
-        for (const row of input.quarantined) {
-            lines.push(
-                `| ${row.test} | ${row.owner} | ${new Date(row.expiresAt).toISOString()} | ${row.reason || '—'} | ${row.evidencePath || '—'} |`,
-            )
-        }
-    }
-    const expired = expiredQuarantines(input.quarantined, input.now)
-    if (expired.length > 0) {
-        lines.push('', `⛔ 已过期的隔离（${expired.length} 条）：要么修，要么删，不能继续挂着`)
-        for (const row of expired) {
-            lines.push(`  - ${row.test}（owner=${row.owner}，已于 ${new Date(row.expiresAt).toISOString()} 到期）`)
-        }
-    }
-    if (input.ledgerProblems.length > 0) {
-        lines.push('', `⚠️ 台账里有 ${input.ledgerProblems.length} 行无法使用（不计入"已隔离"）：`)
-        for (const problem of input.ledgerProblems) lines.push(`  - ${problem}`)
-    }
-    lines.push('')
-    if (input.newest === undefined) {
-        lines.push(
-            `最近计划：（无${input.plansSeen === 0 ? '' : '，产物无法读取'}）— 没有计划产物就无法判断"被隔离的用例最近有没有出现"。`,
-        )
-    } else {
-        lines.push(
-            `最近计划：${input.newest.relative}${input.newest.generatedAt === undefined ? '' : `（${input.newest.generatedAt}）`}` +
-                (input.newest.problem === undefined ? '' : ` — ${input.newest.problem}`),
-        )
-        if (input.newest.summary !== undefined) {
-            lines.push(
-                `  分类：稳定 ${input.newest.summary.stable}、隔离 ${input.newest.summary.quarantine}、查根因 ${input.newest.summary.investigate}、疑似仪器/环境 ${input.newest.summary.suspectInstrumentation}`,
-            )
-        }
-        // The plan's own caveats are the difference between "this test is gone"
-        // and "this report cannot say": dropping them would turn a limitation of
-        // the data into an accusation.
-        for (const note of input.newest.notes ?? []) lines.push(`  说明：${note}`)
-        const runs = input.newest.runs
-        const threshold = input.settings.unseenRunsBeforeWarn
-        // Report mode carries per-test TALLIES, not per-run names. Reading a
-        // nameless run as "nothing was observed" accused every quarantined test —
-        // including the ones the same report proves ran in every run. The tallies
-        // ARE the observed set in that mode; a nameless run alone proves nothing.
-        const tallies = input.newest.observedTests ?? []
-        const namedRuns = runs.filter((run) => run.named.length > 0)
-        const tallyWindow = tallies.reduce((max, tally) => Math.max(max, tally.runs), 0)
-        const window = namedRuns.length > 0 ? runs.length : Math.max(runs.length, tallyWindow)
-        if (window < threshold) {
-            lines.push(
-                runs.length === 0 && tallyWindow === 0
-                    ? `  该计划没有携带逐用例结果（报告只有运行级退出码）：无法判断"最近 ${threshold} 次运行没出现"——**不能**因此说覆盖正在消失。`
-                    : `  该计划只有 ${window} 次运行（少于阈值 ${threshold}）：暂不判定"消失"，先积累运行记录。`,
-            )
-        } else if (namedRuns.length > 0) {
-            const unseen = unseenQuarantines(input.quarantined, runs, threshold)
-            if (unseen.length === 0) {
-                lines.push(`  "最近 ${threshold} 次运行没出现"检查：通过（所有隔离用例都还在被点名）。`)
-            } else {
-                lines.push(`  ⚠️ 可能悄悄丢失的覆盖（最近 ${threshold} 次运行都没点名）：`)
-                for (const row of unseen) {
-                    lines.push(
-                        `    - ${row.test}（owner=${row.owner}）：隔离后被删除/改名/跳过了？覆盖正在静默消失——要么恢复它，要么把隔离条目一起删掉。`,
-                    )
-                }
-            }
-        } else {
-            // No run named anything, but the report did count cases: judge with
-            // the counts it gave, and say exactly which number is being used.
-            const observed = new Set(tallies.filter((tally) => tally.runs >= window).map((tally) => tally.name))
-            const unseen = input.quarantined.filter((row) => !observed.has(row.test)).sort((left, right) => left.test.localeCompare(right.test))
-            if (unseen.length === 0) {
-                lines.push(
-                    `  "最近 ${threshold} 次运行没出现"检查：通过（报告没有逐次点名，但 ${tallies.length} 条用例计数的观察窗口是 ${window} 次运行，每一条隔离用例都在里面）。`,
-                )
-            } else {
-                lines.push(`  ⚠️ 隔离用例在报告的用例计数里没有覆盖全部 ${window} 次运行（报告模式只有计数，没有逐次点名）：`)
-                for (const row of unseen) {
-                    const tally = tallies.find((candidate) => candidate.name === row.test)
-                    lines.push(
-                        `    - ${row.test}（owner=${row.owner}）：${
-                            tally === undefined
-                                ? `报告的 ${window} 次运行里完全没有它——隔离后被删除/改名/跳过了？覆盖正在静默消失：要么恢复它，要么把隔离条目一起删掉`
-                                : `报告里只在 ${tally.runs}/${window} 次运行里被点名（其他运行没有它：可能被跳过或条件执行）`
-                        }。`,
-                    )
-                }
-            }
-        }
-    }
-    lines.push(
-        '',
-        input.missionId === undefined
-            ? '下一步：没有 mission，计划不会落盘；先建任务（spec_create）或省略 missionId 之外的参数重试。'
-            : '下一步：隔离到期前复查（`flaky_plan` 重跑取新数据，本工具只读）；要新增隔离由人执行计划里渲染的命令，本插件不会自己写台账。',
-    )
-    return lines.join('\n')
 }
 
 /** Resolve the quarantine ledger path for one workspace. */

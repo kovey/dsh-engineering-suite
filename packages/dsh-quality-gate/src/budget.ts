@@ -439,6 +439,18 @@ function declaresCaptureGroup(source: string): boolean {
  * @param source - the structurally read declaration, or `undefined` when the
  *   mission's specification declares none.
  */
+/** What is wrong with one spec budget's `regex` (it must compile and declare a capture group). */
+function regexProblem(named: string, regex: string): string | undefined {
+    try {
+        const compiled = new RegExp(regex)
+        if (declaresCaptureGroup(compiled.source)) return undefined
+        return `${named}: regex /${regex}/ 没有捕获组（取数只认第一个捕获组）。` + '下一步：用 spec_amend 给数字加上括号，例如 "size=(\\\\d+)"。'
+    } catch (error) {
+        return `${named}: regex 不是合法正则（${error instanceof Error ? error.message : String(error)}）：${regex}。` + '下一步：用 spec_amend 修正正则。'
+    }
+}
+
+/** Parse the budgets a specification declares, refusing (never guessing) what it cannot judge. */
 export function parseSpecBudgets(source: SpecBudgetSource | undefined): SpecBudgetParse {
     if (source === undefined) return { budgets: [], problems: [] }
     const problems: string[] = []
@@ -512,37 +524,24 @@ export function parseSpecBudgets(source: SpecBudgetSource | undefined): SpecBudg
             continue
         }
         if (regex !== undefined) {
-            try {
-                const compiled = new RegExp(regex)
-                if (!declaresCaptureGroup(compiled.source)) {
-                    problems.push(
-                        `${named}: regex /${regex}/ 没有捕获组（取数只认第一个捕获组）。` +
-                            '下一步：用 spec_amend 给数字加上括号，例如 "size=(\\\\d+)"。',
-                    )
-                    continue
-                }
-            } catch (error) {
-                problems.push(
-                    `${named}: regex 不是合法正则（${error instanceof Error ? error.message : String(error)}）：${regex}。` +
-                        '下一步：用 spec_amend 修正正则。',
-                )
+            const problem = regexProblem(named, regex)
+            if (problem !== undefined) {
+                problems.push(problem)
                 continue
             }
         }
-        const thresholdRaw = entry['threshold']
+        const thresholdRaw = isRecord(entry['threshold']) ? entry['threshold'] : {}
         const threshold: { max?: number; min?: number; maxRegressionPercent?: number } = {}
-        if (isRecord(thresholdRaw)) {
-            for (const key of ['max', 'min', 'maxRegressionPercent'] as const) {
-                const value = optionalNumber(thresholdRaw[key])
-                if (value !== undefined) threshold[key] = value
-                else if (thresholdRaw[key] !== undefined) {
-                    problems.push(`${named}: threshold.${key} 必须是有限数字（收到 ${JSON.stringify(thresholdRaw[key])}）。下一步：用 spec_amend 修正这条预算。`)
-                }
+        for (const key of ['max', 'min', 'maxRegressionPercent'] as const) {
+            const value = optionalNumber(thresholdRaw[key])
+            if (value !== undefined) threshold[key] = value
+            else if (thresholdRaw[key] !== undefined) {
+                problems.push(`${named}: threshold.${key} 必须是有限数字（收到 ${JSON.stringify(thresholdRaw[key])}）。下一步：用 spec_amend 修正这条预算。`)
             }
-            if (threshold.maxRegressionPercent !== undefined && threshold.maxRegressionPercent < 0) {
-                problems.push(`${named}: threshold.maxRegressionPercent 不能是负数（收到 ${threshold.maxRegressionPercent}）。下一步：用 spec_amend 改成 0 或正数。`)
-                delete threshold.maxRegressionPercent
-            }
+        }
+        if (threshold.maxRegressionPercent !== undefined && threshold.maxRegressionPercent < 0) {
+            problems.push(`${named}: threshold.maxRegressionPercent 不能是负数（收到 ${threshold.maxRegressionPercent}）。下一步：用 spec_amend 改成 0 或正数。`)
+            delete threshold.maxRegressionPercent
         }
         if (Object.keys(threshold).length === 0) {
             problems.push(
@@ -673,19 +672,18 @@ export function resolveTarget(    budget: BudgetConfig,
     if (budget.commandId !== undefined) {
         const configured: GateCommandConfig | undefined = config.commands.find((command) => command.id === budget.commandId)
         if (configured === undefined) {
-            return {
-                problem:
-                    `预算 "${budget.id}" 引用了不存在的门禁命令 "${budget.commandId}"：可用的命令 id 是 ` +
-                    `${config.commands.map((command) => command.id).join(', ') || '(无)'}。` +
-                    `下一步：把 commandId 改成上面某一个，或在预算里直接写 command。`,
-            }
+            const problem =
+                `预算 "${budget.id}" 引用了不存在的门禁命令 "${budget.commandId}"：可用的命令 id 是 ` +
+                `${config.commands.map((command) => command.id).join(', ') || '(无)'}。下一步：把 commandId 改成上面某一个，或在预算里直接写 command。`
+            return { problem }
         }
+        const env = configured.env === undefined ? {} : { env: configured.env }
         return {
             target: {
                 command: configured.command,
                 cwd: configured.cwd === undefined ? cwd : path.resolve(cwd, configured.cwd),
                 timeoutMs: configured.timeoutMs,
-                ...(configured.env === undefined ? {} : { env: configured.env }),
+                ...env,
                 source: 'commandId',
             },
         }
@@ -878,14 +876,12 @@ function readLockRecord(file: string): { record?: LockRecord; problem?: string; 
     try {
         const parsed = JSON.parse(text) as unknown
         if (isRecord(parsed) && typeof parsed['at'] === 'number' && Number.isFinite(parsed['at'])) {
-            return {
-                record: {
-                    pid: typeof parsed['pid'] === 'number' ? parsed['pid'] : -1,
-                    at: parsed['at'],
-                    file: typeof parsed['file'] === 'string' ? parsed['file'] : file,
-                },
-                observedAt: stats.mtimeMs,
+            const record: LockRecord = {
+                pid: typeof parsed['pid'] === 'number' ? parsed['pid'] : -1,
+                at: parsed['at'],
+                file: typeof parsed['file'] === 'string' ? parsed['file'] : file,
             }
+            return { record, observedAt: stats.mtimeMs }
         }
         return { problem: '锁定文件内容不是本门禁的记录', observedAt: stats.mtimeMs }
     } catch {
@@ -1401,6 +1397,111 @@ function boundsHold(budget: BudgetConfig, value: number): boolean {
 /** Everything one budget's measurement produced. */
 type Measured = { ok: true; evaluation: BudgetEvaluation } | { ok: false; problem: string }
 
+/** Everything one budget's measurement judged, after its command has run. */
+interface MeasurementFacts {
+    budget: BudgetConfig
+    command: string
+    unit: string
+    entries: readonly BaselineEntry[]
+    baselineFile: string
+    outcome: RunOutcome
+}
+
+/**
+ * The evaluation of a command that did NOT succeed: it is not a measurement, so
+ * the budget is BLOCKed (recorded) but nothing enters the baseline.
+ */
+function failedEvaluation(facts: MeasurementFacts, target: BudgetTarget): BudgetEvaluation {
+    const { budget, outcome } = facts
+    const why =
+        outcome.aborted === true
+            ? '运行已取消（signal 已 abort）'
+            : outcome.timedOut
+              ? `命令超时（${target.timeoutMs}ms）`
+              : outcome.spawnError !== undefined
+                ? `命令无法启动：${outcome.spawnError}`
+                : `命令退出码 ${outcome.exitCode ?? 'null'}`
+    return {
+        id: budget.id,
+        name: budget.name,
+        metric: budget.metric,
+        unit: facts.unit,
+        origin: budget.origin ?? 'config',
+        ...(requirementIdsOf(budget).length === 0 ? {} : { requirementIds: requirementIdsOf(budget) }),
+        command: facts.command,
+        exitCode: outcome.exitCode,
+        durationMs: outcome.durationMs,
+        timedOut: outcome.timedOut,
+        state: 'BLOCK',
+        reason: `命令没有成功执行（${why}）：本次没有测到任何数字，预算判 BLOCK（也不写入基线）`,
+        checks: [
+            { name: '命令退出码', state: 'FAIL', detail: `${why}；命令：${facts.command}` },
+            { name: '数值判定', state: 'UNJUDGED', detail: '命令没有产出可用的测量值，界限与回归都无法判定' },
+        ],
+        baseline: { file: facts.baselineFile, recorded: false, history: facts.entries.length },
+    }
+}
+
+/**
+ * The evaluation of a measurement that produced a number (`valueText` is how the
+ * reason names it, e.g. `命令耗时 12 ms`).
+ */
+function judgedEvaluation(facts: MeasurementFacts, value: number, valueText: string): BudgetEvaluation {
+    const { budget, outcome } = facts
+    const checks = evaluateMeasurement(budget, value, facts.entries)
+    const regression = compareRegression(budget, value, facts.entries)
+    const failed = checks.filter((check) => check.state === 'FAIL')
+    return {
+        id: budget.id,
+        name: budget.name,
+        metric: budget.metric,
+        unit: facts.unit,
+        origin: budget.origin ?? 'config',
+        ...(requirementIdsOf(budget).length === 0 ? {} : { requirementIds: requirementIdsOf(budget) }),
+        value,
+        command: facts.command,
+        exitCode: outcome.exitCode,
+        durationMs: outcome.durationMs,
+        timedOut: false,
+        state: failed.length === 0 ? 'PASS' : 'BLOCK',
+        reason:
+            failed.length === 0
+                ? `${valueText}${regression.state === 'NO-HISTORY' ? '；基线已记录（本次是第 1 次测量）' : ''}`
+                : failed.map((check) => check.detail).join('；'),
+        checks,
+        baseline: {
+            file: facts.baselineFile,
+            recorded: boundsHold(budget, value),
+            history: facts.entries.length,
+            ...(regression.best === undefined ? {} : { comparedValue: regression.best.value, comparedAt: regression.best.at, comparedRun: regression.best.run }),
+        },
+    }
+}
+
+/**
+ * The refusal for output a `regex` could not turn into a number — a refusal, never
+ * a silent pass and never a 0.
+ */
+function unmeasurable(budget: BudgetConfig, target: BudgetTarget, extracted: Extract<Extracted, { ok: false }>, output: string): Measured {
+    const regex = `/${budget.regex ?? ''}/`
+    const problem =
+        extracted.kind === 'no-match'
+            ? [
+                  `预算 "${budget.id}"（${budget.name}）无法判定：正则没有匹配到任何数字——测不到数字就是拒绝，不是"通过"。`,
+                  `- 命令：${target.command}`,
+                  `- 正则：${regex}`,
+                  `- 命令输出尾部：${tail(output.trim(), 400) || '(空)'}`,
+                  '下一步：把 regex 对齐这条命令的真实输出格式（第一个捕获组必须是纯数字），然后重跑 budget_check；本次没有写入基线，也没有记录门禁。',
+              ].join('\n')
+            : [
+                  `预算 "${budget.id}"（${budget.name}）无法判定：正则捕获到的内容不是数字（${JSON.stringify(extracted.raw)}）——按拒绝处理，绝不退化成 0。`,
+                  `- 命令：${target.command}`,
+                  `- 正则：${regex}（第一个捕获组必须是 123 / 12.5 / -3 这类写法）`,
+                  '下一步：调整 regex（只捕获数字本身，单位别放进捕获组），然后重跑 budget_check；本次没有写入基线，也没有记录门禁。',
+              ].join('\n')
+    return { ok: false, problem }
+}
+
 /** Run one budget's command and judge what it produced. */
 async function measureBudget(
     budget: BudgetConfig,
@@ -1426,138 +1527,28 @@ async function measureBudget(
         options.service,
     )
     const output = [outcome.stdout, outcome.stderr].filter((part) => part.trim() !== '').join('\n--- stderr ---\n')
-    const unit = budget.unit ?? defaultUnit(budget.metric)
+    const facts: MeasurementFacts = {
+        budget,
+        command: target.command,
+        unit: budget.unit ?? defaultUnit(budget.metric),
+        entries: options.entries,
+        baselineFile: options.baselineFile,
+        outcome,
+    }
 
     if (outcome.exitCode !== 0 || outcome.timedOut || outcome.spawnError !== undefined || outcome.aborted === true) {
-        const why =
-            outcome.aborted === true
-                ? '运行已取消（signal 已 abort）'
-                : outcome.timedOut
-                  ? `命令超时（${target.timeoutMs}ms）`
-                  : outcome.spawnError !== undefined
-                    ? `命令无法启动：${outcome.spawnError}`
-                    : `命令退出码 ${outcome.exitCode ?? 'null'}`
-        // A command that did not succeed is not a measurement: the budget is
-        // BLOCKed (recorded), but nothing enters the baseline.
-        return {
-            ok: true,
-            evaluation: {
-                id: budget.id,
-                name: budget.name,
-                metric: budget.metric,
-                unit,
-                origin: budget.origin ?? 'config',
-                ...(requirementIdsOf(budget).length === 0 ? {} : { requirementIds: requirementIdsOf(budget) }),
-                command: target.command,
-                exitCode: outcome.exitCode,
-                durationMs: outcome.durationMs,
-                timedOut: outcome.timedOut,
-                state: 'BLOCK',
-                reason: `命令没有成功执行（${why}）：本次没有测到任何数字，预算判 BLOCK（也不写入基线）`,
-                checks: [
-                    { name: '命令退出码', state: 'FAIL', detail: `${why}；命令：${target.command}` },
-                    { name: '数值判定', state: 'UNJUDGED', detail: '命令没有产出可用的测量值，界限与回归都无法判定' },
-                ],
-                baseline: { file: options.baselineFile, recorded: false, history: options.entries.length },
-            },
-        }
+        return { ok: true, evaluation: failedEvaluation(facts, target) }
     }
 
     if (budget.metric === 'durationMs') {
-        const checks = evaluateMeasurement(budget, outcome.durationMs, options.entries)
-        const regression = compareRegression(budget, outcome.durationMs, options.entries)
-        const accepted = boundsHold(budget, outcome.durationMs)
-        const failed = checks.filter((check) => check.state === 'FAIL')
-        return {
-            ok: true,
-            evaluation: {
-                id: budget.id,
-                name: budget.name,
-                metric: budget.metric,
-                unit,
-                origin: budget.origin ?? 'config',
-                ...(requirementIdsOf(budget).length === 0 ? {} : { requirementIds: requirementIdsOf(budget) }),
-                value: outcome.durationMs,
-                command: target.command,
-                exitCode: outcome.exitCode,
-                durationMs: outcome.durationMs,
-                timedOut: false,
-                state: failed.length === 0 ? 'PASS' : 'BLOCK',
-                reason:
-                    failed.length === 0
-                        ? `命令耗时 ${outcome.durationMs} ${unit}${regression.state === 'NO-HISTORY' ? '；基线已记录（本次是第 1 次测量）' : ''}`
-                        : failed.map((check) => check.detail).join('；'),
-                checks,
-                baseline: {
-                    file: options.baselineFile,
-                    recorded: accepted,
-                    history: options.entries.length,
-                    ...(regression.best === undefined
-                        ? {}
-                        : { comparedValue: regression.best.value, comparedAt: regression.best.at, comparedRun: regression.best.run }),
-                },
-            },
-        }
+        const valueText = `命令耗时 ${outcome.durationMs} ${facts.unit}`
+        return { ok: true, evaluation: judgedEvaluation(facts, outcome.durationMs, valueText) }
     }
 
     // `preflightBudgets` guarantees a compilable pattern here.
     const extracted = extractNumber(new RegExp(budget.regex as string), output)
-    if (!extracted.ok) {
-        // Unmeasurable: a refusal, never a silent pass and never a 0.
-        return {
-            ok: false,
-            problem:
-                extracted.kind === 'no-match'
-                    ? [
-                          `预算 "${budget.id}"（${budget.name}）无法判定：正则没有匹配到任何数字——测不到数字就是拒绝，不是"通过"。`,
-                          `- 命令：${target.command}`,
-                          `- 正则：/${budget.regex ?? ''}/`,
-                          `- 命令输出尾部：${tail(output.trim(), 400) || '(空)'}`,
-                          '下一步：把 regex 对齐这条命令的真实输出格式（第一个捕获组必须是纯数字），然后重跑 budget_check；本次没有写入基线，也没有记录门禁。',
-                      ].join('\n')
-                    : [
-                          `预算 "${budget.id}"（${budget.name}）无法判定：正则捕获到的内容不是数字（${JSON.stringify(extracted.raw)}）——按拒绝处理，绝不退化成 0。`,
-                          `- 命令：${target.command}`,
-                          `- 正则：/${budget.regex ?? ''}/（第一个捕获组必须是 123 / 12.5 / -3 这类写法）`,
-                          '下一步：调整 regex（只捕获数字本身，单位别放进捕获组），然后重跑 budget_check；本次没有写入基线，也没有记录门禁。',
-                      ].join('\n'),
-        }
-    }
-    const value = extracted.value
-    const checks = evaluateMeasurement(budget, value, options.entries)
-    const regression = compareRegression(budget, value, options.entries)
-    const accepted = boundsHold(budget, value)
-    const failed = checks.filter((check) => check.state === 'FAIL')
-    return {
-        ok: true,
-        evaluation: {
-            id: budget.id,
-            name: budget.name,
-            metric: budget.metric,
-            unit,
-            origin: budget.origin ?? 'config',
-            ...(requirementIdsOf(budget).length === 0 ? {} : { requirementIds: requirementIdsOf(budget) }),
-            value,
-            command: target.command,
-            exitCode: outcome.exitCode,
-            durationMs: outcome.durationMs,
-            timedOut: false,
-            state: failed.length === 0 ? 'PASS' : 'BLOCK',
-            reason:
-                failed.length === 0
-                    ? `测得 ${value} ${unit}${regression.state === 'NO-HISTORY' ? '；基线已记录（本次是第 1 次测量）' : ''}`
-                    : failed.map((check) => check.detail).join('；'),
-            checks,
-            baseline: {
-                file: options.baselineFile,
-                recorded: accepted,
-                history: options.entries.length,
-                ...(regression.best === undefined
-                    ? {}
-                    : { comparedValue: regression.best.value, comparedAt: regression.best.at, comparedRun: regression.best.run }),
-            },
-        },
-    }
+    if (!extracted.ok) return unmeasurable(budget, target, extracted, output)
+    return { ok: true, evaluation: judgedEvaluation(facts, extracted.value, `测得 ${extracted.value} ${facts.unit}`) }
 }
 
 /**

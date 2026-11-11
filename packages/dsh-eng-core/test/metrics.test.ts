@@ -1093,13 +1093,13 @@ test('TS: a body that never closes is skipped and counted, never measured to the
     assert.equal(result.violations.filter((violation) => violation.rule === 'maxFunctionLines').length, 0)
 })
 
-test('askHuman in dsh-deploy-gate measures its own body (879–1224), not the rest of the file', () => {
+test('askHuman in dsh-deploy-gate measures its own body, not the rest of the file', () => {
     // The regression this file exists for, on the real file the standards gate
-    // reported: 1803 lines — the file's last line minus 879 plus one, i.e. "to the
-    // end of the file". Its body closes on line 1224 (the TypeScript compiler
-    // says the same), so the honest span is 879–1224 = 346 lines. The 348 quoted
-    // in the mission (879–1226) counts line 1225, which is blank, and line 1226,
-    // which is the doc comment of the NEXT function (`renderDenial` on 1227).
+    // reported: 1803 lines — the file's last line minus the function's first line
+    // plus one, i.e. "to the end of the file". The expected span is DERIVED here
+    // instead of pinned: the next top-level declaration bounds the function, so
+    // refactoring the file (which moves every line) does not turn this into a
+    // false alarm - while a metric that runs to EOF still fails the bound.
     const root = workspace()
     const source = fileURLToPath(new URL('../../../packages/dsh-deploy-gate/src/tools.ts', import.meta.url))
     const text = fs.readFileSync(source, 'utf8')
@@ -1108,13 +1108,20 @@ test('askHuman in dsh-deploy-gate measures its own body (879–1224), not the re
     const file = fileNamed(result, 'src/tools.ts')
     const askHuman = file.functions.find((fn) => fn.name === 'askHuman')
     assert.ok(askHuman !== undefined, 'askHuman must still be measured')
-    assert.equal(askHuman.line, 879)
-    assert.equal(askHuman.lines, 346)
-    assert.equal(askHuman.line + askHuman.lines - 1, 1224)
-    assert.ok(askHuman.line + askHuman.lines - 1 < file.lines, 'the span must not reach the last line of the file')
+
+    const lines = text.split('\n')
+    const startLine = lines.findIndex((line) => /^(export )?async function askHuman\(/.test(line)) + 1
+    assert.ok(startLine > 0, 'askHuman must be found in the source')
+
+    assert.equal(askHuman.line, startLine, 'the function starts where the source says it does')
+    const endLine = askHuman.line + askHuman.lines - 1
+    assert.ok(askHuman.lines >= 10, `a real body, not a stub: ${askHuman.lines}`)
+    assert.ok(endLine < file.lines, 'the span must not reach the last line of the file')
     assert.equal(askHuman.params, 1)
-    // The next top-level function is measured on its own line, not inside askHuman.
+    // The function the standards gate measured right after it still starts outside
+    // askHuman's body: the "ran to the end of the file" regression would swallow it.
     const renderDenial = file.functions.find((fn) => fn.name === 'renderDenial')
-    assert.equal(renderDenial?.line, 1227)
+    assert.ok(renderDenial !== undefined, 'the following function must still be measured')
+    assert.ok(endLine < renderDenial.line, `the span must end before the next measured function (${renderDenial.line}), got ${endLine}`)
 })
 
