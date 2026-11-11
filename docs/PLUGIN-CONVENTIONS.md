@@ -222,3 +222,24 @@ ctx.tools.register(defineTool({
    （同一指纹不重复阻断）。
 3. **副作用可回滚**：写文件前先快照（audit-trail 提供），门禁只读不写业务代码。
 4. **工件可审计**：所有落盘内容都是 UTF-8 文本/JSON，可 commit、可 diff。
+
+## 10. 委托成本：子代理跑受影响包，全量验收由 Lead 跑一次
+
+`team_delegate` 等的是子会话**整轮结束**（`subagents.start(...)` 的 run 在子代理最后一次工具调用之后才 resolve）。
+所以委托书里要求子代理"跑两次全量 `bash scripts/verify.sh --quiet`"，会让界面上"子代理已经结束"之后还空等几分钟。
+
+实测数据（2026-11-11，1100+ 文件）：
+
+| 动作 | 单次耗时 |
+|---|---|
+| `bash scripts/verify.sh --quiet` | 160–168 s |
+| `bash scripts/typecheck-all.sh` | 8–9 s |
+| `bash scripts/standards-check.sh --quiet` | 0.5 s |
+| 回合末宿主的自动门禁（工作区变了就全量跑一遍） | ≈ 3 min，且发生在答案写完之后 |
+
+规则：
+
+1. **子代理只跑受影响包的测试**：`node --test packages/<pkg>/test/*.test.ts`（必要时加 `node node_modules/typescript/bin/tsc -p packages/<pkg>/tsconfig.json`）。
+2. **全量验收由 Lead 在收尾时跑一次**：`bash scripts/verify.sh --quiet` + `typecheck` + `standards-check`。
+3. 委托书里**不得**要求子代理跑全量 `verify.sh`（写清楚"不要跑全量，只跑受影响包"）。
+4. 这是**团队约定**，不是门禁规则：门禁照旧跑全量，只是不重复跑。
