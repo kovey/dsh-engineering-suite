@@ -309,13 +309,20 @@ test('interaction_ask：超时 → 拒绝并在报文里给出截止时间（dea
     const silent = scriptedChannel('im', { waitMode: 'never' })
     fake.registry.register(silent.channel)
 
-    const run = await fake.runTool('interaction_ask', { question: '还在吗？', options: ['yes', 'no'], timeoutMs: 40 })
+    // A 40ms budget was load-sensitive: on a loaded machine the card could fail to
+    // leave the process before the deadline, and the refusal read `send-failed`
+    // instead of `timeout` (it only failed in the full concurrent suite). The
+    // budget is not the subject of this test - the refusal and its message are - so
+    // it gets enough headroom to be deterministic, and the deadline is asserted by
+    // SHAPE (a HH:MM:SS clock) instead of a fixed hour prefix.
+    const budgetMs = 400
+    const run = await fake.runTool('interaction_ask', { question: '还在吗？', options: ['yes', 'no'], timeoutMs: budgetMs })
     assert.equal(run.isError, true)
     const text = runText(run)
     assert.ok(text.includes('refused:timeout'), text)
     assert.ok(text.includes('等待超时'), text)
-    assert.ok(text.includes('40ms'), `报文必须写明截止毫秒数：${text}`)
-    assert.ok(text.includes('截止 20'), `报文必须写明截止时刻：${text}`)
+    assert.ok(text.includes(`${budgetMs}ms`), `报文必须写明截止毫秒数：${text}`)
+    assert.match(text, /截止 \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}Z/, `报文必须写明截止时刻（ISO 时间）：${text}`)
     assert.ok(text.includes('超时**不是**拒绝，也**不是**同意'), text)
 
     const rows = rowsOf(cwd)
