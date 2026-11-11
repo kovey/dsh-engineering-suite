@@ -41,6 +41,12 @@ import {
     walkWorkspace,
     type Language,
 } from './scan.js'
+import { countLines, lineOfOffset, matchParen, regexCanStart, scanRegexEnd, scanTemplateEnd, skipSpace } from './metrics-text.js'
+import type { Lexed, MeasuredFunction, StringLiteral } from './metrics-text.js'
+import { bodyOpener, braceIndexAt, braceStructure, closerOf } from './metrics-braces.js'
+import type { Braces } from './metrics-braces.js'
+import { bodySpanOf, spanToMetric } from './metrics-bodies.js'
+import type { FunctionForm } from './metrics-bodies.js'
 
 // --- public types -----------------------------------------------------------
 
@@ -101,6 +107,19 @@ export interface FileMetrics {
     exports: number
     /** Workspace-relative module paths this file imports (resolved when they point inside the workspace). */
     imports: string[]
+    /**
+     * Functions that were found but NOT reported because their span could not be
+     * established (a body brace or bracket that does not pair). Absent when every
+     * function paired.
+     *
+     * Such a function has no honest length, so the honest answer is to leave it
+     * out and say how many were left out — not to run it to the end of the file
+     * and report that number. That is exactly the bug this field exists for: a
+     * 348-line function was reported as 1803 lines (its body closer had been
+     * swallowed by a mis-lexed block comment, and the measurement fell back to
+     * "the rest of the file").
+     */
+    skippedFunctions?: number
 }
 
 /** One broken standard, with a stable identity for the baseline ratchet. */
@@ -163,47 +182,6 @@ function compareText(left: string, right: string): number {
 }
 
 /**
- * Count the lines of a file.
- *
- * An empty file has 0 lines; a file whose last line has no trailing newline
- * still counts that line (the honest answer to "how long is this file").
- */
-function countLines(text: string): number {
-    if (text === '') return 0
-    let total = 1
-    for (let index = 0; index < text.length; index += 1) if (text.charCodeAt(index) === 10) total += 1
-    return text.endsWith('\n') ? total - 1 : total
-}
-
-/** One string literal, kept because import specifiers live inside them. */
-interface StringLiteral {
-    /** 1-based line of the opening quote. */
-    line: number
-    /** Raw content between the quotes (escapes left exactly as written). */
-    value: string
-    /** Offset of the first content character. */
-    start: number
-    /** Offset just past the closing quote (or the end of the file). */
-    end: number
-}
-
-/** A source file lexed once: comments/strings blanked out, plus a line index. */
-interface Lexed {
-    /** Language the file was lexed as (Go's `if` needs no parentheses, TS's does). */
-    language: Language
-    /** Same length as the source: comment and string bodies replaced by spaces (newlines kept). */
-    masked: string
-    /** Raw lines, `\r` stripped (0-based; a trailing newline adds no line). */
-    lines: string[]
-    /** Masked lines, `\r` stripped. */
-    maskedLines: string[]
-    /** Offset at which each line starts. */
-    lineStarts: number[]
-    /** Non-template string literals in source order. */
-    strings: StringLiteral[]
-}
-
-/**
  * Mask comments and string/char literals.
  *
  * Structure (`{}`, `if`, `def`) is then read from `masked`, so a brace inside a
@@ -261,39 +239,38 @@ function lexSource(text: string, language: Language): Lexed {
             // quote inside it (`/['"]/`) would otherwise open a "string" that
             // swallows the rest of the file and silently drops every symbol
             // after it — a real bug found by measuring this very module.
-            let cursor = index + 1
-            let inClass = false
-            let closed = false
-            while (cursor < text.length) {
-                const current = text[cursor] ?? ''
-                if (current === '\\') {
-                    cursor += 2
-                    continue
-                }
-                if (current === '\n') break
-                if (current === '[') inClass = true
-                else if (current === ']') inClass = false
-                else if (current === '/' && !inClass) {
-                    closed = true
-                    break
-                }
-                cursor += 1
-            }
-            if (closed) {
-                blank(index, cursor + 1)
-                index = cursor + 1
+            const stop = scanRegexEnd(text, index)
+            if (stop > 0) {
+                blank(index, stop)
+                index = stop
                 continue
             }
         }
-        if (char === '"' || char === "'" || (!python && char === '`')) {
+        if (!python && char === '`') {
+            // A template literal is masked whole, holes included: its `${…}`
+            // expressions are code, but no symbol is read out of them, and the
+            // mask keeps every brace inside them out of the structure read below.
+            //
+            // Backslash escapes DO count, and this is load-bearing: `\`` is a
+            // backtick INSIDE the literal, not its end. Reading it as the end left
+            // the rest of the literal lying in "code", where a `/**` written in the
+            // prose opened a block comment that ran to the next `*/` — swallowing
+            // the real closing `}` of the enclosing function. That function then
+            // measured to the end of the file: `askHuman` in
+            // dsh-deploy-gate/src/tools.ts reported 1803 lines instead of 348.
+            const stop = scanTemplateEnd(text, index)
+            blank(index, stop)
+            index = stop
+            continue
+        }
+        if (char === '"' || char === "'") {
             const triple = python && text[index + 1] === char && text[index + 2] === char
-            const raw = char === '`'
             const contentStart = index + (triple ? 3 : 1)
             let cursor = contentStart
             let closed = false
             while (cursor < text.length) {
                 const current = text[cursor] ?? ''
-                if (!raw && current === '\\') {
+                if (current === '\\') {
                     cursor += 2
                     continue
                 }
@@ -310,9 +287,7 @@ function lexSource(text: string, language: Language): Lexed {
             }
             const contentEnd = closed ? cursor : text.length
             const stop = closed ? cursor + (triple ? 3 : 1) : text.length
-            // Template literals are excluded: their `${…}` holes are not
-            // specifiers, and a backtick is never an import path.
-            if (!raw) strings.push({ line: lineOf(index) + 1, value: text.slice(contentStart, contentEnd), start: contentStart, end: contentEnd })
+            strings.push({ line: lineOf(index) + 1, value: text.slice(contentStart, contentEnd), start: contentStart, end: contentEnd })
             blank(index, stop)
             index = stop
             continue
@@ -330,52 +305,6 @@ function lexSource(text: string, language: Language): Lexed {
     const lines = text === '' ? [] : splitLines(text)
     const maskedLines = text === '' ? [] : splitLines(masked)
     return { language, masked, lines, maskedLines, lineStarts, strings }
-}
-
-/**
- * Whether a `/` at this position starts a regex literal rather than a division.
- *
- * A regex may only follow an operator, an opening bracket, a comma or the start
- * of the file; after an identifier, a number or a closing bracket the `/` is a
- * division. This is the standard lexical heuristic, and it is what keeps a
- * quote inside a character class (`/['"]/`) from being read as a string.
- */
-function regexCanStart(previous: string): boolean {
-    return previous === '' || '(,=:[!&|?{};+-*%~^<>'.includes(previous)
-}
-
-/** Line index (0-based) holding `offset`, clamped into the file. */
-function lineOfOffset(lexed: Lexed, offset: number): number {
-    let low = 0
-    let high = Math.max(0, lexed.lineStarts.length - 1)
-    while (low < high) {
-        const middle = (low + high + 1) >> 1
-        if ((lexed.lineStarts[middle] ?? 0) <= offset) low = middle
-        else high = middle - 1
-    }
-    return Math.min(low, Math.max(0, lexed.maskedLines.length - 1))
-}
-
-/** Offset of the bracket matching the one at `open`, or -1. */
-function matchParen(masked: string, open: number): number {
-    let depth = 0
-    for (let index = open; index < masked.length; index += 1) {
-        const char = masked[index]
-        if (char === '(' || char === '[' || char === '{') depth += 1
-        else if (char === ')' || char === ']' || char === '}') {
-            depth -= 1
-            if (depth === 0) return index
-            if (depth < 0) return -1
-        }
-    }
-    return -1
-}
-
-/** Offset of the first non-whitespace character at or after `from`. */
-function skipSpace(masked: string, from: number): number {
-    let index = from
-    while (index < masked.length && /\s/.test(masked[index] ?? '')) index += 1
-    return index
 }
 
 /** Whether the `<` at `index` looks like the start of a generic argument list. */
@@ -425,18 +354,6 @@ function paramCount(text: string, generics: boolean): number {
     return Math.max(0, count)
 }
 
-/** Whether a `;` at bracket depth 0 occurs in `[from, to)` — a statement ended. */
-function statementEnded(masked: string, from: number, to: number): boolean {
-    let depth = 0
-    for (let index = from; index < Math.min(to, masked.length); index += 1) {
-        const char = masked[index] ?? ''
-        if (char === '(' || char === '[' || char === '{') depth += 1
-        else if (char === ')' || char === ']' || char === '}') depth = Math.max(0, depth - 1)
-        else if (char === ';' && depth === 0) return true
-    }
-    return false
-}
-
 /**
  * Names declared by a declarator list (`a = 1, b: T = 2` → `['a', 'b']`).
  *
@@ -464,124 +381,6 @@ function declaratorNames(text: string): string[] {
         if (match !== null) names.push(match[1] ?? '')
     }
     return names
-}
-
-// --- brace structure (Go / TS / JS) -----------------------------------------
-
-/** Brace nesting of one file: per-brace matching plus per-line depths. */
-interface Braces {
-    /** Offsets of every `{`/`}` in source order. */
-    offsets: number[]
-    /** Matching brace index (into `offsets`), or -1 for an unmatched brace. */
-    match: number[]
-    /** Depth before that brace. */
-    depthBefore: number[]
-    /** For an opener: the deepest depth reached inside it (its own level included). */
-    subtreeMax: number[]
-    /** Brace depth at the start of each line. */
-    depthBeforeLine: number[]
-    /** Deepest depth reached while scanning each line. */
-    maxDepthLine: number[]
-    maxDepth: number
-    /** 0-based first line reaching {@link maxDepth}. */
-    maxDepthLineIndex: number
-}
-
-function braceStructure(lexed: Lexed): Braces {
-    const masked = lexed.masked
-    const lineCount = lexed.maskedLines.length
-    const offsets: number[] = []
-    const match: number[] = []
-    const depthBefore: number[] = []
-    const subtreeMax: number[] = []
-    const depthBeforeLine = new Array<number>(lineCount).fill(0)
-    const maxDepthLine = new Array<number>(lineCount).fill(0)
-    const stack: { index: number; max: number }[] = []
-    let depth = 0
-    let line = 0
-    for (let index = 0; index < masked.length; index += 1) {
-        while (line + 1 < lineCount && (lexed.lineStarts[line + 1] ?? Number.MAX_SAFE_INTEGER) <= index) {
-            line += 1
-            depthBeforeLine[line] = depth
-            maxDepthLine[line] = depth
-        }
-        const char = masked[index]
-        if (char !== '{' && char !== '}') continue
-        offsets.push(index)
-        depthBefore.push(depth)
-        if (char === '{') {
-            match.push(-1)
-            subtreeMax.push(depth + 1)
-            stack.push({ index: offsets.length - 1, max: depth + 1 })
-            depth += 1
-            maxDepthLine[line] = Math.max(maxDepthLine[line] ?? 0, depth)
-        } else {
-            const top = stack.pop()
-            const index = offsets.length - 1
-            if (top !== undefined) match[top.index] = index
-            match.push(top === undefined ? -1 : top.index)
-            subtreeMax.push(-1)
-            const reached = depth
-            depth = Math.max(0, depth - 1)
-            maxDepthLine[line] = Math.max(maxDepthLine[line] ?? 0, depth)
-            if (top !== undefined) {
-                top.max = Math.max(top.max, reached)
-                subtreeMax[top.index] = top.max
-                const parent = stack[stack.length - 1]
-                if (parent !== undefined) parent.max = Math.max(parent.max, top.max)
-            }
-        }
-    }
-    let maxDepth = 0
-    let maxDepthLineIndex = 0
-    for (let index = 0; index < lineCount; index += 1) {
-        const value = maxDepthLine[index] ?? 0
-        if (value > maxDepth) {
-            maxDepth = value
-            maxDepthLineIndex = index
-        }
-    }
-    return { offsets, match, depthBefore, subtreeMax, depthBeforeLine, maxDepthLine, maxDepth, maxDepthLineIndex }
-}
-
-/** First brace index whose offset is at or after `from`, or -1. */
-function braceIndexAt(braces: Braces, from: number): number {
-    let low = 0
-    let high = braces.offsets.length - 1
-    let found = -1
-    while (low <= high) {
-        const middle = (low + high) >> 1
-        if ((braces.offsets[middle] ?? -1) >= from) {
-            found = middle
-            high = middle - 1
-        } else low = middle + 1
-    }
-    return found
-}
-
-/**
- * The `{` that opens a declaration's body.
- *
- * Go and TS may put an inline type between the signature and the body
- * (`func f() struct{ A int } {`, `function f(): { a: number } {`); such a brace
- * is recognised because the text right after its match is `(`, `)`, `,` or `]`,
- * i.e. it is still inside the signature.
- */
-function bodyOpener(masked: string, from: number, braces: Braces): number {
-    let index = braceIndexAt(braces, from)
-    for (let step = 0; step < 24 && index >= 0 && index < braces.offsets.length; step += 1) {
-        const closer = braces.match[index] ?? -1
-        if (closer < 0) return -1
-        let cursor = (braces.offsets[closer] ?? 0) + 1
-        while (cursor < masked.length && /\s/.test(masked[cursor] ?? '')) cursor += 1
-        const next = masked[cursor]
-        if (next === '(' || next === ')' || next === ',' || next === ']') {
-            index = closer + 1
-            continue
-        }
-        return index
-    }
-    return -1
 }
 
 // --- indentation structure (Python) -----------------------------------------
@@ -654,18 +453,6 @@ function pyStructure(lexed: Lexed): PyStructure {
 
 // --- analysis shapes --------------------------------------------------------
 
-/** One function with its end line kept for span queries. */
-interface MeasuredFunction {
-    name: string
-    /** 1-based first line. */
-    line: number
-    /** 1-based last line (inclusive). */
-    endLine: number
-    lines: number
-    depth: number
-    params: number
-}
-
 /** A raw import specifier as written in the source. */
 interface RawImport {
     specifier: string
@@ -678,11 +465,15 @@ interface RawImport {
 /** Rules-free result of analyzing one file. */
 interface Analysis {
     functions: MeasuredFunction[]
+    /** Functions left out because their span could not be paired. */
+    skipped: number
     maxDepth: number
     /** 1-based line where `maxDepth` is first reached. */
     maxDepthLine: number
     ifBlocks: IfBlockMetric[]
     exports: number
+    /** Import specifiers as written, before resolution. */
+    raw: RawImport[]
 }
 
 // --- Go ---------------------------------------------------------------------
@@ -692,8 +483,10 @@ const GO_IMPORT_SINGLE = /^\s*import\s+(?:[\w.]+\s+)?"/
 const GO_IMPORT_GROUP = /^\s*import\s*\(/
 
 /** Functions of one Go file (methods are named `Type.Name`). */
-function goFunctions(lexed: Lexed, braces: Braces): MeasuredFunction[] {
+function goFunctions(lexed: Lexed, braces: Braces): { functions: MeasuredFunction[]; skipped: number } {
     const functions: MeasuredFunction[] = []
+    /** Functions whose body could not be paired, so no honest length exists. */
+    let skipped = 0
     for (let line = 0; line < lexed.maskedLines.length; line += 1) {
         const match = GO_FUNC.exec(lexed.maskedLines[line] ?? '')
         if (match === null) continue
@@ -704,11 +497,24 @@ function goFunctions(lexed: Lexed, braces: Braces): MeasuredFunction[] {
         const openParen = start + match[0].length - 1
         if (lexed.masked[openParen] !== '(') continue
         const closeParen = matchParen(lexed.masked, openParen)
-        if (closeParen < 0) continue
+        if (closeParen < 0) {
+            // A declaration whose parameter list never closes cannot be measured.
+            skipped += 1
+            continue
+        }
         const opener = bodyOpener(lexed.masked, closeParen + 1, braces)
-        if (opener < 0) continue
-        const closer = braces.match[opener] ?? -1
-        if (closer < 0) continue
+        if (opener < 0) {
+            // No body at all (an assembly stub) is not a measurement failure; a
+            // body brace that does not pair is, and must not be invented.
+            const candidate = braceIndexAt(braces, closeParen + 1)
+            if (candidate >= 0 && closerOf(braces, candidate) < 0) skipped += 1
+            continue
+        }
+        const closer = closerOf(braces, opener)
+        if (closer < 0) {
+            skipped += 1
+            continue
+        }
         const endLine = lineOfOffset(lexed, braces.offsets[closer] ?? start)
         const depth = (braces.subtreeMax[opener] ?? 1) - (braces.depthBefore[opener] ?? 0)
         functions.push({
@@ -720,7 +526,7 @@ function goFunctions(lexed: Lexed, braces: Braces): MeasuredFunction[] {
             params: paramCount(lexed.masked.slice(openParen + 1, closeParen), false),
         })
     }
-    return functions
+    return { functions, skipped }
 }
 
 /** Imports of one Go file, as written (the module prefix still included). */
@@ -968,58 +774,25 @@ function maskGroups(text: string): string {
 }
 
 /** Functions/classes/methods of one TS/JS file. */
-function tsFunctions(lexed: Lexed, braces: Braces): MeasuredFunction[] {
+function tsFunctions(lexed: Lexed, braces: Braces): { functions: MeasuredFunction[]; skipped: number } {
     const functions: MeasuredFunction[] = []
     const masked = lexed.masked
+    /** Functions whose body could not be paired, so no honest length exists. */
+    let skipped = 0
 
-    /** Record a function whose body starts at `from`; skip when there is none. */
-    const record = (name: string, startLine: number, params: number, from: number): void => {
-        const body = skipSpace(masked, from)
-        if (body >= masked.length) return
-        if (masked[body] === '{') {
-            if (statementEnded(masked, from, body)) return
-            const opener = bodyOpener(masked, body, braces)
-            if (opener < 0) return
-            const closer = closerOf(braces, opener)
-            if (closer < 0) return
-            const endLine = lineOfOffset(lexed, braces.offsets[closer] ?? body)
-            const depth = (braces.subtreeMax[opener] ?? 1) - (braces.depthBefore[opener] ?? 0)
-            functions.push({
-                name,
-                line: startLine + 1,
-                endLine: endLine + 1,
-                lines: endLine - startLine + 1,
-                depth: Math.max(1, depth),
-                params,
-            })
-            return
-        }
-        // An expression body (`=> expr`): its span is approximated by the line
-        // on which the statement's bracket balance returns to zero.
-        let balance = 0
-        let cursor = body
-        while (cursor < masked.length) {
-            const char = masked[cursor] ?? ''
-            if (char === '(' || char === '[' || char === '{') balance += 1
-            else if (char === ')' || char === ']' || char === '}') {
-                if (balance === 0) break
-                balance -= 1
-            } else if (balance === 0 && (char === ';' || char === '\n')) break
-            cursor += 1
-        }
-        const endLine = Math.max(startLine, lineOfOffset(lexed, cursor))
-        let depth = 0
-        for (let line = startLine; line <= endLine; line += 1) {
-            depth = Math.max(depth, (braces.maxDepthLine[line] ?? 0) - (braces.depthBeforeLine[startLine] ?? 0))
-        }
-        functions.push({
-            name,
-            line: startLine + 1,
-            endLine: endLine + 1,
-            lines: endLine - startLine + 1,
-            depth: Math.max(1, depth),
-            params,
-        })
+    /**
+     * Record a function whose body starts at `from`; skip (and count) when its
+     * span cannot be stated.
+     *
+     * The span itself is resolved in `metrics-bodies.ts`, because the rules there
+     * (a declaration's return type must not be read as its body, an arrow may
+     * have an expression body) are the difference between a length and a guess.
+     */
+    const record = (name: string, startLine: number, params: number, from: number, form: FunctionForm): void => {
+        const span = bodySpanOf(masked, from, braces, form)
+        const outcome = spanToMetric(lexed, braces, span, { name, startLine, params })
+        if (outcome.kind === 'function') functions.push(outcome.metric)
+        else if (outcome.kind === 'skipped') skipped += 1
     }
 
     /** The `(params)` right after `at` (an optional `<…>` type-parameter list may sit between), or undefined. */
@@ -1072,13 +845,13 @@ function tsFunctions(lexed: Lexed, braces: Braces): MeasuredFunction[] {
                 }
                 const arrow = arrowAt(masked, skipSpace(masked, close + 1), bound)
                 if (arrow < 0 || arrowIsInAType(masked, close + 1, arrow)) return false
-                record(name, startLine, paramCount(masked.slice(cursor + 1, close), true), arrow + 2)
+                record(name, startLine, paramCount(masked.slice(cursor + 1, close), true), arrow + 2, 'arrow')
                 return true
             }
             const arrow = arrowAt(masked, cursor, bound)
             if (arrow < 0) return false
             if (/^[A-Za-z_$][\w$]*$/.test(masked.slice(cursor, arrow).trim())) {
-                record(name, startLine, 1, arrow + 2)
+                record(name, startLine, 1, arrow + 2, 'arrow')
                 return true
             }
             return false
@@ -1093,7 +866,7 @@ function tsFunctions(lexed: Lexed, braces: Braces): MeasuredFunction[] {
         const start = lexed.lineStarts[line] ?? 0
         const params = paramsAt(start + match[0].length)
         if (params === undefined) continue
-        record(match[1] ?? '', line, paramCount(masked.slice(params.open + 1, params.close), true), params.close + 1)
+        record(match[1] ?? '', line, paramCount(masked.slice(params.open + 1, params.close), true), params.close + 1, 'declaration')
     }
 
     // 2. Class members: methods and arrow-valued properties.
@@ -1109,7 +882,7 @@ function tsFunctions(lexed: Lexed, braces: Braces): MeasuredFunction[] {
                 // `TS_METHOD` already consumed the `(`, so the offset points at it.
                 const params = paramsAt(start + method[0].length - 1)
                 if (params === undefined) continue
-                record(name(method[1] ?? ''), line, paramCount(masked.slice(params.open + 1, params.close), true), params.close + 1)
+                record(name(method[1] ?? ''), line, paramCount(masked.slice(params.open + 1, params.close), true), params.close + 1, 'declaration')
                 continue
             }
             const property = TS_PROPERTY.exec(maskedLine)
@@ -1118,7 +891,7 @@ function tsFunctions(lexed: Lexed, braces: Braces): MeasuredFunction[] {
             if (/^function\b/.test(masked.slice(after, after + 9))) {
                 const params = paramsAt(after + 8)
                 if (params === undefined) continue
-                record(name(property[1] ?? ''), line, paramCount(masked.slice(params.open + 1, params.close), true), params.close + 1)
+                record(name(property[1] ?? ''), line, paramCount(masked.slice(params.open + 1, params.close), true), params.close + 1, 'declaration')
                 continue
             }
             recordArrow(name(property[1] ?? ''), line, start + property[0].length, start + 400)
@@ -1141,18 +914,13 @@ function tsFunctions(lexed: Lexed, braces: Braces): MeasuredFunction[] {
         if (/^function\b/.test(masked.slice(cursor, cursor + 9))) {
             const params = paramsAt(cursor + 8)
             if (params === undefined) continue
-            record(name, line, paramCount(masked.slice(params.open + 1, params.close), true), params.close + 1)
+            record(name, line, paramCount(masked.slice(params.open + 1, params.close), true), params.close + 1, 'declaration')
             continue
         }
         recordArrow(name, line, cursor, Math.min(masked.length, assign + 400))
     }
 
-    return functions
-}
-
-/** Matching closer index of an opener index, or -1. */
-function closerOf(braces: Braces, opener: number): number {
-    return braces.match[opener] ?? -1
+    return { functions, skipped }
 }
 
 /** Import/require specifiers of one TS/JS file, read from its string literals. */
@@ -1235,11 +1003,26 @@ function pythonBlockEnd(lexed: Lexed, structure: PyStructure, line: number): num
     return end
 }
 
+/** Deepest indentation level reached inside the block that follows `line`. */
+function pythonDepth(structure: PyStructure, line: number, end: number, defLevel: number): number {
+    let deepest = defLevel
+    for (let cursor = line + 1; cursor <= end; cursor += 1) {
+        if (structure.blank[cursor] === true || structure.continuation[cursor] === true) continue
+        deepest = Math.max(deepest, structure.level[cursor] ?? defLevel)
+    }
+    return deepest
+}
+
 /** Functions and `if` blocks of one Python file. */
-function analyzePythonFunctions(lexed: Lexed, structure: PyStructure): { functions: MeasuredFunction[]; ifBlocks: IfBlockMetric[] } {
+function analyzePythonFunctions(
+    lexed: Lexed,
+    structure: PyStructure,
+): { functions: MeasuredFunction[]; ifBlocks: IfBlockMetric[]; skipped: number } {
     const functions: MeasuredFunction[] = []
     const ifBlocks: IfBlockMetric[] = []
     const stack: { width: number; name: string }[] = []
+    /** Functions whose parameter list could not be paired, so no honest span exists. */
+    let skipped = 0
     for (let line = 0; line < lexed.maskedLines.length; line += 1) {
         if (structure.blank[line] === true || structure.continuation[line] === true) continue
         const maskedLine = lexed.maskedLines[line] ?? ''
@@ -1252,25 +1035,22 @@ function analyzePythonFunctions(lexed: Lexed, structure: PyStructure): { functio
             const start = lexed.lineStarts[line] ?? 0
             const openParen = start + definition[0].length - 1
             const closeParen = matchParen(lexed.masked, openParen)
-            // An unclosed parameter list means the file is malformed: report no
-            // function rather than a span invented from the indentation.
-            if (closeParen < 0) continue
-            const end = pythonBlockEnd(lexed, structure, line)
-            const defLevel = Math.floor(width / structure.step + 1e-9)
-            let deepest = defLevel
-            for (let cursor = line + 1; cursor <= end; cursor += 1) {
-                if (structure.blank[cursor] === true || structure.continuation[cursor] === true) continue
-                deepest = Math.max(deepest, structure.level[cursor] ?? defLevel)
+            // An unclosed parameter list means the file is malformed: no span, counted.
+            if (closeParen < 0) skipped += 1
+            else {
+                const end = pythonBlockEnd(lexed, structure, line)
+                const defLevel = Math.floor(width / structure.step + 1e-9)
+                const deepest = pythonDepth(structure, line, end, defLevel)
+                functions.push({
+                    name: [...stack.map((scope) => scope.name), name].join('.'),
+                    line: line + 1,
+                    endLine: end + 1,
+                    lines: end - line + 1,
+                    depth: Math.max(1, deepest - defLevel),
+                    params: paramCount(lexed.masked.slice(openParen + 1, closeParen), false),
+                })
+                stack.push({ width, name })
             }
-            functions.push({
-                name: [...stack.map((scope) => scope.name), name].join('.'),
-                line: line + 1,
-                endLine: end + 1,
-                lines: end - line + 1,
-                depth: Math.max(1, deepest - defLevel),
-                params: paramCount(lexed.masked.slice(openParen + 1, closeParen), false),
-            })
-            stack.push({ width, name })
             continue
         }
 
@@ -1290,7 +1070,7 @@ function analyzePythonFunctions(lexed: Lexed, structure: PyStructure): { functio
             ifBlocks.push({ line: line + 1, lines: end - line + 1, kind: isIf !== null ? 'if' : 'else' })
         }
     }
-    return { functions, ifBlocks }
+    return { functions, ifBlocks, skipped }
 }
 
 /** Imports of one Python file (relative levels preserved). */
@@ -2035,42 +1815,61 @@ export function measureWorkspace(options: MeasureOptions): MetricsResult {
 }
 
 /** Measure one readable file; never throws (the caller degrades). */
+/**
+ * Everything language-specific about one lexed file, measured in one place.
+ *
+ * A file whose braces (or parameter list) do not pair still measures: the
+ * functions that DO pair are reported, and the ones that do not are counted in
+ * `skipped` instead of being given a length that runs to the end of the file.
+ */
+function analyzeSource(lexed: Lexed, language: Language): Analysis {
+    if (language === 'go') {
+        const braces = braceStructure(lexed)
+        const go = goFunctions(lexed, braces)
+        return {
+            functions: go.functions,
+            skipped: go.skipped,
+            ifBlocks: braceIfBlocks(lexed, braces),
+            exports: goExports(lexed, braces),
+            raw: goImports(lexed),
+            maxDepth: braces.maxDepth,
+            maxDepthLine: braces.maxDepthLineIndex + 1,
+        }
+    }
+    if (language === 'ts' || language === 'js') {
+        const braces = braceStructure(lexed)
+        const ts = tsFunctions(lexed, braces)
+        return {
+            functions: ts.functions,
+            skipped: ts.skipped,
+            ifBlocks: braceIfBlocks(lexed, braces),
+            exports: tsExports(lexed, braces),
+            raw: tsImports(lexed),
+            maxDepth: braces.maxDepth,
+            maxDepthLine: braces.maxDepthLineIndex + 1,
+        }
+    }
+    const structure = pyStructure(lexed)
+    const python = analyzePythonFunctions(lexed, structure)
+    return {
+        functions: python.functions,
+        skipped: python.skipped,
+        ifBlocks: python.ifBlocks,
+        exports: pythonExports(lexed, structure),
+        raw: pythonImports(lexed, structure),
+        maxDepth: structure.maxDepth,
+        maxDepthLine: structure.maxDepthLineIndex + 1,
+    }
+}
+
+/** Measure one readable file; never throws (the caller degrades). */
 function measureFile(rel: string, text: string, language: Language, index: WorkspaceIndex, standards: StandardsConfig): MeasuredFile {
     const lexed = lexSource(text, language)
     const lines = countLines(text)
-    let functions: MeasuredFunction[] = []
-    let ifBlocks: IfBlockMetric[] = []
-    let exports = 0
-    let maxDepth = 0
-    let maxDepthLine = 1
-    let raw: RawImport[] = []
-
-    if (language === 'go') {
-        const braces = braceStructure(lexed)
-        functions = goFunctions(lexed, braces)
-        raw = goImports(lexed)
-        ifBlocks = braceIfBlocks(lexed, braces)
-        exports = goExports(lexed, braces)
-        maxDepth = braces.maxDepth
-        maxDepthLine = braces.maxDepthLineIndex + 1
-    } else if (language === 'ts' || language === 'js') {
-        const braces = braceStructure(lexed)
-        functions = tsFunctions(lexed, braces)
-        raw = tsImports(lexed)
-        ifBlocks = braceIfBlocks(lexed, braces)
-        exports = tsExports(lexed, braces)
-        maxDepth = braces.maxDepth
-        maxDepthLine = braces.maxDepthLineIndex + 1
-    } else {
-        const structure = pyStructure(lexed)
-        const python = analyzePythonFunctions(lexed, structure)
-        functions = python.functions
-        ifBlocks = python.ifBlocks
-        raw = pythonImports(lexed, structure)
-        exports = pythonExports(lexed, structure)
-        maxDepth = structure.maxDepth
-        maxDepthLine = structure.maxDepthLineIndex + 1
-    }
+    const analysis = analyzeSource(lexed, language)
+    const { functions, ifBlocks, exports, maxDepth, raw } = analysis
+    const maxDepthLine = analysis.maxDepthLine
+    const skippedFunctions = analysis.skipped
 
     functions.sort((left, right) => left.line - right.line || left.endLine - right.endLine)
 
@@ -2094,6 +1893,7 @@ function measureFile(rel: string, text: string, language: Language, index: Works
             ifBlocks,
             exports,
             imports: [...importLines.keys()].sort(compareText),
+            ...(skippedFunctions === 0 ? {} : { skippedFunctions }),
         },
         functions,
         depthLine: maxDepthLine,

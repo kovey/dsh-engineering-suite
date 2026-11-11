@@ -28,7 +28,7 @@ harness 相关的东西一律走结构化类型（`AgentLike`、`SubprocessLike`
 | `writer-check.ts` | `scanTrailWriters`、`writersCheck`、`WriterFinding`、`sortFindings` | `ledger.writers` 医生检查：只读扫描门禁/回执/证据/mission 形状/mandate 位置/指纹快照与未知目录，finding 按 state→path 稳定排序 |
 | `rule-mode.ts` | `applyRuleModes`、`parseRuleMode`、`RULE_MODES` | 门禁规则的**模式**（`observe` / `enforce`）：observe 规则照常评估一次、把 would-be 裁决记进 `observations`，但不参与门的有效裁决；未知 mode 是配置问题并保持 enforce |
 | `scan.ts` | `scanWorkspace`、`scanGaps`、`walkWorkspace`、`readCapped`、`languageOf` | 既有仓库的只读扫描：需求文档与候选条目、代码符号（函数/方法/类型/路由/CLI）、测试用例、构建文件与建议命令；再与当前 mission 工件对比得出缺口（详见下文）。`walkWorkspace` 是本包**唯一**的工作区遍历，`scan` 与 `metrics` 共用同一套边界 |
-| `metrics.ts` | `measureWorkspace`、`parseBaseline`、`compareToBaseline` | 代码度量的确定性一半：文件/函数规模、嵌套深度、`if`/`else` 块行数、参数个数、导出面、模块依赖方向与导入环；输出违规清单与基线对比（详见下文） |
+| `metrics.ts` | `measureWorkspace`、`parseBaseline`、`compareToBaseline` | 代码度量的确定性一半：文件/函数规模、嵌套深度、`if`/`else` 块行数、参数个数、导出面、模块依赖方向与导入环；输出违规清单与基线对比（详见下文）。屏蔽层、花括号结构与函数边界各自独立成一个内部模块（`metrics-text.ts` / `metrics-braces.ts` / `metrics-bodies.ts`），本文件只做语言分析与汇总 |
 | `conformance.ts` | `missionConformance`、`conformanceRollup`、`conformanceOverview`、`buildConformanceContext`、`conformanceHeadline`、`HEADLINE_RANK`、`CONFORMANCE_DIMENSIONS` | **一致性总览**：一个 mission 的五个维度（授权/证据/门禁/新鲜度/一致性）+ 仓库级分布；头行 = 最差维度，`unknown` 不优于 `partial`；只读、派生、零权力（详见下文） |
 | `testing.ts` | `createFakeHost`、`tempWorkspace`、`fakeAgent`、`runText` | 单元测试用的假宿主：`tools.register/guard/get`、`on`、`effect`、`systemPrompt.section`、`get()`、`approval.request`、`subagents.start`、`subprocess.spawn`，外加 `emit` / `waterfall`（数组 payload 会展开成多参）/ `runTool` / `sectionText` / `dispose` |
 | `scope.ts`（子路径 `dsh-eng-core/scope`） | `apply`、`name`、`resolveScopeConfig`、`PERSONA_SECTION`、`PERSONA_ORDER`、`ScopeContextLike` | 子代理 scope 里的唯一强制点：先 `ctx.tools.restrict({allow, deny})`（宿主强制，白名单外的工具对子代理不可见）再写 persona section；能力缺失只告警、`restrict` 被拒必须抛（子代理启动失败），空白名单 `allow: []` 拒绝挂载。被 role-guard 与 orchestrator 的 preset 行**按同名挂载** |
@@ -131,7 +131,7 @@ const { added, known, fixed } = compareToBaseline(result.violations, parseBaseli
 |---|---|---|---|
 | `lines` | 全文行数（无尾换行的最后一行也算；空文件 0 行） | 同左 | 同左 |
 | `functions` | `func Name(` 与 `func (r *T) m(`（名字为 `T.m`） | `function name`、类方法（`Class.method`）、`const/let/var name = (…) => …` / `= function (…)`；名字与 `(` 之间的 `<T,>` 类型参数列表允许存在，被括号或类型断言包一层的箭头（`const f = ((a, b) => c) as T`）按内层参数列表算 | 顶层与嵌套 `def`/`async def`，名字带限定（`Class.method`、`outer.inner`），单行 `def f(): pass` 也计入 |
-| `functions[].lines` | 声明行 → 函数体闭合 `}` | 块体同上；表达式体（`=> expr`）近似取语句结束行 | 声明行 → 缩进块最后一行 |
+| `functions[].lines` | 声明行 → 函数体闭合 `}` | 声明行 → **配对**的函数体闭合 `}`：返回类型（`): Promise<T> {`、`): { ok: boolean } {`、`): value is { error: string } {`）会被跳过，不会被当成函数体；表达式体（`=> expr`）取括号配平回到 0 的那一行。花括号/括号配不上的函数**不产出长度**，计入 `skippedFunctions`（见下） | 声明行 → 缩进块最后一行 |
 | `functions[].depth` | 函数体内达到的最大花括号深度（函数体本身算 1 层） | 同左 | 函数体内相对缩进层数（`def` 自身那层不算） |
 | `functions[].params` | 顶层逗号计数：`(a, b string)`=2、`(opts)`=1、`()`=0、尾逗号不算 | 同上；`Map<string, number>` 这类泛型里的逗号不算 | 同上（`self` 计入） |
 | `maxDepth` | 文件最大花括号嵌套（顶层函数体=1） | 同左 | 文件最大缩进层级 |
@@ -156,6 +156,11 @@ const { added, known, fixed } = compareToBaseline(result.violations, parseBaseli
 这种仓库应在自己的 standards 里写 `exempt: ['**/dist/**']`。其余边界：`maxFiles`（默认 4000）、
 `maxFileBytes`（默认 256 KiB）、不跟随目录符号链接；超大/不可读文件跳过（不计入 `files`，但计入
 `stats.filesScanned`），畸形文件**尽力测量、绝不抛异常**（参数列表未闭合的 `func`/`def` 直接不产出符号）。
+**长度不可知的函数不产出长度**：函数体的花括号（或参数列表）配不上时，该函数被跳过并在 `FileMetrics.skippedFunctions`
+里计数——绝不把「文件剩下的部分」当成它的长度。这条规则是一次真实 bug 的结论：一段模板字符串里的 `\`` 被读成
+字符串结束，紧跟其后的 `/**` 被当成块注释、把函数真正的闭合 `}` 一起屏蔽掉，于是 346 行的函数报成了 1803 行
+（文件末行 − 起始行 + 1）。屏蔽层现在按「转义反引号 / `${…}` 洞 / 洞里的嵌套模板 / 正则 / 引号 / 注释」逐段跳过，
+函数边界一律取配对的花括号。
 `exempt` 命中「整条路径」（`**` 可跨目录，`*` 不跨；`vendor` 这种裸目录名不匹配任何文件，要写 `vendor/**`）：
 这些文件计入 `stats.exempted`、保留 `lines`（报告仍能显示体积），但不产出函数、导入与违规。
 输出确定性：文件按 path、函数按 line、违规按 key、环按规范化结果排序；同一输入两次运行结果深度相等；

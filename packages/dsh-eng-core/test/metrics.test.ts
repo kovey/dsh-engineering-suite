@@ -11,6 +11,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
+import { fileURLToPath } from 'node:url'
 import { compareToBaseline, measureWorkspace, parseBaseline } from '../dist/index.js'
 import type { FileMetrics, MetricsResult, StandardsConfig, Violation } from '../dist/index.js'
 
@@ -944,3 +945,176 @@ test('imports: a `./x.js` specifier resolves to the `x.ts` source beside it', ()
     const result = measureWorkspace({ cwd: root, standards: { languages: { ts: {} } } })
     assert.deepEqual(fileNamed(result, 'src/store.ts').imports, ['src/helper.ts'])
 })
+
+test('TS: a span is the paired body, whatever the signature and the body contain', () => {
+    const root = workspace()
+    // Every construct here has already, at some point, been mis-read as
+    // structure: a multi-line parameter object, a template literal holding
+    // braces, a regex holding `{…}`, and a body with nested functions. A span
+    // that is not the paired `{ … }` shows up as a number that is too large
+    // (running into the next declaration) or too small (stopping at a brace
+    // inside a literal).
+    write(
+        root,
+        'src/shapes.ts',
+        [
+            'type Deps = { store: string }',
+            '',
+            'export async function withMultiLineParams(input: {',
+            '    deps: Deps',
+            "    toolName: 'run'",
+            '    signal?: AbortSignal',
+            '}): Promise<string> {',
+            '    const prose = `deploy ${input.toolName} to ${input.deps.store}`',
+            '    return prose',
+            '}',
+            '',
+            'export function templates(value: string): string {',
+            '    const one = `a ${value} {b} c`',
+            '    const two = `escaped \\` backtick and a /** not a comment */ inside`',
+            '    return one + two',
+            '}',
+            '',
+            'export function regexes(text: string): boolean {',
+            '    const braces = /\\{\\d+\\}/g',
+            '    return braces.test(text)',
+            '}',
+            '',
+            'export function outer(value: number): number {',
+            '    const inner = (x: number): number => {',
+            '        return x + 1',
+            '    }',
+            '    function nested(y: number): number {',
+            '        return y * 2',
+            '    }',
+            '    return nested(inner(value))',
+            '}',
+            '',
+        ].join('\n'),
+    )
+    const result = measureWorkspace({ cwd: root, standards: { languages: { ts: {} } } })
+    const file = fileNamed(result, 'src/shapes.ts')
+    assert.deepEqual(
+        file.functions.map((fn) => [fn.name, fn.line, fn.lines, fn.depth, fn.params]),
+        [
+            // 3 → 10: the body ends at the `}` on line 10, not at the `{` of the
+            // parameter object (line 3) and not at the end of the file.
+            ['withMultiLineParams', 3, 8, 1, 1],
+            // 12 → 16: both templates are text; `/**` inside one is not a comment.
+            ['templates', 12, 5, 1, 1],
+            // 18 → 21: the `{}` inside the regex literal is not structure.
+            ['regexes', 18, 4, 1, 1],
+            // 23 → 31: the outer body owns both nested functions.
+            ['outer', 23, 9, 2, 1],
+            ['inner', 24, 3, 1, 1],
+            ['nested', 27, 3, 1, 1],
+        ],
+    )
+    // Everything paired: nothing to count.
+    assert.equal(file.skippedFunctions, undefined)
+})
+
+test('TS: a mis-lexed template can no longer run a function to the end of the file', () => {
+    const root = workspace()
+    // The escaped backtick around `.dsh/**` is the real shape of the bug: read as
+    // the END of the template, the rest of the prose became code, the `/**` in it
+    // opened a block comment, and that comment blanked the function's closing
+    // brace — the function then measured to the end of the file (a 346-line
+    // function was reported as 1803 lines in dsh-deploy-gate/src/tools.ts).
+    write(
+        root,
+        'src/prose.ts',
+        [
+            'export function before(): number {',
+            '    return 1',
+            '}',
+            '',
+            'export function withProse(input: string): string {',
+            '    const note = `the model cannot edit \\`.dsh/**\\` (the host decides)`',
+            '    return note + input',
+            '}',
+            '',
+            'export function after(): number {',
+            '    return 2',
+            '}',
+            '',
+        ].join('\n'),
+    )
+    const result = measureWorkspace({ cwd: root, standards: { languages: { ts: {} } } })
+    const file = fileNamed(result, 'src/prose.ts')
+    assert.deepEqual(
+        file.functions.map((fn) => [fn.name, fn.line, fn.lines]),
+        [
+            ['before', 1, 3],
+            ['withProse', 5, 4],
+            ['after', 10, 3],
+        ],
+    )
+    // The escaped backtick is inside a template: read as its end, the `/**` would
+    // blank everything to the next `*/` (here: to the end of the file) and
+    // `withProse` would be reported as the rest of the file.
+    assert.equal(file.functions.find((fn) => fn.name === 'withProse')?.line ?? 0, 5)
+})
+
+test('TS: a body that never closes is skipped and counted, never measured to the end of the file', () => {
+    const root = workspace()
+    write(
+        root,
+        'src/broken.ts',
+        [
+            'export function whole(): number {',
+            '    return 1',
+            '}',
+            '',
+            'export function missing(): number {',
+            '    if (true) {',
+            '        return 2',
+            '    }',
+            '',
+            'export function last(): number {',
+            '    return 3',
+            '}',
+            '',
+        ].join('\n'),
+    )
+    const result = measureWorkspace({ cwd: root, standards: { languages: { ts: {} } } })
+    const file = fileNamed(result, 'src/broken.ts')
+    // `missing` has no closing brace of its own: its length is unknowable, so it
+    // is left out and counted. Reporting it to the end of the file would invent
+    // a number (and then a violation nobody can fix).
+    assert.equal(file.skippedFunctions, 1)
+    assert.deepEqual(
+        file.functions.map((fn) => [fn.name, fn.line, fn.lines]),
+        [
+            ['whole', 1, 3],
+            ['last', 10, 3],
+        ],
+    )
+    assert.equal(result.violations.filter((violation) => violation.rule === 'maxFunctionLines').length, 0)
+})
+
+test('askHuman in dsh-deploy-gate measures its own body (879–1224), not the rest of the file', () => {
+    // The regression this file exists for, on the real file the standards gate
+    // reported: 1803 lines — the file's last line minus 879 plus one, i.e. "to the
+    // end of the file". Its body closes on line 1224 (the TypeScript compiler
+    // says the same), so the honest span is 879–1224 = 346 lines. The 348 quoted
+    // in the mission (879–1226) counts line 1225, which is blank, and line 1226,
+    // which is the doc comment of the NEXT function (`renderDenial` on 1227).
+    const root = workspace()
+    const source = fileURLToPath(new URL('../../../packages/dsh-deploy-gate/src/tools.ts', import.meta.url))
+    const text = fs.readFileSync(source, 'utf8')
+    write(root, 'src/tools.ts', text)
+    const result = measureWorkspace({ cwd: root, standards: { languages: { ts: {} } } })
+    const file = fileNamed(result, 'src/tools.ts')
+    const askHuman = file.functions.find((fn) => fn.name === 'askHuman')
+    assert.ok(askHuman !== undefined, 'askHuman must still be measured')
+    assert.equal(askHuman.line, 879)
+    assert.equal(askHuman.lines, 346)
+    assert.equal(askHuman.line + askHuman.lines - 1, 1224)
+    assert.ok(askHuman.line + askHuman.lines - 1 < file.lines, 'the span must not reach the last line of the file')
+    assert.equal(askHuman.params, 1)
+    // The next top-level function is measured on its own line, not inside askHuman.
+    const renderDenial = file.functions.find((fn) => fn.name === 'renderDenial')
+    assert.equal(renderDenial?.line, 1227)
+})
+
