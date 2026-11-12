@@ -13,15 +13,20 @@ import {
     approvalModeOf,
     bool,
     isRecord,
+    mergeShellAllowlist,
     num,
+    projectShellPolicyOf,
     reviewChannelOf,
     shellAllowOf,
+    shellPolicyOf,
     str,
     strList,
     type ApprovalMode,
     type ReviewChannel,
+    type ShellPolicy,
 } from './config-values.js'
 import { mergeBootstrap, resolveBootstrap, type BootstrapConfig } from './config-bootstrap.js'
+import { DEFAULT_SHELL_ALLOWLIST } from './shell-allowlist.js'
 
 /** Whether an unapproved specification blocks writes. */
 export type EnforceMode = boolean
@@ -58,12 +63,12 @@ export interface SpecGateConfig {
     /** Shell tools whose command string is analysed for write targets. */
     shellTools: readonly string[]
     /**
-     * How to judge a shell command whose write targets could not be attributed:
-     * `targets` checks what it can and allows the rest (documented blind spot),
-     * `strict` denies, `off` skips shell analysis entirely.
+     * How to judge a shell command: `targets` checks what it can and allows the
+     * rest (documented blind spot), `strict` denies what cannot be attributed,
+     * `allowlist` is the positive list, `off` skips shell analysis. Default
+     * `targets`; only the host picks the mode.
      */
-    shellPolicy: 'targets' | 'strict' | 'off'
-
+    shellPolicy: ShellPolicy
     /**
      * Reviewed shell artifacts that may run even though their write targets are
      * unattributable (`bash scripts/**`). Host-only on purpose: a repository that
@@ -71,6 +76,14 @@ export interface SpecGateConfig {
      * Consulted only under `shellPolicy: 'strict'`.
      */
     shellAllow: readonly string[]
+
+    /**
+     * The positive list of `shellPolicy: 'allowlist'`: a program name (`ls`), a
+     * subcommand prefix (`git status`) or a path prefix/glob (`bash scripts/*.sh`).
+     * Host default plus project additions (append only); adding an entry widens
+     * what can run, so the docs state that risk next to the key.
+     */
+    shellAllowlist: readonly string[]
     /** Tool names never inspected (escape hatch for host tooling). */
     exemptTools: readonly string[]
     /** `auto` requires a passing test design only when `dsh-test-design-gate` is
@@ -122,6 +135,7 @@ const PROJECT_OVERRIDABLE_KEYS: readonly string[] = [
     'writeTools',
     'shellTools',
     'shellPolicy',
+    'shellAllowlist',
     'boundaryExemptPaths',
     'requireTestDesign',
     'approval',
@@ -144,6 +158,14 @@ export interface EffectiveSpecGateConfig {
 
 /**
  * Resolve the configuration that applies to one workspace.
+ *
+ * The three path keys are WRITE targets (the plan ledger, the ADR directory and
+ * its index). A project may relocate those records INSIDE its own workspace and
+ * never outside it: `adrDir: "/tmp/…"` (or `../../…`) would hide the record from
+ * the people reviewing this repository and drop files into a directory the
+ * workspace does not own. A violating value keeps the profile's value (never a
+ * plugin default that silently widens the layout) and is reported as a problem;
+ * a refused key is not "applied".
  * @param host - the profile-resolved configuration (the ceiling).
  * @param layout - the session workspace layout.
  * @param logger - diagnostics sink.
@@ -161,13 +183,6 @@ export function resolveEffectiveConfig(host: SpecGateConfig, layout: Layout, log
             logger?.warn(problem)
         }
     }
-    // The three path keys are WRITE targets (the plan ledger, the ADR directory
-    // and its index). A project may relocate those records INSIDE its own
-    // workspace and never outside it: `adrDir: "/tmp/…"` (or `../../…`) would
-    // hide the record from the people reviewing this repository and drop files
-    // into a directory the workspace does not own. A violating value keeps the
-    // profile's value (never a plugin default that silently widens the layout)
-    // and is reported as a problem; a refused key is not "applied".
     const refusedKeys = new Set<string>()
     const projectPath = (key: 'planFile' | 'adrDir' | 'adrIndexFile'): string | undefined => {
         if (!Object.prototype.hasOwnProperty.call(raw, key)) return undefined
@@ -192,6 +207,12 @@ export function resolveEffectiveConfig(host: SpecGateConfig, layout: Layout, log
     const planFile = projectPath('planFile')
     const adrDir = projectPath('adrDir')
     const adrIndexFile = projectPath('adrIndexFile')
+    const projectPolicy = projectShellPolicyOf(raw['shellPolicy'], host.shellPolicy, file.file)
+    if (projectPolicy.problem !== undefined) {
+        problems.push(projectPolicy.problem)
+        logger?.warn(projectPolicy.problem)
+        refusedKeys.add('shellPolicy')
+    }
 
     // Same provenance rule as `dsh-quality-gate`/`dsh-evidence-gate`: report
     // 'project' only when the file really changed something.
@@ -205,8 +226,9 @@ export function resolveEffectiveConfig(host: SpecGateConfig, layout: Layout, log
         enforceBoundaries: bool(raw['enforceBoundaries'], host.enforceBoundaries),
         writeTools: strList(raw['writeTools'], host.writeTools),
         shellTools: strList(raw['shellTools'], host.shellTools),
-        shellPolicy: raw['shellPolicy'] === 'strict' ? 'strict' : raw['shellPolicy'] === 'off' ? 'off' : raw['shellPolicy'] === 'targets' ? 'targets' : host.shellPolicy,
+        shellPolicy: projectPolicy.policy ?? host.shellPolicy,
         shellAllow: shellAllowOf(raw['shellAllow'], host.shellAllow),
+        shellAllowlist: mergeShellAllowlist(raw['shellAllowlist'], host.shellAllowlist),
         boundaryExemptPaths: strList(raw['boundaryExemptPaths'], host.boundaryExemptPaths ?? []),
         requireTestDesign:
             typeof requireTestDesignRaw === 'boolean' ? requireTestDesignRaw : requireTestDesignRaw === 'auto' ? 'auto' : host.requireTestDesign,
@@ -256,8 +278,9 @@ export function resolveConfig(input: unknown): SpecGateConfig {
         boundaryExemptPaths: strList(raw['boundaryExemptPaths'], []),
         writeTools: strList(raw['writeTools'], DEFAULT_WRITE_TOOLS),
         shellTools: strList(raw['shellTools'], DEFAULT_SHELL_TOOLS),
-        shellPolicy: raw['shellPolicy'] === 'strict' ? 'strict' : raw['shellPolicy'] === 'off' ? 'off' : 'targets',
+        shellPolicy: shellPolicyOf(raw['shellPolicy'], 'targets'),
         shellAllow: shellAllowOf(raw['shellAllow'], []),
+        shellAllowlist: strList(raw['shellAllowlist'], DEFAULT_SHELL_ALLOWLIST),
         exemptTools: strList(raw['exemptTools'], []),
         requireTestDesign:
             typeof raw['requireTestDesign'] === 'boolean' ? raw['requireTestDesign'] : 'auto',

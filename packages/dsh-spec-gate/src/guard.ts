@@ -27,6 +27,7 @@ import {
     unknownTargetReason,
 } from './guard-messages.js'
 import { analyzeShellCommand, shellCommandOf } from './shell.js'
+import { shellAllowlistRefusal } from './shell-allowlist.js'
 import type { SpecGateConfig } from './config.js'
 
 /** The write guard and the diagnostics a test (or a status tool) can inspect. */
@@ -167,6 +168,14 @@ function notApprovedReason(missionId: string, status: string): string {
  *     comment, not a constraint);
  *  3. the target is outside the engineering trail (the gate's trust root).
  *
+ * A shell command is gated only when it actually WRITES something the analyser
+ * could attribute: `ls`, `git status`, `npm test` and other read-only or
+ * unattributable commands stay usable before approval. Under
+ * `shellPolicy: 'allowlist'` every shell segment is judged first against
+ * `shellAllowlist` (see `shell-allowlist.ts`), because "we could not see a
+ * write" is exactly the answer that policy refuses to trust; the ordinary
+ * target/boundary checks then still run for a listed command.
+ *
  * @param deps - configuration, mission stores and the test-design probe.
  * @returns the guard plus a denial counter.
  */
@@ -179,9 +188,8 @@ export function createWriteGuard(deps: WriteGuardDeps): WriteGuard {
     }
     const guard = (exec: WriteGuardExecution): string | undefined => {
         const declared = exec.agent?.session?.header?.cwd
-        // The overlay is per workspace; an undeclared cwd never reaches the
-        // rules below (it is refused), so the profile config is used to decide
-        // that refusal.
+        // The overlay is per workspace; an undeclared cwd never reaches the rules
+        // below (it is refused), so the profile config decides that refusal.
         const config = declared === undefined ? deps.config : deps.configFor(declared).config
         if (!config.enforce) return undefined
         if (config.exemptTools.includes(exec.name)) return undefined
@@ -192,19 +200,14 @@ export function createWriteGuard(deps: WriteGuardDeps): WriteGuard {
         // consulted when the policy is not off.
         const command = isShellTool ? shellCommandOf(exec.arguments) : undefined
         const shell = command === undefined || config.shellPolicy === 'off' ? undefined : analyzeShellCommand(command)
-        // A shell command is gated only when it actually WRITES something the
-        // analyser could attribute; `ls`, `git status`, `npm test` and other
-        // read-only or unattributable commands stay usable before approval
-        // (the `strict` policy is what turns the blind spot into a refusal).
         const shellTargets = shell?.targets ?? []
         const shellWriteLike = isShellTool && shellTargets.length > 0
         const gated = isWriteTool || shellWriteLike
 
         const cwd = exec.agent?.session?.header?.cwd
         if (cwd === undefined) {
-            // Without a workspace there is no mission resolution we can trust:
-            // falling back to the harness's own cwd would gate this write
-            // against a different project's approvals.
+            // No workspace → no mission resolution we can trust (harness cwd
+            // would gate this write against a different project's approvals).
             bump('(undeclared)')
             return undeclaredCwdReason()
         }
@@ -220,10 +223,17 @@ export function createWriteGuard(deps: WriteGuardDeps): WriteGuard {
             bump(store.layout.rootDir)
             return breach
         }
+        const mission = store.resolveForAgent(exec.agent)
+        // Positive-list mode: "no write target we can see" is exactly what this
+        // policy refuses to accept, so it is judged before the target scan.
+        const notListed = isShellTool ? shellAllowlistRefusal(config, command, mission?.id ?? '(no mission)') : undefined
+        if (notListed !== undefined) {
+            bump(store.layout.rootDir)
+            return notListed
+        }
         const target = writeTargetPath(exec.arguments)
         // Only WRITE-ish targets count: a `read` of a forbidden path is not a
-        // modification, and denying it would stop a reviewer from reading the
-        // very file it must review.
+        // modification, and denying it would stop a reviewer reading that file.
         const declaredTargets = [
             ...(isWriteTool && target !== undefined ? [target] : []),
             ...shellTargets,
@@ -247,7 +257,6 @@ export function createWriteGuard(deps: WriteGuardDeps): WriteGuard {
             return reserved.reason
         }
 
-        const mission = store.resolveForAgent(exec.agent)
         // Declarative negative constraints apply to EVERY tool the mission's
         // specification forbids (`tool:`/`argv:`), not just to writes, so they
         // are evaluated before the write-only checks decide to skip the call.

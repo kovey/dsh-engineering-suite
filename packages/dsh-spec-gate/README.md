@@ -261,9 +261,14 @@ profile 是上限，每个仓库可以用 `.dsh/spec-gate.json` 决定**自己**
 { "enforce": false }                                  // 临时/试验仓库：不拦写，其余工具照旧可用
 { "enforceBoundaries": false, "shellPolicy": "strict" } // 边界放宽，但 shell 不可归属就拒绝
 { "writeTools": ["write", "edit", "multi_edit"] }       // 这个仓库的写类工具集
+{ "shellAllowlist": ["mycmd"] }                        // 追加一条正列表条目（只在宿主开了 allowlist 时生效）
 ```
 
-- 可覆盖键：`enforce`、`enforceBoundaries`、`writeTools`、`shellTools`、`shellPolicy`、`boundaryExemptPaths`、`requireTestDesign`、`approval`、`reviewChannel`、`reviewTimeoutMs`、`bootstrap`、`planFile`、`adrDir`、`adrIndexFile`、`milestoneRequired`。
+- 可覆盖键：`enforce`、`enforceBoundaries`、`writeTools`、`shellTools`、`shellPolicy`、`shellAllowlist`、`boundaryExemptPaths`、`requireTestDesign`、`approval`、`reviewChannel`、`reviewTimeoutMs`、`bootstrap`、`planFile`、`adrDir`、`adrIndexFile`、`milestoneRequired`。
+- **`shellPolicy` 只能收紧、不能放宽**：项目级可以选 `targets`/`strict`（且不能弱于宿主当前值），
+  但**不能**自行切到 `allowlist`（那是否放行 shell 面的宿主决策），也**不能**设成 `off` 关掉检查。
+- **`shellAllowlist` 只能追加**：宿主默认条目 + 项目追加条目做并集，项目文件删不掉宿主的条目。
+  追加一条就是扩大可执行面（命中条目的命令不再经过正列表这道闸），所以只在确有必要时加。
 - **不可覆盖**：`enabled`、`logFile`、`rootDir`/`specsDir`/`missionsDir`（宿主决策），写了会被忽略并记日志。
 - 文件本身在信任根里（`.dsh/**` 只允许派生的 `specs/*.md` 被写类工具改写），所以模型不能用 `write` 把自己的门禁关掉。
 - `spec_status` 会显示 `配置来源：项目级 …/profile` 与 `enforce / 边界 / 审批模式`。
@@ -290,7 +295,8 @@ profile 是上限，每个仓库可以用 `.dsh/spec-gate.json` 决定**自己**
 | `enforceBoundaries` | `true` | 是否把写操作目标限制在规格的 `fileBoundaries` 内（支持 `src/**`、`*.json`、`docs` 这类写法） |
 | `boundaryExemptPaths` | `[]` | 额外的放行模式（在规格边界之前判定） |
 | `shellTools` | `['bash','pwsh']` | 会被分析写入目标的 shell 工具 |
-| `shellPolicy` | `'targets'` | `targets`=能识别就查、查不到放行（记录盲区）；`strict`=不可归属即拒绝；`off`=不分析 shell |
+| `shellPolicy` | `'targets'` | `targets`=能识别就查、查不到放行（记录盲区）；`strict`=不可归属即拒绝；`allowlist`=只有命中 `shellAllowlist` 的命令才执行；`off`=不分析 shell |
+| `shellAllowlist` | 见下 | `allowlist` 模式的正列表。默认 `ls`/`cat`/`head`/`tail`/`wc`/`rg`/`grep`/`find`/`git status`/`git diff`/`git log`/`git show`/`node --test`/`tsc`/`bash scripts/*.sh`；条目可以是程序名、子命令前缀（`git status`）或路径前缀/glob（`bash scripts/`、`bash scripts/*.sh`）。项目级只能追加 |
 | `writeTools` | `['write','edit']` | 被视为“写”的工具名 |
 | `exemptTools` | `[]` | 永不检查的工具 |
 | `requireTestDesign` | `'auto'` | `auto` = 只有挂了 `dsh-test-design-gate` 才要求测试设计已通过 |
@@ -327,6 +333,11 @@ profile 是上限，每个仓库可以用 `.dsh/spec-gate.json` 决定**自己**
   `unzip -d DIR`、`mv -t DIR`、`install -t DIR`；解析不了就 `undecidable`（`xargs` 下游是变量、`rsync` 目标是远端、
   `git apply` 的补丁不可见且没有 `--directory`……），由 `shellPolicy` 决定：默认 `targets` 放行但记录盲区，
   `strict` 直接拒绝（推荐在受控仓库里用），`off` 关闭分析。
+- **正列表模式（`shellPolicy: "allowlist"`）**：逐段解析命令（`|`、`||`、`&&`、`;`、换行），每段的首个程序按
+  basename 与 `shellAllowlist` 比较；条目可以带子命令/路径前缀（`git status`、`bash scripts/*.sh`），
+  多 token 条目按位置逐 token 匹配。**任何一段不命中就拒绝**，理由给出最接近的条目、如何追加条目，
+  以及"改用 write/read/grep 等工具"的建议；命令替换（`$(…)`、反引号、进程替换）因为 token 遍历看不见里面的
+  命令，一律拒绝。命中之后**既有的目标/边界/信任根检查照常执行**。默认策略仍是 `targets`，这个模式由宿主开启。
 - **信任根还有一道与命令写法无关的兜底**：监听宿主 `tools/result`，每次工具完成后用 `dsh-eng-core` 的
   `policyFingerprint`（与 mission mandate 同一个函数）比对信任根指纹。套件自己的工具造成的合法变化只刷新基线；
   其它工具（`write`/`edit`/`bash`…）改动了信任根 → 追加一行

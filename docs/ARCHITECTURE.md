@@ -139,7 +139,7 @@ profile 的 loader 行 config           ← 宿主决策：是否启用、日志
 | 插件 | 项目文件 | 可覆盖 | 不可覆盖（写了也忽略并记日志） |
 |---|---|---|---|
 | `dsh-quality-gate` | `.dsh/quality-gate.json` | `commands`（替换）、`limits`、`defaultTimeoutMs`、`maxOutputBytes`、`writeTools`、`turnStop`、`afterWrite` | `enabled`、`logFile`、布局 |
-| `dsh-spec-gate` | `.dsh/spec-gate.json` | `enforce`、`enforceBoundaries`、`writeTools`、`shellTools`、`shellPolicy`、`boundaryExemptPaths`、`requireTestDesign`、`approval` | `enabled`、`logFile`、`rootDir`/`specsDir`/`missionsDir` |
+| `dsh-spec-gate` | `.dsh/spec-gate.json` | `enforce`、`enforceBoundaries`、`writeTools`、`shellTools`、`shellPolicy`（只能收紧）、`shellAllowlist`（只能追加）、`boundaryExemptPaths`、`requireTestDesign`、`approval` | `enabled`、`logFile`、`rootDir`/`specsDir`/`missionsDir` |
 | `dsh-evidence-gate` | `.dsh/evidence-gate.json` | `requiredEvidenceKinds`、`requireGate`、`gateSource`、`requireCleanTree`、`maxGateAgeMinutes`、`maxOutputTail` | `enabled`、`logFile`、布局、**`allowForceOverride`**（它放松的是模型能主动传的 `force`）、`prompt` |
 | `dsh-test-design-gate` | `.dsh/test-design-gate.json` | `minTextLength`、`strict`、`allowDanglingCase`、`requireAllScenarios` | `enabled`、`logFile`、布局、`prompt` |
 | `dsh-audit-trail` | `.dsh/audit-trail.json` | `snapshot.*`（开关/上限）、`writeTools`、`trackTools`、`ignoreTools`、`maxArgsSummary`、`maxResultTail`、`redactArgs` | `enabled`、`logFile`、`auditDir`/`rootDir`（审计轨迹的位置是部署决策）、`prompt` |
@@ -1265,6 +1265,39 @@ ExtApi——那是 TUI 专属面；命令注册表是 TUI / desktop / web 共用
 `*.jsonl` 台账是运行时数据，按设计不参与；静态建模覆盖的是这七类命令的常见形态，其它形态仍是 `undecidable`（在
 `strict` 策略下拒绝、`targets` 策略下是已文档化的盲区）；兜底依赖"套件工具名单"完整，新增套件工具必须加进
 `SUITE_TOOLS`（或通过 `suiteTools` 配置补充），否则它的合法写入会被当成越权。
+
+### 5.32 shell 正列表模式（`shellPolicy: 'allowlist'`）：从"看到写就拦"到"只放行点名的"
+
+`targets`/`strict` 都在回答"这条命令写了什么"：前者把看不清的放过去（已文档化的盲区），后者把看不清的拒掉。
+`allowlist` 换一个方向提问——"这条命令是不是我们评审过的入口"：**不在名单上就一律不执行**，与它可能写什么无关。
+这样，分析器没建模过的命令形状（拼接、包装脚本、未来才出现的工具）不再是绕过路径，而是默认被拒。
+
+**语义**（`src/shell-allowlist.ts`）：
+
+- 逐段解析：按分析器同一组分隔符（`|`、`||`、`&&`、`;`、换行）切分，**任意一段**不命中即拒绝——
+  `git status && rsync …` 里前半段合法不能救后半段。
+- 首个程序按 **basename** 比较（`/bin/ls` 与 `ls` 等价）；条目可以带更多 token 做**按位置的前缀**匹配：
+  `git status` 命中 `git status --porcelain`，`bash scripts/*.sh` 的最后一个 token 是 glob
+  （`*` 不跨路径段、`**` 跨），`bash scripts/` 这种以 `/` 结尾的条目按路径前缀匹配。条目永远不消费参数里
+  的引号：`tokenize` 复用 `shell-lex.ts`，analyzer 与 allowlist 不会对"什么是一个 token"有两种看法。
+- **命令替换逃不掉**：`$(…)`、反引号与进程替换（`<(…)`/`>(…)`）里的命令不在 token 序列里，命中条目也不放行，
+  理由写明"无法静态确认实际运行什么"（fail closed）。找不到命令参数的 shell 调用沿用既有的 fail-closed 拒绝。
+- 命中之后**既有的目标/边界/信任根检查照常执行**：`echo x > .dsh/…` 即使 `echo` 被追加进名单，
+  仍会被信任根拦下；`touch outside.ts` 仍会被文件边界拦下。
+- 拒绝文案（`src/guard-messages.ts`）给出：哪一段、首个程序、**最接近的条目**（只按前缀，接近≠命中）、
+  如何在项目级追加 `shellAllowlist`、以及"改用 write/read/grep 等工具而不是 shell"的建议。
+
+**默认值与权限边界**：默认策略仍然是 `targets`（新取值不改变既有行为）；默认名单是一组只读命令加已评审的
+脚本入口（`ls`/`cat`/`head`/`tail`/`wc`/`rg`/`grep`/`find`/`git status`/`git diff`/`git log`/`git show`/
+`node --test`/`tsc`/`bash scripts/*.sh`）。**如何开启**：在 profile 的 `dsh-spec-gate` 配置里写
+`{ "shellPolicy": "allowlist" }`（需要更多入口时同时给 `shellAllowlist`）；仓库只能在自己的
+`.dsh/spec-gate.json` 里**追加**条目，不能切模式。**`shellPolicy` 由宿主决定**：项目级只能在不放宽宿主值的前提下取
+`targets`/`strict`，不能自行切到 `allowlist`，也不能设成 `off` 把检查关掉；**`shellAllowlist` 可以项目级追加**
+（宿主条目 ∪ 项目条目，项目删不掉宿主的条目）。
+
+**风险**：追加条目 = 扩大可执行面。命中条目的命令不再经过正列表这道闸，所以一条过宽的条目
+（`bash`、`node`、`python3`）等于把该程序的所有用法都放行，只剩目标/边界检查兜底。默认名单里的 `find`
+（`-delete`/`-exec`）与 `node --test`（测试会写产物）同理——它们在名单里是**已评审的决定**，不是"只读命令"的同义词。
 
 ## 6. 为什么这样切分
 

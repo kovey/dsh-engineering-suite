@@ -13,6 +13,16 @@ export type ApprovalMode = 'seam'
 /** The channels that can ask a human to review a specification. */
 export type ReviewChannel = 'auto' | 'tui' | 'approval' | 'questions'
 
+/**
+ * How a shell command is judged.
+ *
+ * `targets` checks what it can see and allows the rest (the documented blind
+ * spot); `strict` refuses what cannot be attributed; `allowlist` is the
+ * positive list (only listed programs run); `off` skips shell analysis. The
+ * default is `targets`, so adding the mode changes no existing behaviour.
+ */
+export type ShellPolicy = 'targets' | 'strict' | 'allowlist' | 'off'
+
 /** A plain object (arrays are values, never configuration sections). */
 export function isRecord(value: unknown): value is Record<string, unknown> {
     return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -75,4 +85,49 @@ export function approvalModeOf(raw: unknown, host: ApprovalMode): ApprovalMode {
 /** Normalise `reviewChannel` in ONE place (two hand-written enums drifted apart). */
 export function reviewChannelOf(value: unknown, fallback: ReviewChannel): ReviewChannel {
     return value === 'auto' || value === 'tui' || value === 'approval' || value === 'questions' ? value : fallback
+}
+
+/** Normalise `shellPolicy` in ONE place (the profile loader). */
+export function shellPolicyOf(value: unknown, fallback: ShellPolicy): ShellPolicy {
+    return value === 'targets' || value === 'strict' || value === 'allowlist' || value === 'off' ? value : fallback
+}
+
+/**
+ * Read the PROJECT-level `shellPolicy`: it may tighten, never widen.
+ *
+ * `allowlist` is a host decision (it decides how much of the shell surface the
+ * deployment is willing to keep), and `off` would let a repository switch the
+ * shell checks off from inside itself. A project may still move between
+ * `targets` and `strict` when that does not weaken the host value — a strict
+ * deployment cannot be relaxed by the repository it watches.
+ * @param value - the untrusted project value.
+ * @param host - the profile value (the ceiling).
+ * @param file - the project file, named in the problem.
+ * @returns the accepted policy, or the problem that made it ignored.
+ */
+export function projectShellPolicyOf(
+    value: unknown,
+    host: ShellPolicy,
+    file: string,
+): { policy?: ShellPolicy; problem?: string } {
+    if (value === undefined) return {}
+    if (value === 'targets' || value === 'strict') {
+        if (host === 'off' || host === 'targets' || host === value) return { policy: value }
+    }
+    return {
+        problem:
+            `${file}: shellPolicy 只能由宿主决定（项目级只能在不放宽宿主策略时取 targets/strict）；` +
+            `"${String(value)}" 已忽略，继续使用 profile 的 ${host}。项目不能自行切到 allowlist 或关掉检查。`,
+    }
+}
+
+/**
+ * Host defaults plus the project's additions (append only, de-duplicated).
+ *
+ * A project may widen the list — that is the documented meaning of the key —
+ * but it can never remove a host entry, so a host-built list cannot be narrowed
+ * silently from inside a repository.
+ */
+export function mergeShellAllowlist(value: unknown, host: readonly string[]): string[] {
+    return [...new Set([...host, ...strList(value, [])])]
 }

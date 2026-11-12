@@ -1,5 +1,44 @@
 ## [未发布]
 
+### 新增 · `shellPolicy: 'allowlist'`：只放行点名过的 shell 入口（`dsh-spec-gate`）
+
+`targets`/`strict` 都在回答"这条命令写了什么"，前者把看不清的放过去、后者把看不清的拒掉；两者都默认
+"没看到写 = 可能是安全的"。这一版加**正列表模式**：不在名单上的命令一律不执行，与它可能写什么无关——
+分析器没建模的命令形状不再是一条绕过路径，而是默认被拒。
+
+- **匹配**（`src/shell-allowlist.ts`）：按分析器同一组分隔符（`|`、`||`、`&&`、`;`、换行）逐段解析，
+  **任意一段**不命中即拒绝。首个程序按 basename 比较（`/bin/ls` ≡ `ls`），多 token 条目按位置逐 token 前缀匹配
+  （`git status` 命中 `git status --porcelain`）；最后一个 token 支持 glob（`bash scripts/*.sh`，`*` 不跨段、
+  `**` 跨段）与以 `/` 结尾的路径前缀（`bash scripts/`）。命令替换/进程替换（`$(…)`、反引号、`<(…)`）因为
+  里面运行的命令不在 token 序列里，命中条目也拒绝（fail closed）；找不到命令参数的 shell 调用沿用既有拒绝。
+- **拒绝文案**（`src/guard-messages.ts`）：点出拒绝的段与首个程序、**最接近的条目**（只按前缀比较，接近≠命中）、
+  如何在项目级追加 `shellAllowlist`，以及"改用 write/read/grep 等工具而不是 shell"的建议。
+- **既有检查照常**：命中名单之后，目标/边界/信任根检查仍按原顺序执行（`echo x > .dsh/…` 即使 `echo` 被追加
+  仍会被信任根拒绝；`touch outside.ts` 仍会被文件边界拒绝）。
+- **配置**（`src/config.ts` / `src/config-values.ts`）：`shellPolicy` 新增 `'allowlist'`，默认仍是 `'targets'`；
+  新键 `shellAllowlist: string[]`，默认 `ls`/`cat`/`head`/`tail`/`wc`/`rg`/`grep`/`find`/`git status`/`git diff`/
+  `git log`/`git show`/`node --test`/`tsc`/`bash scripts/*.sh`。`shellAllowlist` 进入 `PROJECT_OVERRIDABLE_KEYS`
+  但**只能追加**（宿主条目 ∪ 项目条目，项目删不掉宿主的条目）；`shellPolicy` 仍是宿主决策——项目级只能在不放宽
+  宿主值的前提下取 `targets`/`strict`，不能自行切到 `allowlist`，也不能设成 `off` 关掉检查（写了会被忽略并记日志）。
+- **开启方式**：profile 的 `dsh-spec-gate` 配置写 `{ "shellPolicy": "allowlist" }`，需要更多入口时同时给
+  `shellAllowlist`；仓库侧只追加条目。追加条目 = 扩大可执行面（命中条目的命令不再经过正列表这道闸），
+  过宽的条目（`bash`、`node`、`python3`）等于把该程序的所有用法放行——文档把这条风险写在键旁边。
+- **结构**：新模块 `shell-allowlist.ts`（195 行、depth 3、6 个导出）、`guard-messages.ts` 增加一个文案函数、
+  `config.ts`/`config-values.ts` 增加取值归一化与合并；`guard()` 与 `createWriteGuard` 实测 175/188 行（与基线
+  持平，新增判定抽进 helper），`standards-check` 无新增/恶化违规。
+
+**测试面**：新增 `packages/dsh-spec-gate/test/shell-allowlist.test.ts` 14 条（TC-1541…TC-1546 与 AC-008/AC-009
+的补充：git status 允许、`bash scripts/verify.sh --quiet` 允许、git apply 拒绝并给出最接近条目/追加方式、
+rsync 拒绝并点名、项目追加 `mycmd` 生效且宿主条目保留、默认策略仍为 targets、多 token 前缀与 glob、
+逐段/管道/命令替换拒绝、项目不能切 allowlist 或 off、命中名单后信任根/边界仍生效、无命令参数 fail closed）。
+`node --test packages/dsh-spec-gate/test/*.test.ts`：**184 通过 / 0 失败**（原 170 + 新增 14，既有断言未改、未跳过）。
+按团队约定本轮只跑 spec-gate 测试、`tsc` 与 `standards-check`；规格里的 TC-1547（`verify.sh --quiet` 两次全绿）
+由交付门禁执行。
+
+**验证**：`node node_modules/typescript/bin/tsc -p packages/dsh-spec-gate/tsconfig.json` 通过；
+`bash scripts/standards-check.sh --quiet` exit 0。文档：`docs/ARCHITECTURE.md` §5.32（含 5.2 配置表与
+`packages/dsh-spec-gate/README.md` 的键表）。
+
 ### 加固 · 写保护的两道防线：七类命令建模 + 信任根运行时兜底（`dsh-spec-gate`）
 
 **缺口是实测的**：`spec-gate` 的 shell 分析器按操作数位置判断写入，`tar -x -C .dsh/…`、`xargs -I{} cp {} .dsh/…`、

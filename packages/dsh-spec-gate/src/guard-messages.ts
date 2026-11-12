@@ -111,6 +111,39 @@ export function shellUnknownReason(missionId: string, tool: string): string {
     ].join('\n')
 }
 
+/**
+ * A command refused because `shellPolicy: 'allowlist'` does not cover it.
+ *
+ * The denial is written for the MODEL: what was refused, the closest entry
+ * (a near miss is a hint, not a permission), how to add an entry, and what to
+ * use instead of a shell. The risk line is deliberate — widening the list is
+ * the one action this text can invite, so it must not sound free.
+ * @param missionId - mission named in the text.
+ * @param denial - the refusing segment (shape shared with `shell-allowlist.ts`).
+ */
+export function shellAllowlistReason(
+    missionId: string,
+    denial: { segment: string; program: string; hidden?: string; closest?: string },
+): string {
+    const command = denial.segment.length > 200 ? `${denial.segment.slice(0, 200)}…` : denial.segment
+    const closest = denial.closest === undefined ? '（没有前缀相同的条目）' : `\`${denial.closest}\``
+    const reason =
+        denial.hidden === undefined
+            ? `首个程序 \`${denial.program}\` 不在名单上`
+            : `该段含命令替换/进程替换（${denial.hidden}），无法静态确认实际运行什么`
+    return [
+        'spec-gate: shell 命令的这一段不在 shellAllowlist 里，而宿主把 shellPolicy 设为 allowlist，因此拒绝执行。',
+        `mission: ${missionId}`,
+        `命令段：\`${command}\``,
+        `拒因：${reason}。`,
+        `最接近的条目：${closest}（只按前缀比较；接近不等于命中，不在名单上就不放行）。`,
+        '如何追加条目：在仓库的 .dsh/spec-gate.json 写 {"shellAllowlist": ["<程序或前缀>"]}（项目级只能追加，不能删除宿主条目；',
+        '是否开启 allowlist 仍由宿主决定）。注意：追加条目 = 扩大可执行面——命中条目的命令不再经过正列表这道闸。',
+        '也可以改用工具而不是 shell：写文件用 write/edit（带 file_path，仍走文件边界检查），读文件用 read，',
+        '搜索用 grep/glob，运行测试用宿主提供的测试命令。只有当某个程序确实需要长期放行时才追加它。',
+    ].join('\n')
+}
+
 export function unknownTargetReason(missionId: string, tool: string): string {
     return [
         `spec-gate: 写类工具 \`${tool}\` 没有声明目标路径，无法进行文件边界校验，按 fail closed 拒绝。`,
