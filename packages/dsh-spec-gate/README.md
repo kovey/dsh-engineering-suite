@@ -322,8 +322,16 @@ profile 是上限，每个仓库可以用 `.dsh/spec-gate.json` 决定**自己**
   拒绝理由会列出当前边界并指明"改规格 → 重新审批"的路径。边界写法：目录（`src`）、glob（`src/**`、`*.md`）、精确文件。
 - **shell 写入也会被检查**：`bash`/`pwsh` 命令里的重定向（`>`/`>>`）、`tee`、`sed -i`、`rm`/`mv`/`cp`、
   `truncate`、`dd of=` 等可识别的写入目标，会与 `write`/`edit` 一样过信任根与文件边界。
-  无法静态归属的命令（`git checkout`、`find -delete`、`python`/`node` 脚本…）由 `shellPolicy` 决定：
-  默认 `targets` 放行但记录盲区，`strict` 直接拒绝（推荐在受控仓库里用），`off` 关闭分析。
+  操作数不是"最后一个位置参数"的七类命令单独建模：`tar`（解包写 `-C DIR`，创建写 `-f FILE`）、
+  `xargs`（下游命令递归再分析）、`git apply`（补丁里的路径 / `--directory DIR`）、`rsync`（目标操作数）、
+  `unzip -d DIR`、`mv -t DIR`、`install -t DIR`；解析不了就 `undecidable`（`xargs` 下游是变量、`rsync` 目标是远端、
+  `git apply` 的补丁不可见且没有 `--directory`……），由 `shellPolicy` 决定：默认 `targets` 放行但记录盲区，
+  `strict` 直接拒绝（推荐在受控仓库里用），`off` 关闭分析。
+- **信任根还有一道与命令写法无关的兜底**：监听宿主 `tools/result`，每次工具完成后用 `dsh-eng-core` 的
+  `policyFingerprint`（与 mission mandate 同一个函数）比对信任根指纹。套件自己的工具造成的合法变化只刷新基线；
+  其它工具（`write`/`edit`/`bash`…）改动了信任根 → 追加一行
+  `<布局根>/state/trust-root-violations.jsonl`、通过 `interaction` 发 warn 通知，并让后续**写类工具**（含 shell）
+  一律被拒并提示"需要重新审批 mission"，直到进程重启或新 mission 审批成功。读操作不受影响。
 - **负面约束的可执行子集**：`path:` / `tool:` / `cmd:` / `argv:` 四种前缀会被门禁强制
   （分别禁止路径、工具、shell 命令子串、任意工具参数正则），其余散文约束保持提示级并在
   `spec_status` 里单列（`可机器校验 N 条；仅提示级 M 条`）。

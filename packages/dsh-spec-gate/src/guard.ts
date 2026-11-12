@@ -12,10 +12,20 @@
  */
 
 import { matchesShellAllow } from './shell.js'
-import { isInside, isReallyInside, mandateState, pathMatchesAny, pathMatchesPattern, resolvePath, type Mandate, type MissionStore, type MissionStoreRegistry } from 'dsh-eng-core'
+import { mandateState, pathMatchesAny, pathMatchesPattern, resolvePath, type Mandate, type MissionStore, type MissionStoreRegistry } from 'dsh-eng-core'
 import path from 'node:path'
 import type { AgentLike } from 'dsh-eng-core'
-import { evaluateConstraints, type ConstraintViolation } from './constraints.js'
+import { evaluateConstraints } from './constraints.js'
+import {
+    boundaryReason,
+    constraintReason,
+    shellBoundaryReason,
+    shellStrictReason,
+    shellUnknownReason,
+    trustRootViolation,
+    undeclaredCwdReason,
+    unknownTargetReason,
+} from './guard-messages.js'
 import { analyzeShellCommand, shellCommandOf } from './shell.js'
 import type { SpecGateConfig } from './config.js'
 
@@ -44,6 +54,21 @@ export interface WriteGuardDeps {
     stores: MissionStoreRegistry
     /** Whether the sibling test-design gate is mounted (probed once, at call time). */
     testDesignMounted: () => boolean
+    /**
+     * The runtime trust-root fallback (`trust-root-watch.ts`), when mounted.
+     *
+     * Read at call time: after an out-of-band change the watcher is `breached`
+     * and every write-class call is refused, whatever its target says.
+     */
+    trustRoot?: () => TrustRootGuard | undefined
+}
+
+/** The sliver of `TrustRootWatch` the guard consults (no import cycle). */
+export interface TrustRootGuard {
+    /** Seed the baseline before the first tool of a workspace runs. */
+    ensureBaseline: (cwd: string) => void
+    /** The denial text while breached, `undefined` otherwise. */
+    reason: () => string | undefined
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -181,12 +206,20 @@ export function createWriteGuard(deps: WriteGuardDeps): WriteGuard {
             // falling back to the harness's own cwd would gate this write
             // against a different project's approvals.
             bump('(undeclared)')
-            return [
-                'spec-gate: 无法确定本会话的工作区（session.header.cwd 缺失），写操作被拒绝（fail closed）。',
-                '下一步：在带 cwd 的会话里工作；宿主可通过 exemptTools 显式放行该工具（需自行承担风险）。',
-            ].join('\n')
+            return undeclaredCwdReason()
         }
         const store: MissionStore = deps.stores.for(cwd)
+        // The runtime fallback (see `trust-root-watch.ts`): a trust root changed
+        // outside the suite refuses EVERY write-class call, whatever it targets.
+        const trustRoot = deps.trustRoot?.()
+        trustRoot?.ensureBaseline(cwd)
+        // Write-CAPABLE tools only: an unattributable shell command is the hole
+        // this fallback exists for, so it is refused too (reads stay open).
+        const breach = isWriteTool || isShellTool ? trustRoot?.reason() : undefined
+        if (breach !== undefined) {
+            bump(store.layout.rootDir)
+            return breach
+        }
         const target = writeTargetPath(exec.arguments)
         // Only WRITE-ish targets count: a `read` of a forbidden path is not a
         // modification, and denying it would stop a reviewer from reading the
@@ -207,19 +240,11 @@ export function createWriteGuard(deps: WriteGuardDeps): WriteGuard {
         // whether a write is allowed, so a write-class tool may never touch
         // them — otherwise one `write .dsh/missions/<id>/mission.json` forges an
         // approval and the gate approves itself.
-        for (const declared of gated ? declaredTargets : []) {
-            const resolved = resolvePath(declared, cwd)
-            // Containment is checked on the REAL path: a symlink inside the
-            // workspace pointing into `.dsh/` would otherwise pass a lexical
-            // check while the bytes land in the trust root (the model could
-            // rewrite its own thresholds or baseline through `link/x.json`).
-            if (!isReallyInside(store.layout.rootDir, resolved, cwd)) continue
-            // The rendered specification is derived and is the one artifact the
-            // gate may let through without an approval; everything else under
-            // the root is the trust root and stays closed.
-            if (isDerivedSpecArtifact(store, resolved)) return undefined
+        const reserved = gated ? trustRootViolation(store, cwd, declaredTargets) : undefined
+        if (reserved?.kind === 'allow') return undefined
+        if (reserved !== undefined) {
             bump(store.layout.rootDir)
-            return trustRootReason(path.relative(store.layout.cwd, resolved))
+            return reserved.reason
         }
 
         const mission = store.resolveForAgent(exec.agent)
@@ -333,81 +358,3 @@ export function createWriteGuard(deps: WriteGuardDeps): WriteGuard {
         denialsFor: (rootDir: string) => denialsByRoot.get(rootDir) ?? 0,
     }
 }
-
-/**
- * Whether a path is one of the *derived* artifacts a model may rewrite.
- *
- * Only the rendered specification is in this set, and only because it is
- * derived: `spec_approve` and the write guard both read `mission.spec`, never
- * the markdown, and a hand-written artifact that disagrees with the record is
- * rejected by the review digest. Everything else under the root decides trust
- * and therefore stays closed.
- */
-function isDerivedSpecArtifact(store: MissionStore, absoluteTarget: string): boolean {
-    return absoluteTarget.endsWith('.md') && isInside(store.layout.specsDir, absoluteTarget)
-}
-
-function trustRootReason(relative: string): string {
-    return [
-        `spec-gate: \`${relative}\` 属于工程台账（门禁的信任根），不允许通过写类工具修改。`,
-        '这些文件（mission.json / state/** / roles/** / gates / receipts / stages / 审计）决定了"这次改动是否被允许"，',
-        '只能由插件自己的工具写入：规格用 spec_create，评审用 test_design_review，审批用 spec_approve，',
-        '门禁用 quality_gate_run，证据用 evidence_record。',
-        '如果你是在做本套件自身的开发，请让宿主在 spec-gate 的 boundaryExemptPaths 里显式放行对应目录。',
-    ].join('\n')
-}
-
-function constraintReason(violation: ConstraintViolation, missionId: string): string {
-    return [
-        `spec-gate: ${violation.reason}`,
-        `约束原文：\`${violation.constraint.raw}\``,
-        '这条约束是规格的一部分（negativeConstraints），门禁会强制它。',
-        `下一步：如果确实需要这样做，先 spec_create 修改「负面约束」并重新 spec_approve（mission ${missionId}）。`,
-    ].join('\n')
-}
-
-function shellBoundaryReason(missionId: string, relative: string, boundaries: readonly string[]): string {
-    return [
-        `spec-gate: shell 命令要写 \`${relative}\`，不在规格声明的文件边界内，命令被拒绝。`,
-        `mission: ${missionId}`,
-        `允许的边界：${boundaries.length === 0 ? '(规格未声明任何边界)' : boundaries.join(', ')}`,
-        '下一步：把改动收敛到边界内，或先 spec_create 更新 fileBoundaries 并重新 spec_approve。',
-    ].join('\n')
-}
-
-function shellStrictReason(missionId: string, command: string, reasons: readonly string[]): string {
-    return [
-        'spec-gate: shell 命令的写入目标无法静态确认，而宿主把 shellPolicy 设为 strict，因此拒绝执行。',
-        `mission: ${missionId}`,
-        `命令：\`${command.length > 200 ? `${command.slice(0, 200)}…` : command}\``,
-        `原因：${reasons.join('；') || '无法归属写入目标'}`,
-        '下一步：改用声明了 file_path 的写类工具，或把命令拆成可归属的形式；宿主也可把 shellPolicy 调成 targets/off。',
-    ].join('\n')
-}
-
-function shellUnknownReason(missionId: string, tool: string): string {
-    return [
-        `spec-gate: shell 工具 \`${tool}\` 的调用里找不到命令参数，无法校验写入目标，按 fail closed 拒绝。`,
-        `mission: ${missionId}`,
-        '下一步：把命令放在 command 参数里；或让宿主把该工具加入 exemptTools（显式承担风险）。',
-    ].join('\n')
-}
-
-function unknownTargetReason(missionId: string, tool: string): string {
-    return [
-        `spec-gate: 写类工具 \`${tool}\` 没有声明目标路径，无法进行文件边界校验，按 fail closed 拒绝。`,
-        `mission: ${missionId}`,
-        '宿主可以把它加入 spec-gate 的 exemptTools（显式承担风险），或让该工具在参数里带上 file_path/path。',
-    ].join('\n')
-}
-
-function boundaryReason(missionId: string, relative: string, boundaries: readonly string[]): string {
-    return [
-        `spec-gate: 目标路径 \`${relative}\` 不在规格声明的文件边界内，写操作被拒绝。`,
-        `mission: ${missionId}`,
-        `允许的边界：${boundaries.length === 0 ? '(规格未声明任何边界)' : boundaries.join(', ')}`,
-        '下一步：如果确实需要动这个文件，先调用 spec_create 更新规格的 fileBoundaries（并重新 spec_approve），',
-        '不要绕过边界——边界外的改动无法被这次的验收标准覆盖。',
-    ].join('\n')
-}
-

@@ -15,6 +15,14 @@
  * @module dsh-spec-gate/shell
  */
 
+import { escapeRegExp, stripHeredocs, tokenize, withoutQuotedSpans } from './shell-lex.js'
+import { gitSubcommandOf } from './shell-git.js'
+import type { NestedAnalysis } from './shell-model.js'
+import { modelShellWrite } from './shell-tools.js'
+
+/** `>` / `>>` / `2>` as a standalone token. */
+const REDIRECT = /^(?:\d?|&)>>?$/
+
 /** What one shell command appears to write, and what could not be attributed. */
 export interface ShellAnalysis {
     /** Write targets exactly as written in the command (may be relative). */
@@ -36,8 +44,6 @@ const WRITE_COMMANDS: Record<string, { targets: 'all' | 'last' | 'except-first';
     truncate: { targets: 'all', reason: 'truncate 截断文件' },
     mkdir: { targets: 'all', reason: 'mkdir 创建目录' },
     cp: { targets: 'last', reason: 'cp 写入目标文件' },
-    install: { targets: 'last', reason: 'install 写入目标文件' },
-    mv: { targets: 'all', reason: 'mv 移动/覆盖文件' },
     ln: { targets: 'all', reason: 'ln 创建链接' },
     chmod: { targets: 'except-first', reason: 'chmod 修改权限位' },
     chown: { targets: 'except-first', reason: 'chown 修改属主' },
@@ -61,97 +67,7 @@ const UNDECIDABLE_COMMANDS: Record<string, string> = {
     bash: '嵌套 shell 无法静态归属',
     zsh: '嵌套 shell 无法静态归属',
     env: 'env 后的命令无法静态归属',
-    xargs: 'xargs 会按参数执行命令',
     sudo: 'sudo 后的命令无法静态归属',
-}
-
-/** Split a command into tokens, keeping quotes/operators meaningful enough. */
-function tokenize(command: string): string[] {
-    const tokens: string[] = []
-    let current = ''
-    let quote: '"' | "'" | undefined
-    let started = false
-    for (const character of command) {
-        if (quote !== undefined) {
-            if (character === quote) quote = undefined
-            else current += character
-            continue
-        }
-        if (character === '"' || character === "'") {
-            quote = character
-            started = true
-            continue
-        }
-        if (/\s/.test(character)) {
-            if (started || current !== '') {
-                tokens.push(current)
-                current = ''
-                started = false
-            }
-            continue
-        }
-        current += character
-    }
-    if (started || current !== '') tokens.push(current)
-    return tokens
-}
-
-const REDIRECT = /^(?:\d?|&)>>?$/
-
-/** Blank out single/double quoted spans so operators inside them are inert. */
-function withoutQuotedSpans(command: string): string {
-    let out = ''
-    let quote: '"' | "'" | undefined
-    for (const character of command) {
-        if (quote !== undefined) {
-            if (character === quote) {
-                quote = undefined
-                out += ' '
-                continue
-            }
-            out += ' '
-            continue
-        }
-        if (character === '"' || character === "'") {
-            quote = character
-            out += ' '
-            continue
-        }
-        out += character
-    }
-    return out
-}
-
-/** `<<EOF`, `<<-'EOF'`, `<< "EOF"`: the marker that opens a heredoc. */
-const HEREDOC_START = /<<-?\s*(?:['"]?)([A-Za-z_][A-Za-z0-9_]*)/
-
-/**
- * Drop heredoc BODIES, keeping the line that opens each one.
- *
- * A heredoc body is DATA, never shell syntax: a commit message, a markdown snippet
- * or a code sample that happens to contain `>=` or `> out.txt` is not a
- * redirection. Reading it as shell produced two false positives in the wild — a
- * `git commit -F -` whose message said `apiVersion >= 1` was refused for "writing
- * `=`". The opening line IS kept, because a real redirect may precede the marker
- * (`cat > notes.md <<'EOF'`). An unterminated heredoc removes the rest of the
- * command: nothing after it could be trusted as shell syntax either.
- * @param command - the raw command string.
- * @returns the command with every heredoc body removed.
- */
-function stripHeredocs(command: string): string {
-    const lines = command.split('\n')
-    const kept: string[] = []
-    for (let index = 0; index < lines.length; index += 1) {
-        const line = lines[index] ?? ''
-        kept.push(line)
-        const delimiter = HEREDOC_START.exec(line)?.[1]
-        if (delimiter === undefined) continue
-        // Skip the body, stopping ON the delimiter line so the loop's increment
-        // consumes it and whatever follows the heredoc survives.
-        index += 1
-        while (index < lines.length && (lines[index] ?? '').trim() !== delimiter) index += 1
-    }
-    return kept.join('\n')
 }
 
 /**
@@ -194,11 +110,15 @@ function patternMatches(pattern: string, command: string): boolean {
     return new RegExp('^' + source + '(\\s.*)?$').test(command)
 }
 
-function escapeRegExp(text: string): string {
-    return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-}
-
-/** Split `a >b` / `a >> b` / `a 2> b` into segments and record the targets. */
+/**
+ * Split a command at output redirections and record the targets.
+ *
+ * The segments are slices of the RAW (heredoc-stripped) text, not re-joined
+ * tokens: a command model must see the quoting of its arguments (`xargs sh -c
+ * "cp …"`), and a token round-trip loses it. Targets are still read by both a
+ * character pass (catches `>file`) and a token pass (catches `> file`, with the
+ * quotes already removed).
+ */
 function redirectTargets(command: string): { targets: string[]; segments: string[] } {
     const targets: string[] = []
     // Heredoc bodies are data (see `stripHeredocs`): both passes must read the
@@ -210,41 +130,35 @@ function redirectTargets(command: string): { targets: string[]; segments: string
     // the `=` in `apiVersion >= 1` is the tail of the comparison operator, not a
     // file name.
     const pattern = /(\d?|&)>>?\s*([^=\s;&|<>][^\s;&|<>]*)/g
+    const segments: string[] = []
+    let cursor = 0
     let match: RegExpExecArray | null
     while ((match = pattern.exec(unquoted)) !== null) {
         const target = (match[2] ?? '').trim()
         if (target !== '') targets.push(target)
+        segments.push(stripped.slice(cursor, match.index))
+        cursor = match.index + match[0].length
     }
-    // Token-level pass catches `>` written as its own token.
+    segments.push(stripped.slice(cursor))
+    // Token-level pass catches a target written as its own token (`> file`).
     const tokens = tokenize(stripped)
-    const segments: string[] = []
-    let current: string[] = []
     for (let index = 0; index < tokens.length; index += 1) {
         const token = tokens[index] ?? ''
         if (token === '>' || token === '>>') {
             const next = tokens[index + 1]
             if (next !== undefined) targets.push(next)
             index += 1
-            segments.push(current.join(' '))
-            current = []
             continue
         }
-        if (REDIRECT.test(token)) {
-            // `>foo` or `2>foo` written without a space.
-            const inline = token.replace(REDIRECT, '')
-            if (inline !== '') targets.push(inline)
-            const next = tokens[index + 1]
-            if (inline === '' && next !== undefined) {
-                targets.push(next)
-                index += 1
-            }
-            segments.push(current.join(' '))
-            current = []
-            continue
+        if (!REDIRECT.test(token)) continue
+        const inline = token.replace(REDIRECT, '')
+        if (inline !== '') targets.push(inline)
+        const next = tokens[index + 1]
+        if (inline === '' && next !== undefined) {
+            targets.push(next)
+            index += 1
         }
-        current.push(token)
     }
-    segments.push(current.join(' '))
     return { targets, segments }
 }
 
@@ -259,12 +173,15 @@ function redirectTargets(command: string): { targets: string[]; segments: string
 function undecidableReason(base: string, tokens: readonly string[]): string | undefined {
     const sub = tokens[1]
     if (base === 'git') {
+        // Skip global options: `git -C dir checkout` must be read as `checkout`,
+        // not as subcommand `-C` (which matched nothing and passed as read-only).
+        const command = gitSubcommandOf(tokens)
         const WRITE_SUBCOMMANDS = new Set([
             'checkout', 'restore', 'switch', 'apply', 'stash', 'clean', 'reset', 'merge', 'rebase',
             'pull', 'cherry-pick', 'revert', 'rm', 'mv', 'add', 'commit', 'am', 'gc', 'init', 'clone',
         ])
-        if (sub !== undefined && WRITE_SUBCOMMANDS.has(sub)) {
-            return `git ${sub} 会改写工作区或仓库状态`
+        if (command !== undefined && WRITE_SUBCOMMANDS.has(command)) {
+            return `git ${command} 会改写工作区或仓库状态`
         }
         return undefined
     }
@@ -285,12 +202,6 @@ function operandsFor(tokens: readonly string[], mode: 'all' | 'last' | 'except-f
     if (mode === 'except-first') return operands.slice(1)
     return operands
 }
-
-/**
- * Analyse one shell command for write targets.
- * @param command - the raw command string.
- * @returns the extracted targets plus whether anything stayed unattributed.
- */
 
 // --- interpreter payloads ---------------------------------------------------
 //
@@ -392,6 +303,30 @@ function stdinHeredocBodies(command: string, base: string): string[] {
 }
 
 /**
+ * Findings from a `sh -c '…'` payload that is itself a command line.
+ * @param base - the interpreter name (`sh`/`bash`/`zsh`/`dash`).
+ * @param tokens - that command's tokens.
+ * @param depth - recursion depth (the payload is analysed one level deeper).
+ * @returns `undefined` when this command is not a shell interpreter.
+ */
+function shellPayloadFindings(
+    base: string,
+    tokens: readonly string[],
+    depth: number,
+): { targets: string[]; undecidable: boolean; reasons: string[] } | undefined {
+    if (!SHELL_COMMAND_INTERPRETERS.has(base)) return undefined
+    const payload = codeFlagPayload(tokens, ['-c'])
+    if (payload === undefined) return { targets: [], undecidable: false, reasons: [] }
+    // The payload is a command line of its own: analyse it the same way.
+    const nested = analyzeShellCommandNested(payload, depth + 1)
+    return {
+        targets: nested.targets,
+        undecidable: nested.undecidable,
+        reasons: nested.undecidable ? [`${base} -c 载荷中有无法定位目标的写操作`] : [],
+    }
+}
+
+/**
  * Findings from one command's inline interpreter payloads.
  * @param command - the raw command line (heredoc bodies still present).
  * @param depth - recursion depth for `sh -c` payloads.
@@ -417,15 +352,14 @@ function interpreterPayloadFindings(
         const base = head.split('/').pop() ?? head
 
         if (SHELL_COMMAND_INTERPRETERS.has(base)) {
-            const payload = codeFlagPayload(tokens, ['-c'])
-            if (payload !== undefined) {
-                // The payload is a command line of its own: analyse it the same way.
-                const nested = analyzeShellCommandNested(payload, depth + 1)
-                targets.push(...nested.targets)
-                if (nested.undecidable) {
-                    undecidable = true
-                    reasons.push(`${base} -c 载荷中有无法定位目标的写操作`)
-                }
+            const nested = shellPayloadFindings(base, tokens, depth)
+            // `shellPayloadFindings` returns a verdict for every shell command,
+            // so the `undefined` branch only guards the type.
+            if (nested === undefined) continue
+            targets.push(...nested.targets)
+            if (nested.undecidable) {
+                undecidable = true
+                reasons.push(...nested.reasons)
             }
             continue
         }
@@ -467,6 +401,47 @@ export function analyzeShellCommand(command: string): ShellAnalysis {
     return analyzeShellCommandInner(command, 0)
 }
 
+/**
+ * Findings from ONE command in a pipeline.
+ *
+ * Extracted from {@link analyzeShellCommandInner} so the dispatcher stays short
+ * enough to read: the seven modelled families, the operand-position table, the
+ * in-place editors, `dd` and the unattributable-command table are one decision
+ * each, and the caller only merges what they return.
+ * @param part - one command (split on `|`, `&&`, `;`, `||`).
+ * @param command - the whole raw command line (heredoc bodies included).
+ * @param depth - recursion depth for nested analysers.
+ */
+function analyzeOneCommand(part: string, command: string, depth: number): NestedAnalysis {
+    const tokens = tokenize(part.trim())
+    const head = tokens[0]
+    if (head === undefined) return { targets: [], undecidable: false, reasons: [] }
+    const base = head.split('/').pop() ?? head
+    // Families whose operands cannot be read by position (tar/xargs/git apply/
+    // rsync/unzip/mv/install). Handled means "do not guess operands".
+    const modeled = modelShellWrite({ tokens, command, depth, analyze: analyzeShellCommandNested })
+    if (modeled.handled) return modeled
+    const known = WRITE_COMMANDS[base]
+    if (known !== undefined) return { targets: operandsFor(tokens, known.targets), undecidable: false, reasons: [] }
+    if (base === 'sed' || base === 'perl' || base === 'ruby') {
+        // In-place edits name the file last.
+        if (!tokens.some((token) => token === '-i' || token.startsWith('-i'))) {
+            return { targets: [], undecidable: false, reasons: [] }
+        }
+        const file = operandsFor(tokens, 'last')[0]
+        if (file !== undefined) return { targets: [file], undecidable: false, reasons: [] }
+        return { targets: [], undecidable: true, reasons: [`${base} -i 的写法无法识别目标文件`] }
+    }
+    if (base === 'dd') {
+        const of = tokens.find((token) => token.startsWith('of='))
+        if (of !== undefined) return { targets: [of.slice(3)], undecidable: false, reasons: [] }
+        return { targets: [], undecidable: true, reasons: ['dd 未声明 of=，目标不可归属'] }
+    }
+    const why = undecidableReason(base, tokens)
+    if (why !== undefined) return { targets: [], undecidable: true, reasons: [why] }
+    return { targets: [], undecidable: false, reasons: [] }
+}
+
 function analyzeShellCommandInner(command: string, depth: number): ShellAnalysis {
     const { targets: redirected, segments } = redirectTargets(command)
     const targets = [...redirected]
@@ -475,47 +450,15 @@ function analyzeShellCommandInner(command: string, depth: number): ShellAnalysis
 
     for (const segment of segments) {
         if (segment.trim() === '') continue
-        const tokens = tokenize(segment)
         // A pipeline step: every command in it is examined.
         for (const part of segment.split(/\|\||&&|\||;/)) {
-            const partTokens = tokenize(part.trim())
-            const head = partTokens[0]
-            if (head === undefined) continue
-            const base = head.split('/').pop() ?? head
-            const known = WRITE_COMMANDS[base]
-            if (known !== undefined) {
-                const found = operandsFor(partTokens, known.targets)
-                for (const target of found) targets.push(target)
-                continue
-            }
-            if (base === 'sed' || base === 'perl' || base === 'ruby') {
-                // In-place edits name the file last.
-                if (partTokens.some((token) => token === '-i' || token.startsWith('-i'))) {
-                    const file = operandsFor(partTokens, 'last')[0]
-                    if (file !== undefined) targets.push(file)
-                    else {
-                        undecidable = true
-                        reasons.push(`${base} -i 的写法无法识别目标文件`)
-                    }
-                }
-                continue
-            }
-            if (base === 'dd') {
-                const of = partTokens.find((token) => token.startsWith('of='))
-                if (of !== undefined) targets.push(of.slice(3))
-                else {
-                    undecidable = true
-                    reasons.push('dd 未声明 of=，目标不可归属')
-                }
-                continue
-            }
-            const why = undecidableReason(base, partTokens)
-            if (why !== undefined) {
+            const findings = analyzeOneCommand(part, command, depth)
+            targets.push(...findings.targets)
+            if (findings.undecidable) {
                 undecidable = true
-                reasons.push(why)
+                reasons.push(...findings.reasons)
             }
         }
-        void tokens
     }
 
     // Inline interpreter payloads: the blind spot this closes.

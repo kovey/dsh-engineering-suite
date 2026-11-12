@@ -1,5 +1,36 @@
 ## [未发布]
 
+### 加固 · 写保护的两道防线：七类命令建模 + 信任根运行时兜底（`dsh-spec-gate`）
+
+**缺口是实测的**：`spec-gate` 的 shell 分析器按操作数位置判断写入，`tar -x -C .dsh/…`、`xargs -I{} cp {} .dsh/…`、
+`git apply`、`rsync`、`unzip -d`、`mv -t`、`install -t` 都能直接到达 shell（等价的 `cat >> .dsh/…` 会被拒绝）。
+这一版补两道互相独立的防线：
+
+- **命令建模**（`src/shell-tools.ts` / `src/shell-git.ts`）：建模命中即 `handled`，调用方不再猜操作数。
+  `tar` 解包写 `-C DIR`（缺省 `.`）、创建写 `-f FILE`；`xargs` 把下游命令**递归**再分析（变量/展开的下游 →
+  `undecidable`，占位符落在目标上 → `undecidable`）；`git apply` 从补丁的 `+++`/`---` 取路径，`--directory` 或全局
+  `git -C DIR` 加前缀，补丁不可见且无目录 → `undecidable`；`rsync` 取最后一个非选项操作数（远端目标 →
+  `undecidable`）；`unzip -d` / `mv` / `install` 取目录或目标。顺带修掉 `git -C dir checkout` 被读成子命令 `-C`
+  而放行；分段改为从原始文本切片，保留引号（否则 `xargs sh -c "cp …"` 的载荷在建模前就被拆散）。
+- **运行时兜底**（`src/trust-root-watch.ts` + `src/trust-root-events.ts`）：监听宿主 `tools/result`（同时接受
+  `tool/result` 拼写，宿主没有该事件时不注册不报错），每次工具完成后重算信任根指纹。指纹**直接复用**
+  `dsh-eng-core` 的 `policyFingerprint`（与 mission mandate 的 `policyVersion` 同一个函数，运行时目录与 `*.jsonl`
+  不参与），因此两处视图不会分叉。套件工具造成的合法变化只刷新基线；非套件工具造成的变化 → 向
+  `<布局根>/state/trust-root-violations.jsonl` 追加违规行、通过可选的 `interaction` 服务发 warn 通知、并置粘性
+  breach——之后 `guard()` 对写类操作返回"信任根在套件之外被修改，需重新审批 mission"（读操作不受影响），直到进程
+  重启或新 mission 审批成功。纯函数 `fingerprint` / `classifyTool` / `evaluate` 与事件壳分离，便于测试。
+- **结构**：`shell.ts` 的 lexing 抽到 `shell-lex.ts`、共享建模类型抽到 `shell-model.ts`，`guard.ts` 的拒绝文案抽到
+  `guard-messages.ts`（`guard()` 反而缩短）；新增代码全部在结构阈值内，`standards-check` 无新增/恶化。
+
+**测试面**：新增 `packages/dsh-spec-gate/test/shell-tools.test.ts`（11 条，七类命令 + xargs 递归 + 三类 undecidable）
+与 `test/trust-root-watch.test.ts`（10 条，纯函数判定、违规落盘与粘性拒绝、套件工具不误报、interaction 通知、
+`spec_approve` 解除、dispose 后不再观察）。`node --test packages/dsh-spec-gate/test/*.test.ts` **170 通过 / 0 失败**
+（原 149 + 新增 21，既有断言未改、未跳过）。按团队约定本轮只跑 spec-gate 测试、`tsc` 与 `standards-check`；
+规格里的 TC-1536（`verify.sh --quiet` 两次全绿）由交付门禁执行。
+
+**验证**：`node node_modules/typescript/bin/tsc -p packages/dsh-spec-gate/tsconfig.json` 通过；
+`bash scripts/standards-check.sh --quiet` exit 0。文档：`docs/ARCHITECTURE.md` §5.31。
+
 ### 新增 · `/suite set | unset | edit`：人改门禁配置（diff + 原子写），或在当前 UI 打开它
 
 `suite_config` 能告诉你"这个键不会生效"，但改一个阈值仍然要离开会话手工编辑 `.dsh/*.json`。这一版给 `/suite`

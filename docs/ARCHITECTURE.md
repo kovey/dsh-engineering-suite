@@ -1219,6 +1219,53 @@ ExtApi——那是 TUI 专属面；命令注册表是 TUI / desktop / web 共用
 - `suite_init` 只写十份配置，**不写** `.gitignore`、角色文件、approver 名单等宿主工件；那些各有自己的写者
   与批准路径（见 5.24 的单一写者纪律）。
 
+### 5.31 写保护的两道防线：命令建模 + 信任根运行时兜底
+
+`spec-gate` 的 shell 分析器原来只按**操作数位置**判断写入（`cp` 的最后一个参数、`chmod` 的除第一个之外），
+于是七类"操作数不是一个位置参数"的命令能直接穿过去：`tar -x -C .dsh/engineering-suite -f a.tar`（解包进信任根）、
+`xargs -I{} cp {} .dsh/…`（写谁由下游命令决定）、`git apply`（写谁在补丁里）、`rsync`（目标是最后一个操作数）、
+`unzip -d DIR`、`mv -t DIR`、`install -t DIR`。等价的 `cat >> .dsh/…` 一直会被拒绝，这就是一个"写法决定门禁"的洞。
+
+**第一道：命令建模（`src/shell-tools.ts` / `src/shell-git.ts`）**。建模命中后返回 `handled`，调用方**不再**猜
+操作数（否则 `mv -t DIR src` 会只看见 source）。每类命令都产出与既有结构一致的 `targets`；解析不了就是
+`undecidable`（fail closed），不是"没有目标 = 安全"：
+
+| 命令 | 目标 | 不可判定（失败关闭）的情形 |
+|---|---|---|
+| `tar` | `-x`/`--extract` → `-C DIR`（缺省 `.`）；`-c/-r/-u` → `-f FILE` | 模式无法识别；创建/追加却没有 `-f` |
+| `xargs` | 把下游命令**递归**再分析一遍（`-I/-n/-P/...` 的值会被跳过） | 下游命令位置是变量/展开（`$CMD`、`sh -c "$RUN"`）；占位符落在写入目标上（`cp a {}`）；嵌套过深 |
+| `git apply` | 补丁里 `+++`/`---` 的路径；`--directory DIR` 或全局 `git -C DIR` 会加前缀 | 补丁内容不可见（来自文件/网络）且没有 `--directory`/`-C` |
+| `rsync` | 最后一个非选项操作数（跳过 `-e/--exclude/...` 的值） | 目标是远端（`host:path`、`rsync://`）；操作数不足 |
+| `unzip` | `-d DIR`（缺省 `.`） | `-d` 缺少目录参数 |
+| `mv` | 目标目录 / 目标名，以及每个 source（移动会移除它） | 源/目标数量不足 |
+| `install` | `-t DIR`、`-d` 的目录、或最后一个操作数 | 源/目标数量不足；`-d` 没有目录 |
+
+顺带修掉一个同类洞：`git -C dir checkout` 以前被读成子命令 `-C`（不在写子命令集合里）而放行，现在全局选项会被
+跳过，子命令才参与判定。`tar`/`xargs` 等建模还需要**保留引号**：分段从原始命令文本切片，而不是把 token 重新
+用空格拼回去（否则 `xargs sh -c "cp …"` 的载荷会在建模前就被拆散）。
+
+**第二道：信任根运行时兜底（`src/trust-root-watch.ts`）**。静态分析永远是网不是证明——命令可以拼成分析器不认识的
+形状，插件不知道的工具也能写 `.dsh/**`。兜底不依赖命令写法：**信任根只能通过套件自己的工具变化**。实现直接复用
+`dsh-eng-core` 的 `policyFingerprint`（与 mission mandate 的 `policyVersion` 同一个函数、同一组排除规则：运行时目录与
+`*.jsonl` 不参与），因此"门禁的信任根视图"和"兜底的视图"不可能分叉。
+
+- 事件：`ctx.on('tools/result')`（同时注册 `tool/result` 拼写；宿主没有该事件时不注册、不报错）。
+- 纯函数：`fingerprint(cwd)`、`classifyTool(name)`（未知工具一律算 foreign——漏列会**大声**报违规，反方向会静默放行）、
+  `evaluate(before, after, toolName)` → `none` / `refresh` / `violation`。
+- 套件工具（`spec_*` / `quality_gate_run` / `evidence_record` / `adr_record` / `standards_check` / `suite_init` /
+  `suite_config` 等）造成的合法变化：刷新基线，不告警。
+- 非套件工具造成的变化：向 `<布局根>/state/trust-root-violations.jsonl` 追加一行（运行时目录，可写），通过
+  `ctx.get('interaction')` 发一条 warn 通知（可选服务，缺失时只记日志），并置**粘性** `breached`；之后 `guard()` 对
+  写类操作返回"信任根在套件之外被修改，需重新审批 mission"——读操作不受影响。
+- 解除：进程重启，或**新 mission 审批成功**（`spec_approve` 的结果里出现"规格已审批"）。基线在每次工具完成的
+  观察点刷新，所以一次违规不会让后续变化变成永久盲区；违规的"before"由 guard 在每次调用前种子化（`ensureBaseline`），
+  第一个外来写入也有真实的比较基准。
+
+**诚实的边界**：指纹只覆盖策略文件（`.json` 与 `roles/**`），不是 `.dsh/**` 的每个字节——mission 状态、审计、
+`*.jsonl` 台账是运行时数据，按设计不参与；静态建模覆盖的是这七类命令的常见形态，其它形态仍是 `undecidable`（在
+`strict` 策略下拒绝、`targets` 策略下是已文档化的盲区）；兜底依赖"套件工具名单"完整，新增套件工具必须加进
+`SUITE_TOOLS`（或通过 `suiteTools` 配置补充），否则它的合法写入会被当成越权。
+
 ## 6. 为什么这样切分
 
 - **一个关注点一个插件**：门禁可以单独失效（例如先只上 quality-gate），不影响其它环节。

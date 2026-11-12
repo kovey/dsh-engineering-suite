@@ -22,11 +22,12 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import { MissionStoreRegistry, createDelegationPresets, createLogger, expandHome } from 'dsh-eng-core'
-import type { AgentLike } from 'dsh-eng-core'
-import { resolveConfig, resolveEffectiveConfig } from './config.js'
+import type { AgentLike, Logger } from 'dsh-eng-core'
+import { resolveConfig, resolveEffectiveConfig, type SpecGateConfig } from './config.js'
 import { createWriteGuard } from './guard.js'
 import { PROMPT_SECTION, sectionText } from './prompt.js'
 import { registerTools, type ApprovalLike } from './tools.js'
+import { mountTrustRootWatch } from './trust-root-events.js'
 
 export const name = 'dsh-spec-gate'
 
@@ -74,11 +75,22 @@ export function apply(ctx: Context, config: unknown = {}): void {
         // Profile config is the ceiling; each workspace may refine it through
         // its own .dsh/spec-gate.json (a scratch repo can opt out of `enforce`).
         const configFor = (cwd: string) => resolveEffectiveConfig(resolved, stores.for(cwd).layout, logger)
+        // Runtime trust-root fallback: it watches `tools/result` and flips the
+        // guard to refuse writes once the trust root changed outside the suite.
+        // The guard seeds the baseline of every workspace before its first tool
+        // runs, so "before" is a real observation and not a post-hoc guess.
+        const trustRoot = mountTrustRootWatch(context as never, {
+            cwd: process.cwd(),
+            ...(resolved.layout.rootDir === undefined ? {} : { rootDir: resolved.layout.rootDir }),
+            logger,
+            interaction: () => context.get('interaction'),
+        })
         const guard = createWriteGuard({
             config: resolved,
             configFor,
             stores,
             testDesignMounted: () => context.tools.get('test_design_review') !== undefined,
+            trustRoot: () => trustRoot.guard(),
         })
 
         const tools = registerTools(context as never, {
@@ -100,29 +112,10 @@ export function apply(ctx: Context, config: unknown = {}): void {
         })
 
         const disposers: (() => void)[] = [...tools.disposers]
+        disposers.push(trustRoot.dispose)
         if (resolved.enforce) disposers.push(context.tools.guard(guard.guard as never))
-        if (resolved.prompt.enabled) {
-            disposers.push(
-                context.systemPrompt.section({
-                    name: PROMPT_SECTION,
-                    order: resolved.prompt.order,
-                    // Resolved per assembly: the rules the model is told must be
-                    // THIS workspace's effective ones (a repo with
-                    // `enforce: false` must not be told writes are refused).
-                    text: (assemble?: unknown) => {
-                        try {
-                            const scope = (assemble as { scope?: AgentLike } | undefined)?.scope
-                            const cwd = scope?.session?.header?.cwd
-                            if (typeof cwd !== 'string' || cwd === '') return sectionText(resolved)
-                            const effective = resolveEffectiveConfig(resolved, stores.for(cwd).layout, logger)
-                            return sectionText(effective.config, effective.source === 'project' ? effective.file : undefined, cwd)
-                        } catch {
-                            return sectionText(resolved)
-                        }
-                    },
-                }),
-            )
-        }
+        const promptDisposer = mountPromptSection(context, resolved, stores, logger)
+        if (promptDisposer !== undefined) disposers.push(promptDisposer)
 
         ctx.effect(() => () => {
             // Teardown releases the presets this plugin registered, so a reload does
@@ -150,4 +143,41 @@ export function apply(ctx: Context, config: unknown = {}): void {
     } catch (error) {
         logger.error('apply failed:', error)
     }
+}
+
+/**
+ * The prompt section, resolved per assembly.
+ *
+ * The rules the model is told must be THIS workspace's effective ones: a
+ * repository with `enforce: false` must not be told that writes are refused.
+ * Extracted from `apply()` so the assembly function stays within the structural
+ * thresholds; the behaviour is unchanged (same fallback on any resolution error).
+ * @param context - host context (`systemPrompt.section`).
+ * @param resolved - profile configuration (the ceiling).
+ * @param stores - mission stores, for each workspace's project overlay.
+ * @param logger - diagnostics sink for a bad project file.
+ * @returns the section disposer, or `undefined` when the prompt is disabled.
+ */
+function mountPromptSection(
+    context: ContextLike,
+    resolved: SpecGateConfig,
+    stores: MissionStoreRegistry,
+    logger: Logger,
+): (() => void) | undefined {
+    if (!resolved.prompt.enabled) return undefined
+    return context.systemPrompt.section({
+        name: PROMPT_SECTION,
+        order: resolved.prompt.order,
+        text: (assemble?: unknown) => {
+            try {
+                const scope = (assemble as { scope?: AgentLike } | undefined)?.scope
+                const cwd = scope?.session?.header?.cwd
+                if (typeof cwd !== 'string' || cwd === '') return sectionText(resolved)
+                const effective = resolveEffectiveConfig(resolved, stores.for(cwd).layout, logger)
+                return sectionText(effective.config, effective.source === 'project' ? effective.file : undefined, cwd)
+            } catch {
+                return sectionText(resolved)
+            }
+        },
+    })
 }
