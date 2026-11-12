@@ -10,6 +10,12 @@
  *    already has, because these files are the trust root: a scaffold run must not
  *    undo a repository's reviewed thresholds. `force: true` is the only path that
  *    replaces them, and it says `overwrite` in the report.
+ *  - **Creation location is not the read location.** The target comes from
+ *    `scaffoldConfigDir` (`dsh-eng-core/scaffold`), never from
+ *    `resolveLayout().configDir`: that read path falls back to `.dsh/` on an
+ *    empty repository, which is how ten config files once landed in the legacy
+ *    root. The plan therefore carries the layout and the reason, and the report
+ *    prints both.
  *
  * Idempotency falls out of determinism: the generated text depends only on the
  * descriptor and the detected language, so a second `apply` writes nothing (all
@@ -20,7 +26,9 @@
 
 import fs from 'node:fs'
 import path from 'node:path'
-import { configText, detectLanguage, selectDescriptors, type SuiteConfigDescriptor, type SuiteLanguage } from './scaffold-catalog.js'
+import { scaffoldConfigDir, type ScaffoldLayout } from 'dsh-eng-core/scaffold'
+import type { LayoutOptions } from 'dsh-eng-core'
+import { configText, detectLanguage, SUITE_CONFIGS, SUITE_DOCTOR_ID, selectDescriptors, type SuiteConfigDescriptor, type SuiteLanguage } from './scaffold-catalog.js'
 
 /** What happened (or would happen) to one file. */
 export type InitAction = 'write' | 'skip' | 'overwrite'
@@ -39,7 +47,12 @@ export interface InitEntry {
 /** The whole plan (and, after `apply`, what was done). */
 export interface InitPlan {
     cwd: string
+    /** Absolute directory the files are written to (decided by `scaffoldConfigDir`). */
     rootDir: string
+    /** Which branch decided `rootDir`: explicit host override / namespace / legacy. */
+    layout: ScaffoldLayout
+    /** Why that root was chosen (printed verbatim; the legacy branch says "沿用遗留位置"). */
+    reason: string
     language: SuiteLanguage
     dryRun: boolean
     entries: InitEntry[]
@@ -50,8 +63,15 @@ export interface InitPlan {
 /** Inputs of {@link planSuiteInit}. */
 export interface InitInput {
     cwd: string
-    /** The layout root the suite reads configuration from (`Layout.configDir`). */
-    rootDir: string
+    /**
+     * Explicit layout root override (the host's `layout.rootDir`).
+     *
+     * OMITTED on purpose by `/suite init` and `suite_init`: the creation target
+     * is a different question than the read path, so a caller that does not have
+     * an explicit host override must let `scaffoldConfigDir` decide (namespace on
+     * an empty or migrated repository, legacy only when legacy files exist).
+     */
+    rootDir?: string
     /** Write for real (default false). */
     apply?: boolean
     /** Replace existing files (default false). */
@@ -63,6 +83,29 @@ export interface InitInput {
 function relativeTo(cwd: string, target: string): string {
     const relative = path.relative(cwd, target)
     return relative === '' ? path.basename(target) : relative.split(path.sep).join('/')
+}
+
+/**
+ * Build {@link InitInput} for one invocation.
+ *
+ * The host's explicit `layout.rootDir` is the ONLY thing that passes through:
+ * `layout.configDir` is a READ path whose empty-repository fallback is `.dsh/`,
+ * and using it as the write target is exactly the defect `scaffoldConfigDir`
+ * fixes. Both `/suite init` and `suite_init` come through here, so they cannot
+ * disagree about the directory.
+ * @param cwd - workspace root (a session's `header.cwd`).
+ * @param layout - the host's layout options (only `rootDir` is used).
+ * @param flags - the invocation's dry-run/force/only flags.
+ * @returns the input {@link planSuiteInit} expects.
+ */
+export function initInputOf(cwd: string, layout: LayoutOptions, flags: { apply?: boolean; force?: boolean; only?: readonly string[] } = {}): InitInput {
+    return {
+        cwd,
+        ...(layout.rootDir === undefined ? {} : { rootDir: layout.rootDir }),
+        apply: flags.apply === true,
+        force: flags.force === true,
+        ...(flags.only === undefined ? {} : { only: flags.only }),
+    }
 }
 
 function sizeOf(file: string): number {
@@ -83,13 +126,14 @@ function writeText(target: string, text: string): void {
  *
  * Split from {@link planSuiteInit} because the decision tree is the safety
  * property: an existing file is `skip` and is never opened for writing.
- * @param input - the caller's workspace, root and flags.
+ * @param input - the caller's workspace and flags.
+ * @param rootDir - absolute directory the file belongs to (already decided).
  * @param descriptor - the file to plan.
  * @param language - the bytes to generate.
  * @returns the entry the report prints.
  */
-function planEntry(input: InitInput, descriptor: SuiteConfigDescriptor, language: SuiteLanguage): InitEntry {
-    const target = path.join(input.rootDir, descriptor.file)
+function planEntry(input: InitInput, rootDir: string, descriptor: SuiteConfigDescriptor, language: SuiteLanguage): InitEntry {
+    const target = path.join(rootDir, descriptor.file)
     const relative = relativeTo(input.cwd, target)
     const exists = fs.existsSync(target)
     const action: InitAction = exists ? (input.force === true ? 'overwrite' : 'skip') : 'write'
@@ -102,33 +146,50 @@ function planEntry(input: InitInput, descriptor: SuiteConfigDescriptor, language
 /**
  * Plan (and optionally perform) the scaffold.
  *
+ * The write target comes from `scaffoldConfigDir`, NOT from a resolved read
+ * layout: an empty repository reads `.dsh/` but must be CREATED in the namespace,
+ * otherwise the scaffold splits from the convention it documents. The caller's
+ * catalog is passed along so a config file this package adds later still counts
+ * as evidence of a legacy root.
+ *
  * `only` is validated up front by {@link selectDescriptors}: an unknown name
  * throws before anything is written, so a typo cannot produce a half-applied
  * scaffold that looks intentional.
- * @param input - workspace, layout root and the three flags.
- * @returns every file, its action and its byte count.
+ * @param input - workspace, explicit root override (if any) and the three flags.
+ * @returns every file, its action, its byte count and the chosen layout root.
  */
 export function planSuiteInit(input: InitInput): InitPlan {
     const descriptors = selectDescriptors(input.only)
+    const target = scaffoldConfigDir(input.cwd, {
+        ...(input.rootDir === undefined ? {} : { rootDir: input.rootDir }),
+        legacyFiles: [...SUITE_CONFIGS.map((descriptor) => descriptor.file), 'standards-baseline.json', `${SUITE_DOCTOR_ID}.json`],
+    })
     const language = detectLanguage(input.cwd)
-    const entries = descriptors.map((descriptor) => planEntry(input, descriptor, language))
-    return { cwd: input.cwd, rootDir: input.rootDir, language, dryRun: input.apply !== true, entries, problems: [] }
+    const entries = descriptors.map((descriptor) => planEntry(input, target.dir, descriptor, language))
+    return { cwd: input.cwd, rootDir: target.dir, layout: target.layout, reason: target.reason, language, dryRun: input.apply !== true, entries, problems: [] }
 }
 
 const ACTION_ICON: Record<InitAction, string> = { write: '➕', skip: '⏭️', overwrite: '♻️' }
 
+/** `(namespace)` / `(legacy)` / `(explicit)` — the branch that chose the root. */
+function layoutLabel(layout: ScaffoldLayout): string {
+    return `（${layout}）`
+}
+
 /**
  * Render one plan for a person (tool output and `/suite init` share this text).
  * @param plan - the plan to render.
- * @returns Chinese text, one line per file plus the next step.
+ * @returns Chinese text, one line per file plus the layout decision and next step.
  */
 export function renderInitPlan(plan: InitPlan): string {
     const written = plan.entries.filter((entry) => entry.action === 'write').length
     const overwritten = plan.entries.filter((entry) => entry.action === 'overwrite').length
     const skipped = plan.entries.filter((entry) => entry.action === 'skip').length
+    const rootDir = relativeTo(plan.cwd, plan.rootDir) || '.'
     const lines = [
         `suite_init —— 套件配置脚手架（${plan.dryRun ? 'dry-run：只打印计划，未写盘；apply:true 才写入' : 'apply：已写盘'}）`,
-        `工作区：${plan.cwd}；布局根：${relativeTo(plan.cwd, plan.rootDir) || '.'}；检测语言：${plan.language}`,
+        `工作区：${plan.cwd}；布局根：${rootDir}${layoutLabel(plan.layout)}；检测语言：${plan.language}`,
+        `布局判定：${plan.reason}`,
     ]
     for (const entry of plan.entries) lines.push(`${ACTION_ICON[entry.action]} ${entry.action.padEnd(9)} ${entry.relative}  (${entry.bytes} B)`)
     lines.push(`合计：写入 ${written}、覆盖 ${overwritten}、跳过（已存在）${skipped}；共 ${plan.entries.length} 份`)

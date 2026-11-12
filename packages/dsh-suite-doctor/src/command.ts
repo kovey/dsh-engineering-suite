@@ -33,12 +33,12 @@
  * @module dsh-suite-doctor/command
  */
 
-import { resolveLayout, type AgentLike } from 'dsh-eng-core'
+import { resolveLayout, type AgentLike, type LayoutOptions } from 'dsh-eng-core'
 import { isConfigSubcommand, parseConfigInvocation, runConfigInvocation, type SuiteConfigInvocation } from './command-config.js'
 import type { SuiteDoctorConfig } from './config.js'
 import { runSuiteHealth, renderSuiteHealth } from './health.js'
 import { inspectSuiteConfig, renderConfigInspection } from './inspect.js'
-import { planSuiteInit, renderInitPlan } from './scaffold.js'
+import { planSuiteInit, initInputOf, renderInitPlan } from './scaffold.js'
 import { showReport } from './render-report.js'
 import type { ToolDeps } from './tools.js'
 
@@ -190,10 +190,8 @@ export function parseSuiteInvocation(rawInput: unknown): SuiteInvocation {
 }
 
 /** The `init` text: the same plan `suite_init` tools render. */
-function initText(parsed: { apply: boolean; force: boolean; only?: string[] }, cwd: string, rootDir: string): string {
-    return renderInitPlan(
-        planSuiteInit({ cwd, rootDir, apply: parsed.apply, force: parsed.force, ...(parsed.only === undefined ? {} : { only: parsed.only }) }),
-    )
+function initText(parsed: { apply: boolean; force: boolean; only?: string[] }, cwd: string, layout: LayoutOptions): string {
+    return renderInitPlan(planSuiteInit(initInputOf(cwd, layout, parsed)))
 }
 
 /** The `show` text: the same inspection `suite_config` renders. */
@@ -212,7 +210,7 @@ async function operationText(
     const layout = resolveLayout(cwd, config.layout)
     switch (parsed.kind) {
         case 'init':
-            return initText(parsed, cwd, layout.configDir)
+            return initText(parsed, cwd, config.layout)
         case 'show':
             return showText(parsed.plugin, cwd, layout, config)
         case 'doctor':

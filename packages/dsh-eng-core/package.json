@@ -22,6 +22,10 @@
       "types": "./dist/delegations.d.ts",
       "default": "./dist/delegations.js"
     },
+    "./scaffold": {
+      "types": "./dist/scaffold.d.ts",
+      "default": "./dist/scaffold.js"
+    },
     "./context-error": {
       "types": "./dist/context-error.d.ts",
       "default": "./dist/context-error.js"

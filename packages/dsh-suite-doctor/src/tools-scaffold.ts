@@ -19,7 +19,7 @@
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { resolveLayout, type AgentLike } from 'dsh-eng-core'
 import { inspectSuiteConfig, renderConfigInspection } from './inspect.js'
-import { planSuiteInit, renderInitPlan, type InitInput } from './scaffold.js'
+import { initInputOf, planSuiteInit, renderInitPlan } from './scaffold.js'
 import { declaredCwdOf, type ToolDeps } from './tools.js'
 
 const TEXT_OUTPUT = { type: 'string' } as const
@@ -49,7 +49,7 @@ function assertNotCancelled(signal: AbortSignal | undefined, tool: string): void
 }
 
 const INIT_DESCRIPTION =
-    "Scaffold the engineering suite's gate configuration for THIS repository (the calling agent's workspace): ten files under the layout root — spec-gate, test-design-gate, quality-gate, standards (the repository-owned structural standard), evidence-gate, coverage-gate, impact-gate, supply-chain-gate, interaction-gate, deploy-gate. DRY RUN BY DEFAULT: the result lists every file with path / action (write | skip | overwrite) / bytes and writes nothing; only apply:true writes. An existing file is SKIPPED and reported, because these files are the trust root and a scaffold must not undo reviewed thresholds; force:true is the only path that overwrites. Content is generated from the detected ecosystem (ts/js/go/py) and is deterministic, so a second apply changes no byte (idempotent). `only` restricts the run to ids/aliases/file names (quality, spec, test-design, standards, evidence, coverage, impact, supply-chain, interaction, deploy); an unknown or empty `only` is refused before anything is written. The defaults are conservative starting points — review the commands and thresholds afterwards."
+    "Scaffold the engineering suite's gate configuration for THIS repository (the calling agent's workspace): ten files — spec-gate, test-design-gate, quality-gate, standards (the repository-owned structural standard), evidence-gate, coverage-gate, impact-gate, supply-chain-gate, interaction-gate, deploy-gate. The target root is decided by where configuration should be CREATED (never by the read fallback): an empty repository gets `.dsh/engineering-suite/` (created on write), an already-migrated repository keeps that namespace, and a repository whose legacy `.dsh/*-gate.json` files exist keeps writing there so configuration is not split — the report prints `布局根` plus the branch and the reason. DRY RUN BY DEFAULT: the result lists every file with path / action (write | skip | overwrite) / bytes and writes nothing; only apply:true writes. An existing file is SKIPPED and reported, because these files are the trust root and a scaffold must not undo reviewed thresholds; force:true is the only path that overwrites. Content is generated from the detected ecosystem (ts/js/go/py) and is deterministic, so a second apply changes no byte (idempotent). `only` restricts the run to ids/aliases/file names (quality, spec, test-design, standards, evidence, coverage, impact, supply-chain, interaction, deploy); an unknown or empty `only` is refused before anything is written. The defaults are conservative starting points — review the commands and thresholds afterwards."
 
 const INIT_PARAMETERS = {
     apply: { type: 'boolean' as const, description: 'Write the files (default false = dry run: print the plan, write nothing).' },
@@ -84,12 +84,9 @@ function initTool(deps: ToolDeps): unknown {
             assertNotCancelled(signal, 'suite_init')
             const agent = agentOf(exec)
             const cwd = declaredCwdOf(agent)
-            const layout = resolveLayout(cwd, deps.configFor(agent).layout)
-            const input: InitInput = { cwd, rootDir: layout.configDir, apply: args.apply === true, force: args.force === true }
-            if (args.only !== undefined) input.only = args.only
-            const plan = planSuiteInit(input)
+            const plan = planSuiteInit(initInputOf(cwd, deps.configFor(agent).layout, args))
             assertNotCancelled(signal, 'suite_init')
-            deps.logger?.info(`suite_init: ${plan.dryRun ? 'dry-run' : 'apply'} ${plan.entries.length} 份（language=${plan.language}）`)
+            deps.logger?.info(`suite_init: ${plan.dryRun ? 'dry-run' : 'apply'} ${plan.entries.length} 份（language=${plan.language}；布局根=${plan.rootDir}；${plan.layout}）`)
             return renderInitPlan(plan)
         },
     })

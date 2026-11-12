@@ -1,5 +1,31 @@
 ## [未发布]
 
+### 修复 · `/suite init` 把十份配置写进 `.dsh/` 根：创建路径与读取路径分开（`dsh-eng-core` + `dsh-suite-doctor`）
+
+用户实测发现的问题：空仓库（既无 `.dsh/engineering-suite/`、也无 `.dsh/<plugin>.json`）里执行
+`/suite init --apply`，十份配置被写到 `<repo>/.dsh/` 根下，而不是约定的 `<repo>/.dsh/engineering-suite/`。
+根因是写目标复用了读路径：`resolveLayout().configDir` 对未迁移仓库回退 `.dsh/`，写路径把它当成了写入位置；
+因为读方也用同一份回退，文件确实读得到，所以既有测试全绿——缺陷是静默的。
+
+- **新增创建判定**（`dsh-eng-core/src/scaffold.ts`，子路径导出 `dsh-eng-core/scaffold`）：
+  `scaffoldConfigDir(cwd, { rootDir?, legacyFiles? })` 返回 `{ dir, layout, reason }`，四个分支按序：
+  显式 `layout.rootDir`（`explicit`）→ 命名空间已存在（`namespace`，已迁移）→ `.dsh/` 下已有套件配置
+  （`legacy`，**沿用遗留位置，避免数据分裂**）→ 空仓库（`namespace`，写入时创建）。
+  判定是纯函数（只读盘、不建目录），dry-run 仍然零写入。
+- **`/suite init` 与 `suite_init` 改用它**（`planSuiteInit` 内部调用；只有宿主的显式 `layout.rootDir` 才透传）：
+  报告打印 `布局根：<相对路径>（<layout>）` 与 `布局判定：<reason>`；`show` / `doctor` 与各插件的读取路径不变
+  （仍走 `resolveLayout`），init 之后立即能读到刚写入的配置。
+- **测试**：空仓库（顶层目录名断言 + `.dsh/*.json` 必须为空）、已迁移（继续写命名空间、`.dsh/` 不新增 json）、
+  仅遗留（写 `.dsh/`、reason 含"沿用遗留位置"、既有文件 skip 不被覆盖、不创建命名空间）、
+  init 后 `show` / `doctor` 立即读到；另加 `scaffoldConfigDir` 的三类输入、显式覆盖、空串等于"跟随布局"、
+  以及"已迁移 + 遗留文件并存仍写命名空间"的单测。
+- **文档**：`docs/ARCHITECTURE.md` §5.2.1 新增"创建 vs 读取"小节（四个分支表 + 为什么判定必须是纯函数）。
+
+**验证**（按团队约定本轮不跑全量 verify；完整命令集留给交付门禁）：
+`node --test packages/dsh-suite-doctor/test/*.test.ts` → 128 条全绿（原 122 + 新增 6）；
+`node --test packages/dsh-eng-core/test/*.test.ts` → 261 条（260 pass / 1 skip；新增 7 条）；
+两个包 `tsc -p tsconfig.json --noEmit` 退出 0；`bash scripts/standards-check.sh --quiet` → PASS（无新增/恶化）。
+
 ### 兼容 · 适配 dsh 0.2.2-rc.2：子会话审批、新的"缺上下文"错误、扁平化的 activation spec
 
 把 `@deepseek-ai/dsh-{tools,user-questions,user-approval,subagent,agent,commands}@0.2.2-rc.2` 拉进仓库内

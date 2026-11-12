@@ -204,6 +204,32 @@ bash scripts/audit-dsh-paths.sh --selftest # 证明分类器两个方向都认�
 patch 文件（`cordis.patch.yml`）也在这条规矩里：patch 传的是**显式配置**，而显式值永远优先于代码默认值，
 所以一个钉死路径的 patch 键会让布局根解析对那个插件彻底失效——路径键不应出现在 patch 里。
 
+#### 创建 vs 读取：写新配置默认进命名空间，只有读才回退旧根
+
+`resolveLayout(cwd).configDir` 回答的是"**这个仓库的配置在哪**"（读）：对空仓库它会回退到 `.dsh/`。
+把同一个值当写入目标，等于让"读的回退"变成"写的位置"——用户实测就撞上了：空仓库里
+`/suite init --apply` 把十份配置写进了 `<repo>/.dsh/` 根下，而报告与 `show` 都还能读到它们
+（同一份读逻辑也回退），所以没有任何一条测试会红。这类缺陷是静默的。
+
+所以"写新配置"有自己的一次判定：`scaffoldConfigDir(cwd, options)`
+（`dsh-eng-core/src/scaffold.ts`，以子路径 `dsh-eng-core/scaffold` 导出，避免主入口导出面再长）：
+
+| 顺序 | 条件 | 写入目录 | `layout` | 报告里的理由 |
+|---|---|---|---|---|
+| 1 | 宿主显式 `layout.rootDir` | 该值 | `explicit` | 按宿主配置写，不做自动迁移 |
+| 2 | `<repo>/.dsh/engineering-suite/` 已存在 | 命名空间 | `namespace` | 已迁移：继续写命名空间 |
+| 3 | `.dsh/` 下已有套件配置（任一 `*-gate.json`、`standards.json`、`standards-baseline.json`、`suite-doctor.json`，再加上调用方目录清单里的名字） | `.dsh/` | `legacy` | 检测到遗留配置：**沿用遗留位置，避免数据分裂** |
+| 4 | 都没有（空仓库） | 命名空间（写入时创建） | `namespace` | 空仓库：默认创建命名空间，配置住这里 |
+
+- **不做自动迁移**：判定为 `legacy` 的仓库不会被一个 init "顺手"搬进命名空间——一次 init 只写配置，
+  搬家是人的决定（读方两种布局都认）。
+- **判定是纯函数**：只读盘、不建目录。dry-run 必须让工作区逐字节不变，所以目录创建留给写者
+  （`planSuiteInit` 写每个文件前 `mkdir -p`）。
+- **一个判定，两个入口**：`/suite init` 与 `suite_init` 都走 `planSuiteInit`，报告里打印
+  `布局根：<相对路径>（<layout>）` 与 `布局判定：<reason>`；`/suite show`、`/suite doctor` 与各插件
+  仍然只走 `resolveLayout`。空仓库与已迁移两条分支选中的正是 `resolveLayout` 优先的那个目录，
+  所以"init 写 A、插件读 B"不会再出现；只有 `legacy` 分支是刻意的例外，并且报告点名"沿用遗留位置"。
+
 ## 5.3 一个进程服务多个仓库：所有"会认错项目"的地方都要按会话解析
 
 配置分层只是第一层。把整套东西盘一遍后，**必须按会话工作区解析**的有四类（否则会认错项目）：
