@@ -6,6 +6,7 @@
 import path from 'node:path'
 import { tuiReview, type NvimTuiLike, type ReviewArtifacts } from './review.js'
 import { APPROVE_LABEL, reviewCardOf } from './review-card.js'
+import { assertMandateReusable, assertTestDesignApproved, renderApprovalPrompt } from './spec-approval.js'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import {
     approvalStrength,
@@ -36,10 +37,8 @@ import {
     scanGaps,
     scanWorkspace,
     sessionIdOf,
-    scopeWidened,
     sha256,
     startDelegation,
-    specReviewDigest,
     writeJsonAtomic,
     writeTextAtomic,
     type AgentLike,
@@ -88,6 +87,7 @@ import {
     renderBudgetLine,
     specWithBudgetPlan,
     type BudgetPlan,
+    type BudgetRead,
     type SpecBudgetInput,
     type SpecRecordWithBudgets,
 } from './budgets.js'
@@ -557,6 +557,258 @@ function renderChangeLine(change: SpecChange): string {
     }`
 }
 
+/**
+ * Turn a refused approval decision into the tool's answer.
+ *
+ * The reasons stay APART: "a person said no", "the question was withdrawn",
+ * "nobody was asked" and "the host policy refused without dispatching" need
+ * different next steps, and merging them is what made a real failure hard to
+ * diagnose.
+ * @param input - the seams, the mission, and the refusal to explain.
+ * @returns the rejection report (the human is asked what to change).
+ * @throws for every refusal that is not a human rejection.
+ */
+async function refusalForDecision(input: {
+    deps: ToolDeps
+    exec: unknown
+    mission: MissionRecord
+    decision: Extract<ApprovalRequestResult, { outcome: string }>
+    note: string | undefined
+}): Promise<string> {
+    const { deps, exec, mission, decision, note } = input
+    if (decision.outcome === 'rejected' || decision.outcome === 'cancelled') {
+        // A digest mismatch is not a human rejection: the person said yes to a
+        // document that then changed under them.
+        if (decision.problemCode === 'digest-mismatch') {
+            throw new Error(
+                [
+                    `规格审批失败：审阅期间规格工件被改动，本次批准作废（mission ${mission.id}）。`,
+                    decision.problem ?? '',
+                    '下一步：重新调用 `spec_approve`（会展示当前版本）；如果规格本身需要改，先 `spec_create` / `spec_amend`，再 `test_design_review` → `spec_approve`。',
+                ].join('\n'),
+            )
+        }
+        return await handleRejection(deps, exec, mission, decision.outcome, decision.note ?? note)
+    }
+    if (decision.outcome === 'rejected-by-host-policy') {
+        throw new Error(
+            [
+                `规格审批未进行：宿主会话的审批策略 policy=${decision.hostPolicy ?? '(未能读取)'} 让审批接缝在派发之前就拒绝了这次请求，**没有问过任何人**（mission ${mission.id}）。`,
+                '这不是审批人的拒绝，也不是"规格不合格"：规格保持原状、仍需审批。',
+                '下一步（任选其一）：在 nvim-tui 里运行（富审阅卡片不经过宿主策略）；在 desktop / web TUI 里运行（userQuestions plan-review）；或由人把该会话的审批策略从 never 改为 ask（宿主的决定，模型改不了）。',
+            ].join('\n'),
+        )
+    }
+    // `no-answerer`: fail closed, and say exactly that nobody was asked.
+    throw new Error(
+        [
+            `规格审批未进行：没有可用的审批面，**没有人被问到**（mission ${mission.id}）——这既不是拒绝，也不是取消。`,
+            decision.problem ?? '',
+            '下一步（任选其一）：在 nvim-tui 里运行（扩展卡片）；在 desktop / web TUI 里运行（userQuestions plan-review）；让宿主装配审批插件（ctx.approval）；或把 spec-gate 的 reviewChannel 设置为可用的通道。',
+        ].join('\n'),
+    )
+}
+
+/**
+ * Apply the milestone BEFORE any ledger row, so every row records the state
+ * after this call (the ledger is an index of what happened, not a plan).
+ * @returns the `里程碑：A → B` note, or `undefined` when nothing changed.
+ */
+function applyRequestedMilestone(
+    store: MissionStore,
+    mission: MissionRecord,
+    requested: string | undefined,
+): string | undefined {
+    if (requested === undefined) return undefined
+    const before = milestoneOf(mission)
+    if (before === requested) return undefined
+    store.update(mission.id, (record) => ({ labels: labelsWithMilestone(record.labels, requested) }))
+    return `里程碑：${before ?? '(无)'} → ${requested}`
+}
+
+/** The plan-ledger rows one amendment writes (order matters: the last row wins a tie). */
+function amendmentRows(input: {
+    amended: MissionRecord
+    spec: SpecRecord | undefined
+    at: number
+    summary: string
+    milestoneNote: string | undefined
+    /** Whether the amendment itself is a change worth a `spec-amended` row. */
+    specRow: boolean
+    /** The ids this amendment retired, when it retired any. */
+    retired?:
+        | { kind: 'requirement-retired'; target: string; before: string | undefined }
+        | { kind: 'budget-retired'; ids: readonly string[] }
+}): PlanRow[] {
+    const spec = input.spec
+    if (spec === undefined) return []
+    const milestone = milestoneOf(input.amended)
+    const field = milestone === undefined ? {} : { milestone }
+    const rows: PlanRow[] = []
+    if (input.specRow) rows.push(planRowFor(input.amended, spec, 'spec-amended', input.at, input.summary, field))
+    if (input.milestoneNote !== undefined) {
+        rows.push(planRowFor(input.amended, spec, 'milestone-changed', input.at, input.milestoneNote, field))
+    }
+    const retired = input.retired
+    if (retired?.kind === 'requirement-retired') {
+        const text = `作废 ${retired.target}（原内容：${retired.before ?? ''}），编号不复用`
+        rows.push(planRowFor(input.amended, spec, 'requirement-retired', input.at, text, { ...field, retired: [retired.target] }))
+    }
+    if (retired?.kind === 'budget-retired') {
+        const text = `作废预算 ${retired.ids.join('、')}（编号不复用）`
+        rows.push(planRowFor(input.amended, spec, 'budget-retired', input.at, text, { ...field, retiredBudgets: retired.ids }))
+    }
+    return rows
+}
+
+/** What planning a budget amendment produced: the plan, or the refusal text to return. */
+type BudgetAmendmentPlan =
+    | { ok: true; plan: BudgetPlan; summary: string; read: BudgetRead }
+    | { ok: false; text: string }
+
+/**
+ * Plan a budget re-declaration (`budgets`) or a single-budget edit
+ * (`part: 'budget'`) — neither goes through core's `planAmendment`.
+ * @param input - the specification, the validated arguments and the editor.
+ */
+function planBudgetAmendment(input: { spec: SpecRecord; args: AmendArgs; by: string }): BudgetAmendmentPlan {
+    const { spec, args, by } = input
+    const read = readSpecBudgets(spec)
+    const context = {
+        requirementIds: spec.requirements.map((requirement) => requirement.id),
+        criterionIds: spec.acceptanceCriteria.map((criterion) => criterion.id),
+        retiredBudgets: read.retired,
+        retiredSpecIds: spec.retired ?? [],
+    }
+    if (args.budgets !== undefined) {
+        const declared = declareBudgets(read.budgets, args.budgets, {
+            ...context,
+            by,
+            ...(args.note === undefined ? {} : { note: args.note }),
+        })
+        if (!declared.ok) {
+            return {
+                ok: false,
+                text: [
+                    '## 未改动（重声明非功能预算）',
+                    '',
+                    ...declared.problems.map((problem) => `- ${problem}`),
+                    '',
+                    '预算声明没有任何改动，规格也没有升版本（失败不会留下半份文档）。',
+                ].join('\n'),
+            }
+        }
+        return { ok: true, plan: declared.plan, summary: declared.plan.summary, read }
+    }
+    const edited = applyBudgetEdit(
+        read.budgets,
+        { ...context, by },
+        {
+            action: args.action as 'add' | 'update' | 'remove',
+            ...(args.target === undefined || args.target === '' ? {} : { target: args.target }),
+            ...(args.budget === undefined ? {} : { budget: args.budget }),
+            ...(args.note === undefined ? {} : { note: args.note }),
+        },
+    )
+    if (!edited.ok) {
+        return {
+            ok: false,
+            text: [
+                `## 未改动（${args.action} budget${args.target === undefined ? '' : ` ${args.target}`}）`,
+                '',
+                edited.problem,
+                ...(edited.nextSteps === undefined ? [] : ['', '### 下一步', '', edited.nextSteps]),
+                '',
+                '预算声明没有任何改动，规格也没有升版本（失败不会留下半份文档）。',
+            ].join('\n'),
+        }
+    }
+    return { ok: true, plan: edited.plan, summary: edited.summary, read }
+}
+
+/**
+ * The patch a budget amendment writes.
+ *
+ * A budget is part of the document a human approved: the revision revokes the
+ * approval (and only the approval — the test design still covers the same
+ * criteria/cases).
+ */
+function budgetAmendedPatch(
+    record: MissionRecord,
+    spec: SpecRecord,
+    plan: BudgetPlan,
+    at: number,
+): Partial<MissionRecord> {
+    const current = record.spec ?? spec
+    const next: SpecRecordWithBudgets = specWithBudgetPlan(current, plan)
+    return {
+        status: 'draft',
+        spec: {
+            ...next,
+            revision: current.revision + 1,
+            updatedAt: at,
+            approvedAt: undefined,
+            approvedBy: undefined,
+            approvedSource: undefined,
+            approvalMessageId: undefined,
+        },
+    }
+}
+
+/**
+ * Write a planned budget amendment: bump the revision (revoking the approval),
+ * re-render the artifact, and report the change with its history.
+ */
+async function commitBudgetAmendment(input: {
+    deps: ToolDeps
+    agent: AgentLike | undefined
+    store: MissionStore
+    mission: MissionRecord
+    spec: SpecRecord
+    args: AmendArgs
+    requestedMilestone: string | undefined
+    plan: BudgetPlan
+    summary: string
+    read: BudgetRead
+}): Promise<string> {
+    const { deps, agent, store, mission, spec, args, plan, summary, read } = input
+    const now = Date.now()
+    const milestoneNote = applyRequestedMilestone(store, mission, input.requestedMilestone)
+    const updated = store.update(mission.id, (record) => budgetAmendedPatch(record, spec, plan, now))
+    if (updated === undefined) return `mission ${mission.id} 在写入时消失。`
+    store.writeSpec(mission.id, renderSpec(updated))
+    const amended = store.read(mission.id) ?? updated
+    const amendedSpec = amended.spec ?? spec
+    const retiredNow = newlyRetiredBudgets(read.retired, readSpecBudgets(amendedSpec).retired)
+    const ledgerRows = amendmentRows({
+        amended,
+        spec: amendedSpec,
+        at: now,
+        summary,
+        milestoneNote,
+        specRow: plan.changes.length > 0 || args.budgets !== undefined,
+        ...(retiredNow.length === 0 ? {} : { retired: { kind: 'budget-retired' as const, ids: retiredNow } }),
+    })
+    const budgetHistory = readSpecBudgets(amendedSpec).changes.slice(-5)
+    return [
+        `## 已改动规格（revision ${amendedSpec.revision}）`,
+        '',
+        summary,
+        `需求文档：${path.relative(mission.cwd, path.join(store.layout.missionsDir, mission.id, 'spec.md'))}（已重新渲染）`,
+        describeBudgetsOf(amendedSpec),
+        ...(milestoneNote === undefined ? [] : [`里程碑：${milestoneOf(amended) ?? input.requestedMilestone}`]),
+        ...recordPlan(deps, store.layout, effectiveFor(deps, agent), ledgerRows),
+        '',
+        '### 预算变更历史（最近 5 条，无变更时为空）',
+        '',
+        ...(budgetHistory.length === 0 ? ['(无)'] : budgetHistory.map(renderBudgetChangeLine)),
+        '',
+        '### 下一步（标准流程）',
+        '',
+        nextStepsAfter(amendedSpec, [summary]),
+    ].join('\n')
+}
+
 /** Register every spec-gate tool. */
 export function registerTools(
     ctx: { tools: { register: (definition: never) => () => void } },
@@ -845,34 +1097,7 @@ export function registerTools(
                     )
                 }
                 const effective = effectiveFor(deps, agent)
-                if (needsTestDesign(deps, effective)) {
-                    const design = mission.testDesign
-                    if (design === undefined) {
-                        throw new Error(
-                            `mission ${mission.id} 缺少测试设计：请先在 spec_create 的 testDesign 参数中补齐三类场景，再调用 test_design_review。`,
-                        )
-                    }
-                    if (design.passed !== true) {
-                        throw new Error(
-                            `mission ${mission.id} 的测试设计尚未通过评审（用例 ${design.cases.length} 条，未覆盖 ${design.uncovered.join(', ') || '无'}）：请调用 test_design_review。`,
-                        )
-                    }
-                    // The verdict must have been reached against THIS
-                    // specification: a revision (or a hand-edited artifact)
-                    // changes the digest and revokes the old PASS.
-                    const current = specReviewDigest(mission.spec, design)
-                    if (design.specDigest !== current) {
-                        throw new Error(
-                            [
-                                `mission ${mission.id} 的测试设计评审针对的不是当前规格（规格 revision ${mission.spec.revision}）：`,
-                                design.specDigest === undefined
-                                    ? '该评审记录没有绑定规格摘要（可能来自旧版本插件），无法确认它覆盖了当前验收标准。'
-                                    : `评审摘要 ${design.specDigest.slice(0, 12)} ≠ 当前摘要 ${current.slice(0, 12)}。`,
-                                '下一步：对当前规格重新运行 test_design_review，通过后再调用 spec_approve。',
-                            ].join('\n'),
-                        )
-                    }
-                }
+                if (needsTestDesign(deps, effective)) assertTestDesignApproved(mission, mission.spec)
                 // ---- the mandate this approval would produce ------------------
                 // Checked BEFORE a human is asked: widening a mandate or
                 // re-approving a stopped one is refused on the record, not
@@ -887,67 +1112,10 @@ export function registerTools(
                     )
                 }
                 const declaredScope = mandateScopeOf(mission.spec)
-                if (existingMandate.kind === 'present') {
-                    const withdrawn = existingMandate.mandate.withdrawn
-                    if (withdrawn !== undefined) {
-                        throw new Error(
-                            [
-                                `mission ${mission.id} 的 mandate 已于 ${formatTime(withdrawn.at)} 由 ${withdrawn.by} 撤回（${withdrawn.reason}）：拒绝重新审批。`,
-                                '撤回是一个人的停止决定，一次新的审批不能覆盖它（mandate 不可改写）。',
-                                '下一步：用 spec_create 新建 mission 重新提交规格，再 spec_approve。',
-                            ].join('\n'),
-                        )
-                    }
-                    const widened = scopeWidened(existingMandate.mandate.scope, declaredScope)
-                    if (widened.length > 0) {
-                        const current = existingMandate.mandate.scope
-                        throw new Error(
-                            [
-                                `mission ${mission.id} 已有更窄的 mandate（paths: ${current.paths.join('、') || '(未收窄)'}；phases: ${current.phases.join('、') || '(未收窄)'}），本次规格声明的范围更大，拒绝扩大授权。`,
-                                `扩大的部分：${widened.join('、')}。`,
-                                'mandate 不可改写：更宽的范围需要一个新 mission（这也是它防住"先拿窄授权、再悄悄改宽"的方式）。',
-                                '下一步：用 spec_create 新建 mission 重新审批；或把本次规格收敛回原范围内再送审。',
-                            ].join('\n'),
-                        )
-                    }
-                }
+                if (existingMandate.kind === 'present') assertMandateReusable(mission, existingMandate.mandate, declaredScope)
                 const decision = await requestApproval(deps, exec, mission, args.note, effective)
                 if ('outcome' in decision) {
-                    // The reasons stay APART: "a person said no", "the question was
-                    // withdrawn", "nobody was asked" and "the host policy refused
-                    // without dispatching" need different next steps, and merging
-                    // them is what made this month's failure hard to diagnose.
-                    if (decision.outcome === 'rejected' || decision.outcome === 'cancelled') {
-                        // A digest mismatch is not a human rejection: the person
-                        // said yes to a document that then changed under them.
-                        if (decision.problemCode === 'digest-mismatch') {
-                            throw new Error(
-                                [
-                                    `规格审批失败：审阅期间规格工件被改动，本次批准作废（mission ${mission.id}）。`,
-                                    decision.problem ?? '',
-                                    '下一步：重新调用 `spec_approve`（会展示当前版本）；如果规格本身需要改，先 `spec_create` / `spec_amend`，再 `test_design_review` → `spec_approve`。',
-                                ].join('\n'),
-                            )
-                        }
-                        return await handleRejection(deps, exec, mission, decision.outcome, decision.note ?? args.note)
-                    }
-                    if (decision.outcome === 'rejected-by-host-policy') {
-                        throw new Error(
-                            [
-                                `规格审批未进行：宿主会话的审批策略 policy=${decision.hostPolicy ?? '(未能读取)'} 让审批接缝在派发之前就拒绝了这次请求，**没有问过任何人**（mission ${mission.id}）。`,
-                                '这不是审批人的拒绝，也不是"规格不合格"：规格保持原状、仍需审批。',
-                                '下一步（任选其一）：在 nvim-tui 里运行（富审阅卡片不经过宿主策略）；在 desktop / web TUI 里运行（userQuestions plan-review）；或由人把该会话的审批策略从 never 改为 ask（宿主的决定，模型改不了）。',
-                            ].join('\n'),
-                        )
-                    }
-                    // `no-answerer`: fail closed, and say exactly that nobody was asked.
-                    throw new Error(
-                        [
-                            `规格审批未进行：没有可用的审批面，**没有人被问到**（mission ${mission.id}）——这既不是拒绝，也不是取消。`,
-                            decision.problem ?? '',
-                            '下一步（任选其一）：在 nvim-tui 里运行（扩展卡片）；在 desktop / web TUI 里运行（userQuestions plan-review）；让宿主装配审批插件（ctx.approval）；或把 spec-gate 的 reviewChannel 设置为可用的通道。',
-                        ].join('\n'),
-                    )
+                    return await refusalForDecision({ deps, exec, mission, decision, note: args.note })
                 }
                 // WHO approved matters: an IM click carries a user id and the card
                 // it came from, and the ledger keeps both. A terminal answerer that
@@ -1185,126 +1353,10 @@ export function registerTools(
 
                 // --- 预算：整组重声明或单条编辑（都不经过 core 的 planAmendment） -----
                 if (args.budgets !== undefined || args.part === 'budget') {
-                    const read = readSpecBudgets(spec)
-                    const context = {
-                        requirementIds: spec.requirements.map((requirement) => requirement.id),
-                        criterionIds: spec.acceptanceCriteria.map((criterion) => criterion.id),
-                        retiredBudgets: read.retired,
-                        retiredSpecIds: spec.retired ?? [],
-                    }
-                    let plan: BudgetPlan
-                    let summary: string
-                    if (args.budgets !== undefined) {
-                        const declared = declareBudgets(read.budgets, args.budgets, {
-                            ...context,
-                            by,
-                            ...(args.note === undefined ? {} : { note: args.note }),
-                        })
-                        if (!declared.ok) {
-                            return [
-                                '## 未改动（重声明非功能预算）',
-                                '',
-                                ...declared.problems.map((problem) => `- ${problem}`),
-                                '',
-                                '预算声明没有任何改动，规格也没有升版本（失败不会留下半份文档）。',
-                            ].join('\n')
-                        }
-                        plan = declared.plan
-                        summary = declared.plan.summary
-                    } else {
-                        const edited = applyBudgetEdit(
-                            read.budgets,
-                            { ...context, by },
-                            {
-                                action: args.action as 'add' | 'update' | 'remove',
-                                ...(args.target === undefined || args.target === '' ? {} : { target: args.target }),
-                                ...(args.budget === undefined ? {} : { budget: args.budget }),
-                                ...(args.note === undefined ? {} : { note: args.note }),
-                            },
-                        )
-                        if (!edited.ok) {
-                            return [
-                                `## 未改动（${args.action} budget${args.target === undefined ? '' : ` ${args.target}`}）`,
-                                '',
-                                edited.problem,
-                                ...(edited.nextSteps === undefined ? [] : ['', '### 下一步', '', edited.nextSteps]),
-                                '',
-                                '预算声明没有任何改动，规格也没有升版本（失败不会留下半份文档）。',
-                            ].join('\n')
-                        }
-                        plan = edited.plan
-                        summary = edited.summary
-                    }
-                    const now = Date.now()
-                    // The milestone is applied FIRST, so every row below records the
-                    // state after this call.
-                    let milestoneNote: string | undefined
-                    if (requestedMilestone !== undefined) {
-                        const before = milestoneOf(mission)
-                        if (before !== requestedMilestone) {
-                            store.update(mission.id, (record) => ({ labels: labelsWithMilestone(record.labels, requestedMilestone) }))
-                            milestoneNote = `里程碑：${before ?? '(无)'} → ${requestedMilestone}`
-                        }
-                    }
-                    const updated = store.update(mission.id, (record) => {
-                        const current = record.spec ?? spec
-                        const next: SpecRecordWithBudgets = specWithBudgetPlan(current, plan)
-                        return {
-                            // A budget is part of the document a human approved: the
-                            // revision revokes the approval (and only the approval —
-                            // the test design still covers the same criteria/cases).
-                            status: 'draft',
-                            spec: {
-                                ...next,
-                                revision: current.revision + 1,
-                                updatedAt: now,
-                                approvedAt: undefined,
-                                approvedBy: undefined,
-                                approvedSource: undefined,
-                                approvalMessageId: undefined,
-                            },
-                        }
-                    })
-                    if (updated === undefined) return `mission ${mission.id} 在写入时消失。`
-                    const file = store.writeSpec(mission.id, renderSpec(updated))
-                    const amended = store.read(mission.id) ?? updated
-                    const amendedSpec = amended.spec ?? spec
-                    const retiredNow = newlyRetiredBudgets(read.retired, readSpecBudgets(amendedSpec).retired)
-                    const milestoneRow = milestoneOf(amended)
-                    const milestoneField = milestoneRow === undefined ? {} : { milestone: milestoneRow }
-                    const ledgerRows: PlanRow[] = []
-                    if (plan.changes.length > 0 || args.budgets !== undefined) {
-                        ledgerRows.push(planRowFor(amended, amendedSpec, 'spec-amended', now, summary, milestoneField))
-                    }
-                    if (milestoneNote !== undefined) {
-                        ledgerRows.push(planRowFor(amended, amendedSpec, 'milestone-changed', now, milestoneNote, milestoneField))
-                    }
-                    if (retiredNow.length > 0) {
-                        ledgerRows.push(
-                            planRowFor(amended, amendedSpec, 'budget-retired', now, `作废预算 ${retiredNow.join('、')}（编号不复用）`, {
-                                ...milestoneField,
-                                retiredBudgets: retiredNow,
-                            }),
-                        )
-                    }
-                    const budgetHistory = readSpecBudgets(amendedSpec).changes.slice(-5)
-                    return [
-                        `## 已改动规格（revision ${amendedSpec.revision}）`,
-                        '',
-                        summary,
-                        `需求文档：${path.relative(mission.cwd, path.join(store.layout.missionsDir, mission.id, 'spec.md'))}（已重新渲染）`,
-                        describeBudgetsOf(amendedSpec),
-                        ...(milestoneNote === undefined ? [] : [`里程碑：${milestoneRow ?? requestedMilestone}`]),
-                        ...recordPlan(deps, store.layout, effectiveFor(deps, agent), ledgerRows),
-                        '',
-                        '### 预算变更历史（最近 5 条，无变更时为空）',
-                        '',
-                        ...(budgetHistory.length === 0 ? ['(无)'] : budgetHistory.map(renderBudgetChangeLine)),
-                        '',
-                        '### 下一步（标准流程）',
-                        '',
-                        nextStepsAfter(amendedSpec, [summary]),
-                    ].join('\n')
+                    const planned = planBudgetAmendment({ spec, args, by })
+                    if (!planned.ok) return planned.text
+                    const { plan, summary, read } = planned
+                    return await commitBudgetAmendment({ deps, agent, store, mission, spec, args, requestedMilestone, plan, summary, read })
                 }
 
                 const request: AmendRequest = {
@@ -1331,43 +1383,28 @@ export function registerTools(
                     ].join('\n')
                 }
                 const now = Date.now()
-                // The milestone is applied FIRST, so every row below records the
-                // state after this call: the ledger is an index of what happened,
-                // not a plan.
-                let milestoneNote: string | undefined
-                if (requestedMilestone !== undefined) {
-                    const before = milestoneOf(mission)
-                    if (before !== requestedMilestone) {
-                        store.update(mission.id, (record) => ({ labels: labelsWithMilestone(record.labels, requestedMilestone) }))
-                        milestoneNote = `里程碑：${before ?? '(无)'} → ${requestedMilestone}`
-                    }
-                }
+                const milestoneNote = applyRequestedMilestone(store, mission, requestedMilestone)
                 const amended = store.read(mission.id) ?? mission
                 const amendedSpec = amended.spec ?? mission.spec
-                const ledgerRows: PlanRow[] = []
-                if (amendedSpec !== undefined) {
-                    const milestone = milestoneOf(amended)
-                    const milestoneField = milestone === undefined ? {} : { milestone }
-                    // Order matters: the later row wins a same-millisecond tie,
-                    // and the retirement must be the newest mention of the id it
-                    // retires (the rows after it no longer list that id).
-                    ledgerRows.push(planRowFor(amended, amendedSpec, 'spec-amended', now, outcome.summary, milestoneField))
-                    if (milestoneNote !== undefined) {
-                        ledgerRows.push(planRowFor(amended, amendedSpec, 'milestone-changed', now, milestoneNote, milestoneField))
-                    }
-                    if (outcome.change.kind.startsWith('remove-')) {
-                        ledgerRows.push(
-                            planRowFor(
-                                amended,
-                                amendedSpec,
-                                'requirement-retired',
-                                now,
-                                `作废 ${outcome.change.target}（原内容：${outcome.change.before ?? ''}），编号不复用`,
-                                { ...milestoneField, retired: [outcome.change.target] },
-                            ),
-                        )
-                    }
-                }
+                // Order matters: the later row wins a same-millisecond tie, and the
+                // retirement must be the newest mention of the id it retires.
+                const ledgerRows = amendmentRows({
+                    amended,
+                    spec: amendedSpec,
+                    at: now,
+                    summary: outcome.summary,
+                    milestoneNote,
+                    specRow: true,
+                    ...(outcome.change.kind.startsWith('remove-')
+                        ? {
+                              retired: {
+                                  kind: 'requirement-retired' as const,
+                                  target: outcome.change.target,
+                                  before: outcome.change.before,
+                              },
+                          }
+                        : {}),
+                })
                 const history = (store.read(mission.id)?.spec?.changes ?? []).slice(-5)
                 return [
                     `## 已改动规格（revision ${outcome.revision}）`,
@@ -1918,11 +1955,6 @@ async function askWhatToChange(
     }
 }
 
-/** The workspace-relative spelling of a path (for prompts). */
-function relativePathOf(mission: MissionRecord, candidate: string): string {
-    return path.isAbsolute(candidate) ? path.relative(mission.cwd, candidate) || candidate : candidate
-}
-
 /** Absolute paths of everything a reviewer may want to open. */
 function reviewArtifactsOf(mission: MissionRecord, layout: Layout): ReviewArtifacts {
     // The fallback follows the resolved layout: only a mission that never got a
@@ -1942,52 +1974,9 @@ function reviewArtifactsOf(mission: MissionRecord, layout: Layout): ReviewArtifa
     }
 }
 
-/**
- * The text the human reads in the approval prompt.
- *
- * Two directories and two files, so a reviewer can open them (a UI may render
- * the `需求文档:` / `测试用例:` lines as openable paths), the numbers that
- * matter, and what rejection means — the review is a loop, not a one-shot.
- * @param layout - the workspace layout: both directories follow the layout root
- *   (a migrated repository keeps its spec under `.dsh/engineering-suite/specs`).
- */
-export function renderApprovalPrompt(mission: MissionRecord, round: number, layout: Layout, note?: string): string {
-    const spec = mission.spec
-    const criteria = spec?.acceptanceCriteria ?? []
-    const cases = mission.testDesign?.cases ?? []
-    const uncovered = mission.testDesign?.uncovered ?? []
-    const budgets = readSpecBudgets(spec)
-    const relativeMissions = path.relative(layout.cwd, layout.missionsDir) || layout.missionsDir
-    const relativeSpecs = path.relative(layout.cwd, layout.specsDir).split(path.sep).join('/') || '.'
-    const specFile = relativePathOf(mission, mission.specPath ?? path.join(layout.specsDir, `${mission.id}.md`))
-    const designFile = `${relativeMissions}/${mission.id}/test-design-review.md`
-    const lines = [
-        note === undefined ? `规格审批（第 ${round} 次送审）：${mission.title}` : `${note}（第 ${round} 次送审）`,
-        `mission ${mission.id} · rev ${spec?.revision ?? '?'} · 摘要 ${(mission.specDigest ?? '').slice(0, 12) || '?'}`,
-        '',
-        `需求文档目录: ${relativeSpecs}/`,
-        `需求文档: ${specFile}（验收标准 ${criteria.length} 条）`,
-        ...criteria.slice(0, 6).map((criterion) => `  · ${criterion.id} ${criterion.text}`),
-        ...(criteria.length > 6 ? [`  · …另有 ${criteria.length - 6} 条`] : []),
-        '',
-        // 非功能要求也在被审批的文档里：审的人必须看见它们，否则"预算"又变成了事后补的口径。
-        `非功能预算: ${budgets.budgets.length} 条${budgets.retired.length === 0 ? '' : `（已作废编号：${budgets.retired.join('、')}，不会复用）`}`,
-        ...budgets.budgets.slice(0, 6).map((budget) => {
-            const unit = budget.unit ?? defaultBudgetUnit(budget.metric)
-            return `  · ${budget.id} ${budget.name}：${budget.metric} ${describeThreshold(budget.threshold, unit)}（命令 \`${budget.command}\`，关联 ${(budget.requirementIds ?? []).join('、') || '(未关联)'}）`
-        }),
-        ...(budgets.budgets.length > 6 ? [`  · …另有 ${budgets.budgets.length - 6} 条`] : []),
-        '',
-        `测试用例目录: ${relativeMissions}/${mission.id}/`,
-        `测试用例: ${designFile}（用例 ${cases.length} 条${uncovered.length === 0 ? '，覆盖全部验收标准' : `，未覆盖 ${uncovered.join('、')}`}）`,
-        ...cases.slice(0, 6).map((entry) => `  · ${entry.id} → ${entry.covers.join('、') || '(未标注)'}：${entry.expected.slice(0, 40)}`),
-        ...(cases.length > 6 ? [`  · …另有 ${cases.length - 6} 条`] : []),
-        '',
-        '通过：写操作放行。',
-        '不合格：拒绝并在对话里说明要改什么——规格会回到草稿，模型据此重写后再次送审（可反复多轮）。',
-    ]
-    return lines.join('\n')
-}
+// The review sheet the human reads lives with the approval rules: the same
+// module answers "may this be approved?" and "what exactly is being approved?".
+export { renderApprovalPrompt } from './spec-approval.js'
 
 /**
  * What asking the approval kernel produced.
@@ -2064,6 +2053,46 @@ async function answerThroughQuestions(input: {
 }
 
 /**
+ * The preferred rich route: the host TUI's own card UI (nvim-tui's public ext
+ * API), which can OPEN the artifacts and take the note in an input box.
+ * @param input - the review material to show, and the signals to honour.
+ * @returns the card's answer, or `undefined` when this route cannot answer.
+ */
+async function answerThroughTuiCard(input: {
+    deps: ToolDeps
+    config: SpecGateConfig
+    mission: MissionRecord
+    layout: Layout
+    prompt: string
+    round: number
+    shownDigest: string
+    context: { agent?: AgentLike; signal?: AbortSignal }
+}): Promise<GateSurfaceAnswer | undefined> {
+    const tui = input.deps.nvimTui()
+    if (input.config.reviewChannel === 'approval' || tui === undefined) return undefined
+    const outcome = await tuiReview({
+        api: tui,
+        ...(sessionIdOf(input.context.agent) === undefined ? {} : { sessionId: sessionIdOf(input.context.agent) as string }),
+        title: `规格审批（第 ${input.round} 次送审）：${input.mission.title}`,
+        body: input.prompt,
+        artifacts: reviewArtifactsOf(input.mission, input.layout),
+        cwd: input.mission.cwd,
+        log: (message: string) => input.deps.logger.for(input.mission.cwd).info(`[review] ${message}`),
+        ...(input.context.signal === undefined ? {} : { signal: input.context.signal }),
+        timeoutMs: input.config.reviewTimeoutMs,
+    })
+    if (outcome.decision === 'approved') {
+        return { kind: 'answer', decision: 'allowed-once', by: 'approval', via: 'tui-card', displayedDigest: input.shownDigest }
+    }
+    if (outcome.decision === 'rejected') {
+        return { kind: 'answer', decision: 'rejected', via: 'tui-card', ...(outcome.note === undefined ? {} : { note: outcome.note }) }
+    }
+    if (outcome.decision === 'cancelled') return { kind: 'answer', decision: 'cancelled', via: 'tui-card' }
+    // `unavailable`: this route cannot answer — fall through.
+    return undefined
+}
+
+/**
  * Ask for the specification's approval through the gate-authorisation kernel.
  *
  * The surface is `rich` — a review card that can show (and, on the TUI, open)
@@ -2122,30 +2151,8 @@ async function requestApproval(
      * downgrading — that configuration said "this route or nothing".
      */
     const rich: GateSurfaceAdapter = async () => {
-        // Preferred channel: the host TUI's own card UI (nvim-tui's public ext
-        // API), which can OPEN the artifacts and take the note in an input box.
-        const tui = deps.nvimTui()
-        if (config.reviewChannel !== 'approval' && tui !== undefined) {
-            const outcome = await tuiReview({
-                api: tui,
-                ...(sessionIdOf(context.agent) === undefined ? {} : { sessionId: sessionIdOf(context.agent) as string }),
-                title: `规格审批（第 ${roundForReview} 次送审）：${mission.title}`,
-                body: prompt,
-                artifacts: reviewArtifactsOf(mission, layout),
-                cwd: mission.cwd,
-                log: (message: string) => deps.logger.for(mission.cwd).info(`[review] ${message}`),
-                ...(context.signal === undefined ? {} : { signal: context.signal }),
-                timeoutMs: config.reviewTimeoutMs,
-            })
-            if (outcome.decision === 'approved') {
-                return { kind: 'answer', decision: 'allowed-once', by: 'approval', via: 'tui-card', displayedDigest: shownDigest }
-            }
-            if (outcome.decision === 'rejected') {
-                return { kind: 'answer', decision: 'rejected', via: 'tui-card', ...(outcome.note === undefined ? {} : { note: outcome.note }) }
-            }
-            if (outcome.decision === 'cancelled') return { kind: 'answer', decision: 'cancelled', via: 'tui-card' }
-            // `unavailable`: this route cannot answer — fall through.
-        }
+        const tuiAnswer = await answerThroughTuiCard({ deps, config, mission, layout, prompt, round: roundForReview, shownDigest, context })
+        if (tuiAnswer !== undefined) return tuiAnswer
         if (config.reviewChannel === 'tui') {
             throw new Error(
                 '规格审批未进行：reviewChannel=tui，但宿主没有可用的 nvim-tui 扩展 API（ctx.get("nvim-tui")）。' +
