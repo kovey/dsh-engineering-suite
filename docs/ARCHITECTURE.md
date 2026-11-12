@@ -1161,9 +1161,10 @@ IM 面如何被发现：`dsh-interaction-gate` 导出 `imApprovalSurface(ctx, cw
 
 | 入口 | 类型 | 回答 |
 |---|---|---|
-| `suite_init({ apply?, force?, only? })` | 唯一会写文件的入口 | 十份配置**应该**长什么样（默认只打印计划） |
+| `suite_init({ apply?, force?, only? })` | **工具层**唯一会写文件的入口 | 十份配置**应该**长什么样（默认只打印计划） |
 | `suite_config({ plugin? })` | 只读 | 每份配置的**生效来源**（repo / profile / default）与"文件 + 键"级问题 |
 | `/suite init\|show\|doctor` | 只读或按 `--apply` 写 | 同上面两个工具 + 配置级体检（文件在不在、规范/基线/关键路径） |
+| `/suite set\|unset\|edit` | **人**的改动入口（模型没有对应工具） | 改/删一个顶层键（校验键 → 逐键 diff → 原子写），或在当前 UI 打开配置文件 |
 
 **安全性质是设计出来的，不是提示词约束**：
 
@@ -1194,6 +1195,18 @@ IM 面如何被发现：`dsh-interaction-gate` 导出 `imApprovalSurface(ctx, cw
 `register({ name, description, input: { hint }, handler })`，卸载时用返回的 disposer 注销。它不碰 nvim-tui 的
 ExtApi——那是 TUI 专属面；命令注册表是 TUI / desktop / web 共用的宿主契约。宿主没挂载注册表时**不注册、
 也不报错**（只是记一条日志），与 `/kb` 的取舍相同：一个最小宿主不应该因为缺一个可选插件而加载失败。
+
+**命令层的人写入口（`/suite set|unset|edit`）**：写操作只由人敲命令发起。`suite_init` / `suite_config` 两个工具
+不引用任何写模块（测试里逐字符串钉住），所以模型拿不到"直接改门禁配置"的能力；`set`/`unset` 只挂在命令注册面上。
+键判定复用 `inspect.ts` 的 `classifyKey`（与 `suite_config` 报告同一份契约知识，不存在第二份白名单）：未知顶层键
+默认拒绝，`--allow-unknown` 才按字面键名写入并给出警告；`enabled`、`askTimeoutMs` 这类宿主键**一律拒绝**
+（`--allow-unknown` 不放行）——放宽项目级上限不是拼写问题。值是完整 JSON 片段，按原始文本解析（不做 token 重拼，
+字符串里的空格不会被吞掉）；写前逐键打印 `- 旧值` / `+ 新值`，`--dry-run` 只预览、不加锁也不落盘。写盘是
+"`<file>.tmp-<random>` + `renameSync`"的原子替换：任一步失败都删除临时文件、原文件字节不变（半写的门禁配置比不改更糟）；
+文件本身不是合法 JSON 时**拒绝改写**而不是尽力合并。`edit` 把"当前 UI"当可选能力：有 `nvim-tui` 服务时用它的公开
+入口 `require("dsh_tui").open_file_tab(<绝对路径>)`（`/settings edit` 与 `gF` 用的同一个；只暴露 `luaExt.call` 的宿主
+走那条），没有（desktop / web / headless）或打开失败时打印绝对路径 + "在你的编辑器里打开它"，**命令仍算成功**：
+配置内容没有被改动，界面能不能开标签页不该决定这条命令的成败。
 
 **诚实的边界**：
 

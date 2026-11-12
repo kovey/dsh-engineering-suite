@@ -56,8 +56,9 @@
 | `suite_config({ plugin? })` | **只读**列出十份配置与来源（`repo` 仓库文件生效 / `profile` 有文件但没有可用键 / `default` 没有仓库文件），并逐条点名"文件 + 键"：JSON 不可解析、未知顶层键（拼写错、插件根本不读）、被禁止的项目级覆盖键、越出工作区的路径值。未知 `plugin` 过滤被拒绝。 |
 
 **`suite_status` 与 `suite_config` 严格只读**：不写门禁记录、不落盘、不改 mission、不创建 `.dsh/`；也**不授予任何权限**。
-`suite_init` 是唯一会写文件的入口，且默认不写（见上）。测试里有一条"工作区前后逐字节一致"（对整个 `.dsh` 树做内容哈希比对，
-另加一条"没有台账的工作区不会长出 `.dsh/`"）。
+`suite_init` 是**工具层**唯一会写文件的入口（默认还不写），命令层再补一个**人**的按键改动
+（`/suite set|unset`，需要人敲，模型没有对应工具）。测试里有一条"工作区前后逐字节一致"（对整个 `.dsh` 树做内容哈希比对，
+另加一条"没有台账的工作区不会长出 `.dsh/`"），并钉住"工具层不引用任何写模块"。
 
 ### `/suite` 命令（人直接敲，不经过模型）
 
@@ -66,6 +67,9 @@
 ```
 /suite init [--apply] [--force] [--only <id,…>]   # 同 suite_init，默认 dry-run
 /suite show [plugin]                              # 同 suite_config
+/suite set <plugin> <key> <json-value> [--dry-run] [--allow-unknown]   # 改一个顶层键：diff + 原子写
+/suite unset <plugin> <key> [--dry-run] [--allow-unknown]              # 删一个顶层键：diff + 原子写
+/suite edit [plugin]                              # 在当前界面打开配置文件（打不开就给绝对路径）
 /suite doctor                                     # 配置级体检（逐份：在不在、能不能解析、规范/基线/关键路径）
 /suite help
 ```
@@ -73,6 +77,24 @@
 注册走 `ctx.get('commands')`（**可选服务**，不是 `inject`），与 nvim-tui 的扩展 API 无关，所以 TUI / desktop / web
 三端用的是同一个注册面；宿主没挂载注册表时**不注册、也不报错**。handler 调用的是工具同一批函数
 （`planSuiteInit` / `inspectSuiteConfig` / `runSuiteHealth`），人和模型的报告不会分叉。
+
+**`set` / `unset` 是唯一的人写入口**（工具层没有这个能力：`suite_init` / `suite_config` 仍是脚手架/只读，
+`tools-scaffold.ts` 不引用任何写模块）。四条性质：
+
+- **键由插件契约判定**：复用 `inspect.ts` 的 `classifyKey`（`suite_config` 报告用的同一个判定）。未知顶层键默认
+  拒绝，`--allow-unknown` 才按字面键名写入并给出警告；`enabled` / `askTimeoutMs` / `layout` 这类宿主键
+  **一律拒绝**（`--allow-unknown` 不放行）——项目不能给自己放宽上限。
+- **值是完整 JSON 片段**：`true` / `123` / `"x"` / `{...}` / `[...]`；解析失败直接拒绝。值按原始文本解析
+  （不做 token 重拼），字符串里的空格不会被吞掉。键是**顶层键**：嵌套字段请设置整个顶层值。
+- **先 diff 再写**：逐键打印 `- 旧值` / `+ 新值`；`--dry-run` 只打印、不写盘，也不留临时文件。
+- **原子替换**：先写 `<file>.tmp-<random>` 再 `renameSync` 覆盖；任一步失败都删除临时文件、原文件字节不变，
+  并把失败作为命令错误返回。坏 JSON 的文件不会被"尽力改写"，而是拒绝并让你先修正它。
+
+**`edit` 是尽力而为的 UI 路由**：有 `nvim-tui` 服务时用它的公开入口
+（`require("dsh_tui").open_file_tab(<绝对路径>)`，`/settings edit` 与 `gF` 用的同一个入口；只暴露
+`luaExt.call` 的宿主走 `dsh_tui.open_file_tab`），在标签页打开；desktop / web / headless 或打开失败时**不报错**，
+打印绝对路径 + "在你的编辑器里打开它"，命令仍算成功（配置没有被改动）。文件不存在时提示
+`/suite init --apply --only <id>`。
 
 ### 操作者视图：四个问题，按顺序
 

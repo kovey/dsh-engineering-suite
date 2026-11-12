@@ -98,6 +98,26 @@ function reasonFor(key: string): string {
     return HOST_ONLY_REASONS[key] ?? '它不是该插件允许项目级覆盖的键（profile 是上限）'
 }
 
+/** What one top-level key means for a project file. */
+export type KeyVerdict = { kind: 'ok' } | { kind: 'unknown' } | { kind: 'forbidden'; reason: string }
+
+/**
+ * Classify one top-level key against the owning plugin's contract.
+ *
+ * The SINGLE answer to "may this key live in the project file": `suite_config`
+ * renders it as a problem, `/suite set` refuses the write with the same verdict.
+ * Two implementations would drift, and the drift would look like the inspector
+ * accepting a key the editor silently drops.
+ * @param descriptor - the owning plugin's catalog entry.
+ * @param key - the top-level key the project file would carry.
+ * @returns `ok`, `unknown` (not a key the plugin reads) or `forbidden` (host-only).
+ */
+export function classifyKey(descriptor: SuiteConfigDescriptor, key: string): KeyVerdict {
+    if (!descriptor.knownKeys.includes(key)) return { kind: 'unknown' }
+    if (descriptor.projectOwned !== true && !descriptor.overridableKeys.includes(key)) return { kind: 'forbidden', reason: reasonFor(key) }
+    return { kind: 'ok' }
+}
+
 function relativeTo(cwd: string, target: string): string {
     const relative = path.relative(cwd, target)
     return relative === '' ? '.' : relative.split(path.sep).join('/')
@@ -129,18 +149,17 @@ function pathProblemsOf(descriptor: SuiteConfigDescriptor, value: Record<string,
  * @returns source, validation problems and the keys in file order.
  */
 function validateKeys(descriptor: SuiteConfigDescriptor, raw: Record<string, unknown>, row: ConfigInspection): { source: ConfigSource; problems: string[] } {
-    const known = new Set(descriptor.knownKeys)
-    const overridable = new Set(descriptor.overridableKeys)
     const keys = Object.keys(raw)
     const problems: string[] = []
     let applied = 0
     for (const key of keys) {
-        if (!known.has(key)) {
+        const verdict = classifyKey(descriptor, key)
+        if (verdict.kind === 'unknown') {
             problems.push(`${row.file}: 未知顶层键 "${key}"（${descriptor.id} 不读这个键：检查拼写，或写进拥有它的插件配置）`)
             continue
         }
-        if (descriptor.projectOwned !== true && !overridable.has(key)) {
-            problems.push(`${row.file}: 键 "${key}" 不能在项目级覆盖：${reasonFor(key)}；已忽略`)
+        if (verdict.kind === 'forbidden') {
+            problems.push(`${row.file}: 键 "${key}" 不能在项目级覆盖：${verdict.reason}；已忽略`)
             continue
         }
         applied += 1

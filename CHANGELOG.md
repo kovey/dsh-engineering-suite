@@ -1,5 +1,40 @@
 ## [未发布]
 
+### 新增 · `/suite set | unset | edit`：人改门禁配置（diff + 原子写），或在当前 UI 打开它
+
+`suite_config` 能告诉你"这个键不会生效"，但改一个阈值仍然要离开会话手工编辑 `.dsh/*.json`。这一版给 `/suite`
+补上三个**命令层**子命令（模型没有对应工具：`suite_init` / `suite_config` 仍是脚手架/只读）：
+
+- **`/suite set <plugin> <key> <json-value> [--dry-run] [--allow-unknown]`**：改一个顶层键。键判定复用
+  `inspect.ts` 的 `classifyKey`——与 `suite_config` 报告同一份契约知识，不存在第二份白名单。未知顶层键默认拒绝，
+  `--allow-unknown` 才按字面键名写入并给出警告；`enabled` / `askTimeoutMs` / `layout` 这类宿主键**一律拒绝**
+  （`--allow-unknown` 不放行）。值是完整 JSON 片段（`true` / `123` / `"x"` / `{...}` / `[...]`），按原始文本解析
+  （不从 token 重拼，字符串里的空格不会被吞掉），解析失败直接拒绝。
+- **`/suite unset <plugin> <key> [--dry-run] [--allow-unknown]`**：删一个顶层键；键不在文件里时报告"无变化"且不写盘。
+- **写前 diff、写时原子**：逐键打印 `- 旧值` / `+ 新值`；`--dry-run` 只预览，不写盘也不留临时文件。真正写入时先写
+  `<file>.tmp-<random>` 再 `renameSync` 覆盖；任一步失败都删除临时文件、**原文件字节不变**并报错。文件不是合法 JSON
+  时拒绝改写（不尽力合并），`--dry-run` 与真实写入走同一份文档计算，不存在会分叉的第二条路径。
+- **`/suite edit [plugin]`**：在当前 UI 打开配置文件。有 `nvim-tui` 服务时用它的公开入口
+  `require("dsh_tui").open_file_tab(<绝对路径>)`（`/settings edit` 与 `gF` 用的同一个；只暴露 `luaExt.call` 的宿主走
+  `dsh_tui.open_file_tab`）在标签页打开；desktop / web / headless、插件未装载或打开失败时**不报错**，打印绝对路径 +
+  "在你的编辑器里打开它"，命令仍成功。文件不存在时提示 `/suite init --apply --only <id>`；不带 `plugin` 时打开配置目录。
+- **结构**：`src/config-edit.ts`（键判定复用 + diff + 原子写）、`src/open-config.ts`（可选 nvim-tui 路由 + 路径回落）、
+  `src/command-config.ts`（三个子命令的语法与执行）、`src/command.ts`（注册与分发，285 行）、`src/inspect.ts`
+  导出 `classifyKey` 供两处共用（`validateKeys` 改用它，报告文本不变）。工具层（`tools.ts` / `tools-scaffold.ts`）无改动，
+  测试用逐字符串断言钉住"工具层不引用任何写模块"。
+
+**测试面**：新增 `packages/dsh-suite-doctor/test/suite-config-edit.test.ts` 23 条（覆盖 TC-1511…TC-1515；TC-1516 是
+`verify.sh --quiet` 两次全绿的验证级用例，按团队约定本轮不跑全量 verify，交付门禁会跑）：set 新键/改既有键（含数组
+JSON 与值内空格保留）、unset 删键/删不存在的键、未知键拒绝与 `--allow-unknown` 放行、`enabled`/`askTimeoutMs` 拒绝、
+非法 JSON 拒绝、`--dry-run` 后布局根逐字节一致且无 `.tmp-*`、rename 失败后原文件字节不变且临时文件被清理（含
+`writeFileAtomic` 单元面）、坏 JSON 拒绝改写、unknown plugin / 错位 flag、`edit` 无 nvim-tui 回落、有 nvim-tui 走
+`open_file_tab` 且传绝对路径、只有 `luaExt.call` 的宿主、打开失败回落、文件不存在提示、打开配置目录、`/suite help`
+列出新命令、工具层只读。
+`node --test packages/dsh-suite-doctor/test/*.test.ts` **111 通过 / 0 失败**（原 88 + 新增 23，既有断言未改、未跳过）。
+
+**验证**：`node node_modules/typescript/bin/tsc -p packages/dsh-suite-doctor/tsconfig.json` 通过；
+`bash scripts/standards-check.sh --quiet` exit 0（无新增/恶化）。文档：`docs/ARCHITECTURE.md` §5.30 与包内 README。
+
 ### 新增 · `suite_init` / `suite_config` 与 `/suite` 命令：把门禁配置的初始化与检查变成可执行的一步
 
 `dsh-suite-doctor` 原本只有一个只读的 `suite_status`。接入一个仓库仍然要手工翻 `.dsh/*.json`，而且写错一个
