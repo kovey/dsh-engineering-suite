@@ -1,5 +1,31 @@
 ## [未发布]
 
+### 体验 · `/suite` 报告以 nvim-tui 浮窗呈现，文本端保持可用（`dsh-suite-doctor`）
+
+在 TUI 里 `/suite doctor`、`/suite show` 的报告被压成一条长行：宿主用 nvim-tui 的 `app.notice()` 渲染命令结果，
+而 `Feed.appendNotice` 会把空白改成空格。报告原本是分组、缩进的多行文本，到 feed 里就只剩"一坨"。
+这一版把呈现交给浮窗，同时让没有 TUI 的端照旧拿到完整文本：
+
+- **新增 `packages/dsh-suite-doctor/src/render-report.ts`**：`layoutReport(text)` 把现有渲染文本（`suite_config` /
+  `suite doctor` / `suite_init` 计划 / `set|unset` 的 diff / `edit` 的结果）布局成 `{ title, lines, summary, folded }`：
+  首行摘要是"标题 + 报告自己的关键数字"（doctor 的 ok/partial/missing/unknown、show 的份数与问题条数、
+  init 的写入/覆盖/跳过、set|unset 的变更键数），段落之间空行，每行 ≤100 字符（超长按词换行，CJK 长串硬切），
+  正文超过 24 行折叠为 `…另有 N 行（完整文本见 feed）`。
+- **`showReport(ctx, title, text)`**：存在 `nvim-tui`（`ctx.get`，可选服务，不 `inject`）且 `capabilities().headless !== true`
+  时调 `ui.float({ title, lines, height: min(lines+2, 24), width: 88 })`，feed 里留一行摘要（被折叠时摘要后附完整文本，
+  否则"完整文本见 feed"是假话）；下一次 `/suite` 先关掉上一次的浮窗，不叠罗汉。无服务 / 服务缺 `ui.float`·`ui.floatClose`
+  / headless / `float()` 抛错，一律回落为**原始的完整多行文本**，命令仍是 `success`。
+- **`/suite` 全部子命令走同一渲染**：`init` / `show` / `set` / `unset` / `edit` / `doctor` 经 `render-report.ts`，
+  标题形如 `suite · show|doctor|init|set|edit`；`help` 保持纯文本（用法是照着敲的，不弹窗）。浮窗与回落读同一份
+  `layoutReport`，不存在两套文案。
+- **文档**：`docs/ARCHITECTURE.md` §5.30 补"报告的呈现"一节，说明为什么用 `ui.float` 而不用 `ui.card`、硬指标与回落规则，
+  以及"TUI 的 feed 仍是压平的一条长行"这一诚实的边界。
+
+**验证**（按团队约定本轮不跑全量 verify）：`node --test packages/dsh-suite-doctor/test/*.test.ts` → 121 条全绿
+（原 111 条 + 新增 10 条 TC-1610…TC-1615）；`node node_modules/typescript/bin/tsc -p packages/dsh-suite-doctor/tsconfig.json`
+退出 0；`bash scripts/standards-check.sh --quiet` → PASS（无新增/恶化违规）。TC-1616（`verify.sh --quiet` 两次）留给
+交付门禁的完整命令，本次部分验收不作为交付依据。
+
 ### 运维 · `scripts/flaky-hunt.sh`：把"下次偶发失败"变成有名字的证据（`scripts/`）
 
 2026-11-12 的全量 verify 有 3 次偶发非零：前两次有名字所以修掉了（interaction-gate 的 40ms

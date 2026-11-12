@@ -1208,6 +1208,25 @@ ExtApi——那是 TUI 专属面；命令注册表是 TUI / desktop / web 共用
 走那条），没有（desktop / web / headless）或打开失败时打印绝对路径 + "在你的编辑器里打开它"，**命令仍算成功**：
 配置内容没有被改动，界面能不能开标签页不该决定这条命令的成败。
 
+**报告的呈现：浮窗优先，文本兜底（`render-report.ts`）**。宿主把命令结果交给 nvim-tui 的 `app.notice()`，
+而 `Feed.appendNotice` 会 `replace(/\s+/g, ' ')` 把它压成一行——体检的十几项检查、配置差异、脚手架计划到了
+feed 里只剩一条长行。修法不是再写一份短报告，而是把**同一份**报告布局一次，交给能显示它的那个面：
+
+- **为什么是 `ui.float` 而不是 `ui.card`**：card 渲染进 feed（聊天区）且只保留前 4 个动作，长报告在那里同样会被裁；
+  float 是编辑器里的独立缓冲区，多行、可滚动、可复制，正好是"让人读一遍"的场景。
+- **一份报告，两个面**：`layoutReport(text)` 产出 `{ title, lines, summary, folded }`，浮窗正文、首行摘要与文本回落
+  全部读它，不存在第二份会分叉的文案。首行摘要是"标题 + 报告自己的关键数字"（doctor 的 ok/partial/missing/unknown、
+  show 的份数与问题条数、init 的写入/覆盖/跳过、set/unset 的变更键数），由正文**投影**而来。
+- **硬指标**：每行 ≤100 个字符（按码点算，emoji 记一个；超长按词换行，无空格的 CJK 长串硬切并缩进续行）、
+  段落之间空行（状态行/明细/汇总/下一步各自成段）、正文 ≤24 行；超出折叠为 `…另有 N 行（完整文本见 feed）`，
+  此时 feed 里摘要之后附上完整文本——否则这句话就是假的。`help` 固定纯文本：用法是照着敲的，弹窗反而是障碍。
+- **命令永不因 UI 失败**：没有 `ctx.get('nvim-tui')`（**可选服务，不 `inject`**）、`capabilities().headless === true`、
+  服务没有 `ui.float`/`ui.floatClose`、或 `float()` 抛错，都回落为**原始的完整多行文本**，结果仍是 `success`。
+  下一次 `/suite` 先 `floatClose` 上一次的浮窗，避免叠罗汉；关闭失败不算命令失败。
+- **诚实的边界**：TUI 的 feed 仍经 `app.notice()`，宿主会把命令结果压成一行，所以"完整文本见 feed"在 TUI 里是
+  一条被压平的长行（desktop/web 等保留多行的端才能原样看到）；浮窗是否真的可见由 nvim-tui 决定，本插件能确认的
+  只是 `ui.float()` resolve 了。
+
 **诚实的边界**：
 
 - 默认命令是**生态约定**（`go test ./...`、`node --test`、`python -m pytest -q`），不是本仓库的事实；

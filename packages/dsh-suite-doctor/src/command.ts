@@ -20,11 +20,13 @@
  *    `ctx.get('commands')`, never through `inject`: a minimal host without
  *    `@deepseek-ai/dsh-commands` still loads this plugin, and an absent registry
  *    is a logged note, not a failed `apply`.
- *  - **No TUI-specific surface.** Registration uses the harness's command
- *    registry (the same one the TUI, desktop and web composers read), NOT
- *    nvim-tui's extension API — the command is therefore available wherever the
- *    host mounted that registry, and simply absent where it did not. `edit`
- *    consults nvim-tui as an OPTIONAL service and degrades to a path.
+ *  - **No TUI-specific surface for registration.** Registration uses the
+ *    harness's command registry (the same one the TUI, desktop and web
+ *    composers read), NOT nvim-tui's extension API — the command is therefore
+ *    available wherever the host mounted that registry, and simply absent where
+ *    it did not. nvim-tui stays OPTIONAL: `edit` uses its file-tab entry, and
+ *    every report its `ui.float` (`render-report.ts`); without it, same report
+ *    as text.
  *  - **Fail closed on grammar.** An unrecognised sub-command or flag is an error
  *    result carrying the usage; `/suite init` without `--apply` writes nothing.
  *
@@ -37,6 +39,7 @@ import type { SuiteDoctorConfig } from './config.js'
 import { runSuiteHealth, renderSuiteHealth } from './health.js'
 import { inspectSuiteConfig, renderConfigInspection } from './inspect.js'
 import { planSuiteInit, renderInitPlan } from './scaffold.js'
+import { showReport } from './render-report.js'
 import type { ToolDeps } from './tools.js'
 
 /** The registered command name (the `/` is the harness's, not ours). */
@@ -198,30 +201,42 @@ function showText(plugin: string | undefined, cwd: string, layout: ReturnType<ty
     return renderConfigInspection(inspectSuiteConfig({ cwd, layout, host: config }, plugin === undefined ? undefined : [plugin]))
 }
 
-/** Execute one already-parsed, non-help invocation against a known workspace. */
+/** Execute one parsed, non-help invocation and return its raw report text. */
+async function operationText(
+    parsed: Exclude<SuiteInvocation, { kind: 'help' } | { kind: 'error' }>,
+    deps: ToolDeps,
+    cwd: string,
+    agent: AgentLike | undefined,
+): Promise<string> {
+    const config = deps.configFor(agent)
+    const layout = resolveLayout(cwd, config.layout)
+    switch (parsed.kind) {
+        case 'init':
+            return initText(parsed, cwd, layout.configDir)
+        case 'show':
+            return showText(parsed.plugin, cwd, layout, config)
+        case 'doctor':
+            return renderSuiteHealth(runSuiteHealth({ cwd, layout, host: config }))
+        default:
+            // `set` / `unset` / `edit`: the only human write path and the only
+            // optional-UI path. Their grammar and refusals live in command-config.ts.
+            return runConfigInvocation(parsed, { cwd, layout, getService: (name) => deps.ctx().get(name) })
+    }
+}
+
+/**
+ * Execute one operation and present its report: an nvim-tui float when the host
+ * has that OPTIONAL service, the same laid-out report as text otherwise
+ * (`render-report.ts` owns both decisions).
+ */
 async function runOperation(
     parsed: Exclude<SuiteInvocation, { kind: 'help' } | { kind: 'error' }>,
     deps: ToolDeps,
     cwd: string,
     agent: AgentLike | undefined,
 ): Promise<CommandResultLike> {
-    const config = deps.configFor(agent)
-    const layout = resolveLayout(cwd, config.layout)
-    switch (parsed.kind) {
-        case 'init':
-            return { kind: 'success', text: initText(parsed, cwd, layout.configDir) }
-        case 'show':
-            return { kind: 'success', text: showText(parsed.plugin, cwd, layout, config) }
-        case 'doctor':
-            return { kind: 'success', text: renderSuiteHealth(runSuiteHealth({ cwd, layout, host: config })) }
-        default:
-            // `set` / `unset` / `edit`: the only human write path and the only
-            // optional-UI path. Their grammar and refusals live in command-config.ts.
-            return {
-                kind: 'success',
-                text: await runConfigInvocation(parsed, { cwd, layout, getService: (name) => deps.ctx().get(name) }),
-            }
-    }
+    const text = await operationText(parsed, deps, cwd, agent)
+    return showReport({ get: (name) => deps.ctx().get(name) }, `suite · ${parsed.kind}`, text)
 }
 
 /**
