@@ -1,3 +1,38 @@
+## [未发布]
+
+### 运维 · `scripts/flaky-hunt.sh`：把"下次偶发失败"变成有名字的证据（`scripts/`）
+
+2026-11-12 的全量 verify 有 3 次偶发非零：前两次有名字所以修掉了（interaction-gate 的 40ms
+超时预算、orchestrator metrics 的只读用例整树快照），第三次在 v0.8.8 发版前失败，输出里连
+`✖` 都没有——没有包名、没有用例名，等于没有证据。这一版把"下次失败"的取证变成一条命令。
+
+- **采样**：`bash scripts/flaky-hunt.sh [--runs N] [--command <cmd>] [--keep]`，默认 3 次
+  `bash scripts/verify.sh --quiet`（cwd = 仓库根）。每次的完整输出写进
+  `$TMPDIR/flaky-hunt-<时间戳>-XXXXXX/run-<i>.log`，**不写进仓库**（日志目录落在仓库内会被
+  拒绝，exit 2）；失败日志永不删除，结尾打印目录（默认保留全部日志，`--keep` 只是显式声明）。
+- **抓名字**：失败包取 `test-all.sh --quiet` 的 `==> <pkg> (exit N)`；用例名取 node:test 的
+  `✖ …`（没有时回落到 TAP 的 `not ok`；`✖ failing tests:` 这类汇总标题会被过滤）；失败阶段行
+  （`… FAILED`）一并记下。两者都没有时打印日志开头并明说"没有可识别的失败包/用例名"——不编名字。
+- **分单独/并发**：对每个失败包用 `node --test packages/<pkg>/test/*.test.ts` 单独再跑 3 次：
+  0/3 失败 = **单独不复现**（指向共享状态/实时钟/端口或临时目录竞争），≥1/3 失败 = **单独复现**
+  （稳定失败，先按普通 bug 修）。这就是"先抓名字，再分单独/并发，再修"里的"分"。
+- **退出码**：全绿 0（输出"未复现 + 采样次数"，并明说 3 次采样不足以排除低频失败）；
+  任一次失败 1；参数错误 2（`--runs 0`/非数字/未知旗标/空命令都属于这一类：0 次采样不是通过）。
+- **自检**（`scripts/selftest-ops.sh` C18，11 条断言）：脚本存在、`bash -n`、`--help` 退出 0
+  且文档化了 `--runs`/`--command`、`--runs 0` 与 `--runs abc` 被拒（exit 2）、
+  `--command true` 全绿且写"未复现 + 采样次数"、`--command false` 退出 1 且把 TMPDIR 下的
+  日志目录打印出来（日志不落仓库）。采样命令用 `true`/`false`，日志落在 self-test 自己的临时目录。
+- **文档**：`docs/ARCHITECTURE.md` §5.34 写清三步判定顺序、两种单独重跑结论的修法差异，
+  以及"未复现 ≠ 不存在"。
+
+**验证**（按团队约定本轮不跑全量 verify）：`bash -n scripts/flaky-hunt.sh` 通过；
+`--runs 1 --command true` → exit 0，输出"未复现：1 次采样全部通过（采样次数 1，失败 0）。"；
+`--runs 1 --command false` → exit 1，打印失败汇总（"没有可识别的失败包/用例名"）与日志路径；
+`--help` → exit 0；`--runs 0` → exit 2；`bash scripts/selftest-ops.sh` → OPS SELFTEST GREEN；
+`bash scripts/standards-check.sh --quiet` → PASS（无新增/恶化，基线已接受 544 项，扫描 1268 文件）。
+另外用一次性夹具（临时目录，已删除）验证了两条单独重跑分支：包测试全绿时报告"单独不复现"，
+包测试失败时报告"单独复现"并列出 `✖` 用例名。`flaky-hunt.sh --runs 3` 本身留给下一次排查。
+
 ## [0.8.8] — 2026-11-12
 
 ### 加固 · 委派台账去重变成跨进程原子（`dsh-eng-core` / `dsh-role-guard`）

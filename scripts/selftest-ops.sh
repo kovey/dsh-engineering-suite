@@ -570,6 +570,45 @@ else
   fail "project-config: the skip reason is missing — $(cat "$TMP/c17-nofix.out")"
 fi
 
+# C18 — flaky-hunt.sh: 一次偶发失败的价值全在"名字"上。只留下 "exit 1" 的失败，下一次
+# 还是只能靠重跑；所以这里钉住：脚本存在/语法可解析、--help 能跑、--runs 的边界被拒
+# （0 次采样不是"通过"），以及两条最小行为——全绿必须写"未复现 + 采样次数"，失败必须
+# exit 1 并把 TMPDIR 下的日志目录打印出来（日志不写进仓库）。采样命令用 true/false，
+# 日志落在本 self-test 自己的临时目录里，跑完随 $TMP 一起消失，不在仓库或系统临时区留垃圾。
+section "C18 — flaky-hunt.sh: 采样、退出码与 --runs 的边界"
+FLAKY_HUNT="$ROOT/scripts/flaky-hunt.sh"
+if [ -f "$FLAKY_HUNT" ]; then
+  pass "flaky-hunt: scripts/flaky-hunt.sh exists"
+else
+  fail "flaky-hunt: scripts/flaky-hunt.sh is missing"
+fi
+expect_rc 0 "flaky-hunt: the script parses (bash -n)" bash -n "$FLAKY_HUNT"
+expect_rc 0 "flaky-hunt: --help exits 0" bash "$FLAKY_HUNT" --help
+case "$LAST_OUT" in
+  *"--runs N"*"--command"*) pass "flaky-hunt: --help documents --runs/--command" ;;
+  *) fail "flaky-hunt: --help does not document the flags — $LAST_OUT" ;;
+esac
+expect_rc 2 "flaky-hunt: --runs 0 is a usage error (0 samples is not a pass)" bash "$FLAKY_HUNT" --runs 0
+expect_rc 2 "flaky-hunt: a non-numeric --runs is a usage error" bash "$FLAKY_HUNT" --runs abc
+
+HUNT_LOGS="$TMP/c18-logs"
+mkdir -p "$HUNT_LOGS"
+HUNT_LOGS_REAL="$(cd "$HUNT_LOGS" && pwd -P)"
+expect_rc 0 "flaky-hunt: --runs 1 --command true is green (exit 0)" env TMPDIR="$HUNT_LOGS" bash "$FLAKY_HUNT" --runs 1 --command true
+case "$LAST_OUT" in
+  *"未复现"*"1 次采样"*) pass "flaky-hunt: a green sample says 未复现 + the sample count" ;;
+  *) fail "flaky-hunt: a green sample did not report 未复现 with the sample count — $LAST_OUT" ;;
+esac
+expect_rc 1 "flaky-hunt: --runs 1 --command false fails (exit 1)" env TMPDIR="$HUNT_LOGS" bash "$FLAKY_HUNT" --runs 1 --command false
+case "$LAST_OUT" in
+  *"没有可识别的失败包"*) pass "flaky-hunt: a nameless failure says so instead of inventing a name" ;;
+  *) fail "flaky-hunt: the nameless failure was not reported — $LAST_OUT" ;;
+esac
+case "$LAST_OUT" in
+  *"$HUNT_LOGS_REAL"*) pass "flaky-hunt: the log directory under TMPDIR is printed (nothing lands in the repo)" ;;
+  *) fail "flaky-hunt: the log path was not printed — $LAST_OUT" ;;
+esac
+
 section "summary"
 if [ "$FAILURES" = "0" ]; then
   printf '  \033[32mOPS SELFTEST GREEN\033[0m — every finding above is still refused.\n'
