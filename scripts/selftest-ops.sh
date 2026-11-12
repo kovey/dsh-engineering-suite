@@ -609,6 +609,178 @@ case "$LAST_OUT" in
   *) fail "flaky-hunt: the log path was not printed — $LAST_OUT" ;;
 esac
 
+# C19 — migrate-layout.sh: 迁移一个仓库的布局是"数据搬家"，所以这里钉住的不是"搬成功了"
+# 而是四条边界：
+#   1. 默认 dry-run 一个字节都不写；
+#   2. 只搬白名单，其它插件的数据（memory/、chat-interaction/、probe-*）原地不动；
+#   3. 目标已有同名条目 → 拒绝该条、不覆盖、退出码 1（其余条目照常搬，不是整仓放弃）；
+#   4. 无 .dsh 的仓库报"无可迁移"并 exit 0；rename 失败时 copy+校验+删除，
+#      副本校验不通过时**源必须还在**（不得删除未成功迁移的数据）。
+# 夹具全部在 $TMP 里；库里只读脚本本身。
+section "C19 — migrate-layout.sh: dry-run 零写盘、白名单、冲突拒绝、无可迁移、回滚"
+MIGRATE_LAYOUT="$ROOT/scripts/migrate-layout.sh"
+if [ -f "$MIGRATE_LAYOUT" ]; then
+  pass "migrate-layout: scripts/migrate-layout.sh exists"
+else
+  fail "migrate-layout: scripts/migrate-layout.sh is missing"
+fi
+expect_rc 0 "migrate-layout: the script parses (bash -n)" bash -n "$MIGRATE_LAYOUT"
+expect_rc 0 "migrate-layout: --help exits 0" bash "$MIGRATE_LAYOUT" --help
+case "$LAST_OUT" in
+  *"--repo <path>"*"--apply"*"--rollback"*) pass "migrate-layout: --help documents --repo/--apply/--rollback" ;;
+  *) fail "migrate-layout: --help does not document the flags — $LAST_OUT" ;;
+esac
+expect_rc 2 "migrate-layout: no --repo is a usage error (never defaults to cwd)" bash "$MIGRATE_LAYOUT"
+expect_rc 2 "migrate-layout: --repo with no value is a usage error" bash "$MIGRATE_LAYOUT" --repo
+expect_rc 2 "migrate-layout: an unknown flag is a usage error" bash "$MIGRATE_LAYOUT" --repo "$TMP" --nope
+expect_rc 2 "migrate-layout: a repo path that does not exist is a usage error" bash "$MIGRATE_LAYOUT" --repo "$TMP/c19-absent"
+
+LEGACY="$TMP/c19-legacy"
+mkdir -p "$LEGACY/.dsh/specs" "$LEGACY/.dsh/missions/M1" "$LEGACY/.dsh/memory" "$LEGACY/.dsh/chat-interaction"
+printf '{}\n' > "$LEGACY/.dsh/quality-gate.json"
+printf 'spec\n' > "$LEGACY/.dsh/specs/M1.md"
+printf 'mission\n' > "$LEGACY/.dsh/missions/M1/mission.json"
+printf 'row\n' > "$LEGACY/.dsh/plan.jsonl"
+printf 'keep-memory\n' > "$LEGACY/.dsh/memory/s.json"
+printf 'keep-chat\n' > "$LEGACY/.dsh/chat-interaction/c.json"
+printf 'keep-probe\n' > "$LEGACY/.dsh/probe-task-active"
+
+expect_rc 1 "migrate-layout: a dry run with work to do exits 1" bash "$MIGRATE_LAYOUT" --repo "$LEGACY"
+if [ -e "$LEGACY/.dsh/engineering-suite" ]; then
+  fail "migrate-layout: the dry run created the target namespace"
+else
+  pass "migrate-layout: the dry run wrote nothing"
+fi
+case "$LAST_OUT" in
+  *"将迁移 4 项"*"保持不动 3 项"*"冲突 0 项"*)
+    pass "migrate-layout: the dry run classifies 4 suite entries vs 3 foreign ones" ;;
+  *) fail "migrate-layout: the dry-run plan is wrong — $LAST_OUT" ;;
+esac
+
+expect_rc 0 "migrate-layout: --apply migrates" bash "$MIGRATE_LAYOUT" --repo "$LEGACY" --apply
+if [ -f "$LEGACY/.dsh/engineering-suite/quality-gate.json" ] && \
+   [ -f "$LEGACY/.dsh/engineering-suite/specs/M1.md" ] && \
+   [ -f "$LEGACY/.dsh/engineering-suite/missions/M1/mission.json" ] && \
+   [ -f "$LEGACY/.dsh/engineering-suite/plan.jsonl" ]; then
+  pass "migrate-layout: every whitelisted entry moved into .dsh/engineering-suite"
+else
+  fail "migrate-layout: a whitelisted entry did not move — $(find "$LEGACY/.dsh" -mindepth 1 | tr '\n' ' ')"
+fi
+if [ ! -e "$LEGACY/.dsh/quality-gate.json" ] && [ ! -e "$LEGACY/.dsh/specs" ] && [ ! -e "$LEGACY/.dsh/plan.jsonl" ]; then
+  pass "migrate-layout: the migrated entries left the legacy root"
+else
+  fail "migrate-layout: migrated entries were left behind in .dsh/"
+fi
+if [ "$(cat "$LEGACY/.dsh/memory/s.json")" = "keep-memory" ] && \
+   [ "$(cat "$LEGACY/.dsh/chat-interaction/c.json")" = "keep-chat" ] && \
+   [ "$(cat "$LEGACY/.dsh/probe-task-active")" = "keep-probe" ]; then
+  pass "migrate-layout: another plugin's data (memory/, chat-interaction/, probe-*) stayed put"
+else
+  fail "migrate-layout: the migration touched a foreign entry"
+fi
+expect_rc 0 "migrate-layout: a second --apply is a no-op" bash "$MIGRATE_LAYOUT" --repo "$LEGACY" --apply
+
+expect_rc 1 "migrate-layout: --rollback is a dry run by default" bash "$MIGRATE_LAYOUT" --repo "$LEGACY" --rollback
+if [ -f "$LEGACY/.dsh/engineering-suite/quality-gate.json" ]; then
+  pass "migrate-layout: the rollback dry run moved nothing"
+else
+  fail "migrate-layout: the rollback dry run moved data"
+fi
+expect_rc 0 "migrate-layout: --rollback --apply moves the suite entries back" bash "$MIGRATE_LAYOUT" --repo "$LEGACY" --rollback --apply
+if [ -f "$LEGACY/.dsh/quality-gate.json" ] && [ -f "$LEGACY/.dsh/specs/M1.md" ] && [ ! -d "$LEGACY/.dsh/engineering-suite" ]; then
+  pass "migrate-layout: rollback restored .dsh/ and removed the now-empty namespace"
+else
+  fail "migrate-layout: rollback did not restore the legacy layout"
+fi
+if [ -f "$LEGACY/.dsh/memory/s.json" ] && [ -f "$LEGACY/.dsh/chat-interaction/c.json" ]; then
+  pass "migrate-layout: rollback left the foreign entries untouched"
+else
+  fail "migrate-layout: rollback touched a foreign entry"
+fi
+expect_rc 0 "migrate-layout: a second --rollback --apply is a no-op" bash "$MIGRATE_LAYOUT" --repo "$LEGACY" --rollback --apply
+expect_rc 0 "migrate-layout: migrating again after a rollback works" bash "$MIGRATE_LAYOUT" --repo "$LEGACY" --apply
+
+# Conflict: same name on both sides must be refused ENTRY BY ENTRY (not merged, not
+# overwritten), while the rest of the repo still migrates; exit code stays non-zero.
+CONFLICT19="$TMP/c19-conflict"
+mkdir -p "$CONFLICT19/.dsh/engineering-suite"
+printf 'legacy releases\n' > "$CONFLICT19/.dsh/releases.jsonl"
+printf 'migrated releases\n' > "$CONFLICT19/.dsh/engineering-suite/releases.jsonl"
+printf '{}\n' > "$CONFLICT19/.dsh/quality-gate.json"
+expect_rc 1 "migrate-layout: a conflict makes --apply exit 1" bash "$MIGRATE_LAYOUT" --repo "$CONFLICT19" --apply
+if [ "$(cat "$CONFLICT19/.dsh/releases.jsonl")" = "legacy releases" ] && \
+   [ "$(cat "$CONFLICT19/.dsh/engineering-suite/releases.jsonl")" = "migrated releases" ]; then
+  pass "migrate-layout: the conflicting entry was neither overwritten nor merged"
+else
+  fail "migrate-layout: the conflict modified one of the two files"
+fi
+if [ -f "$CONFLICT19/.dsh/engineering-suite/quality-gate.json" ] && [ ! -e "$CONFLICT19/.dsh/quality-gate.json" ]; then
+  pass "migrate-layout: a non-conflicting entry still migrated in the same run"
+else
+  fail "migrate-layout: a conflict aborted the whole repo instead of refusing one entry"
+fi
+case "$LAST_OUT" in
+  *"冲突 1 项"*"已存在"*) pass "migrate-layout: the conflict is listed with its target path" ;;
+  *) fail "migrate-layout: the conflict was not listed — $LAST_OUT" ;;
+esac
+
+# No .dsh at all: "nothing to migrate" and exit 0 — not an error, and not a silent pass.
+NODSH="$TMP/c19-no-dsh"
+mkdir -p "$NODSH"
+expect_rc 0 "migrate-layout: a repo without .dsh exits 0" bash "$MIGRATE_LAYOUT" --repo "$NODSH"
+case "$LAST_OUT" in
+  *"无可迁移"*) pass "migrate-layout: a repo without .dsh says 无可迁移" ;;
+  *) fail "migrate-layout: the no-.dsh repo was not reported — $LAST_OUT" ;;
+esac
+
+# Cross-device rename failure → copy+verify+delete. The self-test cannot create a
+# second filesystem, so a fake `mv` (always failing) selects the fallback path; a
+# fake `cp` that copies NOTHING then proves the source survives a failed verify.
+COPY="$TMP/c19-copy"
+mkdir -p "$COPY/.dsh/specs" "$COPY/.dsh/missions/M1"
+printf 'spec-body\n' > "$COPY/.dsh/specs/M1.md"
+printf 'mission\n' > "$COPY/.dsh/missions/M1/mission.json"
+FAKE_MV="$TMP/c19-fake-mv"
+mkdir -p "$FAKE_MV"
+printf '#!/bin/sh\nexit 1\n' > "$FAKE_MV/mv"
+chmod +x "$FAKE_MV/mv"
+expect_rc 0 "migrate-layout: rename failure falls back to copy+verify+delete" env PATH="$FAKE_MV:$PATH" bash "$MIGRATE_LAYOUT" --repo "$COPY" --apply
+if [ -f "$COPY/.dsh/engineering-suite/specs/M1.md" ] && [ ! -e "$COPY/.dsh/specs" ] && \
+   [ "$(cat "$COPY/.dsh/engineering-suite/missions/M1/mission.json")" = "mission" ]; then
+  pass "migrate-layout: the copy fallback preserved the data and removed the source"
+else
+  fail "migrate-layout: the copy fallback lost or duplicated data"
+fi
+
+BADCOPY="$TMP/c19-bad-copy"
+mkdir -p "$BADCOPY/.dsh/specs"
+printf 'must-survive\n' > "$BADCOPY/.dsh/specs/M9.md"
+FAKE_CP="$TMP/c19-fake-cp"
+mkdir -p "$FAKE_CP"
+printf '#!/bin/sh\nexit 1\n' > "$FAKE_CP/mv"
+printf '#!/bin/sh\nexit 0\n' > "$FAKE_CP/cp"
+chmod +x "$FAKE_CP/mv" "$FAKE_CP/cp"
+expect_rc 1 "migrate-layout: a copy that does not verify is a failure (exit 1)" env PATH="$FAKE_CP:$PATH" bash "$MIGRATE_LAYOUT" --repo "$BADCOPY" --apply
+if [ "$(cat "$BADCOPY/.dsh/specs/M9.md" 2>/dev/null)" = "must-survive" ]; then
+  pass "migrate-layout: an unverified copy never deletes its source"
+else
+  fail "migrate-layout: a failed copy deleted the source (data loss)"
+fi
+if [ ! -d "$BADCOPY/.dsh/engineering-suite" ]; then
+  pass "migrate-layout: a failed migration removes the empty namespace it created"
+else
+  fail "migrate-layout: an empty namespace was left behind (resolveLayout would point at it)"
+fi
+
+# Several --repo values in one invocation: each repo gets its own section, and a
+# clean repo plus a no-.dsh repo is still exit 0.
+expect_rc 0 "migrate-layout: multiple --repo values are all processed" bash "$MIGRATE_LAYOUT" --repo "$LEGACY" --repo "$NODSH"
+if [ "$(printf '%s\n' "$LAST_OUT" | grep -c '^=== ')" = "2" ]; then
+  pass "migrate-layout: one report section per repo"
+else
+  fail "migrate-layout: expected 2 repo sections — $LAST_OUT"
+fi
+
 section "summary"
 if [ "$FAILURES" = "0" ]; then
   printf '  \033[32mOPS SELFTEST GREEN\033[0m — every finding above is still refused.\n'

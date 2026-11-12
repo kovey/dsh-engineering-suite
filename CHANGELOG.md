@@ -1,5 +1,45 @@
 ## [未发布]
 
+### 运维 · `scripts/migrate-layout.sh`：把遗留仓库的套件台账迁进 `.dsh/engineering-suite/`（可回滚）
+
+`resolveLayout()` 是"命名空间存在即优先"，但两个兄弟仓库（`dsh-memory`、`dsh-chat-interaction`）
+仍是遗留布局：套件的门禁配置、`specs/ missions/ audit/ state/` 与别的插件的运行时数据（`memory/`、
+`chat-interaction/`、`probe-*`）混在同一个 `.dsh/` 根下。本版新增迁移脚本：默认 dry-run、只搬白名单、
+冲突逐条拒绝、跨设备退化有校验、并提供 `--rollback`。
+
+- **用法**：`bash scripts/migrate-layout.sh --repo <path> [--repo <path>...] [--apply] [--rollback]`。
+  `--repo` 可重复且必填（不默认当前目录）。输出按仓库分段，固定列出
+  `将迁移 N 项 / 保持不动 M 项 / 冲突 K 项` 与目标路径；退出码 `0`=无需迁移/全部成功、
+  `1`=有冲突或失败（dry-run 时也表示还有待办）、`2`=用法错误。
+- **白名单**（写死在脚本里，逐条注明代码出处）：14 份项目级配置（9 个 `*-gate.json` +
+  `standards.json`、`standards-baseline.json`、`secret-allow.json`、`budgets.json`、
+  `flaky-quarantine.json`）、3 本台账（`plan.jsonl`、`releases.jsonl`、`deployments.jsonl`）、
+  10 个状态目录（`specs missions audit state roles adr gates kb releases interaction`）。
+  `memory/`、`chat-interaction/`、`probe-*` 等**绝不搬**，单独列在"保持不动"里——它们属于别的插件。
+- **安全**：目标已有同名条目 → 该条记冲突、跳过、退出码 1（不覆盖、不合并，其余条目照常搬）；
+  rename 失败（跨设备）退化为 copy+校验（条目数 / 逻辑字节 / 符号链接数）+ 删源，
+  **校验通过前不删源**；一项都没搬成时删掉自己建的**空**命名空间，避免 `resolveLayout`
+  指向空目录；`--rollback` 用同一套冲突规则搬回，并在搬空后 `rmdir` 命名空间，让布局真正回到
+  `.dsh/`；读不到源目录（`find` 失败）按失败处理，不报"没有要迁移的条目"。
+- **自检**（`scripts/selftest-ops.sh` C19，36 条断言）：dry-run 零写盘与分类计数、`--apply` 后
+  白名单条目进入命名空间而 `memory/`、`chat-interaction/`、`probe-*` 原地不动、二次
+  apply/rollback 幂等、冲突条目不覆盖不合并且其余照搬、无 `.dsh` 的仓库报"无可迁移"并 exit 0、
+  回滚复原并移除空命名空间、rename 失败走 copy 路径、以及伪造"什么都不拷"的 `cp` 时**源必须仍在**。
+- **文档**：`docs/ARCHITECTURE.md` §5.2.1 的「遗留布局迁移」小节记录白名单依据、不搬什么、安全性质、回滚、迁移后
+  `resolveLayout` 的确认命令，以及已知边界（`mission.json` 的 `specPath` 不会被改写：规格工具读取
+  走布局根，下一次写规格时自愈）。
+
+**验证**（按团队约定本轮不跑全量 verify；完整命令集留给交付门禁）：
+`bash -n scripts/migrate-layout.sh` 退出 0；`bash scripts/selftest-ops.sh` → OPS SELFTEST GREEN
+（C19 的 36 条断言全部 PASS）；`bash scripts/standards-check.sh --quiet` → PASS（无新增/恶化）。
+仓库内临时夹具上的 dry-run / apply / rollback 三态与冲突/跨设备/校验失败分支均已实测（夹具已删除）。
+真实两仓迁移由 Lead 在沙箱外执行（同一脚本，先 dry-run 再 `--apply`）：
+
+```bash
+bash scripts/migrate-layout.sh --repo ~/workspace/deepseek/dsh-memory --repo ~/workspace/deepseek/dsh-chat-interaction
+bash scripts/migrate-layout.sh --repo ~/workspace/deepseek/dsh-memory --repo ~/workspace/deepseek/dsh-chat-interaction --apply
+```
+
 ### 修复 · `/suite init` 把十份配置写进 `.dsh/` 根：创建路径与读取路径分开（`dsh-eng-core` + `dsh-suite-doctor`）
 
 用户实测发现的问题：空仓库（既无 `.dsh/engineering-suite/`、也无 `.dsh/<plugin>.json`）里执行

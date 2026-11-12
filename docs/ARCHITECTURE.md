@@ -230,6 +230,85 @@ patch 文件（`cordis.patch.yml`）也在这条规矩里：patch 传的是**显
   仍然只走 `resolveLayout`。空仓库与已迁移两条分支选中的正是 `resolveLayout` 优先的那个目录，
   所以"init 写 A、插件读 B"不会再出现；只有 `legacy` 分支是刻意的例外，并且报告点名"沿用遗留位置"。
 
+#### 遗留布局迁移：`scripts/migrate-layout.sh`
+
+`resolveLayout` 是"存在即优先"：仓库里一旦有 `<repo>/.dsh/engineering-suite/`，rootDir 就指向它；
+没有就继续读 `.dsh/`。所以"迁移"只做一件事——把**套件归属条目**搬进命名空间，让两种布局不再同时
+有数据。工具是 `scripts/migrate-layout.sh`，**默认 dry-run**：
+
+```bash
+# dry-run：只打印清单，零写盘
+bash scripts/migrate-layout.sh --repo ~/workspace/deepseek/dsh-memory \
+                               --repo ~/workspace/deepseek/dsh-chat-interaction
+# 确认后执行
+bash scripts/migrate-layout.sh --repo ~/workspace/deepseek/dsh-memory \
+                               --repo ~/workspace/deepseek/dsh-chat-interaction --apply
+# 回退（同样默认 dry-run，加 --apply 才搬）
+bash scripts/migrate-layout.sh --repo <repo> --rollback [--apply]
+```
+
+`--repo` 可以重复且**必填**：脚本不默认当前目录（那等于给"把工具自己的仓库搬了"留一个入口）。
+输出按仓库分段，固定三行清单 `将迁移 N 项` / `保持不动 M 项` / `冲突 K 项`，并打印目标路径。
+
+**白名单与依据**。列表写在脚本里（`SUITE_FILES` / `SUITE_DIRS`），每一条都能在代码里指到出处：
+
+| 类别 | 条目 | 依据 |
+|---|---|---|
+| 项目级配置 | 9 个 `*-gate.json`、`standards.json`、`standards-baseline.json`、`secret-allow.json`、`budgets.json`、`flaky-quarantine.json` | 各插件 `config.ts` 的布局根默认值（`relativeRootFile(cwd, '<name>')`）；`budgets.json` 见 `quality-gate/src/budget.ts`，`flaky-quarantine.json` 见 `impact-gate/src/flaky.ts` |
+| 台账 | `plan.jsonl`（spec-gate）、`releases.jsonl` + `releases/`（evidence-gate）、`deployments.jsonl`（deploy-gate） | `plan-ledger.ts`、`evidence-gate/src/config.ts`、`deploy-gate/src/config.ts` |
+| 状态目录 | `specs/` `missions/` `audit/` `state/` `roles/` `adr/` `gates/` `kb/` `releases/` `interaction/` | `dsh-eng-core/src/writers.ts` 的 `WRITERS` / `KNOWN_STATE_DIRS`，以及 `paths.ts` 的布局 |
+
+**不搬什么，以及为什么**。`.dsh/` 是**共享目录**：`memory/` 是 dsh-memory 的运行时数据，
+`chat-interaction/`、`probe-*`、`feishu-*.json` 属于 dsh-chat-interaction 或正在跑的会话。
+把它们搬进命名空间不只是"别的插件找不到文件"，还会让本套件的信任根重新把它们的运行时状态当成
+策略（§5.2 开头那个"一条消息让所有 mandate 过期"的缺陷）。所以未在白名单里的条目一律原地保留，
+并在"保持不动"清单里逐条列出。`writers.ts` 的 `KNOWN_STATE_DIRS` 还列了
+`deploy/ media/ archive/ bootstrap/`，orchestrator 还写 `retrospectives.jsonl`
+（`retrospective.ts:245`）：它们确实是本套件的其它产物，但不在本次白名单（规格逐项枚举）里，
+因此同样原地保留——要把它们纳入迁移，先改规格，再改脚本，而不是让脚本"顺手多搬一点"。
+
+**安全性质**（脚本的行为，不是承诺）：
+
+- **默认 dry-run**：零写盘，连命名空间目录都不创建。
+- **冲突逐条拒绝**：目标已有同名条目 → 该条记为冲突、跳过；不覆盖、不合并、不删任何一边。
+  其余不冲突的条目照常搬；`--apply` 结束时只要还有冲突或失败就退出码 1 并逐条列出。
+- **跨设备退化**：先试 rename（同文件系统原子）；失败（EXDEV 等）才 copy+校验+删除。校验比较
+  "条目数 / 普通文件总字节 / 符号链接数"——用逻辑字节而不是 `du` 的块数（不同文件系统块大小不同
+  会误报）。**副本校验通过之前绝不删源**；校验失败会删掉未完成的副本、保留源并报失败。
+- **空命名空间清理**：迁移方向一项都没搬成时删掉自己建的**空**命名空间（`rmdir`，不递归），否则
+  `resolveLayout` 会认为"已迁移"而数据还在 `.dsh/` 根；`--rollback` 搬空后同样 `rmdir`，让
+  `resolveLayout` 真正回到 `.dsh/`。
+- **退出码**：`0` = 无需迁移 / 全部成功；`1` = 有冲突或失败（dry-run 时也表示"还有待办"）；
+  `2` = 用法错误。`--rollback` 与迁移使用同一套冲突规则，把命名空间里的白名单条目搬回 `.dsh/` 根。
+- **读不到源目录时不猜**：`find` 失败（权限、I/O）按失败处理，绝不报"没有要迁移的条目"。
+
+**迁移之后怎么确认布局真的换了**（`dsh-eng-core` 的 dist 直接问，不用起会话）：
+
+```bash
+node -e 'const {resolveLayout}=require("./packages/dsh-eng-core/dist/paths.js");
+         const l=resolveLayout(process.argv[1]); console.log(l.rootDir); console.log(l.specsDir); console.log(l.missionsDir)' <repo>
+```
+
+迁移前打印 `<repo>/.dsh`、`<repo>/.dsh/specs`、`<repo>/.dsh/missions`；迁移后打印
+`<repo>/.dsh/engineering-suite` 与它下面的 `specs/`、`missions/`。没有 `.dsh` 的仓库（例如
+`dsh-nvim-tui`）脚本报"无可迁移"并 exit 0。
+
+**已知边界**（诚实记录，不要在迁移报告里略过）：
+
+- 脚本**只搬条目，不改写文件内容**。`mission.json` 里的 `specPath`（例如 `.dsh/specs/<id>.md`）是
+  相对 `cwd` 的历史路径，迁移后不会自动改；规格工具自己的读取走布局根（`MissionStore.readSpec`
+  用 `specFile(layout, id)`），但评审卡里的"打开规格文件"仍会指向旧位置。下一次
+  `spec_create` / `spec_amend` / `spec_approve` 写规格时会刷新它；也可以手工把前缀改成
+  `.dsh/engineering-suite/specs/`。**不要在迁移中顺手批量改写 mission.json**：那是改数据内容，
+  需要单独的规格与评审。
+- 迁移对**正在运行的会话**没有协调能力：先停掉使用这些仓库的会话，或至少确认没有门禁在写台账
+  （`plan.jsonl`、`missions/`），再 `--apply`。
+- 脚本只处理本地文件，不涉及 git；迁移后的删除/新增会出现在 `git status` 里，由人决定怎么提交。
+
+**验证**：`scripts/selftest-ops.sh` 的 C19 用临时夹具钉住以上行为——dry-run 零写盘与分类计数、
+冲突条目不覆盖不合并且其余照搬、无 `.dsh` 报"无可迁移"并 exit 0、回滚复原并移除空命名空间、
+rename 失败走 copy+校验+删除，以及伪造"什么都不拷"的 `cp` 时**源仍在**（不得删除未成功迁移的数据）。
+
 ## 5.3 一个进程服务多个仓库：所有"会认错项目"的地方都要按会话解析
 
 配置分层只是第一层。把整套东西盘一遍后，**必须按会话工作区解析**的有四类（否则会认错项目）：
