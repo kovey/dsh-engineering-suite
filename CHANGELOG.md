@@ -1,3 +1,44 @@
+## [未发布]
+
+### 新增 · `suite_init` / `suite_config` 与 `/suite` 命令：把门禁配置的初始化与检查变成可执行的一步
+
+`dsh-suite-doctor` 原本只有一个只读的 `suite_status`。接入一个仓库仍然要手工翻 `.dsh/*.json`，而且写错一个
+键名（插件根本不读它）不会报错——门禁看起来配置了，实际跑的是默认值。这一版补上写与查：
+
+- **`suite_init({ apply?, force?, only? })`**：为调用方 agent 的**工作区**脚手架十份配置
+  （spec-gate / test-design-gate / quality-gate / standards / evidence-gate / coverage-gate / impact-gate /
+  supply-chain-gate / interaction-gate / deploy-gate）。**默认 dry-run**，逐份报告
+  `path / action(write|skip|overwrite) / bytes`；`apply: true` 才写盘；已存在的文件默认 `skip`（这些文件是
+  信任根，脚手架不得撤销已评审的阈值），`force: true` 才覆盖；生成内容按检测到的生态（ts/js/go/py）且确定性，
+  第二次 apply 一个字节都不改（幂等）；`only` 未知或为空时在写任何文件之前拒绝。
+  `standards.json` 在十份之内：没有它 `standards_check` 会拒绝运行；`deploy-gate.environments` 与
+  `supply-chain-gate.deps.auditCommands` 故意留空（不编造仓库没有的命令/审计器）。
+- **`suite_config({ plugin? })`**：只读（`loadProjectConfig` 以 `cache: false` 读取）。逐份报告生效来源
+  （`repo` 仓库文件生效 / `profile` 有文件但没有可用键 / `default` 没有仓库文件，后两者都是 profile 或内置默认），
+  并点名"文件 + 键"：JSON 不可解析、未知顶层键、被禁止的项目级覆盖键、越出工作区的路径值。未知 `plugin` 被拒绝。
+- **`/suite` 命令**：`init [--apply] [--force] [--only <id,…>]` / `show [plugin]` / `doctor` / `help`。
+  经 `ctx.get('commands')` 注册（可选服务，**不是** `inject`；宿主没挂载注册表时不注册也不报错），
+  不依赖 nvim-tui 的扩展 API，因此 TUI / desktop / web 共用同一个注册面；卸载时由注册表返回的 disposer 注销。
+  handler 复用工具的内部实现（`planSuiteInit` / `inspectSuiteConfig` / `runSuiteHealth`），人与模型不会得到两份结论。
+- **`/suite doctor` 的配置级体检**：每份配置是否存在/可解析/键是否合法、`standards.json` 与
+  `standards-baseline.json`、质量门禁是否有 required 命令、覆盖率来源与阈值、影响分析模板、依赖审计命令、
+  证据检查表、部署环境是否声明回滚、以及所有显式路径是否都在工作区内。`missing` / `unknown` 都不是通过。
+- **结构**：`src/scaffold-catalog.ts`（十份配置的键清单与选择）、`src/scaffold-content.ts`（按生态的默认值）、
+  `src/scaffold.ts`（计划/写入）、`src/inspect.ts`（只读检查）、`src/health.ts`（doctor）、`src/command.ts`
+  （`/suite`）、`src/tools-scaffold.ts`（两个工具）。`index.ts` 把工具、命令与提示词段的注册抽到
+  `registerSurface()`，`apply` 从 88 行回到阈值内。
+
+**测试面**：`packages/dsh-suite-doctor/test/suite-init.test.ts` 新增 16 条（覆盖 TC-1501…TC-1506；TC-1507 是
+`verify.sh --quiet` 两次全绿的验证级用例，按团队约定本轮不跑全量 verify，交付门禁会跑）：空仓库 dry-run
+不写盘、apply 写十份且 JSON 可解析、ts/js/go/py 默认命令、已存在不覆盖、force 覆盖、第二次 apply 后布局根
+逐字节一致、`only` 过滤与未知/空过滤拒绝、`suite_config` 未知键/坏 JSON/越权键/越界路径、工具经调用方工作区
+读写、无注册表不注册不报错、有注册表时 `/suite show|init|doctor` 可执行且 dispose 注销、doctor 空仓库为
+`missing` 而初始化后配置行 `ok`。`node --test packages/dsh-suite-doctor/test/*.test.ts` **88 通过 / 0 失败**
+（原 72 + 新增 16，既有断言未改、未跳过）。
+
+**验证**：`node node_modules/typescript/bin/tsc -p packages/dsh-suite-doctor/tsconfig.json` 通过；
+`bash scripts/standards-check.sh --quiet` exit 0（无新增/恶化）。文档：`docs/ARCHITECTURE.md` §5.30 与包内 README。
+
 ## [0.8.7] — 2026-11-11
 
 ### 变更（不兼容）· 移除 `approval: "auto"`：门禁批准不再能由配置自动放行

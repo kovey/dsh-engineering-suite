@@ -47,14 +47,32 @@
 > （`interaction_status` 先跑一次就会让台账变得可见），只有台账确实被读过且为空，才是"没人在等回答"。
 > 通道的 `reason`（例如"未实现 wait()，只能推送不能收答案"）会单列一行：它比一个 `canAsk: false` 有用得多。
 
-## 工具面（只有一个）
+## 工具面（三个）
 
 | 工具 | 作用 |
 |---|---|
 | `suite_status({ missionId?, json? })` | 跑离线自检 → 合并运行时事实（`withRuntime`）→ 按"需要我 / 健康 / 一致性 / 历史"的顺序输出中文报告（见下「操作者视图」）；`json: true` 给机器读（同一份判定）。`missionId` 不存在时**拒绝**（fail closed），而不是换一个任务报告。 |
+| `suite_init({ apply?, force?, only? })` | 给**当前仓库**脚手架十份门禁配置（spec / test-design / quality / standards / evidence / coverage / impact / supply-chain / interaction / deploy）。**默认 dry-run**：逐份输出 `path / action(write\|skip\|overwrite) / bytes`，不写盘；只有 `apply: true` 才写。已存在的文件默认 `skip`（这些文件是信任根，脚手架不能撤销已评审的阈值），`force: true` 才覆盖。内容按检测到的生态（ts/js/go/py）生成且确定性，第二次 apply 一个字节都不改（幂等）。`only` 过滤，未知/空过滤在写任何文件之前就拒绝。 |
+| `suite_config({ plugin? })` | **只读**列出十份配置与来源（`repo` 仓库文件生效 / `profile` 有文件但没有可用键 / `default` 没有仓库文件），并逐条点名"文件 + 键"：JSON 不可解析、未知顶层键（拼写错、插件根本不读）、被禁止的项目级覆盖键、越出工作区的路径值。未知 `plugin` 过滤被拒绝。 |
 
-**严格只读**：不写门禁记录、不落盘、不改 mission、不创建 `.dsh/`；也**不授予任何权限**。测试里有一条
-"工作区前后逐字节一致"（对整个 `.dsh` 树做内容哈希比对，另加一条"没有台账的工作区不会长出 `.dsh/`"）。
+**`suite_status` 与 `suite_config` 严格只读**：不写门禁记录、不落盘、不改 mission、不创建 `.dsh/`；也**不授予任何权限**。
+`suite_init` 是唯一会写文件的入口，且默认不写（见上）。测试里有一条"工作区前后逐字节一致"（对整个 `.dsh` 树做内容哈希比对，
+另加一条"没有台账的工作区不会长出 `.dsh/`"）。
+
+### `/suite` 命令（人直接敲，不经过模型）
+
+宿主挂载了 `@deepseek-ai/dsh-commands` 时，同一个插件注册 `/suite`：
+
+```
+/suite init [--apply] [--force] [--only <id,…>]   # 同 suite_init，默认 dry-run
+/suite show [plugin]                              # 同 suite_config
+/suite doctor                                     # 配置级体检（逐份：在不在、能不能解析、规范/基线/关键路径）
+/suite help
+```
+
+注册走 `ctx.get('commands')`（**可选服务**，不是 `inject`），与 nvim-tui 的扩展 API 无关，所以 TUI / desktop / web
+三端用的是同一个注册面；宿主没挂载注册表时**不注册、也不报错**。handler 调用的是工具同一批函数
+（`planSuiteInit` / `inspectSuiteConfig` / `runSuiteHealth`），人和模型的报告不会分叉。
 
 ### 操作者视图：四个问题，按顺序
 

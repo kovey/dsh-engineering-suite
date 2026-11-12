@@ -85,13 +85,19 @@ function assertNotCancelled(signal: AbortSignal | undefined): void {
  * `process.cwd()`, and silently reporting on whatever directory the host process
  * happens to run in is worse than refusing. A self-check that describes the
  * wrong repository is a false statement about the right one.
+ *
+ * Exported because the scaffolding tools and `/suite` share the same rule: they
+ * write / inspect configuration of the CALLING repository, never of the host's
+ * working directory.
+ * @param agent - the calling agent.
+ * @returns the declared workspace root.
  */
-function declaredCwdOf(agent: AgentLike | undefined): string {
+export function declaredCwdOf(agent: AgentLike | undefined): string {
     const cwd = sessionCwd(agent, '')
     if (cwd === '') {
         throw new Error(
-            '无法确定工作区：调用方 agent 没有会话目录（session.header.cwd）。suite_status 必须在知道工作区的前提下运行，' +
-                '否则会把某个不相关的仓库当成被测对象。',
+            '无法确定工作区：调用方 agent 没有会话目录（session.header.cwd）。套件工具必须在知道工作区的前提下运行，' +
+                '否则会把某个不相关的仓库当成被测对象（或把配置写到错误的仓库）。',
         )
     }
     return cwd

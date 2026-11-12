@@ -39,6 +39,8 @@ import { MissionStoreRegistry, createLogger, expandHome, type AgentLike } from '
 import { effectiveProbeTimeoutMs, resolveConfig, resolveEffectiveConfig, type SuiteDoctorConfig } from './config.js'
 import { PROMPT_SECTION, sectionText } from './prompt.js'
 import { registerTools, type ToolDeps } from './tools.js'
+import { registerScaffoldTools } from './tools-scaffold.js'
+import { SUITE_COMMAND_NAME, registerSuiteCommand } from './command.js'
 import type { ProbeContext } from './probe.js'
 
 export const name = 'dsh-suite-doctor'
@@ -128,32 +130,10 @@ export function apply(ctx: Context, config: unknown = {}): void {
             logger: log,
         }
 
-        const tools = registerTools(context as never, deps)
-        if (tools.failed.length > 0) log.warn(`tools that failed to register: ${tools.failed.join(', ')}`)
-
-        const disposers: (() => void)[] = [...tools.disposers]
-        if (resolved.prompt.enabled) {
-            disposers.push(
-                context.systemPrompt.section({
-                    name: PROMPT_SECTION,
-                    order: resolved.prompt.order,
-                    // The section is resolved per assembly context (the workspace
-                    // of the session being assembled), never from process.cwd():
-                    // a profile serves several repositories at once.
-                    text: (assembly?: unknown) => {
-                        try {
-                            const scope = (assembly as { scope?: AgentLike } | undefined)?.scope
-                            return sectionText(configFor(scope))
-                        } catch {
-                            return sectionText(resolved)
-                        }
-                    },
-                }),
-            )
-        }
+        const surface = registerSurface(context, deps, configFor)
 
         ctx.effect(() => () => {
-            for (const dispose of disposers) {
+            for (const dispose of surface.disposers) {
                 try {
                     dispose()
                 } catch (error) {
@@ -163,11 +143,72 @@ export function apply(ctx: Context, config: unknown = {}): void {
         })
 
         log.info(
-            `applied (tool: suite_status; expectedPlugins=${resolved.expectedPlugins.join(', ')}; ` +
+            `applied (tools: suite_status, suite_init, suite_config; command: ${surface.commandRegistered ? SUITE_COMMAND_NAME : '(未注册)'}; expectedPlugins=${resolved.expectedPlugins.join(', ')}; ` +
                 `prompt=${resolved.prompt.enabled ? `on(order ${resolved.prompt.order})` : 'off'}; ` +
                 `probeTimeoutMs=${effectiveProbeTimeoutMs(resolved)}（上限 probeTimeoutMsMax=${resolved.probeTimeoutMsMax}）)`,
         )
     } catch (error) {
         log.error('apply failed:', error)
     }
+}
+
+/**
+ * Register everything this plugin contributes to the host surface: the three
+ * tools, the optional `/suite` command and the prompt section.
+ *
+ * Extracted from {@link apply} so the failure handling of `apply` stays
+ * readable, and so the optional-registry rule is visible in one place: the
+ * command is reached through `ctx.get('commands')` (see command.ts), never
+ * `inject`, and its absence is a logged note rather than a failed `apply`.
+ * @param context - the host context.
+ * @param deps - resolved configuration and host accessors.
+ * @param configFor - per-workspace configuration resolver (for the prompt text).
+ * @returns the disposers and whether `/suite` was registered.
+ */
+function registerSurface(
+    context: ContextLike,
+    deps: ToolDeps,
+    configFor: (agent: AgentLike | undefined) => SuiteDoctorConfig,
+): { disposers: (() => void)[]; commandRegistered: boolean } {
+    const tools = registerTools(context as never, deps)
+    if (tools.failed.length > 0) deps.logger?.warn(`tools that failed to register: ${tools.failed.join(', ')}`)
+    const scaffoldTools = registerScaffoldTools(context as never, deps)
+    if (scaffoldTools.failed.length > 0) deps.logger?.warn(`tools that failed to register: ${scaffoldTools.failed.join(', ')}`)
+
+    const disposers: (() => void)[] = [...tools.disposers, ...scaffoldTools.disposers]
+    const command = registerSuiteCommand(context, deps)
+    if (command.dispose !== undefined) disposers.push(command.dispose)
+    if (command.problem !== undefined) deps.logger?.warn(command.problem)
+    if (deps.config.prompt.enabled) disposers.push(promptSection(context, deps.config, configFor))
+    return { disposers, commandRegistered: command.registered }
+}
+
+/**
+ * The prompt text for one assembly context.
+ *
+ * Resolved per assembly (the workspace of the session being assembled), never
+ * from `process.cwd()`: a profile serves several repositories at once, and a
+ * section that named one repository's state for all of them would be wrong in
+ * exactly the way that matters. A failure keeps the profile-level section.
+ */
+function promptText(config: SuiteDoctorConfig, configFor: (agent: AgentLike | undefined) => SuiteDoctorConfig, assembly: unknown): string {
+    try {
+        const scope = (assembly as { scope?: AgentLike } | undefined)?.scope
+        return sectionText(configFor(scope))
+    } catch {
+        return sectionText(config)
+    }
+}
+
+/** Register the prompt section and hand back its disposer. */
+function promptSection(
+    context: ContextLike,
+    config: SuiteDoctorConfig,
+    configFor: (agent: AgentLike | undefined) => SuiteDoctorConfig,
+): () => void {
+    return context.systemPrompt.section({
+        name: PROMPT_SECTION,
+        order: config.prompt.order,
+        text: (assembly?: unknown) => promptText(config, configFor, assembly),
+    })
 }
