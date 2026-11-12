@@ -10,6 +10,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import test from 'node:test'
 import { MissionStoreRegistry, type GateState, type MissionRecord, type MissionStore } from 'dsh-eng-core'
+import { appendDelegation } from 'dsh-eng-core/delegations'
 import { createFakeHost, runText, tempWorkspace, type FakeHost } from 'dsh-eng-core/testing'
 import { name as scopePluginName } from 'dsh-eng-core/scope'
 import { apply, inject, name } from '../dist/index.js'
@@ -177,6 +178,16 @@ function recordPassGate(store: MissionStore, id: string): void {
 /** Issue a receipt the way dsh-evidence-gate does. */
 function issueReceipt(store: MissionStore, id: string): void {
     store.issueReceipt(id, { issuedBy: 'dsh-evidence-gate', gateId: 'GATE-1', evidenceIds: [] })
+}
+
+/**
+ * Record the delegation a role-bearing stage requires before it can be settled
+ * (AC-006 / TC-1552). `team_delegate` writes this row in production; the
+ * orchestrator tests never start a child, so they seed it explicitly — the new
+ * rule is not relaxed for them.
+ */
+function delegateStage(cwd: string, missionId: string, stage = 'implement', role = 'developer'): void {
+    appendDelegation(cwd, { missionId, role, childSessionId: 'session-child', stage, at: Date.now() })
 }
 
 async function orchestrate(fake: FakeHost, args: Record<string, unknown>): Promise<string> {
@@ -433,6 +444,7 @@ test('the happy path advances through all six stages and persists every stage re
     const id = missionIdOf(fake.cwd)
     const store = storeFor(fake.cwd)
     approveMission(store, id)
+    delegateStage(fake.cwd, id)
 
     for (let index = 0; index < DEFAULT_IDS.length; index += 1) {
         const current = DEFAULT_IDS[index] ?? ''
@@ -481,6 +493,7 @@ test('quality-verify with a missing/BLOCK gate rolls back to implement instead o
     const id = missionIdOf(fake.cwd)
     const store = storeFor(fake.cwd)
     approveMission(store, id)
+    delegateStage(fake.cwd, id)
     for (const stageId of ['test-design-review', 'spec-approve', 'implement', 'quality-verify']) {
         await orchestrate(fake, { action: 'advance', verdict: 'PASS' })
         assert.ok(stageId.length > 0)
@@ -508,6 +521,7 @@ test('a PASS gate recorded before the stage was entered does not let it advance'
     const id = missionIdOf(fake.cwd)
     const store = storeFor(fake.cwd)
     approveMission(store, id)
+    delegateStage(fake.cwd, id)
     recordPassGate(store, id) // stale: recorded before quality-verify is entered
     for (let index = 0; index < 4; index += 1) await orchestrate(fake, { action: 'advance' })
     assert.equal(store.read(id)?.stage, 'quality-verify')
@@ -536,6 +550,7 @@ test('the circuit breaker blocks the mission after maxAttempts failures', async 
     const id = missionIdOf(fake.cwd)
     const store = storeFor(fake.cwd)
     approveMission(store, id)
+    delegateStage(fake.cwd, id)
     // spec-clarify → test-design-review → spec-approve → implement → quality-verify
     for (let index = 0; index < 4; index += 1) await orchestrate(fake, { action: 'advance' })
     assert.equal(store.read(id)?.stage, 'quality-verify')
@@ -852,6 +867,7 @@ test('a receipt from an earlier round cannot stamp the current one (regression)'
     const id = missionIdOf(fake.cwd)
     const store = storeFor(fake.cwd)
     approveMission(store, id)
+    delegateStage(fake.cwd, id)
     // Deliver once.
     for (let index = 0; index < 4; index += 1) await orchestrate(fake, { action: 'advance' })
     await new Promise((resolve) => setTimeout(resolve, 5))
@@ -908,6 +924,7 @@ test('a stage role lands in the stage artifact, the prompt text and mission.role
     const id = missionIdOf(fake.cwd)
     const store = storeFor(fake.cwd)
     approveMission(store, id)
+    delegateStage(fake.cwd, id)
 
     // spec-clarify → test-design-review → spec-approve → implement.
     let text = ''
@@ -986,6 +1003,7 @@ test('auto-advance settles a gated stage whose gate passes and steers the model 
     await orchestrate(fake, { action: 'start', summary: 'auto' })
     const id = missionIdOf(cwd)
     approveMission(store, id)
+    delegateStage(cwd, id, 'impl')
     const entered = await orchestrate(fake, { action: 'advance' }) // → impl
     assert.match(entered, /阶段：impl/)
     assert.match(entered, /自动推进：已启用/)
@@ -1124,6 +1142,7 @@ test('auto-advance is off by default: the turn-stopping listener is a no-op (reg
     await orchestrate(fake, { action: 'start', summary: 'default off' })
     const id = missionIdOf(fake.cwd)
     approveMission(store, id)
+    delegateStage(fake.cwd, id)
     for (let index = 0; index < 4; index += 1) await orchestrate(fake, { action: 'advance' })
     assert.equal(store.read(id)?.stage, 'quality-verify')
 
@@ -1443,6 +1462,7 @@ test('the host-driven automatic transition dispatches too (regression: BUG-1)', 
     await orchestrate(fake, { action: 'start', summary: 'hook dispatch' })
     const id = missionIdOf(cwd)
     approveMission(store, id)
+    delegateStage(cwd, id, 'impl')
     await orchestrate(fake, { action: 'advance' }) // → impl (not dispatched)
     assert.equal(fake.subagentStarts.length, 0, 'impl is not in the dispatch list')
 

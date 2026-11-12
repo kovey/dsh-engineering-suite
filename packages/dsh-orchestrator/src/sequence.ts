@@ -31,6 +31,7 @@ import {
     type StageResult,
 } from 'dsh-eng-core'
 import type { OrchestratorConfig } from './config.js'
+import { entryGateRefusal } from './advance-guards.js'
 import { dispatchStage, shouldDispatch, type DispatchDeps, type DispatchOutcome } from './dispatch.js'
 import { evaluateGate, type Verdict } from './gates.js'
 import { MAX_MAX_IN_FLIGHT, MAX_METRICS_WINDOW_DAYS, collectMetrics, renderMetrics } from './metrics.js'
@@ -47,6 +48,7 @@ import {
 import { buildRetrospective, ledgerPath, persistRetrospective, readLedger, renderHistory, type Retrospective } from './retrospective.js'
 import type { StageConfig } from './pipeline.js'
 import { describeMount, refusalForMissingPlugins, requiredPluginStates, type PluginProbe } from './probes.js'
+import { stageRoleDelegationCheck } from './stage-role.js'
 
 const TEXT_OUTPUT = { type: 'string' } as const
 
@@ -1032,15 +1034,7 @@ async function advanceAction(deps: SequenceDeps, probes: Record<string, PluginPr
     const leavesStage = stage.gate.phase === 'exit'
 
     // 2. entry gate — refuse without touching the record (retrying must be free).
-    if (!leavesStage && !outcome.ok) {
-        return [
-            `mission ${mission.id}（${mission.title}）阶段 ${stage.id} 不能进入：门禁未通过。`,
-            `- ${outcome.detail}`,
-            `修复：${outcome.fix ?? '满足门禁后重试。'}`,
-            '',
-            `下一步：${outcome.fix ?? '满足门禁后重新调用 orchestrate({ action: "advance" }) 。'}`,
-        ].join('\n')
-    }
+    if (!leavesStage && !outcome.ok) return entryGateRefusal(mission, stage, outcome)
 
     // 3. exit gate — a failure rolls back instead of advancing (docs.md §4.2).
     if (!outcome.ok) {
@@ -1062,7 +1056,11 @@ async function advanceAction(deps: SequenceDeps, probes: Record<string, PluginPr
         }
     }
 
-    // 5. pass: settle the stage and enter the next one.
+    // 5. role stage — must be delegated before it is settled ('warn' only reports).
+    const roleCheck = stageRoleDelegationCheck({ mode: deps.config.stageRoleDelegation, layout: deps.config.layout, store: ctx.store, mission, stage, cwd: ctx.cwd })
+    if (roleCheck.refusal !== undefined) return roleCheck.refusal
+    const roleWarning = roleCheck.warning === undefined ? [] : [`⚠️ ${roleCheck.warning}`]
+    // 6. pass: settle the stage and enter the next one.
     const settled: StageResultWithRole = {
         stageId: stage.id,
         attempt: current?.attempt ?? 1,
@@ -1088,6 +1086,7 @@ async function advanceAction(deps: SequenceDeps, probes: Record<string, PluginPr
         const retro = safeRetrospective(deps, ctx, finished)
         return [
             `阶段 ${stage.id} 已通过（第 ${settled.attempt} 次，门禁裁决 ${settled.gateState}，${outcome.detail}）。`,
+            ...(roleWarning.length === 0 ? [] : ['', ...roleWarning]),
             `${missionTag(finished)} 已是最后一个阶段，流水线结束，状态 ${finished.status}。`,
             `阶段结果：.dsh/missions/${mission.id}/stages/${stage.id}.json`,
             '交付物：.dsh/missions/' + mission.id + '/receipts/ 与 audit/ 下的审计记录。',
@@ -1098,6 +1097,7 @@ async function advanceAction(deps: SequenceDeps, probes: Record<string, PluginPr
     }
     return [
         `阶段 ${stage.id} 已通过（第 ${settled.attempt} 次，门禁裁决 ${settled.gateState}，${outcome.detail}）→ 下一阶段 ${next.id}。`,
+        ...(roleWarning.length === 0 ? [] : ['', ...roleWarning]),
         '',
         ...(await enterStage(deps, probes, ctx, next, args.summary)),
     ].join('\n')

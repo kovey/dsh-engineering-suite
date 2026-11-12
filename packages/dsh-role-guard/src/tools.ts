@@ -43,11 +43,14 @@ import {
 } from 'dsh-eng-core'
 import { teamDispatchReport } from './agent-teams.js'
 import type { RoleBindingStore } from './bindings.js'
+import { renderChildOutput, stopReasonText } from './child-output.js'
 import type { RoleGuardConfig } from './config.js'
+import { delegationWarnings } from './delegation-warnings.js'
 import type { RoleRegistryCache } from './loader.js'
 import { rolePresetInput } from './presets.js'
 import { resolveRoute, routeLine } from './route.js'
 import type { Role } from './roles.js'
+import { recordStageDelegation } from './stage-delegations.js'
 
 const TEXT_OUTPUT = { type: 'string' } as const
 
@@ -300,30 +303,6 @@ function safeAgentTeams(read: () => unknown): unknown {
     }
 }
 
-function stopReasonText(stopReason: string): string {
-    switch (stopReason) {
-        case 'completed':
-            return '完成'
-        case 'aborted':
-            return '被取消'
-        case 'error':
-            return '模型/传输错误'
-        case 'max-tokens':
-            return '达到 token 上限'
-        case 'refusal':
-            return '子代理拒绝执行'
-        default:
-            return stopReason
-    }
-}
-
-function renderChildOutput(output: readonly { type: string; text?: string }[] | undefined): string {
-    if (output === undefined || output.length === 0) return '(子代理没有产出文本)'
-    return output
-        .map((block) => (block.type === 'text' && typeof block.text === 'string' ? block.text : `[${block.type}]`))
-        .join('\n')
-}
-
 /** Register the role-guard tools. */
 export function registerTools(
     ctx: { tools: { register: (definition: never) => () => void } },
@@ -497,6 +476,12 @@ export function registerTools(
                 // The effective route travels with it, so an audit can see which
                 // model the child actually ran on; so does the dispatch path.
                 const binding = deps.bindings.bind(agent, run.id, role, route.route, 'subagents')
+                // The delegation ledger (dsh-eng-core/delegations): the write
+                // guard and `orchestrate advance` read it to answer "was THIS
+                // stage delegated to a child as THIS role?". Written before the
+                // first result is awaited, so it is on disk while the child works;
+                // a failure is a warning, never a failed delegation.
+                const delegationWarning = recordStageDelegation({ stores: deps.stores, layout: deps.config.layout, logger: deps.logger }, agent, role.id, run.id)
                 let result: Awaited<typeof run.result>
                 try {
                     result = await run.result
@@ -509,29 +494,17 @@ export function registerTools(
                         // disposal failures must not mask the child's result
                     }
                 }
-                const warnings: string[] = []
-                // Route warnings come first: they explain why the child ran where
-                // it did, which is what a cost/audit reader looks for.
-                if (route.ignored.length > 0) {
-                    warnings.push(
-                        `宿主禁用了按调用覆盖模型：沿用角色路由（被忽略的调用参数：${route.ignored.join('、')}）。` +
-                            '模型覆盖是成本决策，是否允许由宿主的 allowModelOverride 决定。',
-                    )
-                }
-                for (const problem of route.problems) warnings.push(problem)
-                for (const problem of dispatchProblems) warnings.push(problem)
-                if (plan.dropped.length > 0) {
-                    warnings.push(`角色文件里这些工具在当前部署不存在，已从白名单剔除：${plan.dropped.join(', ')}`)
-                }
-                if (binding === undefined) {
-                    warnings.push(
-                        `未能记录角色绑定（${run.id} → ${role.id}）：技能白名单对这个子 Agent 不生效（详见 role-guard 日志）。工具白名单不受影响，仍由宿主强制。`,
-                    )
-                }
-                for (const problem of registry.problems()) warnings.push(`角色文件问题：${problem}`)
-                // A preset that failed to register stays visible on every
-                // delegation: another role's dispatch must not hide it.
-                for (const problem of deps.presets.problems()) warnings.push(`Agent Preset：${problem}`)
+                const warnings = delegationWarnings({
+                    route,
+                    dispatchProblems,
+                    droppedTools: plan.dropped,
+                    bindingRecorded: binding !== undefined,
+                    childSessionId: run.id,
+                    roleId: role.id,
+                    registryProblems: registry.problems(),
+                    presetProblems: deps.presets.problems(),
+                    ...(delegationWarning === undefined ? {} : { delegationWarning }),
+                })
                 const header = [
                     `role: ${role.id}（${role.name}，mode=${role.mode}）`,
                     `child session: ${run.id}`,

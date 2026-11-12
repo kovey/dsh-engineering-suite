@@ -1,5 +1,51 @@
 ## [未发布]
 
+### 加固 · 阶段角色成为硬约束：委派记录 + 写守卫 + advance 门禁（`dsh-eng-core` / `dsh-role-guard` / `dsh-spec-gate` / `dsh-orchestrator`）
+
+`implement` 阶段一直声明 `role: developer`，但那是**声明**：写守卫不看它，`advance` 也不看它，主会话
+可以在角色阶段里直接改实现，所有门禁照样全绿——职责分离形同虚设。这一版把"谁被委派做这个阶段"
+变成三处门禁共读的一条事实链。
+
+- **委派记录**（`packages/dsh-eng-core/src/delegations.ts`，171 行 / 10 导出）：`appendDelegation`
+  向 `<布局根>/state/delegations.jsonl` 追加 `{ missionId, role, childSessionId, stage, at }`
+  （append-only、坏尾行读取时跳过、下一次追加先补换行）；`readDelegations` 只读解析并按 mission 过滤；
+  `stageRoleOf(mission, store)` 从**当前阶段工件**取 `role`；`matchesDelegation` 是写守卫与
+  advance 共用的匹配。布局解析复用 `resolveLayout`，因此 rootDir 覆盖与 mission 一致。模块经
+  `dsh-eng-core/delegations` 子路径导出（不扩大 `index.ts` 的导出面）。
+- **role-guard 记录**（`src/stage-delegations.ts` + `src/tools.ts`）：`team_delegate` **成功启动子代理后、
+  await 结果前**追加一行（mission 取 `resolveForAgent` 绑定，stage 取 `mission.stage`，子会话取
+  `run.id`）。**写失败不阻断委派**：工具结果里出现 `warning: 未能写入委派记录…` 并落日志；子代理照常运行
+  （宿主已授权的派发不该因台账失败而失败）。
+- **写守卫**（`src/stage-roles.ts` + `guard.ts`）：mission 当前阶段声明了角色时，只有
+  `delegations.jsonl` 里 `missionId + stage + role + childSessionId(=调用会话)` 全部匹配的调用方可以写；
+  主会话被拒，文案给出当前阶段、允许的角色、`team_delegate({ role: '<role>', … })` 与记录位置。
+  **读操作不受影响**；无绑定 mission、阶段未声明角色时行为完全不变；检查不受 `enforceBoundaries: false`
+  影响（"目标在我自己的边界里"不是主会话自己动手的理由）。为守住结构棘轮，`guard()` 内的审批/mandate
+  判定抽成 `authorisationRefusal`（返回收窄后的 spec）：`guard.ts` 393 行（基线接受 413）、
+  `guard()` 166 行、`createWriteGuard` 179 行。
+- **advance 门禁**（`src/stage-role.ts` + `sequence.ts`）：`advance` 在门禁通过、后继阶段可进入之后、
+  写 settled 工件之前要求该 mission/stage/role 的委派记录；缺失时默认拒绝（`stageRoleDelegation`
+  新配置键，默认 `'reject'`，可设 `'warn'` 仅告警）。拒绝**不移动状态**（stages/implement.json 保持
+  entered，重试免费）；未知取值回落 `'reject'` 并写进配置 issues。门禁失败回退（`onFail`）不受约束。
+  `sequence.ts` 保持 1574 行 / `advanceAction` 122 行（基线 1574 / 124），`metrics` 解析抽到
+  `config-metrics.ts`、入口门禁文案抽到 `advance-guards.ts`，`config.ts` 330 行（基线接受 358）。
+
+**测试面**：新增 `packages/dsh-eng-core/test/delegations.test.ts` 6 条、`packages/dsh-role-guard/test/stage-delegations.test.ts`
+3 条（TC-1550 记录落盘、无 mission 不写行、台账不可写仍派发成功且告警）、`packages/dsh-spec-gate/test/stage-role-guard.test.ts`
+5 条（TC-1551 已委派子会话可写、TC-1553 主会话被拒且文案含 team_delegate/阶段/记录路径、别的 stage/role
+子会话仍被拒、TC-1556 非角色阶段不受影响、读操作不拦）、`packages/dsh-orchestrator/test/stage-role-delegation.test.ts`
+5 条（TC-1554 缺记录被拒且状态不动、TC-1552 有记录可推进、TC-1555 warn 仅告警、非角色阶段不受影响、
+未知配置值回落 reject）。运行结果：eng-core **241（240 pass / 0 fail / 1 skip，skip 为既有 sandbox 限制）**、
+role-guard **54/54**、spec-gate **189/189**、orchestrator **106/106**。**既有断言一条未改**：orchestrator
+有 9 条既有用例经过 `implement`，各自按新规则**制造一条委派记录**作为前置条件（`delegateStage()` 一行），
+没有放宽任何断言或跳过用例。
+按团队约定本轮只跑相关包测试、`tsc` 与 `standards-check`；规格里的 TC-1557（`verify.sh --quiet` 两次全绿）
+由交付门禁执行。**已知边界**：`autoDispatch` 路径（默认关闭）不写委派记录，开启且阶段声明角色时会被新门禁
+拦住，启用前需把写入补到 role-guard service 侧；详见 `docs/ARCHITECTURE.md` §5.33。
+
+**验证**：`node node_modules/typescript/bin/tsc -p packages/dsh-{eng-core,role-guard,spec-gate,orchestrator}/tsconfig.json`
+通过；`bash scripts/standards-check.sh --quiet` exit 0（无新增/恶化违规）。
+
 ### 新增 · `shellPolicy: 'allowlist'`：只放行点名过的 shell 入口（`dsh-spec-gate`）
 
 `targets`/`strict` 都在回答"这条命令写了什么"，前者把看不清的放过去、后者把看不清的拒掉；两者都默认

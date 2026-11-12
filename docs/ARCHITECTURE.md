@@ -1299,6 +1299,61 @@ ExtApi——那是 TUI 专属面；命令注册表是 TUI / desktop / web 共用
 （`bash`、`node`、`python3`）等于把该程序的所有用法都放行，只剩目标/边界检查兜底。默认名单里的 `find`
 （`-delete`/`-exec`）与 `node --test`（测试会写产物）同理——它们在名单里是**已评审的决定**，不是"只读命令"的同义词。
 
+### 5.33 阶段角色从"声明"变"约束"：委派记录 + 写守卫 + advance 门禁
+
+`implement` 阶段声明 `role: developer`，但在这一版之前那只是**声明**：orchestrator 把它写进
+`stages/implement.json` 和阶段提示词，`dsh-role-guard` 负责 `team_delegate` 时按角色给工具白名单，
+而**没有任何门禁检查"这段实现到底是不是由 developer 子会话做的"**。结果是主会话可以直接改实现，
+所有门禁照样全绿——职责分离形同虚设（真实发生过多次）。这一版把三处缺口补成同一条事实链：
+
+```
+team_delegate 成功（role-guard） → <布局根>/state/delegations.jsonl 追加一行
+                                        ↑ 读
+spec-gate 写守卫（implement 阶段） ──────┘ 只有该 mission/stage/role 的子会话可写；主会话被拒
+orchestrator advance（离开 implement）──┘ 没有该记录就不结算阶段（默认拒绝，可配 warn）
+```
+
+**委派记录**（`dsh-eng-core/delegations.ts`，`state/delegations.jsonl`）：append-only JSONL，一行是
+`{ missionId, role, childSessionId, stage, at }`。`missionId`/`stage` 取调用方会话绑定的 mission 与
+`mission.stage`，`childSessionId` 是 `team_delegate` 拿到的子会话 id。写入发生在**子代理结果被 await
+之前**，所以子代理开始写文件时记录已在盘上。坏尾行（崩溃截断）读取时跳过；下一次追加会先补换行，
+不会把新行粘到垃圾行上（`appendJsonl` 的既有语义）。**记录失败不阻断委派**：宿主已经授权的派发不该
+因为磁盘问题失败，工具结果里会出现 `warning: 未能写入委派记录…`，同时记日志——"这个阶段没有委派
+记录"这个事实仍然可见（下一次写守卫/advance 会据此拒绝）。
+
+**写守卫**（`packages/dsh-spec-gate/src/stage-roles.ts`）：在"mission 存在、规格已审批、mandate 成立"
+之后、文件边界之前判定，且**不受 `enforceBoundaries: false` 影响**（"目标在我自己的边界里"不是主会话
+自己动手的理由）：
+
+- 只看 `mission.stage` 对应阶段工件里的 `role`（`stageRoleOf`）；没声明角色的阶段行为完全不变；
+- 只有 `delegations.jsonl` 里存在 `missionId + stage + role + childSessionId(= 调用的 session id)`
+  的调用者才放行；其它一律拒绝，文案给出当前阶段、需要的角色、`team_delegate({ role: '<role>', … })`
+  的完整调用形状、以及委派记录的位置；
+- **读操作从不经过这里**（守卫只对 write-class / 可归属写入的 shell 调用生效）；
+- 没有绑定 mission、或 ledger 读不到 → 前者行为不变，后者按"没有委派"处理（fail closed；同一句
+  拒绝文案，评审者可用同一事实复核）。
+
+**advance 门禁**（`packages/dsh-orchestrator/src/stage-role.ts`）：`advance` 在**阶段门禁通过、
+后继阶段可进入之后、写 settled 工件之前**检查"该 mission/stage/role 是否有一条委派记录"。缺失时：
+
+- 默认 `stageRoleDelegation: 'reject'`：返回拒绝，**不写 settled 工件、mission.stage 不动**，重试免费；
+- `stageRoleDelegation: 'warn'`：照常推进，但结果里以 `⚠️` 段落写明"按 warn 放行"与下一次该怎么做；
+- 未知取值回落 `'reject'` 并把问题写进配置 `issues`（未知值不放宽门禁）；
+- 门禁失败回退（`onFail`）**不**受这条规则约束：失败回退不是"结算成功"，不应被委派要求拦住。
+
+**失败的文案**是给模型看的（模型是唯一能修的人）：拒绝文本固定包含 `team_delegate({ role: '<role>',
+… })`、当前阶段、允许的角色与记录文件路径。测试（`packages/dsh-*/test/`）覆盖：记录落盘（TC-1550）、
+已委派子会话可写（TC-1551）、主会话被拒且文案含 `team_delegate`（TC-1553）、非角色阶段不受影响
+（TC-1556）、advance 缺记录被拒（TC-1554）、`warn` 仅告警（TC-1555）。既有 orchestrator 测试里经过
+`implement` 的用例各自**制造一条委派记录**来满足前置条件（规则没有为测试放宽）。
+
+**已知边界（诚实说明）**：① 本条链只为 `team_delegate` 写记录；`autoDispatch`（§5.6，默认关闭）
+直接走 role-guard 的 service 起子代理，**目前不写**委派记录——开启 autoDispatch 且阶段声明角色时，
+新门禁会拦住该阶段的写入与推进，启用前需要把记录写进 service 侧（单一写者仍是 role-guard）。
+② 记录是运行时状态，不是授权：它只回答"这个阶段派过谁"，不改变任何角色的工具白名单。
+③ 手工调用 `subagent`/官方 teammate 派发不会被记录，因此也不能满足角色阶段——这是"必须用
+`team_delegate`"这条规则的落点，不是遗漏。
+
 ## 6. 为什么这样切分
 
 - **一个关注点一个插件**：门禁可以单独失效（例如先只上 quality-gate），不影响其它环节。

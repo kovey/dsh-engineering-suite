@@ -18,6 +18,10 @@
       "types": "./dist/scope.d.ts",
       "default": "./dist/scope.js"
     },
+    "./delegations": {
+      "types": "./dist/delegations.d.ts",
+      "default": "./dist/delegations.js"
+    },
     "./package.json": "./package.json"
   },
   "files": [

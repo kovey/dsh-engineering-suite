@@ -12,7 +12,7 @@
  */
 
 import { matchesShellAllow } from './shell.js'
-import { mandateState, pathMatchesAny, pathMatchesPattern, resolvePath, type Mandate, type MissionStore, type MissionStoreRegistry } from 'dsh-eng-core'
+import { mandateState, pathMatchesAny, pathMatchesPattern, resolvePath, type Mandate, type MissionRecord, type MissionStore, type MissionStoreRegistry } from 'dsh-eng-core'
 import path from 'node:path'
 import type { AgentLike } from 'dsh-eng-core'
 import { evaluateConstraints } from './constraints.js'
@@ -28,6 +28,7 @@ import {
 } from './guard-messages.js'
 import { analyzeShellCommand, shellCommandOf } from './shell.js'
 import { shellAllowlistRefusal } from './shell-allowlist.js'
+import { stageRoleWriteRefusal } from './stage-roles.js'
 import type { SpecGateConfig } from './config.js'
 
 /** The write guard and the diagnostics a test (or a status tool) can inspect. */
@@ -154,6 +155,38 @@ function notApprovedReason(missionId: string, status: string): string {
         `spec-gate: 规格 ${missionId} 尚未审批（当前状态 ${status}），写操作被拒绝。`,
         '下一步：调用 spec_approve 取得审批（必要时先用 test_design_review 通过测试设计门禁），再重新执行本写操作。',
     ].join('\n')
+}
+
+/**
+ * Whether this mission's approval can still authorise a write.
+ *
+ * Extracted from `createWriteGuard`'s inner loop so the guard function keeps its
+ * accepted size (the structural ratchet) and the four decisions stay readable as
+ * one list: finished mission → no approved spec → broken mandate → `inferred`
+ * mandate. A refusal is returned as text; an approval that stands returns the
+ * narrowed spec, so the boundary checks cannot accidentally read an undefined
+ * `mission.spec`.
+ * @param mission - the resolved mission (only called when it exists).
+ */
+function authorisationRefusal(mission: MissionRecord): { refusal: string } | { spec: NonNullable<MissionRecord['spec']> } {
+    const finished = finishedMissionReason(mission.id, mission.status)
+    if (finished !== undefined) return { refusal: finished }
+    if (mission.spec === undefined || mission.spec.approvedAt === undefined) {
+        return { refusal: notApprovedReason(mission.id, mission.status) }
+    }
+    // The approval is only as strong as the mandate it produced. An `inferred`
+    // mandate (an allowlist that does not contain the approver, a subagent, an
+    // IM click with no allowlist, an automatic approval) is RECORDED and
+    // REPORTED, but it does not satisfy an enforcing gate: the write is refused
+    // here, with the reason naming `inferred` instead of pretending no
+    // specification exists. Legacy (no record) passes: it is a pre-mandate
+    // approval, treated like explicit for compatibility.
+    const mandate = mandateState(mission)
+    if (mandate.kind === 'invalid') return { refusal: invalidMandateReason(mission.id, mandate.reason) }
+    if (mandate.kind === 'present' && mandate.mandate.strength === 'inferred') {
+        return { refusal: inferredMandateReason(mission.id, mandate.mandate) }
+    }
+    return { spec: mission.spec }
 }
 
 /**
@@ -300,31 +333,22 @@ export function createWriteGuard(deps: WriteGuardDeps): WriteGuard {
         // A finished mission can never authorise a write, even with a valid-looking
         // approval: the receipt is immutable (delivered) or the mandate is gone
         // (blocked). Checked BEFORE boundaries so "it is inside my spec" cannot
-        // become the loophole.
-        const finished = finishedMissionReason(mission.id, mission.status)
-        if (finished !== undefined) {
+        // become the loophole. The whole approval/mandate sequence lives in
+        // `authorisationRefusal`; it hands back the narrowed, approved spec.
+        const authorisation = authorisationRefusal(mission)
+        if ('refusal' in authorisation) {
             bump(store.layout.rootDir)
-            return finished
+            return authorisation.refusal
         }
-        if (mission.spec === undefined || mission.spec.approvedAt === undefined) {
+        const spec = authorisation.spec
+        // A stage that declares a role belongs to the child delegated for it.
+        // Checked BEFORE the boundary rules (and independently of
+        // `enforceBoundaries`): "the target is inside my spec" is not a reason
+        // for the lead to do the work itself. Reads never reach this point.
+        const roleRefusal = stageRoleWriteRefusal({ layout: config.layout, store, mission, agent: exec.agent, cwd })
+        if (roleRefusal !== undefined) {
             bump(store.layout.rootDir)
-            return notApprovedReason(mission.id, mission.status)
-        }
-        // The approval is only as strong as the mandate it produced. An
-        // `inferred` mandate (an allowlist that does not contain the approver, a
-        // subagent, an IM click with no allowlist, an automatic approval) is
-        // RECORDED and REPORTED, but it does not satisfy an enforcing gate: the
-        // write is refused here, with the reason naming `inferred` instead of
-        // pretending no specification exists. Legacy (no record) passes: it is a
-        // pre-mandate approval, treated like explicit for compatibility.
-        const mandate = mandateState(mission)
-        if (mandate.kind === 'invalid') {
-            bump(store.layout.rootDir)
-            return invalidMandateReason(mission.id, mandate.reason)
-        }
-        if (mandate.kind === 'present' && mandate.mandate.strength === 'inferred') {
-            bump(store.layout.rootDir)
-            return inferredMandateReason(mission.id, mandate.mandate)
+            return roleRefusal
         }
         if (!config.enforceBoundaries) return undefined
         // A shell tool that we could not attribute is judged by the host policy.
@@ -336,9 +360,9 @@ export function createWriteGuard(deps: WriteGuardDeps): WriteGuard {
             for (const declared of shell.targets) {
                 const resolved = resolvePath(declared, cwd)
                 const relative = path.relative(store.layout.cwd, resolved)
-                if (relative.startsWith('..') || path.isAbsolute(relative) || !pathMatchesAny(mission.spec.fileBoundaries, relative)) {
+                if (relative.startsWith('..') || path.isAbsolute(relative) || !pathMatchesAny(spec.fileBoundaries, relative)) {
                     bump(store.layout.rootDir)
-                    return shellBoundaryReason(mission.id, relative, mission.spec.fileBoundaries)
+                    return shellBoundaryReason(mission.id, relative, spec.fileBoundaries)
                 }
             }
             return undefined
@@ -355,11 +379,11 @@ export function createWriteGuard(deps: WriteGuardDeps): WriteGuard {
         // match `../other-repo/file.ts`.
         if (relativeToCwd.startsWith('..') || path.isAbsolute(relativeToCwd)) {
             bump(store.layout.rootDir)
-            return boundaryReason(mission.id, relativeToCwd, mission.spec.fileBoundaries)
+            return boundaryReason(mission.id, relativeToCwd, spec.fileBoundaries)
         }
-        if (pathMatchesAny(mission.spec.fileBoundaries, relativeToCwd)) return undefined
+        if (pathMatchesAny(spec.fileBoundaries, relativeToCwd)) return undefined
         bump(store.layout.rootDir)
-        return boundaryReason(mission.id, relativeToCwd, mission.spec.fileBoundaries)
+        return boundaryReason(mission.id, relativeToCwd, spec.fileBoundaries)
     }
     return {
         guard,

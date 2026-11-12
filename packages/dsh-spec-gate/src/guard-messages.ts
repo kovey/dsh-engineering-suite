@@ -161,3 +161,32 @@ export function boundaryReason(missionId: string, relative: string, boundaries: 
         '不要绕过边界——边界外的改动无法被这次的验收标准覆盖。',
     ].join('\n')
 }
+
+/**
+ * A write refused because the current stage's role belongs to a delegated child.
+ *
+ * The stage's `role` used to be a declaration; it is now a constraint. This text
+ * is written for the MODEL, which is the only one that can fix it: it names the
+ * stage, the role, the exact `team_delegate` call that unblocks the work, and
+ * where the delegation row will be written. It never suggests a bypass — editing
+ * the mission or the ledger by hand is exactly what the trust-root rule refuses.
+ * @param input - mission/stage/role and the caller's session (for the "not the
+ *   delegated child" statement) plus the ledger path to name.
+ */
+export function stageRoleReason(input: {
+    missionId: string
+    stage: string
+    role: string
+    sessionId?: string
+    ledger: string
+}): string {
+    const caller = input.sessionId === undefined ? '本会话' : `本会话（${input.sessionId}）`
+    return [
+        `spec-gate: 阶段 ${input.stage} 声明了角色 ${input.role}，${caller}不是该 mission 该阶段的已委派子会话，写操作被拒绝。`,
+        `mission: ${input.missionId}`,
+        '原因：阶段角色是硬约束——实现类工作必须由该角色的子会话完成，主会话（lead）直接写会绕过职责分离。',
+        `下一步：在当前阶段调用 team_delegate({ role: '${input.role}', task: '…' }) 派发实现；`,
+        `子会话启动成功后，dsh-role-guard 会向委派记录 ${input.ledger} 追加一行（missionId/stage/role/childSessionId）；`,
+        '该记录存在后，这个子会话的写操作才会被放行。读操作不受影响。',
+    ].join('\n')
+}
