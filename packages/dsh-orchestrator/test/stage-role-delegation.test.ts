@@ -8,8 +8,9 @@ import fs from 'node:fs'
 import path from 'node:path'
 import test from 'node:test'
 import { MissionStoreRegistry, type MissionStore } from 'dsh-eng-core'
-import { appendDelegation } from 'dsh-eng-core/delegations'
+import { appendDelegation, readDelegations } from 'dsh-eng-core/delegations'
 import { createFakeHost, runText, tempWorkspace, type FakeHost } from 'dsh-eng-core/testing'
+import { apply as applyRoleGuard } from 'dsh-role-guard'
 import { apply } from '../dist/index.js'
 import { resolveConfig } from '../dist/config.js'
 
@@ -61,6 +62,54 @@ async function enterImplement(fake: FakeHost): Promise<{ missionId: string; stor
     assert.equal(artifact.role, 'developer', 'precondition: the stage declares a role')
     return { missionId, store: storeFor(fake.cwd) }
 }
+
+/**
+ * A host with the REAL role-guard plugin composed next to the orchestrator, and
+ * `autoDispatch` on for the role-declaring `implement` stage.
+ *
+ * Mounting the real plugin (rather than a stub service) is the point: the seam
+ * under test is "the dispatcher calls service.bind(), and bind leaves the row
+ * advance reads". A stub whose bind() performed the write would assert the
+ * test's own bookkeeping, not the shipped path.
+ */
+function autoDispatchHost(): FakeHost {
+    const cwd = tempWorkspace('orchestrator-stage-role-auto-')
+    const fake = createFakeHost({ cwd, withSubagents: true })
+    // The role whitelist is pruned against the tools this deployment exposes.
+    for (const toolName of ['read', 'write', 'edit', 'bash', 'glob', 'grep', 'todo_write', 'read_image']) {
+        fake.tools.set(toolName, { name: toolName, description: 'stub', parameters: {}, execute: async () => 'ok' } as never)
+    }
+    applyRoleGuard(fake.ctx as never, { logFile: path.join(cwd, 'role-guard.log') })
+    apply(fake.ctx as never, {
+        logFile: path.join(cwd, 'orchestrator.log'),
+        stages: STAGES,
+        autoDispatch: { enabled: true, stages: ['implement'] },
+    })
+    return fake
+}
+
+test('advance passes for an auto-dispatched role child: bind() wrote the record (TC-1562)', async () => {
+    const fake = autoDispatchHost()
+    // Entering `implement` dispatches the child itself; no team_delegate call.
+    const { missionId, store } = await enterImplement(fake)
+    assert.equal(fake.subagentStarts.length, 1, 'the role stage was auto-dispatched exactly once')
+
+    // role-guard's service.bind() produced the SAME row team_delegate would:
+    // the child's session id, the mission, the stage and the role.
+    const rows = readDelegations(fake.cwd, missionId)
+    assert.equal(rows.length, 1, 'one delegation row from the auto-dispatch path')
+    assert.deepEqual(
+        { mission: rows[0]?.missionId, role: rows[0]?.role, stage: rows[0]?.stage, child: rows[0]?.childSessionId },
+        { mission: missionId, role: 'developer', stage: 'implement', child: 'run-1' },
+    )
+
+    // advance must pass on that record alone — this test never calls
+    // appendDelegation(), so "the model forgot to add the row" is not a factor.
+    const text = await orchestrate(fake, { action: 'advance', verdict: 'PASS', summary: '实现完成' })
+    assert.match(text, /→ 下一阶段 review/)
+    assert.doesNotMatch(text, /advance 被拒绝/)
+    assert.equal(store.read(missionId)?.stage, 'review')
+})
 
 test('advance refuses to leave a role stage with no delegation record (TC-1554)', async () => {
     const fake = host()

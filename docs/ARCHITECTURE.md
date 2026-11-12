@@ -1307,10 +1307,11 @@ ExtApi——那是 TUI 专属面；命令注册表是 TUI / desktop / web 共用
 所有门禁照样全绿——职责分离形同虚设（真实发生过多次）。这一版把三处缺口补成同一条事实链：
 
 ```
-team_delegate 成功（role-guard） → <布局根>/state/delegations.jsonl 追加一行
-                                        ↑ 读
-spec-gate 写守卫（implement 阶段） ──────┘ 只有该 mission/stage/role 的子会话可写；主会话被拒
-orchestrator advance（离开 implement）──┘ 没有该记录就不结算阶段（默认拒绝，可配 warn）
+team_delegate 成功（role-guard）────────────┐
+autoDispatch → service.bind()（role-guard）─┴→ <布局根>/state/delegations.jsonl 追加一行（去重）
+                                                 ↑ 读
+spec-gate 写守卫（implement 阶段） ──────────────┘ 只有该 mission/stage/role 的子会话可写；主会话被拒
+orchestrator advance（离开 implement）──────────┘ 没有该记录就不结算阶段（默认拒绝，可配 warn）
 ```
 
 **委派记录**（`dsh-eng-core/delegations.ts`，`state/delegations.jsonl`）：append-only JSONL，一行是
@@ -1320,6 +1321,16 @@ orchestrator advance（离开 implement）──┘ 没有该记录就不结算�
 不会把新行粘到垃圾行上（`appendJsonl` 的既有语义）。**记录失败不阻断委派**：宿主已经授权的派发不该
 因为磁盘问题失败，工具结果里会出现 `warning: 未能写入委派记录…`，同时记日志——"这个阶段没有委派
 记录"这个事实仍然可见（下一次写守卫/advance 会据此拒绝）。
+
+**两条派发路径、一个写者**：`team_delegate` 是模型面对的路径；`autoDispatch`（§5.6，默认关闭）不走
+工具，而是由 orchestrator 调 role-guard service 的 `bind()` 把子代理直接创建出来。`bind()` 在**成功
+写入角色绑定之后**追加委派记录：mission 从传入 `agent` 的绑定 mission 解析（`resolveForAgent`），
+stage 取 `mission.stage`，`role` 与 `childSessionId` 用入参 —— 与 `team_delegate` 完全相同的一行。
+解析不到 mission → **不写行、不报错**（没有可比对的对象）；写失败 → **只告警，不阻断派发**
+（`bind()` 仍返回绑定，技能白名单照常生效；日志里留下"该阶段没有委派记录"）。两条路径共用
+`appendDelegationOnce`：同一 `missionId + stage + role + childSessionId` 已存在时不追加（`at` 不是
+去重键 —— 它描述写入时刻，不描述是哪次委派），因此重复 bind / 重复 `team_delegate` 不会在台账里
+留下噪声行。orchestrator 侧的派发顺序（先起子代理、再 `bind` 写记录、最后子代理工作）没有改变。
 
 **写守卫**（`packages/dsh-spec-gate/src/stage-roles.ts`）：在"mission 存在、规格已审批、mandate 成立"
 之后、文件边界之前判定，且**不受 `enforceBoundaries: false` 影响**（"目标在我自己的边界里"不是主会话
@@ -1344,15 +1355,17 @@ orchestrator advance（离开 implement）──┘ 没有该记录就不结算�
 **失败的文案**是给模型看的（模型是唯一能修的人）：拒绝文本固定包含 `team_delegate({ role: '<role>',
 … })`、当前阶段、允许的角色与记录文件路径。测试（`packages/dsh-*/test/`）覆盖：记录落盘（TC-1550）、
 已委派子会话可写（TC-1551）、主会话被拒且文案含 `team_delegate`（TC-1553）、非角色阶段不受影响
-（TC-1556）、advance 缺记录被拒（TC-1554）、`warn` 仅告警（TC-1555）。既有 orchestrator 测试里经过
-`implement` 的用例各自**制造一条委派记录**来满足前置条件（规则没有为测试放宽）。
+（TC-1556）、advance 缺记录被拒（TC-1554）、`warn` 仅告警（TC-1555）；service `bind()` 侧另覆盖
+写入（TC-1561）、重复 bind/两条路径去重（TC-1563）、无绑定 mission 不写（TC-1564）、台账不可写只告警
+（TC-1565），以及**装配真实 role-guard 的 autoDispatch 端到端用例**（TC-1562：进入角色阶段后 `advance`
+直接通过，测试里没有手工补记录）。既有 orchestrator 测试里经过 `implement` 的用例各自**制造一条委派
+记录**来满足前置条件（规则没有为测试放宽）。
 
-**已知边界（诚实说明）**：① 本条链只为 `team_delegate` 写记录；`autoDispatch`（§5.6，默认关闭）
-直接走 role-guard 的 service 起子代理，**目前不写**委派记录——开启 autoDispatch 且阶段声明角色时，
-新门禁会拦住该阶段的写入与推进，启用前需要把记录写进 service 侧（单一写者仍是 role-guard）。
-② 记录是运行时状态，不是授权：它只回答"这个阶段派过谁"，不改变任何角色的工具白名单。
-③ 手工调用 `subagent`/官方 teammate 派发不会被记录，因此也不能满足角色阶段——这是"必须用
-`team_delegate`"这条规则的落点，不是遗漏。
+**已知边界（诚实说明）**：① 委派记录由 role-guard 统一写入：`team_delegate` 与 `autoDispatch`
+（orchestrator → service `bind()`）都会追加，同一子会话在同一阶段只有一行（`appendDelegationOnce`
+去重）；「自动派发会被角色门禁拦住」这条旧边界已消除。② 记录是运行时状态，不是授权：它只回答"这个
+阶段派过谁"，不改变任何角色的工具白名单。③ 手工调用 `subagent`/官方 teammate 派发不会被记录，因此
+也不能满足角色阶段——这是"必须用 `team_delegate`"这条规则的落点，不是遗漏。
 
 ## 6. 为什么这样切分
 

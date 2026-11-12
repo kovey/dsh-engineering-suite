@@ -10,6 +10,7 @@ import test from 'node:test'
 import {
     DELEGATION_LEDGER,
     appendDelegation,
+    appendDelegationOnce,
     delegationLedgerFile,
     matchesDelegation,
     readDelegations,
@@ -109,6 +110,28 @@ test('stageRoleOf reads the role of the mission’s current stage artifact', () 
     store.update('mission-1', () => ({ stage: 'missing-stage' }))
     assert.equal(stageRoleOf(store.read('mission-1'), store), undefined)
     assert.equal(stageRoleOf(undefined, store), undefined)
+})
+
+test('appendDelegationOnce skips an identical delegation and keeps the legacy append unchanged (TC-1563)', () => {
+    const cwd = tempWorkspace('delegations-once-')
+    const base = { missionId: 'mission-1', role: 'developer', childSessionId: 'child-1', stage: 'implement' }
+
+    assert.deepEqual(appendDelegationOnce(cwd, { ...base, at: 1 }), { file: delegationLedgerFile(cwd), appended: true })
+    // `at` is not part of the key: a retried bind with a later timestamp is the
+    // SAME delegation, so it must not add a second row.
+    assert.deepEqual(appendDelegationOnce(cwd, { ...base, at: 2 }), { file: delegationLedgerFile(cwd), appended: false })
+    assert.equal(readDelegations(cwd, 'mission-1').length, 1)
+
+    // A different child, or a different stage, is a different delegation.
+    assert.equal(appendDelegationOnce(cwd, { ...base, childSessionId: 'child-2', at: 3 }).appended, true)
+    assert.equal(appendDelegationOnce(cwd, { ...base, stage: 'review', at: 4 }).appended, true)
+    assert.equal(readDelegations(cwd, 'mission-1').length, 3)
+
+    // The legacy export keeps its "always append" semantics: callers that rely
+    // on it (the team_delegate path before this change) are not silently altered.
+    appendDelegation(cwd, { ...base, at: 5 })
+    appendDelegation(cwd, { ...base, at: 6 })
+    assert.equal(readDelegations(cwd, 'mission-1').length, 5)
 })
 
 test('an explicit layout rootDir places the ledger under it', () => {

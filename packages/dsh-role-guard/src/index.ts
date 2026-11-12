@@ -229,7 +229,7 @@ export function apply(ctx: Context, config: unknown = {}): void {
                         }
                     },
                     config: { readonlyDeny: resolved.readonlyDeny },
-                    bindings,
+                    bindings, stores, layout: resolved.layout,
                     logger,
                 })
                 disposers.push(context.provide('role-guard', service))

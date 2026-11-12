@@ -10,7 +10,9 @@
  * that second fact:
  *
  * - `dsh-role-guard` appends one row **after** `team_delegate` started a child
- *   successfully (a failed append warns, it never blocks the delegation);
+ *   successfully, and after its service `bind()` recorded an auto-dispatched
+ *   child — the two delegation paths share this single writer (a failed append
+ *   warns, it never blocks the delegation);
  * - `dsh-spec-gate`'s write guard reads it to answer "is the caller the child
  *   this stage was delegated to?" (a read is never gated);
  * - `dsh-orchestrator`'s `advance` reads it to refuse leaving a role-declaring
@@ -101,6 +103,46 @@ export function appendDelegation(cwd: string, input: DelegationInput, options: L
         at: input.at ?? Date.now(),
     })
     return file
+}
+
+/**
+ * What {@link appendDelegationOnce} did: where the row belongs, and whether one
+ * was written (as opposed to already being there).
+ */
+export interface AppendDelegationResult {
+    /** The ledger file the row belongs to. */
+    file: string
+    /** `false` when an identical delegation was already recorded (nothing written). */
+    appended: boolean
+}
+
+/**
+ * Append one delegation row unless the same delegation is already recorded.
+ *
+ * Two writers reach this ledger — `team_delegate` (the model-facing path) and
+ * the role-guard service's `bind` (an autonomous dispatcher such as
+ * `autoDispatch`) — and a retried call must not add noise: the key is the exact
+ * tuple every reader matches on (`missionId + stage + role + childSessionId`).
+ * `at` is deliberately NOT part of the key: it says when a row was written, not
+ * which delegation it describes.
+ *
+ * The read-then-append is not atomic. One process owns the ledger in practice,
+ * and two identical rows would still mean the same thing to every reader, so a
+ * rare race degrades to a duplicate line rather than a wrong decision.
+ * @param cwd - workspace root.
+ * @param input - who was delegated, as what, for which stage.
+ * @param options - layout overrides (the plugin's `layout` config).
+ * @returns the file and whether a row was appended.
+ */
+export function appendDelegationOnce(cwd: string, input: DelegationInput, options: LayoutOptions = {}): AppendDelegationResult {
+    const stage = input.stage === undefined || input.stage === '' ? undefined : input.stage
+    const file = delegationLedgerFile(cwd, options)
+    const existing = readDelegations(cwd, input.missionId, options).some(
+        (record) => record.role === input.role && record.childSessionId === input.childSessionId && record.stage === stage,
+    )
+    if (existing) return { file, appended: false }
+    appendDelegation(cwd, input, options)
+    return { file, appended: true }
 }
 
 /**

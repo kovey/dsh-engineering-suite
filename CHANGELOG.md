@@ -6,16 +6,23 @@
 可以在角色阶段里直接改实现，所有门禁照样全绿——职责分离形同虚设。这一版把"谁被委派做这个阶段"
 变成三处门禁共读的一条事实链。
 
-- **委派记录**（`packages/dsh-eng-core/src/delegations.ts`，171 行 / 10 导出）：`appendDelegation`
+- **委派记录**（`packages/dsh-eng-core/src/delegations.ts`，213 行 / 12 导出）：`appendDelegation`
   向 `<布局根>/state/delegations.jsonl` 追加 `{ missionId, role, childSessionId, stage, at }`
-  （append-only、坏尾行读取时跳过、下一次追加先补换行）；`readDelegations` 只读解析并按 mission 过滤；
-  `stageRoleOf(mission, store)` 从**当前阶段工件**取 `role`；`matchesDelegation` 是写守卫与
-  advance 共用的匹配。布局解析复用 `resolveLayout`，因此 rootDir 覆盖与 mission 一致。模块经
-  `dsh-eng-core/delegations` 子路径导出（不扩大 `index.ts` 的导出面）。
+  （append-only、坏尾行读取时跳过、下一次追加先补换行）；`appendDelegationOnce` 是两条派发路径共用的
+  去重写入（键 = `missionId + stage + role + childSessionId`，`at` 不参与；已存在则 `appended:false` 不追加）；
+  `readDelegations` 只读解析并按 mission 过滤；`stageRoleOf(mission, store)` 从**当前阶段工件**取 `role`；
+  `matchesDelegation` 是写守卫与 advance 共用的匹配。布局解析复用 `resolveLayout`，因此 rootDir 覆盖与
+  mission 一致。模块经 `dsh-eng-core/delegations` 子路径导出（不扩大 `index.ts` 的导出面）。
 - **role-guard 记录**（`src/stage-delegations.ts` + `src/tools.ts`）：`team_delegate` **成功启动子代理后、
   await 结果前**追加一行（mission 取 `resolveForAgent` 绑定，stage 取 `mission.stage`，子会话取
   `run.id`）。**写失败不阻断委派**：工具结果里出现 `warning: 未能写入委派记录…` 并落日志；子代理照常运行
   （宿主已授权的派发不该因台账失败而失败）。
+- **自动派发也写**（`src/service.ts`）：`autoDispatch` 不走 `team_delegate`，它直接调 role-guard service 的
+  `bind()` 起子代理——`bind` 现在在**成功写入角色绑定之后**追加同一形状的记录（mission 从传入 `agent` 的
+  绑定 mission 解析，stage 取 `mission.stage`，role/childSessionId 用入参）。解析不到 mission → 不写行、
+  不报错；写失败 → **只告警，不阻断派发**（`bind` 仍返回绑定，技能白名单照常生效）。两条路径共用
+  `appendDelegationOnce`，重复 bind / 重复 team_delegate 不产生噪声行。为守住结构棘轮，`createRolePlanner`
+  的 registry 解析抽成文件级 `registryFor`（`service.ts` 258 行，`createRolePlanner` 93 → 77 行）。
 - **写守卫**（`src/stage-roles.ts` + `guard.ts`）：mission 当前阶段声明了角色时，只有
   `delegations.jsonl` 里 `missionId + stage + role + childSessionId(=调用会话)` 全部匹配的调用方可以写；
   主会话被拒，文案给出当前阶段、允许的角色、`team_delegate({ role: '<role>', … })` 与记录位置。
@@ -35,16 +42,23 @@
 5 条（TC-1551 已委派子会话可写、TC-1553 主会话被拒且文案含 team_delegate/阶段/记录路径、别的 stage/role
 子会话仍被拒、TC-1556 非角色阶段不受影响、读操作不拦）、`packages/dsh-orchestrator/test/stage-role-delegation.test.ts`
 5 条（TC-1554 缺记录被拒且状态不动、TC-1552 有记录可推进、TC-1555 warn 仅告警、非角色阶段不受影响、
-未知配置值回落 reject）。运行结果：eng-core **241（240 pass / 0 fail / 1 skip，skip 为既有 sandbox 限制）**、
-role-guard **54/54**、spec-gate **189/189**、orchestrator **106/106**。**既有断言一条未改**：orchestrator
-有 9 条既有用例经过 `implement`，各自按新规则**制造一条委派记录**作为前置条件（`delegateStage()` 一行），
-没有放宽任何断言或跳过用例。
-按团队约定本轮只跑相关包测试、`tsc` 与 `standards-check`；规格里的 TC-1557（`verify.sh --quiet` 两次全绿）
-由交付门禁执行。**已知边界**：`autoDispatch` 路径（默认关闭）不写委派记录，开启且阶段声明角色时会被新门禁
-拦住，启用前需把写入补到 role-guard service 侧；详见 `docs/ARCHITECTURE.md` §5.33。
+未知配置值回落 reject）。**autoDispatch 补齐**再新增：eng-core `appendDelegationOnce` 去重 1 条（TC-1563）、
+role-guard `packages/dsh-role-guard/test/bind-delegations.test.ts` 4 条（TC-1561 bind 写行、TC-1563 重复 bind
+与两条路径去重、TC-1564 无绑定 mission 不写、TC-1565 台账不可写只告警）、orchestrator
+`stage-role-delegation.test.ts` 1 条（TC-1562：**装配真实 role-guard**，autoDispatch 进入角色阶段后
+`advance` 直接通过，测试里没有 `appendDelegation()` 手工补记录）。运行结果（本轮重跑）：eng-core
+**242（241 pass / 0 fail / 1 skip，skip 为既有 sandbox 限制）**、role-guard **58/58**、orchestrator
+**107/107**；spec-gate **189/189** 为该条目首轮记录（本轮未改该包、未重跑）。**既有断言一条未改**：
+orchestrator 有 9 条既有用例经过 `implement`，各自按新规则**制造一条委派记录**作为前置条件
+（`delegateStage()` 一行），没有放宽任何断言或跳过用例。
+按团队约定本轮只跑相关包测试、`tsc` 与 `standards-check`；规格里的 TC-1566（`verify.sh --quiet` 两次全绿）
+由交付门禁执行。**已知边界**：① `autoDispatch`（默认关闭）现在也写委派记录——orchestrator 经 service
+`bind()` 起子代理，`bind` 在写角色绑定后追加同一台账行，因此角色阶段的写守卫与 `advance` 对它同样成立；
+② 手工 `subagent`/官方 teammate 派发仍然不写，因此仍不能满足角色阶段（详见 `docs/ARCHITECTURE.md` §5.33）。
 
-**验证**：`node node_modules/typescript/bin/tsc -p packages/dsh-{eng-core,role-guard,spec-gate,orchestrator}/tsconfig.json`
-通过；`bash scripts/standards-check.sh --quiet` exit 0（无新增/恶化违规）。
+**验证**：`node node_modules/typescript/bin/tsc -p packages/dsh-{eng-core,role-guard,orchestrator}/tsconfig.json`
+通过；`node --test packages/dsh-{eng-core,role-guard,orchestrator}/test/*.test.ts` 全绿（见上）；
+`bash scripts/standards-check.sh --quiet` exit 0（无新增/恶化违规）。
 
 ### 新增 · `shellPolicy: 'allowlist'`：只放行点名过的 shell 入口（`dsh-spec-gate`）
 

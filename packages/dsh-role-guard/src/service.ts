@@ -22,10 +22,11 @@
  */
 
 import fs from 'node:fs'
-import type { AgentLike, Layout } from 'dsh-eng-core'
+import type { AgentLike, Layout, LayoutOptions, MissionStoreRegistry } from 'dsh-eng-core'
 import type { RoleBinding, RoleBindingStore } from './bindings.js'
 import { roleRoute, resolveRoute, type EffectiveRoute } from './route.js'
 import type { Role } from './roles.js'
+import { recordStageDelegation } from './stage-delegations.js'
 import { filterRefusal, planToolFilter, type FilterConfig, type ToolFilterPlan } from './tools.js'
 
 /** One role resolved for another plugin. */
@@ -97,6 +98,13 @@ export interface RolePlannerDeps {
     config: FilterConfig
     /** Where child bindings are recorded: the skill gate's oracle. */
     bindings: RoleBindingStore
+    /**
+     * Mission store registry: `bind` resolves the delegating agent's mission so
+     * an auto-dispatched child leaves the same delegation row as `team_delegate`.
+     */
+    stores: MissionStoreRegistry
+    /** The plugin's layout overrides, so the ledger lives where missions do. */
+    layout: LayoutOptions
     /** A logger, for refusals and un-writable bindings. */
     logger?: { warn: (message: string, error?: unknown) => void }
 }
@@ -107,30 +115,9 @@ export interface RolePlannerDeps {
  * @returns the service another plugin can consume.
  */
 export function createRolePlanner(deps: RolePlannerDeps): RoleGuardService {
-    /** The registry for one request: an explicit workspace wins over the agent's. */
-    const registryFor = (request: { cwd?: string; agent?: AgentLike }): ReturnType<RolePlannerDeps['rolesFor']> => {
-        if (request.cwd === undefined || request.cwd === '') return deps.rolesFor(deps.layoutFor(request.agent))
-        // A named workspace that does not exist is a caller bug, and silently
-        // using the builtin layer would drop that workspace's role overrides —
-        // the layer a host most often uses to DEMOTE a role. Refuse instead.
-        let stat: fs.Stats | undefined
-        try {
-            stat = fs.statSync(request.cwd)
-        } catch {
-            stat = undefined
-        }
-        if (stat === undefined || !stat.isDirectory()) {
-            throw new Error(
-                `工作区 "${request.cwd}" 不存在或不是目录：按 fail closed 拒绝解析角色。` +
-                    '（静默退回内置角色层会丢掉该工作区的角色覆盖，而降权覆盖正是它最常见的用途。）',
-            )
-        }
-        return deps.rolesFor(deps.layoutForCwd(request.cwd))
-    }
-
     return {
         plan(request) {
-            const registry = registryFor(request)
+            const registry = registryFor(deps, request)
             // The same two gates as `team_delegate`, in the same order: a broken
             // definition must never fall back to a wider builtin role.
             if (registry.brokenIds().includes(request.role)) {
@@ -172,12 +159,12 @@ export function createRolePlanner(deps: RolePlannerDeps): RoleGuardService {
             }
         },
         list(cwd) {
-            return registryFor(cwd === undefined ? {} : { cwd })
+            return registryFor(deps, cwd === undefined ? {} : { cwd })
                 .list()
                 .map((entry) => entry.id)
         },
         bind(request) {
-            const registry = registryFor(request)
+            const registry = registryFor(deps, request)
             const role = registry.get(request.role)
             if (role === undefined) {
                 deps.logger?.warn(`service.bind 找不到角色 ${request.role}：未写绑定，该子会话没有技能白名单`)
@@ -194,8 +181,78 @@ export function createRolePlanner(deps: RolePlannerDeps): RoleGuardService {
                 deps.logger?.warn(
                     `service.bind 写入失败（session ${request.sessionId}，角色 ${role.id}）：该子会话没有技能白名单`,
                 )
+                return undefined
             }
+            // A successful bind IS a delegation: leave the same ledger row the
+            // team_delegate path writes, so an auto-dispatched child satisfies
+            // the stage-role write guard and `advance` (AC-001/AC-003).
+            recordBindDelegation(deps, request, role.id)
             return binding
         },
+    }
+}
+
+/**
+ * The registry for one request: an explicit workspace wins over the agent's.
+ *
+ * Lives outside {@link createRolePlanner} so the factory's measured size stays
+ * inside the structural ratchet; it closes over nothing but its arguments.
+ * @param deps - registry resolver.
+ * @param request - the caller's workspace/agent.
+ * @throws when a named workspace does not exist (fail closed).
+ */
+function registryFor(deps: RolePlannerDeps, request: { cwd?: string; agent?: AgentLike }): ReturnType<RolePlannerDeps['rolesFor']> {
+    if (request.cwd === undefined || request.cwd === '') return deps.rolesFor(deps.layoutFor(request.agent))
+    // A named workspace that does not exist is a caller bug, and silently
+    // using the builtin layer would drop that workspace's role overrides —
+    // the layer a host most often uses to DEMOTE a role. Refuse instead.
+    let stat: fs.Stats | undefined
+    try {
+        stat = fs.statSync(request.cwd)
+    } catch {
+        stat = undefined
+    }
+    if (stat === undefined || !stat.isDirectory()) {
+        throw new Error(
+            `工作区 "${request.cwd}" 不存在或不是目录：按 fail closed 拒绝解析角色。` +
+                '（静默退回内置角色层会丢掉该工作区的角色覆盖，而降权覆盖正是它最常见的用途。）',
+        )
+    }
+    return deps.rolesFor(deps.layoutForCwd(request.cwd))
+}
+
+/**
+ * Record the delegation a successful `bind` implies.
+ *
+ * An autonomous dispatcher (the orchestrator's `autoDispatch`) turns a stage's
+ * role into a child through this seam instead of `team_delegate`; without this
+ * row the stage-role write guard and `advance` would keep refusing a child that
+ * WAS delegated. Mission and stage come from the delegating agent's bound
+ * mission (`resolveForAgent`), exactly like the tool path — the ledger keeps one
+ * writer and the rows carry the same shape.
+ *
+ * Failure policy matches `team_delegate`: an unwritable ledger is a warning,
+ * never a failed dispatch (the host already authorised the child). No bound
+ * mission → no row and no warning; there is nothing to compare against.
+ * @param deps - store registry, layout and logger.
+ * @param request - the bind request (role, child session, workspace and agent).
+ * @param role - resolved role id.
+ */
+function recordBindDelegation(
+    deps: RolePlannerDeps,
+    request: { role: string; sessionId: string; cwd?: string; agent?: AgentLike },
+    role: string,
+): void {
+    try {
+        // The returned warning is already logged by the shared writer; `bind`
+        // must not turn it into a refusal, so only an UNEXPECTED throw is logged
+        // here (and even that leaves the written role binding usable).
+        recordStageDelegation({ stores: deps.stores, layout: deps.layout, logger: deps.logger }, request.agent, role, request.sessionId, request.cwd)
+    } catch (error) {
+        try {
+            deps.logger?.warn(`service.bind 写入委派记录失败（session ${request.sessionId}，角色 ${role}）：本次派发照常执行。`, error)
+        } catch {
+            // A logger must never turn a bookkeeping failure into a dispatch failure.
+        }
     }
 }

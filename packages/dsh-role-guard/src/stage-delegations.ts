@@ -17,7 +17,7 @@
  */
 
 import { sessionCwd, type AgentLike, type LayoutOptions, type MissionRecord, type MissionStoreRegistry } from 'dsh-eng-core'
-import { appendDelegation } from 'dsh-eng-core/delegations'
+import { appendDelegationOnce } from 'dsh-eng-core/delegations'
 
 /** The slice of {@link import('./tools.js').ToolDeps} this module needs. */
 export interface StageDelegationDeps {
@@ -36,10 +36,17 @@ export interface StageDelegationDeps {
  * `resolveForAgent` rule the gates use (a child delegating further inherits its
  * parent's mission), and the stage is the mission's current stage — the exact
  * pair the write guard and `advance` will compare against.
+ *
+ * This is the ledger's single writer for both delegation paths: `team_delegate`
+ * (model-facing) and the role-guard service's `bind` (an autonomous dispatcher).
+ * The append is de-duplicated on `missionId + stage + role + childSessionId`, so
+ * a retry of either path cannot add a second identical row.
  * @param deps - store registry, layout and logger.
  * @param agent - the delegating agent (its session owns the mission binding).
  * @param role - role id the child was started as.
  * @param childSessionId - the child's session id (`team_delegate`'s `run.id`).
+ * @param cwd - explicit workspace (an autonomous dispatcher knows it); omitted
+ *   or empty means the delegating agent's session workspace.
  * @returns a warning text when the row could not be written, `undefined` otherwise.
  */
 export function recordStageDelegation(
@@ -47,21 +54,22 @@ export function recordStageDelegation(
     agent: AgentLike | undefined,
     role: string,
     childSessionId: string,
+    cwd?: string,
 ): string | undefined {
-    const cwd = sessionCwd(agent)
+    const workspace = cwd === undefined || cwd === '' ? sessionCwd(agent) : cwd
     let mission: MissionRecord | undefined
     try {
-        mission = deps.stores.for(cwd).resolveForAgent(agent)
+        mission = deps.stores.for(workspace).resolveForAgent(agent)
     } catch (error) {
-        return warn(deps, cwd, error)
+        return warn(deps, workspace, error)
     }
     // No bound mission → nothing the ledger could be compared against. The
     // delegation still runs; there is nothing to warn about (the role binding
     // and the tool list do not depend on a mission).
     if (mission === undefined) return undefined
     try {
-        appendDelegation(
-            cwd,
+        appendDelegationOnce(
+            workspace,
             {
                 missionId: mission.id,
                 role,
@@ -72,7 +80,7 @@ export function recordStageDelegation(
         )
         return undefined
     } catch (error) {
-        return warn(deps, cwd, error)
+        return warn(deps, workspace, error)
     }
 }
 
