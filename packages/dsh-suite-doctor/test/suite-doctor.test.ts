@@ -21,7 +21,7 @@ import test, { after } from 'node:test'
 import { MissionStoreRegistry, clearProjectConfigCache, resolveLayout } from 'dsh-eng-core'
 import { createFakeHost, runText, tempWorkspace, type FakeHost } from 'dsh-eng-core/testing'
 import { apply, effectiveProbeTimeoutMs, inject, name, resolveConfig, resolveEffectiveConfig } from '../dist/index.js'
-import { registerTools } from '../dist/tools.js'
+import { declaredCwdOf, registerTools } from '../dist/tools.js'
 
 const hosts: FakeHost[] = []
 
@@ -414,6 +414,20 @@ test('a session without a workspace is refused instead of reporting on process.c
     const run = await fake.runTool('suite_status', {})
     assert.equal(run.isError, true)
     assert.match(runText(run), /无法确定工作区/)
+})
+
+test('the missing-workspace refusal is thrown as a CONTEXT failure, not an argument error (rc.2)', () => {
+    // 0.2.2-rc.2 的宿主按 `ToolContextUnavailableError` 把"调用缺少上下文"归为模型无法修正的
+    // 失败；rc.1 没有这个类，所以回落必须同名同 code（dsh-eng-core/context-error 负责翻译）。
+    assert.throws(
+        () => declaredCwdOf({ id: 'agent-1', session: { id: 'session-1', header: { id: 'session-1', cwd: '' } } }),
+        (error: Error & { code?: string }) => {
+            assert.equal(error.name, 'ToolContextUnavailableError')
+            assert.equal(error.code, 'TOOL_CONTEXT_UNAVAILABLE')
+            assert.match(error.message, /无法确定工作区/)
+            return true
+        },
+    )
 })
 
 test('an unknown missionId is refused (fail closed), not silently ignored', async () => {

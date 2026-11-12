@@ -371,7 +371,17 @@ test('an activation start carries agentPreset and maxDepth, and never persona/to
         maxDepth: 1,
         legacy: { persona: 'ignored here', filter: { allow: ['read'] } },
     })
-    const spec = host.specs[0] as { request: Record<string, unknown>; signal: AbortSignal; delivery: string; provider: string; label: string }
+    const spec = host.specs[0] as {
+        request: Record<string, unknown>
+        signal: AbortSignal
+        delivery: string
+        provider: string
+        label: string
+        agentPreset?: string
+        prompt?: { type: string; text?: string }[]
+        parent?: { id?: string }
+        maxDepth?: number
+    }
     assert.equal(spec.provider, 'spawn')
     assert.equal(spec.label, 'label')
     assert.equal(spec.delivery, 'caller', 'the product returns to the caller, not as a second parent turn')
@@ -380,10 +390,53 @@ test('an activation start carries agentPreset and maxDepth, and never persona/to
     assert.equal(spec.request['persona'], undefined)
     assert.equal(spec.request['toolFilter'], undefined)
     assert.equal(spec.request['signal'], undefined, 'the signal rides on the activation spec')
+    // 0.2.2-rc.2 flattens the spec (`extends Omit<SubagentStartRequest, 'label'|'signal'>`),
+    // so the SAME fields must also be at the top level: one object, both builds.
+    assert.equal(spec.agentPreset, 'test:one', 'rc.2 读顶层 agentPreset')
+    assert.equal(spec.maxDepth, 1, 'rc.2 读顶层 maxDepth')
+    assert.equal(spec.parent?.id, 'agent-1', 'rc.2 读顶层 parent（rc.1 只读 spec.request）')
+    assert.equal(spec.prompt?.[0]?.text, 'do the thing', 'rc.2 读顶层 prompt')
     assert.equal(run.id, 'activation-1')
     assert.equal((await run.result).stopReason, 'completed')
     await run.dispose()
     assert.equal(host.disposed(), 1)
+})
+
+test('0.2.2-rc.2 host: a FLAT activation spec still starts (that host never reads `request`)', async () => {
+    // rc.2's `startActivation` reads `spec.parent` / `spec.prompt` /
+    // `spec.agentPreset` / `spec.maxDepth` DIRECTLY (`assertSubagentMaxDepth(spec.maxDepth)`,
+    // `spec.parent.id`, …), so the rc.1-only shape (`{ provider, label, request,
+    // signal, delivery }`) throws there on `spec.parent.id`. This fake refuses the
+    // same way, which is the only way to prove the dual shape without installing
+    // rc.2 (upgrading the user's harness is out of scope).
+    const started: { preset?: string; depth?: number; parent?: string }[] = []
+    const services: DelegationServices = {
+        startActivation: async (spec) => {
+            assert.equal(typeof spec.parent?.id, 'string', 'rc.2 直接读 spec.parent')
+            assert.equal(Array.isArray(spec.prompt), true, 'rc.2 直接读 spec.prompt')
+            assert.equal(spec.agentPreset, 'test:one', 'rc.2 直接读 spec.agentPreset（顶层）')
+            started.push({
+                ...(spec.agentPreset === undefined ? {} : { preset: spec.agentPreset }),
+                ...(spec.maxDepth === undefined ? {} : { depth: spec.maxDepth }),
+                ...(spec.parent === undefined ? {} : { parent: spec.parent.id }),
+            })
+            return { childId: 'child-rc2', result: Promise.resolve(result()), dispose: async () => undefined }
+        },
+        list: () => ['spawn'],
+        getProvider: (name) => ({ name, capabilities: { agentPreset: true } }),
+    }
+    const run = await startDelegation(services, {
+        owner: OWNER,
+        provider: 'spawn',
+        plan: { kind: 'activation', presetId: 'test:one' },
+        label: 'rc2',
+        prompt: 'hi',
+        parent: { id: 'agent-9' },
+        signal: new AbortController().signal,
+        maxDepth: 1,
+    })
+    assert.equal(run.id, 'child-rc2')
+    assert.deepEqual(started, [{ preset: 'test:one', depth: 1, parent: 'agent-9' }])
 })
 
 test('a legacy start carries persona/toolFilter in the request and still normalises', async () => {

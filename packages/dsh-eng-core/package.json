@@ -22,6 +22,10 @@
       "types": "./dist/delegations.d.ts",
       "default": "./dist/delegations.js"
     },
+    "./context-error": {
+      "types": "./dist/context-error.d.ts",
+      "default": "./dist/context-error.js"
+    },
     "./package.json": "./package.json"
   },
   "files": [

@@ -4,9 +4,12 @@
  * This package is a library, not a Cordis plugin: it exports the mission store
  * (the durable contract between the gates), the deterministic command runner,
  * the git fingerprinter, file/JSONL helpers, the specification markdown
- * format, and the structured logger. It imports nothing from
+ * format, and the structured logger. This entry point imports nothing from
  * `@deepseek-ai/*` at runtime, so every plugin that depends on it stays
- * loadable against any harness build with a compatible public API.
+ * loadable against any harness build with a compatible public API. The one
+ * exception is the optional `dsh-eng-core/context-error` subpath: it PROBES the
+ * harness package for `ToolContextUnavailableError` and degrades to a same-named
+ * fallback, so it adds no load-time requirement either.
  *
  * @module dsh-eng-core
  */

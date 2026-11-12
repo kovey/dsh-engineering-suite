@@ -32,6 +32,7 @@ import {
     type Logger,
     type MissionStoreRegistry,
 } from 'dsh-eng-core'
+import { toolContextUnavailableError } from 'dsh-eng-core/context-error'
 import { effectiveProbeTimeoutMs, type SuiteDoctorConfig } from './config.js'
 import { renderOperatorView } from './operator.js'
 import { probeRuntime, type AttentionProbe, type ProbeContext } from './probe.js'
@@ -95,7 +96,7 @@ function assertNotCancelled(signal: AbortSignal | undefined): void {
 export function declaredCwdOf(agent: AgentLike | undefined): string {
     const cwd = sessionCwd(agent, '')
     if (cwd === '') {
-        throw new Error(
+        throw toolContextUnavailableError(
             '无法确定工作区：调用方 agent 没有会话目录（session.header.cwd）。套件工具必须在知道工作区的前提下运行，' +
                 '否则会把某个不相关的仓库当成被测对象（或把配置写到错误的仓库）。',
         )

@@ -40,7 +40,7 @@ import {
     type ReleaseMission,
     type ReleaseNotes,
 } from './releases.js'
-import { declaredCwd, NO_WORKSPACE_ERROR } from './workspace.js'
+import { declaredCwd, noWorkspaceError } from './workspace.js'
 import {
     renderAlreadyDelivered,
     renderBlocked,
@@ -129,7 +129,7 @@ function agentOf(exec: unknown): AgentLike | undefined {
 function storeFor(deps: ToolDeps, exec: unknown): { store: MissionStore; agent: AgentLike | undefined; cwd: string } {
     const agent = agentOf(exec)
     const cwd = declaredCwd(agent)
-    if (cwd === undefined) throw new Error(NO_WORKSPACE_ERROR)
+    if (cwd === undefined) throw noWorkspaceError()
     return { store: deps.stores.for(cwd), agent, cwd }
 }
 

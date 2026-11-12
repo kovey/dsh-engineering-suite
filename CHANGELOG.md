@@ -1,5 +1,50 @@
 ## [未发布]
 
+### 兼容 · 适配 dsh 0.2.2-rc.2：子会话审批、新的"缺上下文"错误、扁平化的 activation spec
+
+把 `@deepseek-ai/dsh-{tools,user-questions,user-approval,subagent,agent,commands}@0.2.2-rc.2` 拉进仓库内
+临时目录解包，与本机安装的 `0.2.2-rc.1` 逐 `.d.ts`/构建产物 diff（临时目录比对完即删除）。结论是**两处真实
+不兼容 + 一处新能力**，其余"确实没变"的项在 `docs/ARCHITECTURE.md` §5.35 逐项列出并给了依据。
+
+- **被委派的子会话不再发注定被拒的 `user-questions`**（`dsh-spec-gate`，新模块
+  `review-questions.ts`）：rc.2 把"谁可以问人"的判定从运行时所有权（`agents.roots()`）改成持久化的
+  `session.header.origin === 'subagent'`，子会话调用一律 `DELEGATED_CALLER`。`spec_approve` 的富审阅卡
+  因此在发问前先用**我们自己的委派台账**（`state/delegations.jsonl`）判断"当前会话是不是这个 mission 派出的
+  子会话"（台账之外还看 `origin`：role-guard 写台账失败只告警，行缺失不等于没委派）：命中就跳过 questions，
+  改走 nvim-tui 卡片 → 宿主 `approval/request`（两者都没有子会话限制）；一个面都没有时落回内核的
+  `no-answerer`，错误里点名"被委派子会话 + DELEGATED_CALLER"。`reviewChannel=questions` 不静默降级，而是
+  明确拒绝并给出改法。打回理由的追问（`askWhatToChange`）走同一条规则。用户可见文案与日志行
+  （`questions 通道跳过：委派台账里 mission X 的子会话 Y …`）都写进了测试。
+- **采用 `ToolContextUnavailableError`**（`dsh-eng-core`，新子路径 `dsh-eng-core/context-error`）：
+  rc.2 用这个类（`extends HarnessError`，`code = 'TOOL_CONTEXT_UNAVAILABLE'`）表示"工具调用缺少上下文"，
+  宿主按 `code`/`name` 归类为模型无法修正的失败。`toolContextUnavailableError(message)` 优先用动态
+  `import('@deepseek-ai/dsh-tools')` 取到的宿主类（模块加载时启动一次、不阻塞、失败不抛），取不到
+  （rc.1 没有该导出，或独立安装下 peer 不可解析）就回落成**同名同 code** 的 `Error`——rc.1 行为不变，
+  rc.2 能正确归类。已改用的三处拒绝点：`dsh-spec-gate`/`dsh-suite-doctor` 的 `declaredCwdOf`
+  （缺 `session.header.cwd`）与 `dsh-evidence-gate` 的 `noWorkspaceError()`；消息逐字保留。
+- **一个 activation spec 同时适配两种形状**（`dsh-eng-core/delegation.ts`）：rc.1 的
+  `startActivation` 只读 `spec.request.parent/prompt/agentPreset`，rc.2 的 spec 改为
+  `extends Omit<SubagentStartRequest,'label'|'signal'>`（**平铺**）只读顶层字段——只发嵌套形状时 rc.2 会在
+  `spec.parent.id` 上抛 TypeError，所有派发（角色、阶段自动派发、impact 复核、spec_bootstrap 草稿）都会挂。
+  现在同一个对象既带 `request: {…}` 也带顶层 `…request` + `agentPreset`，两版各读自己认识的键。
+  这一条容易漏掉：类型 diff 看着只是内部重排（`ActivationObserver` 移除、`pool` 移动），但入参
+  `SubagentActivationSpec` 本身也从嵌套改成了平铺。
+- **文档**：`docs/ARCHITECTURE.md` §5.35 逐项列出 rc.1 → rc.2 的新增/变更/未变（含包内原文与"0 命中"的
+  依据）、A/B/C 的适配理由，以及诚实的边界——不升级用户宿主，所以 rc.2 路径由包内原文 + 在 rc.1 上模拟
+  rc.2 读取规则的测试支撑，真机验证留到升级 rc.2 的第一步。
+
+**验证**（按团队约定本轮不跑全量 verify）：`node --test packages/dsh-eng-core/test/*.test.ts` → 254 条
+（253 pass / 1 skip；新增 TC-1631…TC-1635，另加一个"rc.2 扁平 spec"用例）；`node --test
+packages/dsh-spec-gate/test/*.test.ts` → 195 条全绿（新增 TC-1641…TC-1646）；
+`node --test packages/dsh-suite-doctor/test/*.test.ts` → 122 条全绿；`node --test
+packages/dsh-evidence-gate/test/*.test.ts` → 61 条全绿；派发接缝的另外四个使用方
+（`dsh-role-guard` 58 / `dsh-orchestrator` 107 / `dsh-impact-gate` 64 / `dsh-standards-gate` 43）
+全绿；四个改动包 `tsc -p tsconfig.json --noEmit` 退出 0；`bash scripts/standards-check.sh --quiet`
+→ PASS（无新增、无恶化；临时解包目录 `docs/rc2-probe/` 已删除，它曾贡献 17 项新增违规）。
+`bash scripts/verify.sh --quiet --changed`（迭代模式，**不作为交付依据**）也全绿：build / type-check /
+tests / 跨包集成 / 工具自检五段都 ok。`TC-1625`（完整 `verify.sh --quiet` 两次 + git status 无残留）
+留给交付门禁的完整命令。
+
 ### 体验 · `/suite` 报告以 nvim-tui 浮窗呈现，文本端保持可用（`dsh-suite-doctor`）
 
 在 TUI 里 `/suite doctor`、`/suite show` 的报告被压成一条长行：宿主用 nvim-tui 的 `app.notice()` 渲染命令结果，

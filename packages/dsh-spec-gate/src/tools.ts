@@ -5,7 +5,7 @@
 
 import path from 'node:path'
 import { tuiReview, type NvimTuiLike, type ReviewArtifacts } from './review.js'
-import { APPROVE_LABEL, reviewCardOf } from './review-card.js'
+import { approvalArtifacts, delegatedCallerOf, reviewThroughQuestions, type QuestionsLike } from './review-questions.js'
 import { assertMandateReusable, assertTestDesignApproved, renderApprovalPrompt } from './spec-approval.js'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import {
@@ -55,6 +55,7 @@ import {
     type SpecChange,
     type SpecRecord,
 } from 'dsh-eng-core'
+import { toolContextUnavailableError } from 'dsh-eng-core/context-error'
 import { buildIndex, checkDraft, parseDraftAnswer, renderBrief, renderDraft } from './bootstrap.js'
 import {
     BOOTSTRAP_OWNER,
@@ -199,32 +200,6 @@ export interface ToolDeps {
      * cannot keep. A host without `ctx.agentPresets` is refused, never downgraded.
      */
     presets: DelegationPresets
-}
-
-/** Structural view of `@deepseek-ai/dsh-user-questions`' service. */
-interface QuestionsLike {
-    ask: (request: {
-        agent: AgentLike
-        signal?: AbortSignal
-        /** Keys the client card to the real tool call (never a fabricated id). */
-        wait?: { callId: string; timed?: boolean }
-        questions: {
-            id: string
-            question: string
-            /** Rendered as markdown by the client UIs (desktop / web TUI). */
-            detail?: string
-            header?: string
-            multiSelect?: boolean
-            options?: { label: string; description?: string }[]
-            /**
-             * Presentation intent. `plan-review` is the official "a document is
-             * submitted for review" card: `detail` is the document itself (markdown,
-             * which the clients beautify) and `approve` names the approving option;
-             * every other option declines it.
-             */
-            intent?: { kind: 'plan-review'; detail: string; approve: string }
-        }[]
-    }) => Promise<{ answers: { id: string; selected: string[]; custom?: string }[] }>
 }
 
 interface CreateArgs {
@@ -376,7 +351,7 @@ function agentOf(exec: unknown): AgentLike | undefined {
 function declaredCwdOf(agent: AgentLike | undefined): string {
     const cwd = agent?.session?.header?.cwd
     if (typeof cwd !== 'string' || cwd === '') {
-        throw new Error(
+        throw toolContextUnavailableError(
             [
                 '无法确定本会话的工作区（session.header.cwd 缺失）：规格与 mission 会被写到错误的目录，因此本工具拒绝执行。',
                 '下一步：在带 cwd 的会话里工作（宿主应给会话设置 header.cwd）。',
@@ -1920,6 +1895,14 @@ async function askWhatToChange(
     context: { agent?: AgentLike; signal?: AbortSignal },
     mission: MissionRecord,
 ): Promise<string | undefined> {
+    // The same rc.2 restriction applies to this follow-up question: a delegated
+    // child's ask is refused (`DELEGATED_CALLER`), so do not send a doomed card —
+    // the review card's own note box is where a rejection note is written.
+    const delegated = delegatedCallerOf({ mission, store: deps.stores.for(mission.cwd), agent: context.agent })
+    if (delegated !== undefined) {
+        deps.logger.for(mission.cwd).info(`[review] 打回理由：调用方是被委派子会话（${delegated.sessionId}），跳过 user-questions`)
+        return undefined
+    }
     const questions = deps.questions()
     if (questions === undefined || context.agent === undefined) return undefined
     try {
@@ -2037,6 +2020,9 @@ async function answerThroughQuestions(input: {
         store: input.store,
         missionsDir: input.missionsDir,
         round: input.round,
+        // `questions` is a questions-ONLY configuration: skipping the route (a
+        // delegated caller rc.2 would refuse) must refuse, not fall through.
+        strict: config.reviewChannel === 'questions',
         log: (message: string) => deps.logger.for(mission.cwd).info(`[review] ${message}`),
     })
     if (decided === undefined) return undefined
@@ -2180,13 +2166,18 @@ async function requestApproval(
         deps.logger
             .for(mission.cwd)
             .warn(
-                '规格审批：没有 nvim-tui 卡片、也没有 userQuestions 通道，退回宿主审批接缝' +
+                '规格审批：没有可回答的 nvim-tui 卡片、也没有可回答的 userQuestions 通道' +
+                    '（缺服务，或调用方是被委派子会话而被跳过），退回宿主审批接缝' +
                     '（via=host-seam；reason 内含完整审阅材料，决定仍绑定规格摘要）',
             )
         const approval = deps.approval()
         if (approval === undefined) {
+            const delegated = delegatedCallerOf({ mission, store, agent: context.agent })
             throw new Error(
                 '规格审批未通过：宿主没有装配审批通道（ctx.approval），而 spec-gate 的 approval 模式是 "seam"。' +
+                    (delegated === undefined
+                        ? ''
+                        : `本次 user-questions 通道也因调用方是被委派子会话（${delegated.sessionId}）而被跳过（0.2.2-rc.2 会以 DELEGATED_CALLER 拒绝它），因此没有任何面可以问人。`) +
                     `approval="auto" 已移除（不会再有任何自动批准路径），请装配审批插件或在有审批通道的客户端里运行。（mission ${mission.id}）`,
             )
         }
@@ -2268,72 +2259,4 @@ async function requestApproval(
 function callIdOf(context: unknown): string | undefined {
     const value = (context as { callId?: unknown }).callId
     return typeof value === 'string' && value !== '' ? value : undefined
-}
-
-/**
- * Ask for approval through the host's structured-question seam.
- *
- * Why this seam and not the approval one: the approval waterfall carries a single
- * `reason` STRING, so a client can only show one blob. `user-questions` carries
- * structured questions with markdown `detail` and an `intent`, which is what the
- * desktop app and the web TUI render as a real review card. The decision still
- * lands in our own ledger and mandate — the answer is mapped to the host's
- * approval vocabulary, never treated as an authorisation by itself.
- * @param input - seam, caller identity, mission and the reviewer-facing text.
- * @returns the mapped decision, or `undefined` when the seam gave nothing usable.
- */
-async function reviewThroughQuestions(input: {
-    questions: QuestionsLike
-    agent: AgentLike
-    signal?: AbortSignal
-    callId?: string
-    mission: MissionRecord
-    store: MissionStore
-    missionsDir: string
-    round: number
-    log: (message: string) => void
-}): Promise<
-    | { decision: 'allowed-once'; by: 'approval'; messageId: string; source: 'questions'; allowed: true }
-    | { outcome: 'rejected'; note?: string }
-    | { outcome: 'cancelled' }
-    | undefined
-> {
-    const { mission, round } = input
-    const question = reviewCardOf({
-        mission,
-        store: input.store,
-        artifacts: approvalArtifacts(mission, input.missionsDir),
-        round,
-    })
-    try {
-        const answer = await input.questions.ask({
-            agent: input.agent,
-            ...(input.signal === undefined ? {} : { signal: input.signal }),
-            ...(input.callId === undefined ? {} : { wait: { callId: input.callId } }),
-            questions: [question],
-        })
-        const row = answer.answers[0]
-        if (row === undefined) return undefined
-        const selected = row.selected ?? []
-        if (selected.includes(APPROVE_LABEL)) {
-            input.log(`questions 通道：${mission.id} 第 ${round} 轮通过`)
-            return { decision: 'allowed-once', by: 'approval', messageId: '', source: 'questions', allowed: true }
-        }
-        const note = (row.custom ?? '').trim() || selected.join('、')
-        input.log(`questions 通道：${mission.id} 第 ${round} 轮被打回（${note || '未填理由'}）`)
-        return { outcome: 'rejected', ...(note === '' ? {} : { note }) }
-    } catch (error) {
-        const code = (error as { code?: unknown }).code
-        if (code === 'ASK_ABORTED') return { outcome: 'cancelled' }
-        input.log(`questions 通道不可用（${error instanceof Error ? error.message : String(error)}）：回落到审批接缝`)
-        return undefined
-    }
-}
-
-/** The artifacts a reviewer should be able to open before deciding. */
-function approvalArtifacts(mission: MissionRecord, missionsDir: string): string[] {
-    return [
-        ...(mission.specPath === undefined ? [] : [mission.specPath]),
-        path.relative(mission.cwd, path.join(missionsDir, mission.id, 'test-design-review.md')),
-    ]
 }

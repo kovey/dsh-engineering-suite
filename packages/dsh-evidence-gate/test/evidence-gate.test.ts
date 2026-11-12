@@ -30,6 +30,7 @@ import { apply, inject, name } from '../dist/index.js'
 import { releaseNotesDirOf, releasesFileOf, resolveConfig, resolveEffectiveConfig } from '../dist/config.js'
 import { captureEvidence } from '../dist/evidence.js'
 import type { ReleaseRow } from '../dist/releases.js'
+import { noWorkspaceError } from '../dist/workspace.js'
 
 const SESSION = 'session-1'
 const GATE_SOURCE = 'dsh-quality-gate'
@@ -2153,4 +2154,13 @@ test('release 工具在未声明工作区时拒绝执行，且不写任何文件
         assert.match(String(run.content), /无法确定本会话的工作区/)
     }
     assert.equal(fs.existsSync(path.join(ws, '.dsh')), false, '未声明工作区时不得写台账/发布说明')
+})
+
+test('the missing-workspace refusal is a CONTEXT failure, not an argument error (rc.2)', () => {
+    // 0.2.2-rc.2 的宿主按 `ToolContextUnavailableError` 归类"调用缺少上下文"；rc.1 没有
+    // 这个类，回落由 dsh-eng-core/context-error 提供同样的 name/code，调用方无需分版本。
+    const error = noWorkspaceError()
+    assert.equal(error.name, 'ToolContextUnavailableError')
+    assert.equal((error as { code?: unknown }).code, 'TOOL_CONTEXT_UNAVAILABLE')
+    assert.match(error.message, /无法确定本会话的工作区/)
 })

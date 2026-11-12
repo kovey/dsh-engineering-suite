@@ -1444,6 +1444,74 @@ orchestrator metrics 的只读用例整树快照），第三次在 v0.8.8 发版
 失败日志的决定不该由一个"取证"脚本替人做。退出码：全绿 0、任一次失败 1、参数错误 2
 （`--runs 0` 属于参数错误：0 次采样不是通过）。
 
+### 5.35 适配 dsh 0.2.2-rc.2：两个真实接缝、一处新能力、以及"确实没变"的清单
+
+2026-11-12 把 `@deepseek-ai/dsh-{tools,user-questions,user-approval,subagent,agent,commands}@0.2.2-rc.2`
+从 npm 拉进仓库内临时目录解包（`docs/rc2-probe/`，**比对完即删除**：临时解包物不进仓库），与本机安装的
+`0.2.2-rc.1` 逐文件 diff。**证据是包内 `.d.ts` / 构建产物的原文**，不是猜测；下表的顺序就是
+"新增 → 变更 → 未变"。
+
+| 接缝 | rc.1 | rc.2 | 结论 |
+|---|---|---|---|
+| `tools.guard` | `ToolGuard` 返回 `string`（拒绝理由）或 `undefined`；`checkGuards()` 同 | 返回值放宽为 `string`、`ToolGuardDenial { reason, info?: ToolErrorInfo }` 或 `undefined`；`checkGuards()` 同步放宽 | **新增（向后兼容）**：返回值被放宽。我们所有守卫返回 `string`，仍合法 → 无需改动 |
+| tool 失败结果的 `ToolErrorInfo` | 无 | error result 增加可选 `info?: ToolErrorInfo`（"structured error identity"） | **新增（可选）**：本套件不消费该字段（`grep ToolErrorInfo` = 0）→ 无影响 |
+| `approval/request`（`dsh-user-approval`） | — | `lib/**` 与 rc.1 的 diff **只有 `.map` 文件** | **经核对无影响**：公开接缝逐字未变，审批接缝仍可被子会话调用（A 的回落面依靠这一点） |
+| `user-questions/request` | `assertLiveRoot`：`if (!agents.roots().includes(agent)) throw … 'DELEGATED_CALLER'`（运行时"被别的 live agent 拥有"） | `if (agent.session.header.origin === 'subagent') throw … 'DELEGATED_CALLER'`（持久化的 origin） | **变更（语义）**：被委派子会话在 rc.2 上**确定**问不到人 → A 适配 |
+| `subagents`（`SubagentActivationSpec`） | `{ provider, label, request: Omit<SubagentStartRequest, …>, signal, delivery }`（**嵌套**，Omit 掉 `label`/`signal`） | `interface SubagentActivationSpec extends Omit<SubagentStartRequest, …>`（**平铺**，另有 `name?`/`childId?`） | **变更（形状）**：rc.1 只读 `spec.request`、rc.2 只读顶层字段 → C 适配（一个对象同时携带两种形状） |
+| `subagents` 其余类型 | `ActivationObserver`（`observer`）、`pool`、`ownedChildren`、`announced` | `ActivationObserver` 移除；`pool` 移到树根；新增 `SubagentRunId`、`runId/name/root/ancestors/path`，`announced → accepted` | **经核对无影响**：`grep ActivationObserver\|SubagentRunId\|ownedChildren\|namesOf` = 0 命中（`startActivation` 的签名本身未变） |
+| `dsh-agent` 运行时所有权 | `enter(agent, owner)`、`isOwnedBy(id, owner)` | `enter(agent)`；`isOwnedBy` 移除；其余 diff 是注释 | **经核对无影响**：`grep isOwnedBy\|enter(` = 0 命中。这正是 user-questions 改用 `origin` 的原因（运行时所有权被删了） |
+| `commands` | — | 只有 `typert.*`/`.map` 差异 | **经核对无影响**：命令注册的公开面未变 |
+| `session.append`（数组形式"双载"） | 数组逐条提交/发布 | 数组**全部提交后**按序发布 | **经核对无影响**：本套件不写 session 事件（`session.append` = 0 命中） |
+| `interrupt_agent` 默认关闭、`BundleInfo.update` | — | 二者都是 0.2.2 的既有项，rc.2 调了默认值/形状 | **经核对无影响**：`grep interrupt_agent\|BundleInfo` = 0 命中 |
+
+**A. 被委派子会话的 `spec_approve`：跳过注定被拒的 user-questions**（`packages/dsh-spec-gate/src/review-questions.ts`）。
+rc.1 的拒绝依据是运行时所有权（`agents.roots()`），rc.2 换成持久化的 `session.header.origin === 'subagent'`：
+对"被 `team_delegate` 派出去的子会话"两版都会拒（`DELEGATED_CALLER`），但 rc.2 是**确定**拒绝，且拒绝
+发生在 `ask()` 里——面板从未渲染，日志只剩一句"通道不可用"，读起来像宿主坏了。所以发问前先用**我们自己的
+委派台账**（`<layout>/state/delegations.jsonl`，`dsh-role-guard` 在 `team_delegate`/autodispatch 成功后写）
+判断"当前会话是不是这个 mission 派出的子会话"：命中就**不发卡**，改走 nvim-tui 卡片 → 宿主 `approval/request`
+（这两个面都没有子会话限制）；若一个面都没有，落回门禁内核的 `no-answerer`，并在错误里点名"被委派子会话
++ rc.2 的 `DELEGATED_CALLER`"。`reviewChannel=questions` 是"只走这条路"的配置，跳过时不静默降级，而是
+明确拒绝（`no-answerer` 措辞 + 改法）。台账之外还看 `origin`：role-guard 写台账失败只告警不阻断派发，
+那时"行缺失"不代表"没委派"。用户可见文案（节选）：
+
+> 规格审批未进行（no-answerer）：…… 是被委派的子会话：0.2.2-rc.2 的 user-questions 对这类调用直接抛
+> DELEGATED_CALLER（子会话没有人类应答者），问出去只会是一张没人看得到的卡片。reviewChannel=questions
+> 要求走这条通道，本套件不会静默降级。下一步（任选其一）：把 spec-gate 的 reviewChannel 改回 auto……
+
+打回理由的追问（`askWhatToChange`）走同一条规则：同一张注定被拒的卡不发。日志行
+`questions 通道跳过：委派台账里 mission X 的子会话 Y（developer@implement）……` 是该路径的可复核证据。
+
+**B. 采用新能力：`ToolContextUnavailableError`**（`packages/dsh-eng-core/src/context-error.ts`，子路径
+`dsh-eng-core/context-error`）。rc.2 用 `ToolContextUnavailableError`（`extends HarnessError`，
+`code = 'TOOL_CONTEXT_UNAVAILABLE'`）表示"工具调用缺少上下文"——**不是模型能靠改参数修正的错误**；分类走
+`code`/`name`，不解析消息。选择理由：本套件恰好有一批"缺少工作区/调用方/服务"的拒绝点，它们此前一律抛
+普通 `Error`，宿主只能当成参数错误；改用这个类之后，rc.2 能正确归类，而 rc.1 行为不变。回落策略：
+`probeToolContextUnavailableErrorHost()` 用动态 `import('@deepseek-ai/dsh-tools')` 取宿主导出的类（模块
+被 import 时启动一次、不阻塞、失败不抛）；取不到（rc.1 没有该导出，或独立安装下 peer 不可解析）就构造
+同名同 `code` 的 `Error`。**不静态 import 的理由**：eng-core 的入口对 `@deepseek-ai/*` 零运行时依赖，这是
+"换一个兼容 harness 构建也能加载"的前提；动态 import 让它保持"可选增强"。已改用的三处：
+`dsh-spec-gate`/`dsh-suite-doctor` 的 `declaredCwdOf`（缺 `session.header.cwd`）、`dsh-evidence-gate` 的
+`noWorkspaceError()`；消息逐字保留，另有测试断言 `name === 'ToolContextUnavailableError'` 与
+`code === 'TOOL_CONTEXT_UNAVAILABLE'`（`dsh-suite-doctor`/`dsh-evidence-gate` 直接调用导出的拒绝构造器，
+`dsh-spec-gate` 通过端到端用例断言消息）。
+
+**C. 同一处形状变更的第二个受害者：`startActivation` 的 spec**（`packages/dsh-eng-core/src/delegation.ts`）。
+这一条**容易漏掉**：`subagents` 的类型 diff 看着只是内部重排（`ActivationObserver` 移除、`pool` 移到树根），
+但 `SubagentActivationSpec` 本身也变了——rc.1 的 `startActivation` 只读
+`spec.request.parent/prompt/agentPreset`（`assertSubagentMaxDepth(spec.request.maxDepth)`），rc.2 的同一行
+代码读的是 `spec.parent.id` / `spec.prompt` / `spec.agentPreset` / `spec.maxDepth`。只发嵌套形状时 rc.2 会
+在 `spec.parent.id` 上抛 TypeError，**所有**派发（role-guard 的角色、orchestrator 的阶段自动派发、
+impact 的复核子会话、spec_bootstrap 的草稿子代理）都会挂。修法是一个对象同时携带两种形状：
+`request: { …request, agentPreset }` + 顶层 `…request, agentPreset`——两版各读自己认识的键、忽略另一个，
+不需要运行时版本探测。测试里有一个"只读顶层字段、读不到就断言失败"的 rc.2 假宿主钉住这条。
+
+**诚实边界**：按规格的负面约束，不升级/不改动本机安装的宿主，因此**没有在真 rc.2 上跑过全量 verify**。
+rc.2 的三条路径由两类证据支撑：① 上面表格里的包内原文；② 在 rc.1 上模拟 rc.2 读取规则的测试（扁平 spec 的
+假宿主、`origin=subagent` 的子会话、`hostClass` 注入的 loader seam）。真机验证应作为升级 rc.2 的第一步，
+届时重点看：`team_delegate` 的派发行、被委派子会话调用 `spec_approve` 的日志/结果、以及三处拒绝点在宿主
+结果面板里的分类。
+
 ## 6. 为什么这样切分
 
 - **一个关注点一个插件**：门禁可以单独失效（例如先只上 quality-gate），不影响其它环节。

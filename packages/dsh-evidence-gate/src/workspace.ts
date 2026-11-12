@@ -10,6 +10,7 @@
  * @module dsh-evidence-gate/workspace
  */
 
+import { toolContextUnavailableError } from 'dsh-eng-core/context-error'
 import type { AgentLike } from 'dsh-eng-core'
 
 /**
@@ -34,3 +35,15 @@ export function declaredCwd(agent: AgentLike | undefined): string | undefined {
  */
 export const NO_WORKSPACE_ERROR =
     '无法确定本会话的工作区（session.header.cwd 缺失），为避免把证据/回执写到错误的项目，本工具拒绝执行。下一步：在带 cwd 的会话里工作，显式传 missionId 也需要工作区才能定位台账，因此不能绕过这一步。'
+
+/**
+ * The refusal above, as the error the tool bodies throw.
+ *
+ * A missing workspace is missing CONTEXT (the session never declared one), not
+ * an argument the model can fix by retrying — so it is thrown as the harness's
+ * `ToolContextUnavailableError` where the version provides it (0.2.2-rc.2+),
+ * and as a same-named `Error` on older hosts (`dsh-eng-core/context-error`).
+ */
+export function noWorkspaceError(): Error {
+    return toolContextUnavailableError(NO_WORKSPACE_ERROR)
+}

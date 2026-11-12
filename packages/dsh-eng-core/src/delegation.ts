@@ -5,10 +5,10 @@
  * Why a shared module and not one implementation per plugin: harness 0.2.2-rc.1
  * deleted `subagents.start(provider, request)`, and `SubagentStartRequest`
  * carries neither `persona` nor `toolFilter`. A child is now created by
- * `startActivation(spec)` with `spec.request = Omit<SubagentStartRequest,
- * 'label' | 'signal'>`, and **`request.agentPreset` must be set** or the preset
- * never mounts — the child then runs with the parent's whole tool surface and
- * the deployment only *believes* it enforced a restriction. The identity and
+ * `startActivation(spec)` (request nested under `spec.request` on rc.1, flat on
+ * rc.2 — one spec carries both), and **the preset must be set** or it never
+ * mounts: the child then runs with the parent's whole tool surface and the
+ * deployment only *believes* it enforced a restriction. The identity and
  * the whitelist travel as an Agent Preset (`ctx.agentPresets.register(def)`,
  * async) whose rows mount in the CHILD scope; the shared row plugin is
  * `dsh-eng-core/scope`, which calls `ctx.tools.restrict(...)` + installs the
@@ -94,12 +94,13 @@ export interface DelegationRequest {
     maxDepth?: number
 }
 
-/** `SubagentActivationSpec` (harness 0.2.2-rc.1+). */
-export interface DelegationActivationSpec {
+/** `SubagentActivationSpec`: rc.1 nests the request under `request`, rc.2 flattens it (both keys below carry it). */
+export interface DelegationActivationSpec extends Partial<DelegationRequest> {
     provider: string
     label: string
-    /** The modern request plus the preset that must be mounted into the child. */
+    /** rc.1 shape: the start request plus the preset that must be mounted into the child. */
     request: DelegationRequest & { agentPreset?: string }
+    agentPreset?: string
     signal: AbortSignal
     /** `caller`: the product returns to the tool call, not as a second parent turn. */
     delivery: 'parent' | 'caller'
@@ -710,9 +711,9 @@ const noopDispose = async (): Promise<void> => undefined
  * @returns the normalised child run.
  */
 export async function startDelegation(subagents: DelegationServices, input: StartDelegationInput): Promise<DelegationRun> {
-    // `signal` is deliberately NOT part of the modern request: 0.2.2-rc.1 carries it
-    // on the activation SPEC, and sending it inside `request` too would be a
-    // claim about an API that does not have that field.
+    // `signal` is deliberately NOT part of the modern request: the activation SPEC
+    // carries it, and a `signal` field inside `request` would claim an API that
+    // does not have one.
     const request: DelegationRequest = {
         prompt: [{ type: 'text', text: input.prompt }],
         parent: input.parent,
@@ -722,18 +723,17 @@ export async function startDelegation(subagents: DelegationServices, input: Star
     if (input.plan.kind === 'activation') {
         if (typeof subagents.startActivation !== 'function') throw new Error('startActivation disappeared between the plan and the call')
         try {
-            // BOUND call, never `const f = service.startActivation; f(...)`:
-            // the host service is a class instance whose methods use `this`
-            // (`expectProvider`, the provider registry). A detached call throws
-            // "Cannot read properties of undefined (reading 'expectProvider')"
-            // — which is exactly how this shipped broken the first time, because
-            // every fake in the tests was a plain function that needed no `this`.
+            // BOUND call, never `const f = service.startActivation; f(...)`: the host
+            // service is a class instance whose methods use `this` (`expectProvider`),
+            // and a detached call throws — how this shipped broken once.
             const activation = await subagents.startActivation({
                 provider: input.provider,
                 label: input.label,
-                // THE load-bearing field: without it the host mounts no preset and
-                // the child runs with the parent's whole tool surface.
+                // THE load-bearing field (the host mounts no preset without it).
+                // rc.1 reads the request HERE; rc.2 reads these same fields at the TOP level.
                 request: { ...request, agentPreset: input.plan.presetId },
+                ...request,
+                agentPreset: input.plan.presetId,
                 signal: input.signal,
                 delivery: 'caller',
             })

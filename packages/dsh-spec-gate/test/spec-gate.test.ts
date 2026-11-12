@@ -7,6 +7,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import test from 'node:test'
 import { MissionStoreRegistry, resolveLayout, specReviewDigest } from 'dsh-eng-core'
+import { appendDelegation } from 'dsh-eng-core/delegations'
 import { createFakeHost, fakeAgent, runText, tempWorkspace, type FakeHost } from 'dsh-eng-core/testing'
 
 function fakeAgentFor(cwd: string, id: string, sessionId: string) {
@@ -2017,6 +2018,126 @@ test('TC-1152 when the bound DOES bite, the card says so and names the full docu
     assert.match(detail, /正文过长/, '截断必须显式可见')
     assert.match(detail, /\.dsh\/.*\.md|specs\//, '并且指出完整文档位置')
 })
+
+// --- rc.2：被委派子会话不得再走 user-questions（2026-11-12，0.2.2-rc.2 适配） ---
+//
+// rc.2 的 `dsh-user-questions` 改成按 `session.header.origin === 'subagent'` 拒绝
+// （`DELEGATED_CALLER`），rc.1 按"被别的 live agent 拥有"拒绝。两种规则下子会话都问不到人，
+// 但 rc.2 是**确定**拒绝：所以 spec_approve 必须不发这张卡，改走 nvim-tui 卡片/审批接缝，
+// 一个面都没有时明确报 no-answerer。
+
+/** 子会话身份：rc.2 的拒绝依据（origin），session id 可被委派台账点名。 */
+function childAgent(cwd: string, sessionId = 'session-child') {
+    return { id: 'agent-child', session: { id: sessionId, header: { id: sessionId, cwd, origin: 'subagent' } } }
+}
+
+function delegatedHost(options: {
+    answer?: (request: unknown) => unknown
+    approvalOutcome?: 'allowed-once' | 'rejected'
+    withApproval?: boolean
+    reviewChannel?: string
+    sessionId?: string
+}) {
+    const cwd = tempWorkspace('spec-gate-delegated-')
+    const sessionId = options.sessionId ?? 'session-child'
+    const asked: unknown[] = []
+    const fake = createFakeHost({
+        cwd,
+        agent: childAgent(cwd, sessionId),
+        ...(options.approvalOutcome === undefined ? {} : { approvalOutcome: options.approvalOutcome }),
+        ...(options.withApproval === false ? { withApproval: false } : {}),
+        services: {
+            userQuestions: {
+                ask: async (request: unknown) => {
+                    asked.push(request)
+                    return (options.answer ?? answerWith(['通过']))(request)
+                },
+            },
+        },
+    })
+    apply(fake.ctx as never, {
+        logFile: path.join(cwd, 'spec-gate.log'),
+        ...(options.reviewChannel === undefined ? {} : { reviewChannel: options.reviewChannel }),
+    })
+    return { fake, asked, cwd, sessionId }
+}
+
+/** Record the mission's delegation row (what `dsh-role-guard` writes after team_delegate). */
+function recordDelegation(cwd: string, sessionId: string): void {
+    const mission = new MissionStoreRegistry().for(cwd).active(sessionId)
+    assert.ok(mission !== undefined, 'spec_create 之后应能按会话读到 mission')
+    appendDelegation(cwd, { missionId: mission.id, role: 'developer', childSessionId: sessionId, stage: 'implement', at: Date.now() })
+}
+
+test('TC-1641 delegated child: user-questions is skipped from the LEDGER, approval seam still answers', async () => {
+    const { fake, asked, cwd, sessionId } = delegatedHost({ approvalOutcome: 'allowed-once' })
+    await fake.runTool('spec_create', DRAFT)
+    recordDelegation(cwd, sessionId)
+    const text = runText(await fake.runTool('spec_approve', {}))
+    assert.match(text, /规格已审批/, '审批接缝（既非 questions）必须还能完成审批')
+    assert.equal(asked.length, 0, 'rc.2 会以 DELEGATED_CALLER 拒绝子会话：不得发出注定被拒的卡片')
+    const log = fs.readFileSync(path.join(cwd, 'spec-gate.log'), 'utf8')
+    assert.match(log, new RegExp(`委派台账里 mission .* 的子会话 ${sessionId}`), '日志必须说明跳过的依据')
+    assert.match(log, /DELEGATED_CALLER/, '日志必须点名 rc.2 的拒绝码，否则看起来像通道坏了')
+})
+
+test('TC-1642 delegated child + NO approval seam: nobody is asked, and the result says so (no-answerer)', async () => {
+    const { fake, asked, cwd, sessionId } = delegatedHost({ withApproval: false })
+    await fake.runTool('spec_create', DRAFT)
+    recordDelegation(cwd, sessionId)
+    const run = await fake.runTool('spec_approve', {})
+    assert.equal(run.isError, true, '没有面可以问人 → 审批不成立')
+    const text = runText(run)
+    assert.match(text, /没有人被问到/, '必须是 no-answerer 的措辞，而不是"被拒绝"')
+    assert.match(text, /被委派子会话/, '结果里要说明 questions 为什么没问')
+    assert.equal(asked.length, 0, '仍然是 0 次发问')
+    assert.equal(new MissionStoreRegistry().for(cwd).active(sessionId)?.spec?.approvedAt, undefined)
+})
+
+test('TC-1643 reviewChannel=questions + delegated child: 明确拒绝，不静默降级到审批接缝', async () => {
+    const { fake, asked, cwd, sessionId } = delegatedHost({ reviewChannel: 'questions', approvalOutcome: 'allowed-once' })
+    await fake.runTool('spec_create', DRAFT)
+    recordDelegation(cwd, sessionId)
+    const text = runText(await fake.runTool('spec_approve', {}))
+    assert.match(text, /no-answerer/, 'questions-only 配置下没有别的面可用')
+    assert.match(text, /被委派的子会话/)
+    assert.match(text, /reviewChannel=questions/, '拒绝理由必须点名配置，否则改法看不出来')
+    assert.equal(asked.length, 0)
+    assert.equal(new MissionStoreRegistry().for(cwd).active(sessionId)?.spec?.approvedAt, undefined, '配置说"只走 questions"，那就不能偷偷走接缝')
+})
+
+test('TC-1644 a ROOT session still uses user-questions: the ledger row of ANOTHER session is not a match', async () => {
+    // 反例：只按"台账里有行"就跳过，会让主会话也丢掉结构化审阅卡。
+    const { fake, asked, cwd } = questionsHost({ answer: answerWith(['通过']) })
+    await fake.runTool('spec_create', DRAFT)
+    const mission = new MissionStoreRegistry().for(cwd).active('session-1')
+    assert.ok(mission !== undefined)
+    appendDelegation(cwd, { missionId: mission.id, role: 'developer', childSessionId: 'session-other', stage: 'implement', at: Date.now() })
+    const text = runText(await fake.runTool('spec_approve', {}))
+    assert.match(text, /规格已审批/)
+    assert.equal(asked.length, 1, '主会话必须照旧走结构化审阅卡')
+})
+
+test('TC-1645 delegated child with no ledger row (role-guard write failed): origin=subagent still skips', async () => {
+    // 台账写失败只告警、不阻断委派——委派是真的，行可以缺；origin 补上这一种情况。
+    const { fake, asked, cwd } = delegatedHost({ approvalOutcome: 'allowed-once' })
+    await fake.runTool('spec_create', DRAFT)
+    const text = runText(await fake.runTool('spec_approve', {}))
+    assert.match(text, /规格已审批/)
+    assert.equal(asked.length, 0)
+    assert.match(fs.readFileSync(path.join(cwd, 'spec-gate.log'), 'utf8'), /origin=subagent/)
+})
+
+test('TC-1646 the rejection FOLLOW-UP question is skipped too (a doomed card is not sent)', async () => {
+    const { fake, asked, cwd, sessionId } = delegatedHost({ approvalOutcome: 'rejected' })
+    await fake.runTool('spec_create', DRAFT)
+    recordDelegation(cwd, sessionId)
+    const text = runText(await fake.runTool('spec_approve', {}))
+    assert.match(text, /打回/)
+    assert.equal(asked.length, 0, '打回理由的追问也不得发给会被拒绝的子会话')
+    assert.equal(new MissionStoreRegistry().for(cwd).active(sessionId)?.approval?.state, 'rejected', '打回本身仍要记录')
+})
+
 
 // --- 已交付/已停止的 mission 不得再放行写入（2026-11-10，"定死"） ------------------
 
