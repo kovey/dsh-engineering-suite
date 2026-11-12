@@ -1,9 +1,11 @@
 /**
  * The delegation ledger (`state/delegations.jsonl`): append/read round-trip,
  * crash-truncated tails, malformed rows, and the stage-role helper the write
- * guard and `advance` share.
+ * guard and `advance` share — plus the `mkdir` lock that makes the de-duplicated
+ * append atomic across processes (TC-1571…TC-1575).
  */
 import assert from 'node:assert/strict'
+import { spawn } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
 import test from 'node:test'
@@ -12,12 +14,55 @@ import {
     appendDelegation,
     appendDelegationOnce,
     delegationLedgerFile,
+    delegationLockDir,
     matchesDelegation,
     readDelegations,
     stageRoleOf,
 } from '../dist/delegations.js'
 import { MissionStoreRegistry, resolveLayout } from '../dist/index.js'
 import { tempWorkspace } from '../dist/testing.js'
+
+/** The built module, so a child process exercises exactly what the suite ships. */
+const DIST_MODULE = new URL('../dist/delegations.js', import.meta.url).href
+
+/**
+ * Run one de-duplicated append in a REAL second process.
+ *
+ * Concurrency cannot be shown in this process: `appendDelegationOnce` is
+ * synchronous, so ten `Promise.all` calls would run one after another and a
+ * missing lock would still look green. Two OS processes racing on the same
+ * read-then-append is the only evidence that means anything — the child prints
+ * its pid so a caller can prove it really talked to ten different processes.
+ * @param cwd - workspace root both processes share.
+ * @param input - the delegation row to append.
+ * @returns the child's pid (its exit code was 0; a non-zero one rejects).
+ */
+function appendInChildProcess(cwd: string, input: Record<string, unknown>): Promise<number> {
+    const script = [
+        `import { appendDelegationOnce } from ${JSON.stringify(DIST_MODULE)}`,
+        `appendDelegationOnce(${JSON.stringify(cwd)}, ${JSON.stringify(input)})`,
+        'process.stdout.write(String(process.pid))',
+        '',
+    ].join('\n')
+    return new Promise((resolve, reject) => {
+        const child = spawn(process.execPath, ['--input-type=module', '-e', script], { stdio: ['ignore', 'pipe', 'pipe'] })
+        let stdout = ''
+        let stderr = ''
+        child.stdout.on('data', (chunk: Buffer) => {
+            stdout += chunk.toString()
+        })
+        child.stderr.on('data', (chunk: Buffer) => {
+            stderr += chunk.toString()
+        })
+        child.on('error', reject)
+        child.on('close', (code) => {
+            const pid = Number(stdout.trim())
+            if (code !== 0) reject(new Error(`child process exited ${String(code)}: ${stderr}`))
+            else if (!Number.isInteger(pid) || pid <= 0) reject(new Error(`child process printed no pid: ${stdout}`))
+            else resolve(pid)
+        })
+    })
+}
 
 test('appendDelegation writes one JSONL row under the layout state dir and reads it back', () => {
     const cwd = tempWorkspace('delegations-')
@@ -141,4 +186,121 @@ test('an explicit layout rootDir places the ledger under it', () => {
     const expected = path.join(resolveLayout(cwd, options).stateDir, DELEGATION_LEDGER)
     assert.equal(fs.existsSync(expected), true)
     assert.equal(fs.existsSync(path.join(cwd, '.dsh', 'state', DELEGATION_LEDGER)), false)
+})
+
+/** The row every concurrency case below competes over. */
+const RACE_ROW = { missionId: 'mission-1', role: 'developer', childSessionId: 'child-1', stage: 'implement', at: 1 }
+
+test('concurrent writers of the SAME delegation leave exactly one row (TC-1571)', async () => {
+    const cwd = tempWorkspace('delegations-race-same-')
+    // Ten OS processes race on the same read-then-append.
+    const pids = await Promise.all(Array.from({ length: 10 }, () => appendInChildProcess(cwd, RACE_ROW)))
+    // Evidence that this was real concurrency, not ten sequential calls.
+    assert.equal(new Set(pids).size, 10)
+
+    assert.equal(readDelegations(cwd, 'mission-1').length, 1)
+    // One physical line: the deduplication happened in the writer, not only in
+    // the reader (two rows would still "read as one delegation", but they are
+    // exactly the noise the lock exists to remove).
+    assert.equal(fs.readFileSync(delegationLedgerFile(cwd), 'utf8').trimEnd().split('\n').length, 1)
+    // Every writer released the lock it took.
+    assert.equal(fs.existsSync(delegationLockDir(cwd)), false)
+})
+
+test('concurrent writers of DIFFERENT delegations lose no row (TC-1572)', async () => {
+    const cwd = tempWorkspace('delegations-race-diff-')
+    const inputs = Array.from({ length: 10 }, (_value, index) => ({ ...RACE_ROW, childSessionId: `child-${index}` }))
+    const pids = await Promise.all(inputs.map((input) => appendInChildProcess(cwd, input)))
+    assert.equal(new Set(pids).size, 10)
+
+    const records = readDelegations(cwd, 'mission-1')
+    assert.equal(records.length, 10)
+    // Every child's row is there, in some order: the lock serialises them, it
+    // does not drop them.
+    assert.deepEqual(
+        records.map((record) => record.childSessionId).sort(),
+        inputs.map((input) => input.childSessionId).sort(),
+    )
+    assert.equal(fs.existsSync(delegationLockDir(cwd)), false)
+})
+
+test('a lock held by another writer degrades to an unlocked append with a warning (TC-1573)', () => {
+    const cwd = tempWorkspace('delegations-lock-busy-')
+    const lockDir = delegationLockDir(cwd)
+    fs.mkdirSync(lockDir, { recursive: true })
+    const warnings: string[] = []
+    const startedAt = Date.now()
+    const result = appendDelegationOnce(cwd, RACE_ROW, {}, { warn: (message) => warnings.push(message) })
+    const waited = Date.now() - startedAt
+
+    // Degraded, not dropped: the row is on disk…
+    assert.equal(result.appended, true)
+    assert.equal(result.deduped, false)
+    assert.match(result.warning ?? '', /锁/)
+    assert.equal(readDelegations(cwd, 'mission-1').length, 1)
+    // …and both the return value and the log say de-duplication was skipped.
+    assert.equal(warnings.length >= 1, true)
+    assert.match(warnings.join('|'), /降级/)
+    // It retried for the whole budget instead of appending without looking.
+    assert.equal(waited >= 1_000, true)
+    // A lock this call never owned is never removed — the holder may be alive.
+    assert.equal(fs.existsSync(lockDir), true)
+})
+
+test('an expired lock directory is taken over, used, and released (TC-1574)', () => {
+    const cwd = tempWorkspace('delegations-lock-stale-')
+    const file = delegationLedgerFile(cwd)
+    const lockDir = delegationLockDir(cwd)
+    fs.mkdirSync(lockDir, { recursive: true })
+    // A dead holder: the directory has not been touched for a minute.
+    const staleSeconds = (Date.now() - 60_000) / 1000
+    fs.utimesSync(lockDir, staleSeconds, staleSeconds)
+
+    const warnings: string[] = []
+    const result = appendDelegationOnce(cwd, RACE_ROW, {}, { warn: (message) => warnings.push(message) })
+
+    // The normal shape: deduplication really ran (no degraded marker), the
+    // takeover was recorded, and the lock was released after the write.
+    assert.deepEqual(result, { file, appended: true })
+    assert.match(warnings.join('|'), /过期锁/)
+    assert.equal(readDelegations(cwd, 'mission-1').length, 1)
+    assert.equal(fs.existsSync(lockDir), false)
+})
+
+test('a stale lock that cannot be removed is never forced: the append degrades (AC-001)', () => {
+    const cwd = tempWorkspace('delegations-lock-refuse-')
+    const lockDir = delegationLockDir(cwd)
+    // Stale AND undeletable: a non-empty directory fails `rmdir` with ENOTEMPTY.
+    // Recursively deleting it could remove a live holder's lock, so the correct
+    // behaviour is to give up the takeover and degrade — not to force it.
+    fs.mkdirSync(lockDir, { recursive: true })
+    fs.writeFileSync(path.join(lockDir, 'holder-still-here'), '')
+    const staleSeconds = (Date.now() - 60_000) / 1000
+    fs.utimesSync(lockDir, staleSeconds, staleSeconds)
+
+    const warnings: string[] = []
+    const result = appendDelegationOnce(cwd, RACE_ROW, {}, { warn: (message) => warnings.push(message) })
+
+    assert.equal(result.appended, true)
+    assert.equal(result.deduped, false)
+    assert.match(result.warning ?? '', /放弃接管/)
+    assert.equal(readDelegations(cwd, 'mission-1').length, 1)
+    // The lock and the holder's marker inside it are untouched.
+    assert.deepEqual(fs.readdirSync(lockDir), ['holder-still-here'])
+    const logged = warnings.join('|')
+    assert.match(logged, /过期锁/)
+    assert.match(logged, /无法接管/)
+})
+
+test('an append that throws still releases the lock (TC-1575)', () => {
+    const cwd = tempWorkspace('delegations-lock-throw-')
+    const file = delegationLedgerFile(cwd)
+    const lockDir = delegationLockDir(cwd)
+    fs.mkdirSync(path.dirname(file), { recursive: true })
+    // The ledger path is a DIRECTORY: acquiring the lock succeeds (it lives next
+    // to it), then the single append fails with EISDIR. Without the `finally`
+    // the lock directory would stay behind and stall every later writer.
+    fs.mkdirSync(file)
+    assert.throws(() => appendDelegationOnce(cwd, RACE_ROW))
+    assert.equal(fs.existsSync(lockDir), false)
 })

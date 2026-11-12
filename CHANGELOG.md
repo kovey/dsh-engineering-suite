@@ -1,13 +1,51 @@
 ## [未发布]
 
+### 加固 · 委派台账去重变成跨进程原子（`dsh-eng-core` / `dsh-role-guard`）
+
+上一版把"读台账 → 判重 → 追加"写成一个函数，并诚实承认它**不是原子的**（`delegations.ts` 原注释：
+"The read-then-append is not atomic"）：两个写者同时进入临界区就会各写一行。这一版把整段临界区挪进
+一个 `<ledger>.lock` **目录锁**（`mkdir` 的"创建成功"与"已存在"是同一个原子操作），于是"同一元组
+只有一行"从"实践中如此"变成"可验证"。
+
+- **锁协议**（新模块 `packages/dsh-eng-core/src/file-lock.ts`，178 行 / 5 导出）：
+  `acquireDirLock(lockDir, logger?)` 最多 40 次、总预算 1.5s，10ms 起每次 ×1.5、100ms 封顶的退避；
+  锁目录 mtime 超过 10s（`DIR_LOCK_STALE_MS`）按**过期锁**处理——**先 warn、再 `rmdir`**，删不掉就
+  **放弃接管**（绝不递归删除一个可能是活着的持有者的锁），继续等到预算用尽。`releaseDirLock` 只做
+  `rmdir`，失败只告警：写已经完成，此时抛错会把一次成功的追加报成失败。退避用共享 `Int32Array` +
+  `Atomics.wait`（写入路径是同步的，不能 `await`）。
+- **读在锁内**（`delegations.ts`，279 行 / 13 导出）：`appendDelegationOnce(cwd, input, options, logger?)`
+  先取锁，**再**读台账判重，再追加，`finally` 释放。锁外读等于把竞态窗口挪个位置，没有消除。
+  `delegationLockDir` 保证锁与台账同目录（`<ledger>.lock`），布局覆盖不会出现"锁一个目录、写另一个文件"。
+- **降级不丢行**：拿不到锁（活着的持有者占满预算，或过期锁不可删除）→ 不加锁直接追加，返回
+  `{ file, appended: true, deduped: false, warning }` 并 `logger.warn`；`role-guard` 的
+  `recordStageDelegation` 把这个 warning 作为工具结果的 `warning:` 行带回（行在盘上，只是没去重）。
+  `appendDelegation`（总是追加）语义不变，两条路径共用同一次 `appendFileSync` + 补换行（`appendJsonl`），
+  所以降级也不会把行粘到崩溃截断的尾行上。
+- **测试**（`packages/dsh-eng-core/test/delegations.test.ts` 7 → 13 条）：10 个**真子进程**（`spawn`，
+  各自报 pid，断言 10 个不同 pid）并发写同一元组只留 1 行（TC-1571）、10 个并发写不同元组 10 行不丢
+  （TC-1572）、锁被占用时等满预算后降级并在返回值与日志里告警（TC-1573）、过期锁被接管并释放
+  （TC-1574）、追加抛错（台账路径是目录 → `EISDIR`）后锁目录不残留（TC-1575）、过期但**删不掉**的锁
+  （非空目录 → `ENOTEMPTY`）不被强删、放弃接管并降级（AC-001）。**TC-1571 不是空测试**：
+  把 `dist/file-lock.js` 的获取改成恒失败（变异）后，该用例从"1 行"变成"10 行"并失败；恢复构建
+  （`bash scripts/build-all.sh dsh-eng-core`）后重新全绿，dist 里无变异残留。
+- **文档**：`docs/ARCHITECTURE.md` §5.33 增加"去重是跨进程原子的"一节（锁协议、过期接管、降级语义），
+  并把"已知边界"里的去重说明补上"锁不可用时降级为可能重复一行、但不丢行"。
+
+**验证**：`node --test packages/dsh-eng-core/test/*.test.ts` → 248 条（247 pass / 0 fail / 1 skip，
+skip 为既有 sandbox 限制）；`node --test packages/dsh-role-guard/test/*.test.ts` → 58/58；两个包
+`tsc -p tsconfig.json --noEmit` 通过；`bash scripts/standards-check.sh --quiet` → PASS（0 新增/恶化，
+本次扫描 1267 个文件）。按团队约定本轮只跑相关包测试、`tsc` 与 `standards-check`；规格里的 TC-1576
+（`bash scripts/verify.sh --quiet` 两次全绿）由交付门禁执行。
+
 ### 加固 · 阶段角色成为硬约束：委派记录 + 写守卫 + advance 门禁（`dsh-eng-core` / `dsh-role-guard` / `dsh-spec-gate` / `dsh-orchestrator`）
 
 `implement` 阶段一直声明 `role: developer`，但那是**声明**：写守卫不看它，`advance` 也不看它，主会话
 可以在角色阶段里直接改实现，所有门禁照样全绿——职责分离形同虚设。这一版把"谁被委派做这个阶段"
 变成三处门禁共读的一条事实链。
 
-- **委派记录**（`packages/dsh-eng-core/src/delegations.ts`，213 行 / 12 导出）：`appendDelegation`
-  向 `<布局根>/state/delegations.jsonl` 追加 `{ missionId, role, childSessionId, stage, at }`
+- **委派记录**（`packages/dsh-eng-core/src/delegations.ts`，本次改动时 213 行 / 12 导出；随后的原子
+  去重把它扩到 279 行 / 13 导出，见上一节）：`appendDelegation` 向 `<布局根>/state/delegations.jsonl`
+  追加 `{ missionId, role, childSessionId, stage, at }`
   （append-only、坏尾行读取时跳过、下一次追加先补换行）；`appendDelegationOnce` 是两条派发路径共用的
   去重写入（键 = `missionId + stage + role + childSessionId`，`at` 不参与；已存在则 `appended:false` 不追加）；
   `readDelegations` 只读解析并按 mission 过滤；`stageRoleOf(mission, store)` 从**当前阶段工件**取 `role`；

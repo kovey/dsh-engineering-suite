@@ -40,14 +40,18 @@ export interface StageDelegationDeps {
  * This is the ledger's single writer for both delegation paths: `team_delegate`
  * (model-facing) and the role-guard service's `bind` (an autonomous dispatcher).
  * The append is de-duplicated on `missionId + stage + role + childSessionId`, so
- * a retry of either path cannot add a second identical row.
+ * a retry of either path cannot add a second identical row; the deduplication
+ * happens under a directory lock, and when that lock is unavailable the row is
+ * still written (without deduplication) and the reason comes back as a warning.
  * @param deps - store registry, layout and logger.
  * @param agent - the delegating agent (its session owns the mission binding).
  * @param role - role id the child was started as.
  * @param childSessionId - the child's session id (`team_delegate`'s `run.id`).
  * @param cwd - explicit workspace (an autonomous dispatcher knows it); omitted
  *   or empty means the delegating agent's session workspace.
- * @returns a warning text when the row could not be written, `undefined` otherwise.
+ * @returns a warning text when the row could not be written — or was written
+ *   without de-duplication because the ledger lock was unavailable — and
+ *   `undefined` otherwise.
  */
 export function recordStageDelegation(
     deps: StageDelegationDeps,
@@ -68,7 +72,7 @@ export function recordStageDelegation(
     // and the tool list do not depend on a mission).
     if (mission === undefined) return undefined
     try {
-        appendDelegationOnce(
+        const result = appendDelegationOnce(
             workspace,
             {
                 missionId: mission.id,
@@ -77,8 +81,12 @@ export function recordStageDelegation(
                 ...(mission.stage === undefined || mission.stage === '' ? {} : { stage: mission.stage }),
             },
             deps.layout,
+            deps.logger,
         )
-        return undefined
+        // `warning` is the degraded path: the row IS on disk, but without the
+        // lock. Returning it keeps "de-duplication was skipped" visible in the
+        // tool result instead of only in the log.
+        return result.warning
     } catch (error) {
         return warn(deps, workspace, error)
     }

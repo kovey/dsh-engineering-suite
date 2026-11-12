@@ -23,10 +23,18 @@
  * and a truncated tail line is skipped rather than repaired (the next append
  * starts on a fresh line, see `appendJsonl`).
  *
+ * De-duplication (`appendDelegationOnce`) is **atomic across processes**: the
+ * read that decides "already recorded?" happens inside a `<ledger>.lock`
+ * directory held via `mkdir` (see `file-lock.ts`). A lock that cannot be taken
+ * degrades to an unlocked append and says so, because a duplicate row means the
+ * same thing to every reader while a missing row is a delegation the role gates
+ * cannot see.
+ *
  * @module dsh-eng-core/delegations
  */
 
 import path from 'node:path'
+import { acquireDirLock, releaseDirLock, type DirLockLogger } from './file-lock.js'
 import { appendJsonl, readJsonl } from './io.js'
 import { resolveLayout, type LayoutOptions } from './paths.js'
 import type { MissionRecord, StageResult } from './types.js'
@@ -82,7 +90,22 @@ export function delegationLedgerFile(cwd: string, options: LayoutOptions = {}): 
 }
 
 /**
- * Append one delegation row (single line, atomic-ish append).
+ * Absolute path of the directory lock guarding that ledger (`<ledger>.lock`).
+ *
+ * One path, one owner: the lock sits next to the file it protects so a moved
+ * layout cannot leave writers locking one directory while appending to another.
+ */
+export function delegationLockDir(cwd: string, options: LayoutOptions = {}): string {
+    return `${delegationLedgerFile(cwd, options)}.lock`
+}
+
+/**
+ * Append one delegation row (single line, one `appendFileSync`).
+ *
+ * "Always append" is the whole contract — no de-duplication, no lock. The write
+ * itself is still one line with the missing-newline repair handled by
+ * `appendJsonl`, so a row can never be glued onto a crash-truncated tail; callers
+ * that want "at most one row per delegation" use {@link appendDelegationOnce}.
  *
  * Letting the error escape is deliberate: the caller decides whether an
  * unwritten record blocks it. `team_delegate` reports it as a warning and lets
@@ -95,6 +118,12 @@ export function delegationLedgerFile(cwd: string, options: LayoutOptions = {}): 
  */
 export function appendDelegation(cwd: string, input: DelegationInput, options: LayoutOptions = {}): string {
     const file = delegationLedgerFile(cwd, options)
+    appendDelegationRow(file, input)
+    return file
+}
+
+/** The single write both append paths share: one row, one JSONL line. */
+function appendDelegationRow(file: string, input: DelegationInput): void {
     appendJsonl(file, {
         missionId: input.missionId,
         role: input.role,
@@ -102,7 +131,6 @@ export function appendDelegation(cwd: string, input: DelegationInput, options: L
         ...(input.stage === undefined || input.stage === '' ? {} : { stage: input.stage }),
         at: input.at ?? Date.now(),
     })
-    return file
 }
 
 /**
@@ -114,10 +142,20 @@ export interface AppendDelegationResult {
     file: string
     /** `false` when an identical delegation was already recorded (nothing written). */
     appended: boolean
+    /**
+     * `false` only when the row was appended **without** the lock (`appended` is
+     * then `true`): an identical delegation may already have a row. Absent on a
+     * normal append and on a de-duplicated call, so existing callers see the same
+     * shape they always did.
+     */
+    deduped?: false
+    /** Present exactly when `deduped` is `false`: why de-duplication was skipped. */
+    warning?: string
 }
 
 /**
- * Append one delegation row unless the same delegation is already recorded.
+ * Append one delegation row unless the same delegation is already recorded —
+ * atomically, across processes.
  *
  * Two writers reach this ledger — `team_delegate` (the model-facing path) and
  * the role-guard service's `bind` (an autonomous dispatcher such as
@@ -126,23 +164,51 @@ export interface AppendDelegationResult {
  * `at` is deliberately NOT part of the key: it says when a row was written, not
  * which delegation it describes.
  *
- * The read-then-append is not atomic. One process owns the ledger in practice,
- * and two identical rows would still mean the same thing to every reader, so a
- * rare race degrades to a duplicate line rather than a wrong decision.
+ * The critical section is "read the ledger, decide, append" and it runs while
+ * holding `<ledger>.lock` (a `mkdir` directory, see `file-lock.ts`). The read is
+ * **inside** the lock on purpose: a read taken before acquiring it describes a
+ * ledger another process may append to before this one does.
+ *
+ * When the lock cannot be taken (a live holder past the wait budget, or a stale
+ * lock directory that cannot be removed), this **degrades to an unlocked
+ * append** and returns `{ appended: true, deduped: false, warning }` (also
+ * logged): a duplicate row means the same delegation to every reader, while
+ * dropping the row would hide the delegation from the role gates. The lock is
+ * released in a `finally`, so a throwing append cannot leave it behind.
  * @param cwd - workspace root.
  * @param input - who was delegated, as what, for which stage.
  * @param options - layout overrides (the plugin's `layout` config).
- * @returns the file and whether a row was appended.
+ * @param logger - optional logger for the degraded/lock warnings.
+ * @returns the file, whether a row was appended, and — when de-duplication had
+ *   to be skipped — `deduped: false` plus the warning text.
  */
-export function appendDelegationOnce(cwd: string, input: DelegationInput, options: LayoutOptions = {}): AppendDelegationResult {
+export function appendDelegationOnce(
+    cwd: string,
+    input: DelegationInput,
+    options: LayoutOptions = {},
+    logger?: DirLockLogger,
+): AppendDelegationResult {
     const stage = input.stage === undefined || input.stage === '' ? undefined : input.stage
     const file = delegationLedgerFile(cwd, options)
-    const existing = readDelegations(cwd, input.missionId, options).some(
-        (record) => record.role === input.role && record.childSessionId === input.childSessionId && record.stage === stage,
-    )
-    if (existing) return { file, appended: false }
-    appendDelegation(cwd, input, options)
-    return { file, appended: true }
+    const lockDir = delegationLockDir(cwd, options)
+    const lock = acquireDirLock(lockDir, logger)
+    if (!lock.acquired) {
+        const warning = `未能获取委派台账锁（${lock.reason ?? lockDir}）。已降级为不加锁追加：并发写入同一元组时可能留下重复行（读者仍把它当成同一次委派）；不降级就会丢记录。`
+        logger?.warn(warning)
+        appendDelegationRow(file, input)
+        return { file, appended: true, deduped: false, warning }
+    }
+    try {
+        // Inside the lock — see the note above; this read is the whole point.
+        const existing = readDelegations(cwd, input.missionId, options).some(
+            (record) => record.role === input.role && record.childSessionId === input.childSessionId && record.stage === stage,
+        )
+        if (existing) return { file, appended: false }
+        appendDelegationRow(file, input)
+        return { file, appended: true }
+    } finally {
+        releaseDirLock(lockDir, logger)
+    }
 }
 
 /**
