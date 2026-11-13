@@ -1,5 +1,18 @@
 ## [未发布]
 
+### 新增 · `scripts/switch-tui-to-release.mjs`：把 profile 切到发布版
+
+把"tui 只消费发布产物"从口头约定变成可执行的一步：脚本备份 `package.json`/`pnpm-lock.yaml`，
+补 `typescript`+`@types/node` 到 devDependencies、把 `dsh-engineering-suite` 钉到
+`#v<version>`、写入仓库 URL 形式的 `allowBuilds` 与 `strictDepBuilds: false`，然后跑
+`pnpm install`（由 profile 的 postinstall 生成 dist），最后做三条验收，任一不过就非零退出。
+
+真机结果（本机 tui profile）：`version=0.8.11`、`dist=16/16`、
+`require.resolve('dsh-spec-gate')` → `~/.dsh/profiles/tui/node_modules/dsh-engineering-suite/packages/dsh-spec-gate/dist/index.js`，
+20 个 `dsh-*` 软链指向安装副本；共享层的开发树软链保持不动（nvim-tui 继续当测试面）。
+
+## [未发布]
+
 ### 修复 · 一条依赖毫秒推进的用例（`dsh-orchestrator`）
 
 "本轮 PASS 允许离开阶段"的用例在为阶段记录 PASS 时直接读 `Date.now()`；而门禁的陈旧判定是
