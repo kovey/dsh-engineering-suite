@@ -28,7 +28,8 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { scaffoldConfigDir, type ScaffoldLayout } from 'dsh-eng-core/scaffold'
 import type { LayoutOptions } from 'dsh-eng-core'
-import { configText, detectLanguage, SUITE_CONFIGS, SUITE_DOCTOR_ID, selectDescriptors, type SuiteConfigDescriptor, type SuiteLanguage } from './scaffold-catalog.js'
+import { configText, detectLanguageInfo, SUITE_CONFIGS, SUITE_DOCTOR_ID, selectDescriptors, type SuiteConfigDescriptor, type SuiteLanguage } from './scaffold-catalog.js'
+import { coverageNoteOf } from './scaffold-languages.js'
 
 /** What happened (or would happen) to one file. */
 export type InitAction = 'write' | 'skip' | 'overwrite'
@@ -54,6 +55,10 @@ export interface InitPlan {
     /** Why that root was chosen (printed verbatim; the legacy branch says "沿用遗留位置"). */
     reason: string
     language: SuiteLanguage
+    /** The manifest that decided the language, or why the default applied (printed verbatim). */
+    languageReason: string
+    /** Why the coverage command is empty, for the ecosystems whose report format is unsupported. */
+    coverageNote?: string
     dryRun: boolean
     entries: InitEntry[]
     /** Non-fatal notes (currently: none — kept so the shape can grow honestly). */
@@ -164,9 +169,21 @@ export function planSuiteInit(input: InitInput): InitPlan {
         ...(input.rootDir === undefined ? {} : { rootDir: input.rootDir }),
         legacyFiles: [...SUITE_CONFIGS.map((descriptor) => descriptor.file), 'standards-baseline.json', `${SUITE_DOCTOR_ID}.json`],
     })
-    const language = detectLanguage(input.cwd)
-    const entries = descriptors.map((descriptor) => planEntry(input, target.dir, descriptor, language))
-    return { cwd: input.cwd, rootDir: target.dir, layout: target.layout, reason: target.reason, language, dryRun: input.apply !== true, entries, problems: [] }
+    const detection = detectLanguageInfo(input.cwd)
+    const entries = descriptors.map((descriptor) => planEntry(input, target.dir, descriptor, detection.language))
+    const coverageNote = coverageNoteOf(detection.language)
+    return {
+        cwd: input.cwd,
+        rootDir: target.dir,
+        layout: target.layout,
+        reason: target.reason,
+        language: detection.language,
+        languageReason: detection.reason,
+        ...(coverageNote === undefined ? {} : { coverageNote }),
+        dryRun: input.apply !== true,
+        entries,
+        problems: [],
+    }
 }
 
 const ACTION_ICON: Record<InitAction, string> = { write: '➕', skip: '⏭️', overwrite: '♻️' }
@@ -189,8 +206,12 @@ export function renderInitPlan(plan: InitPlan): string {
     const lines = [
         `suite_init —— 套件配置脚手架（${plan.dryRun ? 'dry-run：只打印计划，未写盘；apply:true 才写入' : 'apply：已写盘'}）`,
         `工作区：${plan.cwd}；布局根：${rootDir}${layoutLabel(plan.layout)}；检测语言：${plan.language}`,
+        `语言判定：${plan.languageReason}`,
         `布局判定：${plan.reason}`,
     ]
+    // An empty coverage command is a decision, not an omission: say why, where a
+    // person reading the plan can act on it.
+    if (plan.coverageNote !== undefined) lines.push(`覆盖率：${plan.language} 的命令留空 —— ${plan.coverageNote}`)
     for (const entry of plan.entries) lines.push(`${ACTION_ICON[entry.action]} ${entry.action.padEnd(9)} ${entry.relative}  (${entry.bytes} B)`)
     lines.push(`合计：写入 ${written}、覆盖 ${overwritten}、跳过（已存在）${skipped}；共 ${plan.entries.length} 份`)
     if (plan.dryRun) lines.push('下一步：suite_init({ apply: true })（已存在的文件默认跳过；force:true 才覆盖）')

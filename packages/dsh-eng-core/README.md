@@ -104,6 +104,9 @@ outcome.observations               // 影子记录（would: 'BLOCK'），按 rul
 不做的事：不解析表达式、不做类型推断与调用图；Go 路由要求「HTTP 动词选择器 + 以 `/` 开头的字面量路径」
 （常量路径、`fmt.Sprintf` 拼出的路径不猜）；裸 `func TestXxx` 不算 case；`type`/`main` 符号不参与
 `scanGaps.uncoveredSymbols` 统计；扫描是广度优先，深层数据目录（如 `testdata/` 大转储）不会挤掉浅层源码。
+**符号/用例只解析 Go、TS/JS、Python 三种**（`SCANNED_LANGUAGES`）：`.rs/.java/.kt/.kts/.cs/.php/.rb/.swift`
+这些扩展名会出现在 `stats.languages` 里（"这个仓库有多少文件"，是诚实的证据），但扫描器**不**用别的语言的正则
+去猜它们的符号与测试用例——猜出来的符号不是证据。要度量它们的函数规模用 `measureWorkspace`（见下节）。
 
 ## 代码度量（metrics）
 
@@ -140,6 +143,18 @@ const { added, known, fixed } = compareToBaseline(result.violations, parseBaseli
 | `imports` | `go.mod` 的 module 前缀命中的导入 → 工作区相对**目录** | 只解析 `./`、`../`，按 `.ts/.tsx/.js/.mjs/.cjs`、`/index.*` 依次试探 → 命中**文件** | `from .x import y`（按点数回退目录）与工作区内存在的顶层包 → 目录或 `.py` 文件 |
 | `layers` | 某层文件导入了「不在本层、也不在任何 `mayImport` 前缀下」的工作区路径 → 每条导入一条违规 | 同左 | 同左 |
 | `cycle` | `forbidCycles: true` 时按 SCC 枚举简单环：旋转到字典序最小的路径开头、去重、上限 200 个 | 同左（文件粒度） | 同左（目录会展开为该目录下所有被测 `.py`） |
+
+本次扩到 11 种生态后加入的两个语言族（上表只列了 Go/TS/JS/Python 三列）：
+
+| 家族 | 语言 | 函数怎么认 | 结束定界 | 近似与边界（如实记录） |
+|---|---|---|---|---|
+| 花括号族 | Rust、Java、Kotlin、C#、PHP、Swift | Rust `fn`（含 `pub`、`impl` 内方法）；Java/C# `[修饰符] 返回类型 名字(`（构造器也算）；Kotlin `fun`；PHP `function`；Swift `func`/`init`。参数表之后到函数体之间的返回类型、`throws`、`where`、`: base(...)` 按括号深度跳过 | 配对的 `}`（复用 `metrics-braces`） | 表达式体（C# `=> expr`、Kotlin `fun f() = …`）**不产出长度**（没有可配对的花括号，不是"1 行"）；原始字符串 `r#"…"#`、Swift `"""`、PHP heredoc、嵌套块注释按普通字面量/注释处理；`new X() { … }` 这类匿名类体不算方法 |
+| `end` 族 | Ruby | `def`（含 `self.f`、setter `f=`、`[]`/`[]=`/运算符名、括号与无括号参数） | `end` 关键字计数：`def/class/module/if/unless/while/until/case/begin/for/do` 开、`end` 收；修饰符形式 `x if y` / `x while y` 不开块；`while … do` 只开一次；`do \|x\|` 同行算一次开；Ruby 3 `def f = expr` 不占 `end` | `=begin/=end` 块注释与 `__END__` 数据段不识别；`exports` = 顶层 `def`/`class`/`module` 个数（Ruby 没有导出关键字）；`ifBlocks` 只记 `if`/`unless`，`else` 挂在其所属 `if` 上 |
+
+屏蔽层的两条同族规则：Ruby 的 `#` 是行注释；PHP 的 `#` 只在**不是** `#[`（PHP 8 属性）时才是注释（把属性当注释
+会把被它修饰的声明一起删掉）。Rust 的 `'a` 被识别为**生命周期**而不是字符字面量——否则参数表会被当成字符串吞掉，
+函数直接从度量里消失。本次新增的八种扩展名（`.rs .java .kt .kts .cs .php .rb .swift`）都映射到对应语言，
+**未识别的扩展名 `languageOf` 返回 `undefined`**：`other` 只是 `FileMetrics.language` 的兜底桶，不是"一种语言"。
 
 规则解析：`standards.languages[语言]` 优先，缺失时用 `languages.default`，两者都没有则该文件只被测量、不产生违规
 （**不做逐条合并**）。`maxFileLines`/`maxExports` 的文件级违规标签为 `(file)`，其余为符号名；`maxDepth` 报告最深处的行号。

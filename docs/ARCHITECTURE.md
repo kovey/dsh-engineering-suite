@@ -1343,6 +1343,67 @@ feed 里只剩一条长行。修法不是再写一份短报告，而是把**同�
 - `suite_init` 只写十份配置，**不写** `.gitignore`、角色文件、approver 名单等宿主工件；那些各有自己的写者
   与批准路径（见 5.24 的单一写者纪律）。
 
+#### 5.30.1 支持的生态与检测优先级（11 种）
+
+`suite_init` 的默认命令、`standards.json` 的阈值、`supply-chain-gate` 的 manifest 清单，都按**检测到的生态**生成。
+检测只做一件事：按下面这张**固定顺序**查仓库根目录的 manifest，**第一个命中**的胜出；同时把"命中哪个文件"作为
+检测依据打印出来（`suite_init` 的 `语言判定：检测依据：命中 Cargo.toml`）——"检测为 rust"没有依据，就是一句无法核对
+的断言，而多生态仓库正是静默选错的地方。
+
+| 优先级 | 生态（`SuiteLanguage`） | 命中依据（根目录） | 覆盖率报告格式 |
+|---|---|---|---|
+| 1 | `ts` | `tsconfig.json`、`tsconfig.base.json` | lcov |
+| 2 | `go` | `go.mod` | go-cover |
+| 3 | `rust` | `Cargo.toml` | lcov |
+| 4 | `java` | `pom.xml`、`build.gradle` | **不支持（jacoco）→ 留空** |
+| 5 | `kotlin` | `build.gradle.kts` | **不支持（jacoco/kover）→ 留空** |
+| 6 | `csharp` | `*.sln`、`*.csproj` | cobertura |
+| 7 | `php` | `composer.json` | **不支持（clover）→ 留空** |
+| 8 | `ruby` | `Gemfile`、`*.gemspec` | lcov（`simplecov-lcov`） |
+| 9 | `swift` | `Package.swift` | lcov（`llvm-cov export`） |
+| 10 | `py` | `pyproject.toml`、`setup.py`、`requirements.txt` | lcov |
+| 11 | `js` | `package.json` | lcov |
+| — | `ts`（默认） | 都没有命中 | lcov |
+
+顺序是规格的一部分，不是实现细节：`tsconfig.json` 与 `go.mod` 并存必须得到 `ts`；`Cargo.toml` 与 `package.json`
+并存必须得到 `rust`；`pom.xml` 与 `build.gradle.kts` 并存得到 `java`（Java 在 Kotlin 之前），只带
+`build.gradle.kts` 才是 Kotlin。`*.sln`/`*.csproj`/`*.gemspec` 用扩展名匹配（目录项按名字排序，两次运行同一答案），
+目录同名的不算命中。全部没有命中时返回 `ts`，并明确写"没有找到任何已知 manifest，按约定默认 ts"——默认值不等于检测结果。
+
+**默认命令（每种生态的起点，需要人复核）**：
+
+| 生态 | `test`（必填） | `lint`（不阻断） | `impact` 模板 | 覆盖率命令 → 报告 |
+|---|---|---|---|---|
+| ts | `node --test` | `npx tsc --noEmit` | `node --test {files}` | `npx c8 --reporter=lcov npm test` → `coverage/lcov.info` |
+| js | `npm test` | `npm run lint` | `node --test {files}` | 同上 |
+| go | `go test ./...` | `go vet ./...` | `go test {files}` | `go test ./... -coverprofile=coverage/cover.out` → `coverage/cover.out`（go-cover） |
+| py | `python -m pytest -q` | `python -m ruff check .` | `python -m pytest {files}` | `python -m pytest -q --cov --cov-report=lcov:coverage/lcov.info` → lcov |
+| rust | `cargo test` | `cargo clippy -- -D warnings` | `cargo test {files}` | `cargo llvm-cov --lcov --output-path coverage/lcov.info` → lcov |
+| java | `mvn -q test` | `mvn -q -DskipTests verify` | `mvn -q -Dtest={files} test` | **留空** |
+| kotlin | `gradle test` | `gradle detekt` | `gradle test --tests {files}` | **留空** |
+| csharp | `dotnet test` | `dotnet format --verify-no-changes` | `dotnet test --filter {files}` | `dotnet test --collect:"XPlat Code Coverage"` → `coverage/coverage.cobertura.xml`（cobertura） |
+| php | `vendor/bin/phpunit` | `vendor/bin/phpcs` | `vendor/bin/phpunit {files}` | **留空** |
+| ruby | `bundle exec rspec` | `bundle exec rubocop` | `bundle exec rspec {files}` | `bundle exec rspec` + `simplecov-lcov` → `coverage/lcov.info` |
+| swift | `swift test` | `swiftlint` | `swift test --filter {files}` | `swift test --enable-code-coverage` + `llvm-cov export` → lcov |
+
+**覆盖率格式的硬限制**：覆盖率门禁只解析 `lcov`、`cobertura`、`go-cover`、`istanbul-json`。Java/Kotlin 的 jacoco
+（XML/CSV）与 PHP 的 clover 不在其中，所以这三种生态的 `coverageCommand` 与 `reportFile` **写成空字符串**：
+空值在覆盖率门禁里就是"未配置"（拒绝执行），而指向一份解析不了的文件只会让门禁看起来"配了"却什么都门禁不了。
+`thresholds.total: 70` 仍然写进文件（期望值本身是有意义的），`suite_init` 的输出里逐条打印原因，并说明出路：
+先接入能产出 lcov/cobertura 的工具（例如 jacoco → cobertura 转换器、PHPUnit 的 cobertura 报告），再把两个键填上。
+Ruby 的覆盖率命令就是"跑测试"：报告由 `simplecov-lcov` 在 `spec_helper` 里产出，仓库需要自己启用它。
+
+**生态代码 ↔ 结构度量的语言码**：`standards.json` 的 `languages` 键用的是 `dsh-eng-core` 在
+`FileMetrics.language` 里报告的代码（`python` 而不是 `py`，`csharp` 而不是 `c#`）。键写错不会报错——度量只是
+找不到该语言的阈值，于是"规则写了却什么都不门禁"。脚手架按上表的代码生成（Python 的键因此是 `python`），
+阈值分组与 `docs/ARCHITECTURE.md` §5.7 的度量实现一致：花括号类沿用 ts 的 300/60，Ruby/Python 参照 py 的 400/60。
+
+**测量侧的对应能力**（`dsh-eng-core`）：`.rs`/`.java`/`.kt`/`.kts`/`.cs`/`.php`/`.swift` 走既有的花括号词法，
+`.rb` 走 `end` 关键字匹配（`def/class/module/if/unless/while/until/case/begin/do` 计数、`end` 收尾、修饰符形式
+`x if y` 不开块、`do |x|` 同行算一次开、Ruby 3 的 `def f = expr` 不占 `end`）。Rust 的 `'a` 生命周期不会被当成
+字符串开头（否则参数表会被当成字符串吞掉，函数直接消失）。`scanWorkspace` 对这批新语言只统计"有多少文件"，
+**不**用 TS 的正则去猜符号——数量是诚实的证据，猜出来的符号不是。
+
 ### 5.31 写保护的两道防线：命令建模 + 信任根运行时兜底
 
 `spec-gate` 的 shell 分析器原来只按**操作数位置**判断写入（`cp` 的最后一个参数、`chmod` 的除第一个之外），

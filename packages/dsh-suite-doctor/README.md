@@ -52,7 +52,19 @@
 | 工具 | 作用 |
 |---|---|
 | `suite_status({ missionId?, json? })` | 跑离线自检 → 合并运行时事实（`withRuntime`）→ 按"需要我 / 健康 / 一致性 / 历史"的顺序输出中文报告（见下「操作者视图」）；`json: true` 给机器读（同一份判定）。`missionId` 不存在时**拒绝**（fail closed），而不是换一个任务报告。 |
-| `suite_init({ apply?, force?, only? })` | 给**当前仓库**脚手架十份门禁配置（spec / test-design / quality / standards / evidence / coverage / impact / supply-chain / interaction / deploy）。**默认 dry-run**：逐份输出 `path / action(write\|skip\|overwrite) / bytes`，不写盘；只有 `apply: true` 才写。已存在的文件默认 `skip`（这些文件是信任根，脚手架不能撤销已评审的阈值），`force: true` 才覆盖。内容按检测到的生态（ts/js/go/py）生成且确定性，第二次 apply 一个字节都不改（幂等）。`only` 过滤，未知/空过滤在写任何文件之前就拒绝。 |
+| `suite_init({ apply?, force?, only? })` | 给**当前仓库**脚手架十份门禁配置（spec / test-design / quality / standards / evidence / coverage / impact / supply-chain / interaction / deploy）。**默认 dry-run**：逐份输出 `path / action(write\|skip\|overwrite) / bytes`，不写盘；只有 `apply: true` 才写。已存在的文件默认 `skip`（这些文件是信任根，脚手架不能撤销已评审的阈值），`force: true` 才覆盖。内容按检测到的生态生成且确定性，第二次 apply 一个字节都不改（幂等）。`only` 过滤，未知/空过滤在写任何文件之前就拒绝。 |
+
+**支持的生态（11 种）与检测依据**：`ts / js / go / py / rust / java / kotlin / csharp / php / ruby / swift`。
+检测按**固定优先级**查仓库根的 manifest，第一个命中者胜出：`tsconfig(.base).json` → ts、`go.mod` → go、
+`Cargo.toml` → rust、`pom.xml`/`build.gradle` → java、`build.gradle.kts` → kotlin、`*.sln`/`*.csproj` → csharp、
+`composer.json` → php、`Gemfile`/`*.gemspec` → ruby、`Package.swift` → swift、`pyproject/setup.py/requirements` → py、
+`package.json` → js，都没有 → ts（并明确写"这是默认值，不是检测结果"）。计划里打印**检测依据**
+（`语言判定：检测依据：命中 Cargo.toml`）：多生态仓库正是静默选错的地方，一句"检测为 rust"没有依据就无法核对。
+
+**覆盖率只给能读的格式**：覆盖率门禁只解析 lcov / cobertura / go-cover / istanbul-json。Java/Kotlin（jacoco）与
+PHP（clover）的 `coverageCommand`/`reportFile` **写成空字符串**（空值 = 未配置，门禁拒绝执行），并在 `suite_init`
+输出与 `docs/ARCHITECTURE.md` §5.30.1 里写明原因与出路（先用能产出 lcov/cobertura 的工具）。指向一份解析器读不懂的
+报告，只会让门禁看起来"配了"。每种生态的默认命令表与结构阈值见 §5.30.1。
 | `suite_config({ plugin? })` | **只读**列出十份配置与来源（`repo` 仓库文件生效 / `profile` 有文件但没有可用键 / `default` 没有仓库文件），并逐条点名"文件 + 键"：JSON 不可解析、未知顶层键（拼写错、插件根本不读）、被禁止的项目级覆盖键、越出工作区的路径值。未知 `plugin` 过滤被拒绝。 |
 
 **`suite_status` 与 `suite_config` 严格只读**：不写门禁记录、不落盘、不改 mission、不创建 `.dsh/`；也**不授予任何权限**。

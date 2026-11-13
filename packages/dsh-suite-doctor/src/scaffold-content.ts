@@ -7,76 +7,19 @@
  * person is expected to review — in particular the commands, which name the
  * ecosystem's conventional runner rather than inventing a project-specific one.
  *
+ * The per-language DATA (commands, manifests, thresholds, the reason three
+ * ecosystems have no coverage command) lives in `scaffold-languages.ts`; this
+ * module only renders it into the JSON documents.
+ *
  * @module dsh-suite-doctor/scaffold-content
  */
 
-/** The ecosystems `suite_init` knows default commands for. */
-export type SuiteLanguage = 'ts' | 'js' | 'go' | 'py'
+import { defaultsOf, STANDARDS_LANGUAGES, THRESHOLDS, type SuiteLanguage } from './scaffold-languages.js'
 
-interface LanguageDefaults {
-    test: string
-    lint: string
-    coverageCommand: string
-    reportFile: string
-    reportFormat?: string
-    impactTemplate: string
-    manifests: readonly string[]
-}
+export type { SuiteLanguage }
 
-const LANGUAGE_DEFAULTS: Record<SuiteLanguage, LanguageDefaults> = {
-    ts: {
-        test: 'node --test',
-        lint: 'npx tsc --noEmit',
-        coverageCommand: 'npx c8 --reporter=lcov npm test',
-        reportFile: 'coverage/lcov.info',
-        impactTemplate: 'node --test {files}',
-        manifests: ['package.json', 'pnpm-lock.yaml'],
-    },
-    js: {
-        test: 'npm test',
-        lint: 'npm run lint',
-        coverageCommand: 'npx c8 --reporter=lcov npm test',
-        reportFile: 'coverage/lcov.info',
-        impactTemplate: 'node --test {files}',
-        manifests: ['package.json', 'pnpm-lock.yaml'],
-    },
-    go: {
-        test: 'go test ./...',
-        lint: 'go vet ./...',
-        coverageCommand: 'go test ./... -coverprofile=coverage/cover.out',
-        reportFile: 'coverage/cover.out',
-        reportFormat: 'go-cover',
-        impactTemplate: 'go test {files}',
-        manifests: ['go.mod', 'go.sum'],
-    },
-    py: {
-        test: 'python -m pytest -q',
-        lint: 'python -m ruff check .',
-        coverageCommand: 'python -m pytest -q --cov --cov-report=lcov:coverage/lcov.info',
-        reportFile: 'coverage/lcov.info',
-        impactTemplate: 'python -m pytest {files}',
-        manifests: ['requirements.txt', 'pyproject.toml'],
-    },
-}
-
-/** Which language keys the standards file declares, per detected ecosystem. */
-const STANDARDS_LANGUAGES: Record<SuiteLanguage, readonly string[]> = {
-    ts: ['ts', 'js'],
-    js: ['js'],
-    go: ['go'],
-    py: ['py'],
-}
-
-const THRESHOLDS: Record<SuiteLanguage, Record<string, number>> = {
-    ts: { maxFileLines: 300, maxFunctionLines: 60, maxDepth: 4, maxIfBlockLines: 20, maxParams: 5, maxExports: 15 },
-    js: { maxFileLines: 300, maxFunctionLines: 60, maxDepth: 4, maxIfBlockLines: 20, maxParams: 5, maxExports: 15 },
-    go: { maxFileLines: 400, maxFunctionLines: 80, maxDepth: 4, maxIfBlockLines: 25, maxParams: 6, maxExports: 20 },
-    py: { maxFileLines: 400, maxFunctionLines: 60, maxDepth: 4, maxIfBlockLines: 20, maxParams: 6, maxExports: 20 },
-}
-
-function defaultsOf(language: SuiteLanguage): LanguageDefaults {
-    return LANGUAGE_DEFAULTS[language]
-}
+/** Every placeholder a coverage command may need, resolved by the coverage gate. */
+const COVERAGE_THRESHOLD = { total: 70 }
 
 /** The repository-owned structural standard (`standards.json`). */
 export function standardsContent(language: SuiteLanguage): Record<string, unknown> {
@@ -85,7 +28,7 @@ export function standardsContent(language: SuiteLanguage): Record<string, unknow
     return {
         languages,
         forbidCycles: true,
-        exempt: ['**/*.test.ts', '**/*.test.js', '**/*_test.go', '**/test_*.py', '**/dist/**', '**/build/**', '**/vendor/**', '**/node_modules/**'],
+        exempt: ['**/*.test.ts', '**/*.test.js', '**/*_test.go', '**/test_*.py', '**/*_test.rb', '**/*_spec.rb', '**/dist/**', '**/build/**', '**/vendor/**', '**/node_modules/**'],
     }
 }
 
@@ -100,14 +43,23 @@ export function qualityGateContent(language: SuiteLanguage): Record<string, unkn
     }
 }
 
-/** Coverage source + threshold, so the gate is not refused for "no threshold". */
+/**
+ * Coverage source + threshold, so the gate is not refused for "no threshold".
+ *
+ * For Java/Kotlin/PHP `coverageCommand` and `reportFile` are EMPTY strings: the
+ * coverage gate reads an empty value as "not configured" and refuses to run,
+ * which is the honest outcome while the report format (jacoco/clover) is not one
+ * this suite parses. `thresholds` is still written — the intended 70% belongs in
+ * the file — and the reason is printed by `suite_init` and documented in
+ * `docs/ARCHITECTURE.md`.
+ */
 export function coverageGateContent(language: SuiteLanguage): Record<string, unknown> {
     const defaults = defaultsOf(language)
     return {
         coverageCommand: defaults.coverageCommand,
         reportFile: defaults.reportFile,
         ...(defaults.reportFormat === undefined ? {} : { reportFormat: defaults.reportFormat }),
-        thresholds: { total: 70 },
+        thresholds: { ...COVERAGE_THRESHOLD },
     }
 }
 

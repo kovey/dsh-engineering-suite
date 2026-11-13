@@ -1,5 +1,60 @@
 ## [未发布]
 
+### 特性 · 语言支持从 4 种扩到 11 种：检测、脚手架默认、结构度量与 `end` 词法（`dsh-suite-doctor` + `dsh-eng-core`）
+
+`ts/js/go/py` 之外的七种生态（`rust/java/kotlin/csharp/php/ruby/swift`）现在从"检测 → 脚手架默认命令 →
+结构度量 → standards 阈值"整条链路可用。三处一起改是刻意的：只补检测会让 `suite_init` 生成别家的命令，
+只补阈值会让 `standards_check` 对一个语言静默地什么都不门禁。
+
+- **检测（`dsh-suite-doctor/src/scaffold-catalog.ts`）**：`SuiteLanguage` 扩到 11 种，`detectLanguageInfo()` 按
+  **固定优先级**查仓库根 manifest —— `tsconfig(.base).json` → ts、`go.mod` → go、`Cargo.toml` → rust、
+  `pom.xml`/`build.gradle` → java、`build.gradle.kts` → kotlin、`*.sln`/`*.csproj` → csharp、`composer.json` → php、
+  `Gemfile`/`*.gemspec` → ruby、`Package.swift` → swift、`pyproject/setup.py/requirements` → py、`package.json` → js，
+  都没有 → ts。扩展名类依据（`*.sln`/`*.csproj`/`*.gemspec`）用 `readdir` 匹配并排序（两次运行同一答案；同名目录不算命中）。
+  计划与 `/suite init` 打印**检测依据**（`语言判定：检测依据：命中 Cargo.toml`）：没有依据的"检测为 X"无法核对，
+  而多生态仓库正是静默选错的地方。`detectLanguage()` 保留原签名（返回语言），证据由 `detectLanguageInfo()` 提供。
+- **脚手架默认（`packages/dsh-suite-doctor/src/scaffold-languages.ts`，新拆出的数据模块）**：每种生态给出
+  `test`/`lint`/`impact` 模板与 manifest 列表；覆盖率**只在报告格式受支持时**给命令（lcov / cobertura /
+  go-cover）：rust `cargo llvm-cov --lcov`、csharp `dotnet test --collect:"XPlat Code Coverage"` → cobertura、
+  ruby `bundle exec rspec` + simplecov-lcov、swift `swift test --enable-code-coverage` → lcov。
+  **java/kotlin/php 的 `coverageCommand` 与 `reportFile` 写成空字符串**（jacoco/clover 不在受支持格式里：
+  空值 = 未配置 → 覆盖率门禁拒绝执行），原因同时出现在 `suite_init` 的输出行
+  （`覆盖率：java 的命令留空 —— …`）与 `docs/ARCHITECTURE.md` §5.30.1，并说明出路（先接入能产出 lcov/cobertura 的工具）。
+  `standards.json` 的语言键改用度量侧真正使用的代码（**`python` 而不是 `py`**——旧键永远匹配不到被测文件，
+  写了阈值却什么都不门禁）；花括号类沿用 ts 的 300/60，Ruby/Python 参照 py 的 400/60。
+- **度量（`packages/dsh-eng-core`）**：新增 `src/languages.ts`（11 种语言的唯一扩展名表，`.rs .java .kt .kts .cs
+  .php .rb .swift` 就位；`scan.ts` 改为 re-export，`other` 仍只是 `FileMetrics.language` 的兜底桶，
+  **未知扩展名仍返回 `undefined`**）。`Language` 增加 `rust/java/kotlin/csharp/php/ruby/swift`。
+  - 花括号族（`src/metrics-brace-languages.ts`，新）：Rust `fn`（含 `pub`/`impl` 内方法）、Java/C# 的
+    `[修饰符] 类型 名字(`、Kotlin `fun`、PHP `function`、Swift `func`/`init`；参数表之后的返回类型/`throws`/`where`/
+    `: base(...)` 按括号深度跳过再找配对的 `}`。表达式体（C# `=>`、Kotlin `fun f() = …`）没有可配对花括号，
+    **不产出长度**（不是"1 行"）；匿名类体 `new X() { … }` 不算方法。
+  - `end` 族（`src/metrics-ruby.ts`，新）：`def/class/module/if/unless/while/until/case/begin/for/do` 开、`end` 收；
+    修饰符形式 `x if y` 不开块、`while … do` 只开一次、`do |x|` 同行算一次开、Ruby 3 `def f = expr` 不占 `end`；
+    `ifBlocks` 记 `if`/`unless`；`exports` = 顶层 `def`/`class`/`module` 数（Ruby 无导出关键字，README 已声明这是近似）。
+  - 屏蔽层：Ruby 的 `#` 是行注释；PHP 的 `#` 只在不是 `#[`（PHP 8 属性）时才是注释（把属性当注释会连声明一起删掉）；
+    Rust 的 `'a` 识别为**生命周期**而不是字符字面量（否则参数表被当字符串吞掉，函数从度量里消失）。
+  - `if`/`else` 块分析从 `metrics.ts` 拆到 `src/metrics-branch.ts`、参数计数拆到 `src/metrics-params.ts`、
+    语言分析接口拆到 `src/metrics-analysis.ts`：`metrics.ts` 本就在文件行数棘轮上（1994 行基线），拆出后它反而变小
+    （~1900），新增能力不再靠"再挤进同一个文件"。
+- **扫描（`scanWorkspace`）**：新语言出现在 `stats.languages`（"有多少文件"是诚实的证据），但**不**用 TS 的正则去猜
+  它们的符号与测试用例——猜出来的符号不是证据（`SCANNED_LANGUAGES`）。
+- **测试**：`dsh-eng-core` 新增 `test/metrics-languages.test.ts`（7 种新扩展名各一条"函数跨度不被吞掉"的断言 +
+  Ruby `end` 嵌套/修饰符/无尽方法 + 扩展名映射与 `stats.languages`），`scan.test.ts` 增加 `languageOf` 11 种映射与
+  "新语言只计数不猜符号"；`dsh-suite-doctor` 新增 `test/suite-init-languages.test.ts`（11 种 manifest 检测表 +
+  优先级冲突用例 + 每种生态的默认命令快照 + 三种不支持覆盖率的留空与说明）；`dsh-standards-gate` 新增
+  `test/standards-gate-languages.test.ts`（7 种新语言各一条 fixture，函数超长必须 BLOCK）。
+- **文档**：`docs/ARCHITECTURE.md` §5.30.1 新增"支持的生态与检测优先级（11 种）"（优先级表、默认命令表、
+  覆盖率格式限制、语言码与阈值分组）；`packages/dsh-eng-core/README.md` 与 `packages/dsh-suite-doctor/README.md`
+  记录新的度量家族、近似的边界与检测依据。
+
+**验证**（按团队约定本轮不跑全量 verify，完整命令集留给交付门禁）：三个包 `tsc` 退出 0；
+`node --test packages/dsh-eng-core/test/*.test.ts`（273 项：272 pass / 1 skipped）、
+`node --test packages/dsh-suite-doctor/test/*.test.ts`（133 项全 pass）、
+`node --test packages/dsh-standards-gate/test/*.test.ts`（44 项全 pass）；
+`bash scripts/standards-check.sh --quiet` → PASS（无新增/恶化）。既有断言未改动（唯一的行为变化是检测优先级与
+`standards.json` 的 `py` → `python`，两者都有新用例正面覆盖）。
+
 ### 运维 · `scripts/migrate-layout.sh`：把遗留仓库的套件台账迁进 `.dsh/engineering-suite/`（可回滚）
 
 `resolveLayout()` 是"命名空间存在即优先"，但两个兄弟仓库（`dsh-memory`、`dsh-chat-interaction`）

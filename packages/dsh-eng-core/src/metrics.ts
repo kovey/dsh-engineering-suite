@@ -47,6 +47,15 @@ import { bodyOpener, braceIndexAt, braceStructure, closerOf } from './metrics-br
 import type { Braces } from './metrics-braces.js'
 import { bodySpanOf, spanToMetric } from './metrics-bodies.js'
 import type { FunctionForm } from './metrics-bodies.js'
+import { braceIfBlocks, type IfBlockMetric } from './metrics-branch.js'
+import { paramCount } from './metrics-params.js'
+import type { LanguageAnalysis } from './metrics-analysis.js'
+import { familyAnalysis, isBraceFamily } from './metrics-brace-languages.js'
+import { rubyAnalysis } from './metrics-ruby.js'
+import { findCycles } from './metrics-cycles.js'
+
+/** One `if`/`else` block of a brace language (the measurement half lives in `metrics-branch.ts`). */
+export type { IfBlockMetric }
 
 // --- public types -----------------------------------------------------------
 
@@ -88,18 +97,12 @@ export interface FunctionMetric {
     params: number
 }
 
-/** One `if`/`else` block and its span in lines. */
-export interface IfBlockMetric {
-    line: number
-    lines: number
-    kind: 'if' | 'else'
-}
-
 /** Everything measured about one file. */
 export interface FileMetrics {
     /** Workspace-relative. */
     path: string
-    language: 'go' | 'ts' | 'js' | 'python' | 'other'
+    /** The analyser that measured it; `other` is the bucket for a file no analyser claims. */
+    language: Language | 'other'
     lines: number
     functions: FunctionMetric[]
     maxDepth: number
@@ -181,6 +184,81 @@ function compareText(left: string, right: string): number {
     return 0
 }
 
+/** One quote-delimited literal: where its content is and where scanning resumes. */
+interface QuotedLiteral {
+    /** Offset of the first content character. */
+    contentStart: number
+    /** Offset just past the content (the closing quote, or the end of the file). */
+    contentEnd: number
+    /** Offset just past the closing quote (or the end of the file). */
+    stop: number
+}
+
+/**
+ * Scan the quote starting at `index`.
+ *
+ * Python triple quotes are recognised, and a backslash always escapes the next
+ * character — so `'\''` and a line continuation inside a string both stay inside
+ * the literal. This lives outside `lexSource` because that loop is at its depth
+ * ratchet, and "where does this literal end" is a question with its own answer.
+ * @param text - the whole source file.
+ * @param index - offset of the opening quote.
+ * @param python - whether triple-quoted strings apply.
+ * @param char - the quote character (`"` or `'`).
+ */
+function scanQuotedLiteral(text: string, index: number, python: boolean, char: string): QuotedLiteral {
+    const triple = python && text[index + 1] === char && text[index + 2] === char
+    const contentStart = index + (triple ? 3 : 1)
+    let cursor = contentStart
+    let closed = false
+    while (cursor < text.length) {
+        const current = text[cursor] ?? ''
+        if (current === '\\') {
+            cursor += 2
+            continue
+        }
+        if (triple) {
+            if (current === char && text[cursor + 1] === char && text[cursor + 2] === char) {
+                closed = true
+                break
+            }
+        } else if (current === char) {
+            closed = true
+            break
+        }
+        cursor += 1
+    }
+    const contentEnd = closed ? cursor : text.length
+    const stop = closed ? cursor + (triple ? 3 : 1) : text.length
+    return { contentStart, contentEnd, stop }
+}
+
+/** Longest Rust escape this accepts (`'\u{1F600}'` is 10 characters). */
+const RUST_ESCAPE_MAX_CHARS = 12
+
+/**
+ * Whether the `'` at `index` opens a Rust char literal rather than a lifetime.
+ *
+ * `'a'`, `'\n'` and `'\''` are char literals; the `'a` of `&'a str`, `Foo<'a>`
+ * and `'static` is a lifetime. Lexically the difference is a closing quote
+ * within one character (or one escape), which is exactly what this returns — so
+ * a lifetime is never blanked as a string.
+ * @param text - the whole source file.
+ * @param index - offset of the quote.
+ */
+function rustCharLiteral(text: string, index: number): boolean {
+    const next = text[index + 1]
+    if (next === undefined) return false
+    if (next !== '\\') return next !== "'" && text[index + 2] === "'"
+    for (let cursor = index + 2; cursor < Math.min(text.length, index + RUST_ESCAPE_MAX_CHARS); cursor += 1) {
+        const current = text[cursor]
+        if (current === '\n') return false
+        if (current === '\\') cursor += 1
+        else if (current === "'") return true
+    }
+    return false
+}
+
 /**
  * Mask comments and string/char literals.
  *
@@ -213,7 +291,11 @@ function lexSource(text: string, language: Language): Lexed {
     let lastCode = ''
     while (index < text.length) {
         const char = text[index] ?? ''
-        if (python && char === '#') {
+        // `#` comments: Python, Ruby, and PHP — where `#[` opens an ATTRIBUTE
+        // (PHP 8), not a comment, so blanking it would delete the declaration it
+        // decorates.
+        const hashComment = python || language === 'ruby' || (language === 'php' && text[index + 1] !== '[')
+        if (hashComment && char === '#') {
             const stop = text.indexOf('\n', index)
             const end = stop < 0 ? text.length : stop
             blank(index, end)
@@ -264,32 +346,17 @@ function lexSource(text: string, language: Language): Lexed {
             continue
         }
         if (char === '"' || char === "'") {
-            const triple = python && text[index + 1] === char && text[index + 2] === char
-            const contentStart = index + (triple ? 3 : 1)
-            let cursor = contentStart
-            let closed = false
-            while (cursor < text.length) {
-                const current = text[cursor] ?? ''
-                if (current === '\\') {
-                    cursor += 2
-                    continue
-                }
-                if (triple) {
-                    if (current === char && text[cursor + 1] === char && text[cursor + 2] === char) {
-                        closed = true
-                        break
-                    }
-                } else if (current === char) {
-                    closed = true
-                    break
-                }
-                cursor += 1
+            if (language === 'rust' && char === "'" && !rustCharLiteral(text, index)) {
+                // `'a` is a LIFETIME, not a string: reading it as one blanks the
+                // rest of the signature (parameters included), and the function
+                // then disappears from the measurement entirely.
+                index += 1
+                continue
             }
-            const contentEnd = closed ? cursor : text.length
-            const stop = closed ? cursor + (triple ? 3 : 1) : text.length
-            strings.push({ line: lineOf(index) + 1, value: text.slice(contentStart, contentEnd), start: contentStart, end: contentEnd })
-            blank(index, stop)
-            index = stop
+            const literal = scanQuotedLiteral(text, index, python, char)
+            strings.push({ line: lineOf(index) + 1, value: text.slice(literal.contentStart, literal.contentEnd), start: literal.contentStart, end: literal.contentEnd })
+            blank(index, literal.stop)
+            index = literal.stop
             continue
         }
         if (!/\s/.test(char)) lastCode = char
@@ -305,53 +372,6 @@ function lexSource(text: string, language: Language): Lexed {
     const lines = text === '' ? [] : splitLines(text)
     const maskedLines = text === '' ? [] : splitLines(masked)
     return { language, masked, lines, maskedLines, lineStarts, strings }
-}
-
-/** Whether the `<` at `index` looks like the start of a generic argument list. */
-function looksGeneric(text: string, index: number): boolean {
-    const before = text[index - 1]
-    if (before === undefined || !/[A-Za-z0-9_$>]/.test(before)) return false
-    const after = text[index + 1]
-    if (after === undefined || !/[A-Za-z_$([{'"]/.test(after)) return false
-    let depth = 0
-    for (let cursor = index + 1; cursor < text.length; cursor += 1) {
-        const char = text[cursor]
-        if (char === '<') depth += 1
-        else if (char === '>') {
-            if (depth === 0) return true
-            depth -= 1
-        } else if (char === '(' || char === '[' || char === '{') depth += 1
-        else if (char === ')' || char === ']' || char === '}') {
-            if (depth === 0) return false
-            depth -= 1
-        }
-    }
-    return false
-}
-
-/**
- * Count declared parameters.
- *
- * Top-level commas only: `(a, b string)` is 2, `(opts)` is 1, `()` is 0. A
- * trailing comma (legal in Go and TS) is not an extra parameter. In TS a `<`
- * that looks like a generic argument list counts as nesting, so
- * `(a: Map<string, number>)` is 1.
- */
-function paramCount(text: string, generics: boolean): number {
-    const trimmed = text.trim()
-    if (trimmed === '') return 0
-    let depth = 0
-    let count = 1
-    for (let index = 0; index < text.length; index += 1) {
-        const char = text[index] ?? ''
-        if (char === '(' || char === '[' || char === '{') depth += 1
-        else if (char === ')' || char === ']' || char === '}') depth = Math.max(0, depth - 1)
-        else if (generics && char === '<' && looksGeneric(text, index)) depth += 1
-        else if (generics && char === '>' && depth > 0) depth = Math.max(0, depth - 1)
-        else if (char === ',' && depth === 0) count += 1
-    }
-    if (trimmed.endsWith(',')) count -= 1
-    return Math.max(0, count)
 }
 
 /**
@@ -462,16 +482,8 @@ interface RawImport {
     level?: number
 }
 
-/** Rules-free result of analyzing one file. */
-interface Analysis {
-    functions: MeasuredFunction[]
-    /** Functions left out because their span could not be paired. */
-    skipped: number
-    maxDepth: number
-    /** 1-based line where `maxDepth` is first reached. */
-    maxDepthLine: number
-    ifBlocks: IfBlockMetric[]
-    exports: number
+/** Rules-free result of analyzing one file: its language's measurement plus its imports. */
+interface Analysis extends LanguageAnalysis {
     /** Import specifiers as written, before resolution. */
     raw: RawImport[]
 }
@@ -829,32 +841,30 @@ function tsFunctions(lexed: Lexed, braces: Braces): { functions: MeasuredFunctio
                 cursor = skipSpace(masked, after)
                 continue
             }
-            if (masked[cursor] === '(') {
-                const close = matchParen(masked, cursor)
-                if (close < 0 || close > bound) return false
-                const inner = skipSpace(masked, cursor + 1)
-                // `((a, b) => c) as T`: parentheses that open with another `(`
-                // and hold an arrow only WRAP the function, so the list inside
-                // them is the real one. A parameter of function type
-                // (`(event, listener: (…) => unknown)`) starts with a name and
-                // is therefore read as the parameter list it is.
-                if (inner < close && masked[inner] === '(' && arrowAt(masked, inner, close) >= 0) {
-                    cursor = inner
-                    bound = close
-                    continue
-                }
-                const arrow = arrowAt(masked, skipSpace(masked, close + 1), bound)
-                if (arrow < 0 || arrowIsInAType(masked, close + 1, arrow)) return false
-                record(name, startLine, paramCount(masked.slice(cursor + 1, close), true), arrow + 2, 'arrow')
-                return true
-            }
-            const arrow = arrowAt(masked, cursor, bound)
-            if (arrow < 0) return false
-            if (/^[A-Za-z_$][\w$]*$/.test(masked.slice(cursor, arrow).trim())) {
+            if (masked[cursor] !== '(') {
+                const arrow = arrowAt(masked, cursor, bound)
+                if (arrow < 0) return false
+                if (!/^[A-Za-z_$][\w$]*$/.test(masked.slice(cursor, arrow).trim())) return false
                 record(name, startLine, 1, arrow + 2, 'arrow')
                 return true
             }
-            return false
+            const close = matchParen(masked, cursor)
+            if (close < 0 || close > bound) return false
+            const inner = skipSpace(masked, cursor + 1)
+            // `((a, b) => c) as T`: parentheses that open with another `(`
+            // and hold an arrow only WRAP the function, so the list inside
+            // them is the real one. A parameter of function type
+            // (`(event, listener: (…) => unknown)`) starts with a name and
+            // is therefore read as the parameter list it is.
+            if (inner < close && masked[inner] === '(' && arrowAt(masked, inner, close) >= 0) {
+                cursor = inner
+                bound = close
+                continue
+            }
+            const arrow = arrowAt(masked, skipSpace(masked, close + 1), bound)
+            if (arrow < 0 || arrowIsInAType(masked, close + 1, arrow)) return false
+            record(name, startLine, paramCount(masked.slice(cursor + 1, close), true), arrow + 2, 'arrow')
+            return true
         }
         return false
     }
@@ -1032,25 +1042,25 @@ function analyzePythonFunctions(
         const definition = PY_DEF.exec(maskedLine)
         if (definition !== null) {
             const name = definition[2] ?? ''
-            const start = lexed.lineStarts[line] ?? 0
-            const openParen = start + definition[0].length - 1
+            const openParen = (lexed.lineStarts[line] ?? 0) + definition[0].length - 1
             const closeParen = matchParen(lexed.masked, openParen)
             // An unclosed parameter list means the file is malformed: no span, counted.
-            if (closeParen < 0) skipped += 1
-            else {
-                const end = pythonBlockEnd(lexed, structure, line)
-                const defLevel = Math.floor(width / structure.step + 1e-9)
-                const deepest = pythonDepth(structure, line, end, defLevel)
-                functions.push({
-                    name: [...stack.map((scope) => scope.name), name].join('.'),
-                    line: line + 1,
-                    endLine: end + 1,
-                    lines: end - line + 1,
-                    depth: Math.max(1, deepest - defLevel),
-                    params: paramCount(lexed.masked.slice(openParen + 1, closeParen), false),
-                })
-                stack.push({ width, name })
+            if (closeParen < 0) {
+                skipped += 1
+                continue
             }
+            const end = pythonBlockEnd(lexed, structure, line)
+            const defLevel = Math.floor(width / structure.step + 1e-9)
+            const deepest = pythonDepth(structure, line, end, defLevel)
+            functions.push({
+                name: [...stack.map((scope) => scope.name), name].join('.'),
+                line: line + 1,
+                endLine: end + 1,
+                lines: end - line + 1,
+                depth: Math.max(1, deepest - defLevel),
+                params: paramCount(lexed.masked.slice(openParen + 1, closeParen), false),
+            })
+            stack.push({ width, name })
             continue
         }
 
@@ -1123,184 +1133,6 @@ function pythonExports(lexed: Lexed, structure: PyStructure): number {
         }
     }
     return count
-}
-
-// --- if blocks (brace languages) --------------------------------------------
-
-/**
- * How many lines an `if` header may span (see {@link ifBlockOpener}).
- *
- * Real headers are one line, or two-three when a call's arguments wrap
- * (`if err := alerter.AddRule(observability.AlertRule{…}); err != nil {`).
- * Twenty is generous and still bounds the work one `if` can cause on a
- * pathological file — the old code used a 300-character window instead, which
- * was both too small (it lost real blocks whose `{` sat 307 characters away)
- * and unprincipled.
- */
-const IF_HEADER_MAX_LINES = 20
-
-/** Characters that cannot start an `if` condition: `if:`/`if,` are object keys. */
-const NOT_A_CONDITION_START = ':,)]}=.'
-
-/** Whether the character can be part of an identifier. */
-function isWordChar(char: string | undefined): boolean {
-    return char !== undefined && /[A-Za-z0-9_$]/.test(char)
-}
-
-/** Index of the previous non-whitespace character, or -1. */
-function previousNonSpace(masked: string, from: number): number {
-    for (let index = from - 1; index >= 0; index -= 1) {
-        if (!/\s/.test(masked[index] ?? '')) return index
-    }
-    return -1
-}
-
-/** Offset of the bracket matching the one at `open`, or -1 when it is not closed before `stop`. */
-function matchParenBefore(masked: string, open: number, stop: number): number {
-    let depth = 0
-    for (let index = open; index < Math.min(stop, masked.length); index += 1) {
-        const char = masked[index] ?? ''
-        if (char === '(' || char === '[' || char === '{') depth += 1
-        else if (char === ')' || char === ']' || char === '}') {
-            depth -= 1
-            if (depth === 0) return index
-            if (depth < 0) return -1
-        }
-    }
-    return -1
-}
-
-/**
- * The `{` that opens the block of an `if` header, or -1 when there is none.
- *
- * `from` is the offset just after the `if` keyword. The header is PARSED, never
- * guessed, so a brace-less one-liner (`if (!resolved.enabled) return`) can no
- * longer adopt an unrelated `{` further down the file:
- *
- * - TS/JS require parentheses, so the condition is consumed by matching its `)`
- *   and the block exists only when the next non-space character is `{`
- *   (`if (x)\n{` is still a block, `if (x)\n  return` is not).
- * - Go needs none, so the condition runs to the first `{` at bracket depth 0 on
- *   the logical line, skipping a composite literal in the init statement
- *   (`if want := []any{1}; !ok {`), the header may start with any character
- *   (`if *flag {`, `if &x {`, `if 1 < 2 {`) and it may continue on the next line
- *   when the line ends with an operator (`&&`), which is exactly Go's automatic
- *   semicolon insertion rule.
- *
- * The scan is bounded to {@link IF_HEADER_MAX_LINES} lines — far more than any
- * real header (the longest one in the repositories measured is 3) and enough to
- * hold a composite literal inside the condition.
- */
-function ifBlockOpener(lexed: Lexed, braces: Braces, from: number): number {
-    const masked = lexed.masked
-    const headerLine = lineOfOffset(lexed, from)
-    const lastLine = Math.min(headerLine + IF_HEADER_MAX_LINES, lexed.lineStarts.length - 1)
-    const stop = lexed.lineStarts[lastLine] ?? masked.length
-    const open = skipSpace(masked, from)
-    if (open >= stop) return -1
-    if (lexed.language !== 'go' && masked[open] === '(') {
-        const close = matchParenBefore(masked, open, stop)
-        if (close < 0) return -1
-        const next = skipSpace(masked, close + 1)
-        if (next >= stop) return -1
-        return masked[next] === '{' ? next : -1
-    }
-    if (NOT_A_CONDITION_START.includes(masked[open] ?? '')) return -1
-    let depth = 0
-    for (let index = open; index < stop; index += 1) {
-        const char = masked[index] ?? ''
-        if (char === '(' || char === '[') depth += 1
-        else if (char === ')' || char === ']') depth = Math.max(0, depth - 1)
-        else if (char === '{' && depth === 0) {
-            // A composite literal in an `if` init statement (`if v := T{a}; …`)
-            // is not the block: it is the only place where a `{` at depth 0 can
-            // be followed by `;` instead of a statement body.
-            const literal = compositeLiteralEnd(masked, braces, index)
-            if (literal >= 0) {
-                index = literal
-                continue
-            }
-            return index
-        } else if (char === '}' && depth === 0) return -1
-        else if (char === '\n' && depth === 0 && !continuesOnNextLine(masked, index)) return -1
-    }
-    return -1
-}
-
-/** Offset of the `}` closing a composite literal at `offset`, or -1 when there is none. */
-function compositeLiteralEnd(masked: string, braces: Braces, offset: number): number {
-    const index = braceIndexAt(braces, offset)
-    if (index < 0 || (braces.offsets[index] ?? -1) !== offset) return -1
-    const closer = braces.match[index] ?? -1
-    if (closer < 0) return -1
-    const end = braces.offsets[closer] ?? -1
-    if (end < 0) return -1
-    return masked[skipSpace(masked, end + 1)] === ';' ? end : -1
-}
-
-/**
- * Whether a line ending at the `\n` at `newline` continues the statement.
- *
- * Go inserts a semicolon when a line ends with an identifier, a literal, `)`,
- * `]`, `}`, `++`/`--` or `return`; a line ending in an operator does not end the
- * statement, so an `if` condition may wrap (`… &&\n  other`).
- */
-function continuesOnNextLine(masked: string, newline: number): boolean {
-    const previous = previousNonSpace(masked, newline)
-    if (previous < 0) return false
-    return ',;:+-*/%&|^<>=!.(['.includes(masked[previous] ?? '')
-}
-
-/**
- * Every `if`/`else if`/`else` block of a brace-language file.
- *
- * A one-liner without a block (`if (x) return`, `if 1 < 2 return`) is skipped,
- * `} else if (y) {` counts as an `if` whose span starts at the `else`, and a
- * bare `} else {` counts as an `else`. A header whose condition spans several
- * lines is still one block, and the opener may sit far from the `if` (up to
- * {@link IF_HEADER_MAX_LINES} lines).
- */
-function braceIfBlocks(lexed: Lexed, braces: Braces): IfBlockMetric[] {
-    const masked = lexed.masked
-    const blocks: IfBlockMetric[] = []
-    const seen = new Set<number>()
-
-    const collect = (candidate: number, headerLine: number, kind: 'if' | 'else'): void => {
-        if (candidate < 0 || masked[candidate] !== '{') return
-        const index = braceIndexAt(braces, candidate)
-        if (index < 0 || (braces.offsets[index] ?? -1) !== candidate) return
-        const closer = closerOf(braces, index)
-        if (closer < 0) return
-        if (seen.has(candidate)) return
-        seen.add(candidate)
-        const endLine = lineOfOffset(lexed, braces.offsets[closer] ?? candidate)
-        blocks.push({ line: headerLine + 1, lines: endLine - headerLine + 1, kind })
-    }
-
-    for (let index = 0; index < masked.length; index += 1) {
-        if (masked[index] !== 'i' && masked[index] !== 'e') continue
-        if (masked.startsWith('if', index)) {
-            if (isWordChar(masked[index - 1]) || isWordChar(masked[index + 2])) continue
-            const before = previousNonSpace(masked, index)
-            const gap = before < 0 ? '' : masked.slice(before + 1, index)
-            const previous = before < 0 ? '' : masked[before] ?? ''
-            // `else if` is collected from its `else`, so it is not counted twice.
-            if (!gap.includes('\n') && !';{}()'.includes(previous)) continue
-            collect(ifBlockOpener(lexed, braces, index + 2), lineOfOffset(lexed, index), 'if')
-            continue
-        }
-        if (!masked.startsWith('else', index)) continue
-        if (isWordChar(masked[index - 1]) || isWordChar(masked[index + 4])) continue
-        const before = previousNonSpace(masked, index)
-        const gap = before < 0 ? '' : masked.slice(before + 1, index)
-        const previous = before < 0 ? '' : masked[before] ?? ''
-        if (!gap.includes('\n') && previous !== '}' && previous !== ';') continue
-        const next = skipSpace(masked, index + 4)
-        const headerLine = lineOfOffset(lexed, index)
-        if (masked.startsWith('if', next) && !isWordChar(masked[next + 2])) collect(ifBlockOpener(lexed, braces, next + 2), headerLine, 'if')
-        else collect(masked[next] === '{' ? next : -1, headerLine, 'else')
-    }
-    return blocks.sort((left, right) => left.line - right.line || compareText(left.kind, right.kind))
 }
 
 // --- workspace index & import resolution ------------------------------------
@@ -1418,130 +1250,6 @@ function readGoModule(cwd: string, maxFileBytes: number, logger: Logger): string
     const text = readCapped(path.join(cwd, 'go.mod'), maxFileBytes, logger)
     if (text === undefined) return undefined
     return /^\s*module\s+(\S+)\s*$/m.exec(text)?.[1]
-}
-
-// --- cycles -----------------------------------------------------------------
-
-const MAX_CYCLES = 200
-const MAX_CYCLE_STEPS = 200_000
-
-/** Rotate a cycle so the lexicographically smallest path comes first. */
-function normaliseCycle(cycle: readonly string[]): string[] {
-    let pivot = 0
-    for (let index = 1; index < cycle.length; index += 1) {
-        if (compareText(cycle[index] ?? '', cycle[pivot] ?? '') < 0) pivot = index
-    }
-    return [...cycle.slice(pivot), ...cycle.slice(0, pivot)]
-}
-
-/**
- * Every simple import cycle of the graph, normalised and deduplicated.
- *
- * Only strongly connected components are searched; the result is capped
- * ({@link MAX_CYCLES}) and so is the traversal ({@link MAX_CYCLE_STEPS}), so a
- * pathological graph degrades to "the first N cycles" instead of hanging.
- */
-function findCycles(edges: Map<string, string[]>, logger: Logger): string[][] {
-    const nodes = [...edges.keys()].sort(compareText)
-    const adjacency = new Map<string, string[]>()
-    const reverse = new Map<string, string[]>()
-    for (const node of nodes) {
-        adjacency.set(node, [...new Set(edges.get(node) ?? [])].filter((target) => target !== node).sort(compareText))
-        reverse.set(node, [])
-    }
-    for (const node of nodes) {
-        for (const target of adjacency.get(node) ?? []) reverse.get(target)?.push(node)
-    }
-    for (const node of nodes) reverse.get(node)?.sort(compareText)
-
-    // Kosaraju: a finish order over the graph, then components over its reverse.
-    const order: string[] = []
-    const visited = new Set<string>()
-    for (const start of nodes) {
-        if (visited.has(start)) continue
-        const stack: { node: string; cursor: number }[] = [{ node: start, cursor: 0 }]
-        visited.add(start)
-        while (stack.length > 0) {
-            const frame = stack[stack.length - 1] as { node: string; cursor: number }
-            const neighbours = adjacency.get(frame.node) ?? []
-            if (frame.cursor < neighbours.length) {
-                const next = neighbours[frame.cursor] as string
-                frame.cursor += 1
-                if (!visited.has(next)) {
-                    visited.add(next)
-                    stack.push({ node: next, cursor: 0 })
-                }
-                continue
-            }
-            order.push(frame.node)
-            stack.pop()
-        }
-    }
-    const componentOf = new Map<string, number>()
-    let componentCount = 0
-    for (let index = order.length - 1; index >= 0; index -= 1) {
-        const start = order[index] as string
-        if (componentOf.has(start)) continue
-        const id = componentCount
-        componentCount += 1
-        const stack: string[] = [start]
-        componentOf.set(start, id)
-        while (stack.length > 0) {
-            const node = stack.pop() as string
-            for (const next of reverse.get(node) ?? []) {
-                if (!componentOf.has(next)) {
-                    componentOf.set(next, id)
-                    stack.push(next)
-                }
-            }
-        }
-    }
-    const components = new Map<number, string[]>()
-    for (const node of nodes) {
-        const id = componentOf.get(node) ?? -1
-        if (id < 0) continue
-        const bucket = components.get(id) ?? []
-        bucket.push(node)
-        components.set(id, bucket)
-    }
-
-    const found = new Map<string, string[]>()
-    let steps = 0
-    for (const id of [...components.keys()].sort((left, right) => left - right)) {
-        const component = components.get(id) ?? []
-        if (component.length < 2) continue
-        const members = new Set(component)
-        for (const start of [...component].sort(compareText)) {
-            if (found.size >= MAX_CYCLES || steps >= MAX_CYCLE_STEPS) break
-            const path: string[] = [start]
-            const onPath = new Set<string>([start])
-            const walk = (node: string): void => {
-                if (found.size >= MAX_CYCLES || steps >= MAX_CYCLE_STEPS) return
-                for (const next of adjacency.get(node) ?? []) {
-                    steps += 1
-                    if (steps >= MAX_CYCLE_STEPS || found.size >= MAX_CYCLES) return
-                    if (!members.has(next)) continue
-                    if (next === start) {
-                        if (path.length < 2) continue
-                        const cycle = normaliseCycle(path)
-                        found.set(cycle.join('\u0000'), cycle)
-                        continue
-                    }
-                    if (onPath.has(next)) continue
-                    onPath.add(next)
-                    path.push(next)
-                    walk(next)
-                    path.pop()
-                    onPath.delete(next)
-                }
-            }
-            walk(start)
-        }
-    }
-    if (found.size >= MAX_CYCLES || steps >= MAX_CYCLE_STEPS) {
-        logger.debug(`metrics: 导入环枚举达到上限（${MAX_CYCLES} 个 / ${MAX_CYCLE_STEPS} 步），已截断`)
-    }
-    return [...found.values()].sort((left, right) => compareText(left.join('\n'), right.join('\n')))
 }
 
 // --- rules ------------------------------------------------------------------
@@ -1691,6 +1399,43 @@ function violationsFor(file: MeasuredFile, rules: RuleSet, standards: StandardsC
 
 // --- measurement ------------------------------------------------------------
 
+/** The measured nodes one import points at (empty when the target is external or unmeasured). */
+function targetsOf(index: WorkspaceIndex, file: MeasuredFile, target: string): string[] {
+    if (file.metrics.language === 'go') return index.goDirs.has(target) ? [target] : []
+    if (index.measured.has(target)) return [target]
+    return index.pythonInDir.get(target) ?? []
+}
+
+/**
+ * Build the import graph of the measured files: edges plus the line each edge
+ * came from (so a cycle can name a place a person can open).
+ *
+ * Go nodes are package DIRECTORIES, every other language is file-grained — the
+ * same convention the layer rules use.
+ */
+function buildEdges(index: WorkspaceIndex, measured: readonly MeasuredFile[]): { edges: Map<string, string[]>; edgeLines: Map<string, number> } {
+    const edges = new Map<string, string[]>()
+    const edgeLines = new Map<string, number>()
+    const nodeOf = (file: MeasuredFile): string =>
+        file.metrics.language === 'go' ? path.posix.dirname(file.metrics.path) : file.metrics.path
+    for (const file of measured) {
+        const from = nodeOf(file)
+        const bucket = edges.get(from) ?? []
+        for (const target of file.metrics.imports) {
+            for (const node of targetsOf(index, file, target)) {
+                if (node === from) continue
+                bucket.push(node)
+                if (!edges.has(node)) edges.set(node, [])
+                const key = `${from}\u0000${node}`
+                if (!edgeLines.has(key)) edgeLines.set(key, file.importLines.get(target) ?? 1)
+            }
+        }
+        edges.set(from, bucket)
+    }
+    return { edges, edgeLines }
+}
+
+
 /**
  * Measure one workspace against its declared standards.
  *
@@ -1768,33 +1513,12 @@ export function measureWorkspace(options: MeasureOptions): MetricsResult {
 
     let cycles: string[][] = []
     if (standards.forbidCycles === true) {
-        const edges = new Map<string, string[]>()
-        const edgeLines = new Map<string, number>()
-        const nodeOf = (file: MeasuredFile): string =>
-            file.metrics.language === 'go' ? path.posix.dirname(file.metrics.path) : file.metrics.path
-        for (const file of measured) {
-            const from = nodeOf(file)
-            const bucket = edges.get(from) ?? []
-            for (const target of file.metrics.imports) {
-                let targets: string[]
-                if (file.metrics.language === 'go') targets = index.goDirs.has(target) ? [target] : []
-                else if (index.measured.has(target)) targets = [target]
-                else targets = index.pythonInDir.get(target) ?? []
-                for (const node of targets) {
-                    if (node === from) continue
-                    bucket.push(node)
-                    if (!edges.has(node)) edges.set(node, [])
-                    const key = `${from}\u0000${node}`
-                    if (!edgeLines.has(key)) edgeLines.set(key, file.importLines.get(target) ?? 1)
-                }
-            }
-            edges.set(from, bucket)
-        }
-        cycles = findCycles(edges, logger)
+        const graph = buildEdges(index, measured)
+        cycles = findCycles(graph.edges, logger)
         for (const cycle of cycles) {
             const first = cycle[0] ?? ''
             const second = cycle[1] ?? ''
-            const line = edgeLines.get(`${first}\u0000${second}`) ?? 1
+            const line = graph.edgeLines.get(`${first}\u0000${second}`) ?? 1
             const id = cycle.join(' -> ')
             violations.push(violationOf('cycle', first, id, line, cycle.length, 0, `导入环 ${id} -> ${first}（${cycle.length} 个模块，上限 0）`))
         }
@@ -1849,6 +1573,8 @@ function analyzeSource(lexed: Lexed, language: Language): Analysis {
             maxDepthLine: braces.maxDepthLineIndex + 1,
         }
     }
+    if (language === 'ruby') return { ...rubyAnalysis(lexed), raw: [] }
+    if (isBraceFamily(language)) return { ...familyAnalysis(lexed, language), raw: [] }
     const structure = pyStructure(lexed)
     const python = analyzePythonFunctions(lexed, structure)
     return {

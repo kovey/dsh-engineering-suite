@@ -10,7 +10,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
-import { scanGaps, scanWorkspace } from '../dist/index.js'
+import { languageOf, scanGaps, scanWorkspace } from '../dist/index.js'
 import type { CodeSymbol, ScanResult, SpecRecord, TestDesign } from '../dist/index.js'
 
 function workspace(): string {
@@ -770,4 +770,42 @@ test('scanGaps reports the missing artifacts it can prove', () => {
     fs.writeFileSync(path.join(cwd, '.dsh', 'quality-gate.json'), '{ "commands": [] }\n')
     const configured: ScanResult = { ...commandless, cwd }
     assert.deepEqual(scanGaps({ scan: configured, spec, testDesign }).missingArtifacts, [])
+})
+
+test('languageOf: eleven ecosystems by extension, and unknown extensions stay unknown', () => {
+    const expected: [string, string][] = [
+        ['src/a.go', 'go'],
+        ['src/a.ts', 'ts'],
+        ['src/a.tsx', 'ts'],
+        ['src/a.js', 'js'],
+        ['src/a.mjs', 'js'],
+        ['src/a.cjs', 'js'],
+        ['src/a.py', 'python'],
+        ['src/a.rs', 'rust'],
+        ['src/a.java', 'java'],
+        ['src/a.kt', 'kotlin'],
+        ['src/a.kts', 'kotlin'],
+        ['src/a.cs', 'csharp'],
+        ['src/a.php', 'php'],
+        ['src/a.rb', 'ruby'],
+        ['src/a.swift', 'swift'],
+    ]
+    for (const [file, language] of expected) assert.equal(languageOf(file), language, `${file} must be ${language}`)
+    assert.equal(languageOf('src/Main.RS'), 'rust', 'extension matching is case-insensitive')
+    // "unknown" is `undefined`, never `other`: `other` is the bucket
+    // `FileMetrics.language` keeps for a file no analyser claimed, and returning
+    // it here would make the scanner try to parse every `.zzz`/`.md` as code.
+    for (const file of ['src/x.zzz', 'src/Makefile', 'src/.hidden', 'src/noext']) {
+        assert.equal(languageOf(file), undefined, `${file} has no analyser`)
+    }
+})
+
+test('scan counts the new languages as code evidence without inventing symbols', () => {
+    const cwd = workspace()
+    write(cwd, 'src/lib.rs', 'pub fn main() {}\n')
+    write(cwd, 'src/app.rb', 'class App\nend\n')
+    const scan = scanWorkspace({ cwd })
+    assert.deepEqual(scan.stats.languages, { ruby: 1, rust: 1 })
+    assert.deepEqual(scan.symbols, [], 'the TS symbol regex must not be run over Rust/Ruby')
+    assert.deepEqual(scan.tests, [])
 })

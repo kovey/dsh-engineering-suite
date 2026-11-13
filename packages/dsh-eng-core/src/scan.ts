@@ -38,6 +38,7 @@ import { exists, listDir, readJson } from './io.js'
 import { resolveLayout } from './paths.js'
 import { projectConfigFile } from './project-config.js'
 import { silentLogger, type Logger } from './log.js'
+import { languageOf, type Language } from './languages.js'
 import type { SpecRecord, TestCase, TestDesign } from './types.js'
 
 /** One requirement document found in the workspace. */
@@ -166,18 +167,17 @@ const MAX_UNCOVERED_SYMBOLS = 100
 
 // --- languages --------------------------------------------------------------
 
-/** Languages the scanner understands (detected by extension). */
-export type Language = 'go' | 'ts' | 'js' | 'python'
+/**
+ * Languages the scanner understands (detected by extension).
+ *
+ * The table itself lives in `languages.ts`: the scanner, the metrics and the
+ * knowledge base all ask the same question, and a per-consumer copy of the map
+ * is how a `.rb` gets measured by one and silently ignored by another.
+ */
+export { languageOf, type Language }
 
-const LANGUAGE_BY_EXTENSION: Readonly<Record<string, Language>> = {
-    '.go': 'go',
-    '.ts': 'ts',
-    '.tsx': 'ts',
-    '.js': 'js',
-    '.mjs': 'js',
-    '.cjs': 'js',
-    '.py': 'python',
-}
+/** Languages whose symbols and test cases this scanner parses (a count is all the rest get). */
+const SCANNED_LANGUAGES: ReadonlySet<Language> = new Set<Language>(['go', 'ts', 'js', 'python'])
 
 /** Root build/config files reported by a scan, in a stable (alphabetical) order. */
 const BUILD_FILE_NAMES: readonly string[] = [
@@ -207,14 +207,6 @@ function compareText(left: string, right: string): number {
 /** POSIX, workspace-relative form of `target` (the spelling every path uses). */
 function relativeTo(cwd: string, target: string): string {
     return path.relative(cwd, target).split(path.sep).join('/')
-}
-
-/** The language of a workspace-relative path, or `undefined` when nothing analyzes it. */
-export function languageOf(rel: string): Language | undefined {
-    const base = path.posix.basename(rel).toLowerCase()
-    const dot = base.lastIndexOf('.')
-    if (dot <= 0) return undefined
-    return LANGUAGE_BY_EXTENSION[base.slice(dot)]
 }
 
 /**
@@ -906,6 +898,7 @@ export function scanWorkspace(options: ScanOptions): ScanResult {
                 return
             }
             if (language === undefined) return
+            if (!SCANNED_LANGUAGES.has(language)) return // 只计数：别的语言的符号不猜
             const text = readCapped(abs, maxFileBytes, logger)
             if (text === undefined) return
 
@@ -983,8 +976,7 @@ export function scanWorkspace(options: ScanOptions): ScanResult {
     tests.sort((left, right) => compareText(left.path, right.path))
     for (const evidence of tests) evidence.cases.sort((left, right) => left.line - right.line)
 
-    const sortedLanguages: Record<string, number> = {}
-    for (const key of Object.keys(languages).sort(compareText)) sortedLanguages[key] = languages[key] as number
+    const sortedLanguages: Record<string, number> = Object.fromEntries(Object.keys(languages).sort(compareText).map((key) => [key, languages[key] as number]))
 
     if (truncated) logger.debug(`scan: 达到 maxFiles=${maxFiles}，结果已截断`)
 
