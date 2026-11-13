@@ -1,5 +1,17 @@
 ## [未发布]
 
+### 修复 · 可选 peer 改为运行时解析；安装方改用 profile postinstall（`dsh-eng-core` / `docs/RELEASE.md`）
+
+`context-error` 里的动态 `import(...)` 用的是**字面量模块名**，tsc 会在构建期解析它；独立安装
+（git 依赖的 `prepare`）没有那个 peer，于是 `TS2307` 让整个构建失败。现在模块名在运行时才
+计算：宿主装了这个包就用它的类，没装就回落同名 fallback（`name`/`code` 不变）。
+
+实测（pnpm 12 + `nodeLinker: hoisted`，从 GitHub 装 `#main`）确认安装方最稳的姿势：profile 的
+`devDependencies` 带 `typescript`/`@types/node`，`postinstall` 执行
+`node node_modules/dsh-engineering-suite/scripts/prepare-install.mjs` —— **16 个 dist 全部生成**、
+`require.resolve('dsh-spec-gate')` 指向安装副本、`node_modules` 下 16 条 bundle 软链。依赖自身的
+`prepare` 路线受 pnpm 放行与副作用缓存影响，可能被跳过（也已写进文档）。
+
 ### 修复 · 安装时构建缺 `@types/node`（`package.json` / `docs/RELEASE.md`）
 
 `prepare` 在真实安装里跑起来了，但 16 个包全部编译失败：`TS2688 Cannot find type definition

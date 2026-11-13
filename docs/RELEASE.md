@@ -71,3 +71,32 @@ git push origin main && git push origin vX.Y.Z
   `tui`：生产面只消费发布版；本地测试用 `nvim-tui`）；
 - 已安装的 profile 想换到某个 tag：`scripts/install-into-dsh.sh --allow-tui` 之后重装依赖，或直接
   `pnpm add github:kovey/dsh-engineering-suite#<tag>`。
+
+## 五、安装方最稳的姿势：由 profile 的 postinstall 触发构建
+
+依赖自身的 `prepare` 在 pnpm 里有两道坎：**pnpm 10 直接拒绝执行**
+（`ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED`），**pnpm ≥11 需要 `allowBuilds` 放行**，而且 git 依赖
+不能用裸包名——必须写仓库 URL：
+
+```yaml
+allowBuilds:
+  'dsh-engineering-suite@git+https://github.com/kovey/dsh-engineering-suite.git': true
+```
+
+即便放行，pnpm 的副作用缓存也可能让后续安装**跳过** `prepare`，装完仍然没有 `dist`。
+所以安装方最稳的做法是**由 profile 自己触发构建**（根项目的生命周期脚本永远执行、不需要放行、
+不会被依赖缓存吃掉），并把编译器与类型声明放在 profile 的 devDependencies 里：
+
+```json
+// ~/.dsh/profiles/<name>/package.json
+{
+  "devDependencies": { "typescript": "^5.9.3", "@types/node": "^26.6.6" },
+  "scripts": { "postinstall": "node node_modules/dsh-engineering-suite/scripts/prepare-install.mjs" }
+}
+```
+
+实测（pnpm 12.18.0 + `nodeLinker: hoisted` + 上面这份 profile 配置，从 GitHub 装 `#main`）：
+**16 个 `dist/index.js` 全部生成**、`require.resolve('dsh-spec-gate')` 指向
+`node_modules/dsh-engineering-suite/packages/dsh-spec-gate/dist/index.js`、
+`node_modules` 下出现 **16 条 bundle 软链**（含套件包本身共 17 个 `dsh-*` 条目）。
+
