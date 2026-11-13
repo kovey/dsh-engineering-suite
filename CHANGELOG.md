@@ -1,5 +1,42 @@
 ## [未发布]
 
+### 特性 · `project-config.sh` 的 `detect_lint()` 与 `suggestCommands()` 补齐语言面（lint 只在有约定时给）
+
+`detect()` 早就认 `composer.json`/`Gemfile`/`mix.exs`/`Package.swift`/`build.gradle(.kts)`/`pom.xml`/`CMakeLists.txt`/
+`*.csproj`/`*.sln`，但 `detect_lint()` 只认 Cargo、pyproject+ruff、pnpm、npm，`dsh-eng-core` 的 `suggestCommands()`
+也只覆盖 Cargo/go.mod/python/pnpm/yarn/package.json/Makefile——检测不说谎，默认 lint 却只对四五个生态成立。
+
+- **`scripts/project-config.sh`：`detect_lint()` 改为按 `detect()` 已经判定的 `$KIND` 分支**，不再自己重查一遍文件
+  （"是什么生态"与"lint 是什么"必须由同一个事实决定，两条清单各查一遍迟早各说各话）：`rust`→`cargo clippy -- -D warnings`、
+  `go`→`go vet ./...`、`python`→`ruff check .`（**仅** `pyproject.toml` 自己声明了 ruff）、`node`→`pnpm run lint`/`npm run lint`
+  （锁文件决定）、`php`→`vendor/bin/phpcs`、`ruby`→`bundle exec rubocop`、`swift`→`swiftlint`、
+  `jvm`→`./gradlew detekt`（gradle）/`mvn -q -DskipTests verify`（maven）、`dotnet`→`dotnet format --verify-no-changes`、
+  `elixir`→`mix format --check-formatted`；`cpp`/`make` **明确留空**（报告显示 `(无)`），`--lint` 显式给出时仍最优先。
+  没有为没有约定 linter 的生态编命令：那只会给每次生成的门禁挂上一条必然失败的 lint。
+- **`dsh-eng-core` 的 `suggestCommands()` 补 7 个生态**，顺序与 `detect()` 一致（包管理器清单先、通用构建文件后、
+  Makefile 最后）：`composer.json`→php（`vendor/bin/phpunit` + `vendor/bin/phpcs`）、`Gemfile`/`*.gemspec`→ruby
+  （`bundle exec rspec` + `bundle exec rubocop`）、`Package.swift`→swift（`swift test` + `swiftlint`）、
+  `build.gradle(.kts)`→jvm（`./gradlew test` + `./gradlew detekt`，与 shell 一样无条件用 wrapper——两侧任何一侧
+  偷偷加"存在 `gradlew` 才用"的条件就会漂移）、`pom.xml`→jvm（`mvn -q test` + `mvn -q -DskipTests verify`；shell 侧仍是
+  `mvn test`，同一个 runner、识别结果一致）、`mix.exs`→elixir（`mix test` + `mix format --check-formatted`）、
+  `CMakeLists.txt`→cpp（`ctest`，**无 lint**）、`*.csproj`/`*.sln`→dotnet（`dotnet test` + `dotnet format --verify-no-changes`）。
+  两个内部小函数（`pair()` 收拢"test + 可选 lint"、`hasSuffixed()` 处理 `*.gemspec`/`*.csproj`/`*.sln`）让每个分支一行，
+  `scan.ts` 反而仍在行数棘轮基线内（1081 ≤ 基线 1088）。
+- **一致性测试**（`packages/dsh-eng-core/test/test-commands.test.ts`）：`detect()` 的每个分支各一个 fixture，两侧各跑一遍
+  （shell `--print` + `scanWorkspace().suggestedCommands`），断言 kind 相同、lint 文本逐字相同、test 命令被
+  `recognizeTestCommand` 识别成同一个 runner 且生态与 kind 对应，并断言"没有约定 linter 的生态不产出 lint 项"。
+  `tsconfig.json` 也有一行：它**不是** `detect()` 的分支，所以两侧都必须回答"未识别"（shell `--print` exit 3）——
+  测试钉的是真实行为，不是期望。`*.gemspec`/`*.sln` 作为后缀变体单独断言。新增断言只追加，既有断言与既有用例的
+  期望值未改写。
+- **文档**：`docs/ARCHITECTURE.md` §5.30.1 的检测优先级表补一列"shell 脚手架：`kind` / `test` / `lint`"，并说明 shell
+  自己的优先级、它为什么比 `SuiteLanguage` 多 `elixir`/`cpp`/`make`、以及两侧如何被测试钉在一起。
+
+**验证**（按团队约定本轮不跑全量 verify）：`node --test packages/dsh-eng-core/test/*.test.ts`（274 项：273 pass / 1 skipped）、
+`node node_modules/typescript/bin/tsc -p packages/dsh-eng-core/tsconfig.json` 退出 0、`bash -n scripts/project-config.sh` 退出 0、
+17 个临时 manifest 夹具的 `--print` dry-run（每个 kind 的 test/lint 见 §5.30.1 新列）、
+`bash scripts/standards-check.sh --quiet` → PASS（无新增/恶化）。负向验证：把 `CMakeLists.txt` 分支临时改成带
+`cppcheck` 的 lint 后，一致性测试按 manifest 名失败；改回后全绿。
+
 ### 特性 · 语言支持从 4 种扩到 11 种：检测、脚手架默认、结构度量与 `end` 词法（`dsh-suite-doctor` + `dsh-eng-core`）
 
 `ts/js/go/py` 之外的七种生态（`rust/java/kotlin/csharp/php/ruby/swift`）现在从"检测 → 脚手架默认命令 →

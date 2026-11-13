@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict'
-import { execFileSync } from 'node:child_process'
+import { execFileSync, spawnSync } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
 import test from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { TEST_COMMAND_TABLE, recognizeTestCommand, testCommandLabel } from '../dist/test-commands.js'
+import { scanWorkspace } from '../dist/index.js'
 import { tempWorkspace } from 'dsh-eng-core/testing'
 
 /**
@@ -237,4 +238,140 @@ test('the scaffold keeps --test/--lint winning over detection, and --print write
     assert.equal(detected.lint, 'vendor/bin/phpcs', '--lint must win over the detected lint')
     assert.equal(recognizeTestCommand(detected.test).matched, true)
     assert.equal(fs.existsSync(path.join(cwd, '.dsh')), false)
+})
+
+/**
+ * Run the scaffold read-only and parse its three printed lines.
+ *
+ * Unlike {@link detectWithScaffold} this tolerates exit 3 ("nothing
+ * recognised") instead of throwing: "both sides see no ecosystem" is a
+ * legitimate agreement, and a test that cannot observe it would have to skip
+ * exactly the manifest (`tsconfig.json`) the acceptance criteria names.
+ */
+function runScaffold(cwd: string): { kind: string; test: string; lint: string; status: number } {
+    const result = spawnSync('bash', [SCAFFOLD, '--workspace', cwd, '--print'], { encoding: 'utf8' })
+    const values = new Map<string, string>()
+    for (const line of (result.stdout ?? '').split('\n')) {
+        const at = line.indexOf('=')
+        if (at > 0) values.set(line.slice(0, at), line.slice(at + 1))
+    }
+    return {
+        kind: values.get('kind') ?? '',
+        test: values.get('test') ?? '',
+        lint: values.get('lint') ?? '',
+        status: result.status ?? -1,
+    }
+}
+
+/**
+ * One fixture per manifest `detect()` actually branches on, with the answers
+ * both sides must give. `tsconfig.json` is deliberately absent (see the
+ * `detect()` body: the shell has no tsconfig branch), `mix.exs`/`CMakeLists.txt`
+ * are here because `suggestCommands` gained them, and `*.gemspec`/`*.sln` are
+ * covered as suffix variants at the end of the test.
+ */
+const AGREEMENT_FIXTURES: readonly { file: string; body: string; kind: string; command: string; lint: string }[] = [
+    { file: 'composer.json', body: '{}\n', kind: 'php', command: 'vendor/bin/phpunit', lint: 'vendor/bin/phpcs' },
+    { file: 'Gemfile', body: 'source "https://rubygems.org"\n', kind: 'ruby', command: 'bundle exec rspec', lint: 'bundle exec rubocop' },
+    { file: 'mix.exs', body: 'defmodule Demo.MixProject do\nend\n', kind: 'elixir', command: 'mix test', lint: 'mix format --check-formatted' },
+    { file: 'Package.swift', body: '// swift-tools-version:5.9\n', kind: 'swift', command: 'swift test', lint: 'swiftlint' },
+    { file: 'build.gradle.kts', body: 'plugins {}\n', kind: 'jvm', command: './gradlew test', lint: './gradlew detekt' },
+    { file: 'pom.xml', body: '<project/>\n', kind: 'jvm', command: 'mvn -q test', lint: 'mvn -q -DskipTests verify' },
+    { file: 'Cargo.toml', body: '[package]\nname = "demo"\n', kind: 'rust', command: 'cargo test', lint: 'cargo clippy -- -D warnings' },
+    { file: 'go.mod', body: 'module demo\n', kind: 'go', command: 'go test ./...', lint: 'go vet ./...' },
+    { file: 'pyproject.toml', body: '[project]\nname = "demo"\n', kind: 'python', command: 'pytest -q', lint: '' },
+    { file: 'pnpm-lock.yaml', body: 'lockfileVersion: 9\n', kind: 'node', command: 'pnpm test', lint: 'pnpm run lint' },
+    { file: 'yarn.lock', body: '# yarn\n', kind: 'node', command: 'yarn test', lint: '' },
+    { file: 'package.json', body: '{"name":"demo"}\n', kind: 'node', command: 'npm test', lint: 'npm run lint' },
+    { file: 'CMakeLists.txt', body: 'project(demo)\n', kind: 'cpp', command: 'ctest', lint: '' },
+    { file: 'app.csproj', body: '<Project/>\n', kind: 'dotnet', command: 'dotnet test', lint: 'dotnet format --verify-no-changes' },
+    { file: 'Makefile', body: 'build:\n\ttrue\n\ntest:\n\ttrue\n', kind: 'make', command: 'make test', lint: '' },
+]
+
+/** The recogniser ecosystem each detected kind must land in (table names, not shell names). */
+const KIND_ECOSYSTEM: Readonly<Record<string, string>> = {
+    php: 'PHP',
+    ruby: 'Ruby',
+    elixir: 'Elixir/Erlang',
+    swift: 'Swift/Apple',
+    jvm: 'JVM',
+    rust: 'Rust',
+    go: 'Go',
+    python: 'Python',
+    node: 'JavaScript/TypeScript',
+    dotnet: '.NET',
+    cpp: 'C/C++',
+    make: '通用包装器',
+}
+
+test('the scaffold and suggestCommands agree on every manifest either side detects (drift guard)', () => {
+    for (const fixture of AGREEMENT_FIXTURES) {
+        const cwd = tempWorkspace('agreement-')
+        fs.writeFileSync(path.join(cwd, fixture.file), fixture.body)
+
+        const shell = runScaffold(cwd)
+        assert.equal(shell.status, 0, `${fixture.file}: the scaffold did not recognise the manifest`)
+        assert.equal(shell.kind, fixture.kind, `${fixture.file}: the scaffold detected a different kind`)
+
+        const suggested = scanWorkspace({ cwd }).suggestedCommands
+        const testCommand = suggested.find((entry) => entry.id === 'test')
+        const lintCommand = suggested.find((entry) => entry.id === 'lint')
+        assert.equal(testCommand?.command, fixture.command, `${fixture.file}: suggestCommands picked a different test command`)
+        assert.equal(lintCommand?.command ?? '', fixture.lint, `${fixture.file}: suggestCommands picked a different lint command`)
+        // One table, two languages: the lint default is literally the same text.
+        assert.equal(shell.lint, fixture.lint, `${fixture.file}: the scaffold's lint default drifted from suggestCommands`)
+        // "Same ecosystem": the recogniser reads both sides' test command as the
+        // same runner, and that runner is the one the detected kind names.
+        const shellLabel = testCommandLabel(recognizeTestCommand(shell.test))
+        const scanLabel = testCommandLabel(recognizeTestCommand(fixture.command))
+        assert.equal(shellLabel, scanLabel, `${fixture.file}: the two sides name different runners (${shellLabel} vs ${scanLabel})`)
+        assert.equal(shellLabel?.split(' / ')[0], KIND_ECOSYSTEM[fixture.kind], `${fixture.file}: recogniser ecosystem disagrees with the detected kind`)
+        // No lint entry for an ecosystem without a conventional linter — the
+        // absence is the assertion (cpp/make must not grow an invented linter).
+        assert.equal(suggested.some((entry) => entry.id === 'lint'), fixture.lint !== '', `${fixture.file}: lint presence must follow the convention, not invent one`)
+        assert.deepEqual(
+            suggested.map((entry) => [entry.id, entry.required, entry.phase]),
+            fixture.lint === '' ? [['test', true, 'gate']] : [['test', true, 'gate'], ['lint', false, 'lint']],
+            `${fixture.file}: required/phase invariants changed`,
+        )
+    }
+
+    // `detect()` has no tsconfig branch, so a tsconfig-only workspace is "no
+    // ecosystem" on BOTH sides. The acceptance criteria named tsconfig; this
+    // pins the behaviour that actually exists instead of pretending the shell
+    // recognises it.
+    const tsconfig = tempWorkspace('agreement-')
+    fs.writeFileSync(path.join(tsconfig, 'tsconfig.json'), '{}\n')
+    const shell = runScaffold(tsconfig)
+    assert.equal(shell.status, 3, 'tsconfig.json: the scaffold must report "nothing recognised", not invent a language')
+    assert.equal(shell.kind, 'unknown', 'tsconfig.json: wrong kind')
+    assert.equal(shell.test, '', 'tsconfig.json: no test command may be invented')
+    assert.equal(shell.lint, '', 'tsconfig.json: no lint command may be invented')
+    assert.deepEqual(scanWorkspace({ cwd: tsconfig }).suggestedCommands, [], 'tsconfig.json: suggestCommands must not invent a test command either')
+
+    // Suffix manifests: the scan side reads `*.gemspec`/`*.sln` as the same
+    // ecosystems the shell reaches through `Gemfile`/`*.csproj`.
+    const gem = tempWorkspace('agreement-')
+    fs.writeFileSync(path.join(gem, 'demo.gemspec'), 'Gem::Specification.new\n')
+    assert.deepEqual(
+        scanWorkspace({ cwd: gem }).suggestedCommands.map((entry) => entry.command),
+        ['bundle exec rspec', 'bundle exec rubocop'],
+        '*.gemspec: must be ruby',
+    )
+    const sln = tempWorkspace('agreement-')
+    fs.writeFileSync(path.join(sln, 'App.sln'), 'Microsoft Visual Studio Solution File\n')
+    assert.deepEqual(
+        scanWorkspace({ cwd: sln }).suggestedCommands.map((entry) => entry.command),
+        ['dotnet test', 'dotnet format --verify-no-changes'],
+        '*.sln: must be dotnet',
+    )
+    assert.equal(runScaffold(sln).kind, 'dotnet', '*.sln: the scaffold reads the same manifest')
+
+    // A DIRECTORY whose name ends in a manifest extension is not a manifest: the
+    // shell's `[ -f ]` ignores it, so the scan side must ignore it too.
+    const directoryOnly = tempWorkspace('agreement-')
+    fs.mkdirSync(path.join(directoryOnly, 'x.csproj'))
+    fs.mkdirSync(path.join(directoryOnly, 'y.gemspec'))
+    assert.deepEqual(scanWorkspace({ cwd: directoryOnly }).suggestedCommands, [], 'a directory named *.csproj/*.gemspec is not a manifest')
+    assert.equal(runScaffold(directoryOnly).status, 3, 'a directory named *.csproj/*.gemspec is "nothing recognised" for the scaffold too')
 })

@@ -680,11 +680,29 @@ function command(id: string, name: string, text: string, required: boolean, phas
 }
 
 /**
- * The commands this workspace implies, mirroring `scripts/project-config.sh`:
- * the same detection order, the same command lines and the same labels, so a
- * suggestion can be written into `.dsh/quality-gate.json` unchanged. Late
- * entries are unreachable in practice, but the order is what makes the pick
- * unambiguous when a repository carries several ecosystems.
+ * One ecosystem's commands: the gate command every repository of that kind has,
+ * plus the lint command its own convention provides — omitted where there is no
+ * convention (C/C++), because an invented one would warn on every run forever.
+ */
+function pair(test: string, lint?: string): SuggestedCommand[] {
+    const commands = [command('test', '单元测试', test, true, 'gate')]
+    if (lint !== undefined) commands.push(command('lint', 'lint', lint, false, 'lint'))
+    return commands
+}
+
+/** Whether the workspace root holds a regular file named `*.suffix` (`.gemspec`, `.csproj`, `.sln`, …). */
+function hasSuffixed(cwd: string, suffixes: readonly string[]): boolean {
+    return listDir(cwd).some((name) => suffixes.some((suffix) => name.endsWith(suffix)) && !isDirectory(path.join(cwd, name)))
+}
+
+/**
+ * The commands this workspace implies, mirroring `scripts/project-config.sh`
+ * (`detect()` + `detect_lint()`): the same detection order, the same command
+ * lines and the same labels, so a suggestion can be written into
+ * `.dsh/quality-gate.json` unchanged. Late entries are unreachable in practice,
+ * but the order is what makes the pick unambiguous when a repository carries
+ * several ecosystems: a manifest that names its own runner wins over generic
+ * build files, and the Makefile is the last resort.
  *
  * Two invariants: nothing is emitted that was not detected in the workspace,
  * and `lint` is never required (a missing lint script must not block delivery).
@@ -692,48 +710,31 @@ function command(id: string, name: string, text: string, required: boolean, phas
 function suggestCommands(cwd: string, logger: Logger): SuggestedCommand[] {
     const has = (name: string): boolean => exists(path.join(cwd, name))
 
-    if (has('Cargo.toml')) {
-        return [
-            command('test', '单元测试', 'cargo test', true, 'gate'),
-            command('lint', 'lint', 'cargo clippy -- -D warnings', false, 'lint'),
-        ]
-    }
-    if (has('go.mod')) {
-        return [
-            command('test', '单元测试', 'go test ./...', true, 'gate'),
-            command('lint', 'lint', 'go vet ./...', false, 'lint'),
-        ]
-    }
+    if (has('composer.json')) return pair('vendor/bin/phpunit', 'vendor/bin/phpcs')
+    if (has('Gemfile') || hasSuffixed(cwd, ['.gemspec'])) return pair('bundle exec rspec', 'bundle exec rubocop')
+    if (has('mix.exs')) return pair('mix test', 'mix format --check-formatted')
+    if (has('Package.swift')) return pair('swift test', 'swiftlint')
+    // `detect()` names the wrapper unconditionally: both sides must agree even on
+    // a repository that forgot to commit `gradlew` (the command then fails loudly
+    // instead of silently grading a bare `gradle` the project never installed).
+    if (has('build.gradle') || has('build.gradle.kts')) return pair('./gradlew test', './gradlew detekt')
+    if (has('pom.xml')) return pair('mvn -q test', 'mvn -q -DskipTests verify')
+    if (has('Cargo.toml')) return pair('cargo test', 'cargo clippy -- -D warnings')
+    if (has('go.mod')) return pair('go test ./...', 'go vet ./...')
     if (has('pyproject.toml') || has('pytest.ini') || isDirectory(path.join(cwd, 'tests'))) {
-        const commands = [command('test', '单元测试', 'pytest -q', true, 'gate')]
         const pyproject = has('pyproject.toml')
             ? readCapped(path.join(cwd, 'pyproject.toml'), DEFAULT_MAX_FILE_BYTES, logger)
             : undefined
-        if (pyproject !== undefined && /ruff/i.test(pyproject)) {
-            commands.push(command('lint', 'lint', 'ruff check .', false, 'lint'))
-        }
-        return commands
+        return pair('pytest -q', pyproject !== undefined && /ruff/i.test(pyproject) ? 'ruff check .' : undefined)
     }
-    if (has('pnpm-lock.yaml')) {
-        return [
-            command('test', '单元测试', 'pnpm test', true, 'gate'),
-            command('lint', 'lint', 'pnpm run lint', false, 'lint'),
-        ]
-    }
-    if (has('yarn.lock')) {
-        return [command('test', '单元测试', 'yarn test', true, 'gate')]
-    }
-    if (has('package.json')) {
-        return [
-            command('test', '单元测试', 'npm test', true, 'gate'),
-            command('lint', 'lint', 'npm run lint', false, 'lint'),
-        ]
-    }
+    if (has('pnpm-lock.yaml')) return pair('pnpm test', 'pnpm run lint')
+    if (has('yarn.lock')) return pair('yarn test')
+    if (has('package.json')) return pair('npm test', 'npm run lint')
+    if (has('CMakeLists.txt')) return pair('ctest')
+    if (hasSuffixed(cwd, ['.csproj', '.sln'])) return pair('dotnet test', 'dotnet format --verify-no-changes')
     if (has('Makefile')) {
         const makefile = readCapped(path.join(cwd, 'Makefile'), DEFAULT_MAX_FILE_BYTES, logger)
-        if (makefile !== undefined && /^test:/m.test(makefile)) {
-            return [command('test', '单元测试', 'make test', true, 'gate')]
-        }
+        if (makefile !== undefined && /^test:/m.test(makefile)) return pair('make test')
     }
     return []
 }

@@ -1350,25 +1350,41 @@ feed 里只剩一条长行。修法不是再写一份短报告，而是把**同�
 检测依据打印出来（`suite_init` 的 `语言判定：检测依据：命中 Cargo.toml`）——"检测为 rust"没有依据，就是一句无法核对
 的断言，而多生态仓库正是静默选错的地方。
 
-| 优先级 | 生态（`SuiteLanguage`） | 命中依据（根目录） | 覆盖率报告格式 |
-|---|---|---|---|
-| 1 | `ts` | `tsconfig.json`、`tsconfig.base.json` | lcov |
-| 2 | `go` | `go.mod` | go-cover |
-| 3 | `rust` | `Cargo.toml` | lcov |
-| 4 | `java` | `pom.xml`、`build.gradle` | **不支持（jacoco）→ 留空** |
-| 5 | `kotlin` | `build.gradle.kts` | **不支持（jacoco/kover）→ 留空** |
-| 6 | `csharp` | `*.sln`、`*.csproj` | cobertura |
-| 7 | `php` | `composer.json` | **不支持（clover）→ 留空** |
-| 8 | `ruby` | `Gemfile`、`*.gemspec` | lcov（`simplecov-lcov`） |
-| 9 | `swift` | `Package.swift` | lcov（`llvm-cov export`） |
-| 10 | `py` | `pyproject.toml`、`setup.py`、`requirements.txt` | lcov |
-| 11 | `js` | `package.json` | lcov |
-| — | `ts`（默认） | 都没有命中 | lcov |
+| 优先级 | 生态（`SuiteLanguage`） | 命中依据（根目录） | 覆盖率报告格式 | shell 脚手架：`kind` / `test` / `lint`（`scripts/project-config.sh`） |
+|---|---|---|---|---|
+| 1 | `ts` | `tsconfig.json`、`tsconfig.base.json` | lcov | **无 `tsconfig` 分支** → 通常命中 `package.json` → `node` |
+| 2 | `go` | `go.mod` | go-cover | `go` / `go test ./...` / `go vet ./...` |
+| 3 | `rust` | `Cargo.toml` | lcov | `rust` / `cargo test` / `cargo clippy -- -D warnings` |
+| 4 | `java` | `pom.xml`、`build.gradle` | **不支持（jacoco）→ 留空** | `jvm` / `mvn test`（pom）或 `./gradlew test`（gradle） / `mvn -q -DskipTests verify` 或 `./gradlew detekt` |
+| 5 | `kotlin` | `build.gradle.kts` | **不支持（jacoco/kover）→ 留空** | `jvm` / `./gradlew test` / `./gradlew detekt` |
+| 6 | `csharp` | `*.sln`、`*.csproj` | cobertura | `dotnet` / `dotnet test` / `dotnet format --verify-no-changes` |
+| 7 | `php` | `composer.json` | **不支持（clover）→ 留空** | `php` / `vendor/bin/phpunit` / `vendor/bin/phpcs` |
+| 8 | `ruby` | `Gemfile`、`*.gemspec` | lcov（`simplecov-lcov`） | `ruby` / `bundle exec rspec` / `bundle exec rubocop` |
+| 9 | `swift` | `Package.swift` | lcov（`llvm-cov export`） | `swift` / `swift test` / `swiftlint` |
+| 10 | `py` | `pyproject.toml`、`setup.py`、`requirements.txt` | lcov | `python` / `pytest -q` / `ruff check .`（**仅** `pyproject.toml` 含 ruff，否则无） |
+| 11 | `js` | `package.json` | lcov | `node` / `npm test` / `npm run lint`（`pnpm-lock.yaml`→`pnpm`、`yarn.lock`→`yarn test` 无 lint） |
+| — | `ts`（默认） | 都没有命中 | lcov | `unknown` / **空**（`--print` 以 exit 3 报告"未识别"） / 空 |
 
 顺序是规格的一部分，不是实现细节：`tsconfig.json` 与 `go.mod` 并存必须得到 `ts`；`Cargo.toml` 与 `package.json`
 并存必须得到 `rust`；`pom.xml` 与 `build.gradle.kts` 并存得到 `java`（Java 在 Kotlin 之前），只带
 `build.gradle.kts` 才是 Kotlin。`*.sln`/`*.csproj`/`*.gemspec` 用扩展名匹配（目录项按名字排序，两次运行同一答案），
 目录同名的不算命中。全部没有命中时返回 `ts`，并明确写"没有找到任何已知 manifest，按约定默认 ts"——默认值不等于检测结果。
+
+**shell 脚手架（`scripts/project-config.sh --print`）是第二份清单，优先级与上表不同**：它按 `composer.json` →
+`Gemfile` → `mix.exs` → `Package.swift` → `build.gradle(.kts)` → `pom.xml` → `Cargo.toml` → `go.mod` →
+`pyproject.toml`/`pytest.ini`/`tox.ini`/`tests/` → `pnpm-lock.yaml` → `yarn.lock` → `package.json` → `CMakeLists.txt` →
+`*.csproj`/`*.sln` → `Makefile`（有 `test:` 目标）查文件，**没有 `tsconfig.json` 分支**（TS 仓库通常因 `package.json`
+命中 `node`）。它的 kind 比 `SuiteLanguage` 多三种（`elixir`、`cpp`、`make`）：上表回答"用哪套语言阈值与默认命令"，
+shell 的 kind 回答"该跑什么命令"，两者服务于不同的问题，不强行对齐。`detect_lint()` 跟着**同一个** `$KIND` 分支
+（不再自己重查一遍文件，否则"是什么生态"与"lint 是什么"迟早各说各话），规则是"有约定 linter 才给"：`cpp`（C/C++
+的 clang-tidy 要项目自己配）与 `make` 明确留空、报告显示 `(无)`；`--lint` 显式给出时永远优先。没有约定却编一条命令，
+只会让每次生成的门禁都挂着一个必然失败的 lint。
+
+**两张表由测试钉住，而不是靠注释**：`dsh-eng-core` 的 `suggestCommands()` 是同一张清单的 TypeScript 副本
+（`scanWorkspace` 用它给"建议命令"，可原样写进 `.dsh/quality-gate.json`）。`packages/dsh-eng-core/test/test-commands.test.ts`
+对每个 `detect()` 分支各建一个 fixture，两侧各跑一遍并断言 **kind 相同 / lint 文本逐字相同 / test 命令被识别成同一个
+runner**，不一致时错误信息里点出 manifest 名；同一个测试还钉住 `tsconfig.json` 两侧都"未识别"（shell `--print` exit 3）、
+`cpp` 不产出 lint 项，以及 `*.gemspec`/`*.sln` 这类后缀 manifest 落到哪个生态。
 
 **默认命令（每种生态的起点，需要人复核）**：
 

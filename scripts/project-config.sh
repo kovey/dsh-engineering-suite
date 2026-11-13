@@ -159,12 +159,43 @@ detect() {
   if [ -n "$TEST_CMD" ]; then DETECTED_TEST="$TEST_CMD"; fi
 }
 
+# lint 默认值：按 detect() 已经判定的 `$KIND` 分支，而不是再查一遍文件——
+# "检测到哪种生态"和"该生态的 lint 是什么"必须由同一个事实决定，否则两份清单
+# 迟早各说各话（eng-core 的 suggestCommands 是同一张表的 TypeScript 副本，
+# 两侧由 packages/dsh-eng-core/test/test-commands.test.ts 的 manifest 表钉住）。
+#
+# 有约定 linter 的生态才给命令：cpp / make（以及将来新增但还没约定的生态）**明确
+# 返回空**（报告里显示 `(无)`），不编一条。理由见 header：一条跑不起来的 lint
+# 会让 `--write` 生成一份必然失败的门禁（lint 不阻断，但会一直 WARN），比空着更糟。
+# `--lint` 仍然最优先：显式给的命令永远赢过任何检测。
 detect_lint() {
   if [ -n "$LINT_CMD" ]; then echo "$LINT_CMD"; return; fi
-  if [ -f "$WS/Cargo.toml" ]; then echo "cargo clippy -- -D warnings"; return; fi
-  if [ -f "$WS/pyproject.toml" ] && grep -q "ruff" "$WS/pyproject.toml" 2>/dev/null; then echo "ruff check ."; return; fi
-  if [ -f "$WS/pnpm-lock.yaml" ]; then echo "pnpm run lint"; return; fi
-  if [ -f "$WS/package.json" ]; then echo "npm run lint"; return; fi
+  case "$KIND" in
+    rust) echo "cargo clippy -- -D warnings" ;;
+    go) echo "go vet ./..." ;;
+    # python 没有统一 linter：只有 pyproject.toml 自己声明了 ruff 才建议，否则留空。
+    python)
+      if [ -f "$WS/pyproject.toml" ] && grep -q "ruff" "$WS/pyproject.toml" 2>/dev/null; then
+        echo "ruff check ."
+      fi ;;
+    # node 的 lint 脚本由 package.json 提供，锁文件决定用哪个包管理器调用它。
+    node)
+      if [ -f "$WS/pnpm-lock.yaml" ]; then echo "pnpm run lint"
+      elif [ -f "$WS/package.json" ]; then echo "npm run lint"
+      fi ;;
+    php) echo "vendor/bin/phpcs" ;;
+    ruby) echo "bundle exec rubocop" ;;
+    swift) echo "swiftlint" ;;
+    # jvm 的 kind 不区分 maven/gradle：lint 按实际存在的构建文件二选一。
+    jvm)
+      if [ -f "$WS/build.gradle" ] || [ -f "$WS/build.gradle.kts" ]; then echo "./gradlew detekt"
+      else echo "mvn -q -DskipTests verify"
+      fi ;;
+    dotnet) echo "dotnet format --verify-no-changes" ;;
+    elixir) echo "mix format --check-formatted" ;;
+    # cpp / make：没有默认 linter（clang-tidy 之类要项目自己配置），明确留空。
+    cpp|make|unknown) ;;
+  esac
   echo ""
 }
 
