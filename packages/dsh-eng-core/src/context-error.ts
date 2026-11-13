@@ -70,6 +70,18 @@ class FallbackToolContextUnavailableError extends Error {
 /** The host constructor found by a probe (sticky: a later failure keeps it). */
 let hostConstructor: ToolErrorConstructor | undefined
 
+/**
+ * Whether {@link hostConstructor} came from a caller-supplied loader.
+ *
+ * The module starts a default probe at load time, and that probe may resolve
+ * after a caller has already supplied its own loader (the tests do exactly
+ * that). Without this flag the two race on one module-level variable: the
+ * default probe would silently overwrite the injected class, and the same
+ * process would classify the same refusal two different ways depending on
+ * which probe finished last.
+ */
+let explicitProbe = false
+
 /** The default loader: the harness package the plugins already peer-depend on. */
 function defaultHostLoader(): Promise<unknown> {
     return import('@deepseek-ai/dsh-tools')
@@ -92,13 +104,33 @@ export async function probeToolContextUnavailableErrorHost(
         const module = (await load()) as { ToolContextUnavailableError?: unknown } | undefined
         const candidate = module?.ToolContextUnavailableError
         if (typeof candidate !== 'function') return undefined
-        hostConstructor = candidate as ToolErrorConstructor
-        return hostConstructor
+        const found = candidate as ToolErrorConstructor
+        // A caller-supplied loader speaks for its caller, not for the process:
+        // it publishes its result, and from then on the default probe only
+        // reports — it never takes the variable back.
+        if (load !== defaultHostLoader) {
+            hostConstructor = found
+            explicitProbe = true
+            return found
+        }
+        if (!explicitProbe) hostConstructor = found
+        return found
     } catch {
         // rc.1 has no such export; an unresolvable peer module is the same case.
         return undefined
     }
 }
+
+/**
+ * Forget what the probe learned: the stored constructor AND the explicit-probe
+ * marker. For tests that need a clean module state between cases — production
+ * never calls it, because a resolved class is deliberately sticky.
+ */
+export function resetContextErrorProbe(): void {
+    hostConstructor = undefined
+    explicitProbe = false
+}
+
 
 /**
  * Build the error a gate throws when a tool call lacks required context.

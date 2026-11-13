@@ -15,6 +15,7 @@ import test from 'node:test'
 import {
     TOOL_CONTEXT_UNAVAILABLE,
     probeToolContextUnavailableErrorHost,
+    resetContextErrorProbe,
     toolContextUnavailableError,
 } from '../dist/context-error.js'
 
@@ -80,4 +81,29 @@ test('TC-1635 the probe reports exactly what the INSTALLED harness exports', asy
     const host = (await import('@deepseek-ai/dsh-tools')) as { ToolContextUnavailableError?: unknown }
     const probed = await probeToolContextUnavailableErrorHost()
     assert.equal(probed, host.ToolContextUnavailableError, '探针结果必须与宿主包的实际导出一致（rc.1=无，rc.2=类）')
+})
+
+test('TC-1731 an injected class survives the background default probe', async () => {
+    // The module starts a default probe at load time; it may resolve after this
+    // injected one. Whichever finishes last must not decide the answer.
+    const injected = await probeToolContextUnavailableErrorHost(async () => ({
+        ToolContextUnavailableError: FakeHostToolContextUnavailableError,
+    }))
+    assert.equal(injected, FakeHostToolContextUnavailableError)
+
+    const real = await probeToolContextUnavailableErrorHost()
+    assert.equal(real, (await import('@deepseek-ai/dsh-tools')).ToolContextUnavailableError, '默认探测仍报告宿主的真实导出')
+    assert.ok(
+        toolContextUnavailableError('缺少服务') instanceof FakeHostToolContextUnavailableError,
+        '默认探测不得覆盖显式注入的类（否则同一进程里分类会漂移）',
+    )
+})
+
+test('TC-1732 reset returns the module to its initial state', async () => {
+    await probeToolContextUnavailableErrorHost(async () => ({ ToolContextUnavailableError: FakeHostToolContextUnavailableError }))
+    resetContextErrorProbe()
+    const error = toolContextUnavailableError('缺少调用方')
+    assert.equal(error.name, 'ToolContextUnavailableError', 'reset 之后回落为同名 fallback，形状不变')
+    assert.equal((error as { code?: string }).code, TOOL_CONTEXT_UNAVAILABLE)
+    assert.ok(!(error instanceof FakeHostToolContextUnavailableError), 'reset 之后不应再是注入的那个类')
 })
