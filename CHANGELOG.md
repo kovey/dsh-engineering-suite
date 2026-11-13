@@ -1,4 +1,4 @@
-## [未发布]
+## [0.8.11] — 2026-11-13
 
 ### 修复 · 可选 peer 改为运行时解析；安装方改用 profile postinstall（`dsh-eng-core` / `docs/RELEASE.md`）
 
@@ -22,7 +22,6 @@ file for 'node'`。原因是 `tsconfig.base.json` 声明 `types: ["node"]`，而
 
 顺带清掉了探针遗留的 26MB `.pnpm-store`。
 
-## [未发布]
 
 ### 修复 · 宿主类探测与测试注入的竞态（`dsh-eng-core`）
 
