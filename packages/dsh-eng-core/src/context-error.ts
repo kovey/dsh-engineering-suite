@@ -84,7 +84,13 @@ let explicitProbe = false
 
 /** The default loader: the harness package the plugins already peer-depend on. */
 function defaultHostLoader(): Promise<unknown> {
-    return import('@deepseek-ai/dsh-tools')
+    // The specifier is COMPUTED on purpose: a literal dynamic import makes tsc
+    // resolve the peer at BUILD time, and the standalone install that builds this
+    // package (a git dependency's `prepare`) has no such module — the whole build
+    // then fails with TS2307 for something that is optional by design and only
+    // ever resolved at runtime.
+    const hostModule = '@deepseek-ai/dsh-tools'
+    return import(hostModule)
 }
 
 /**
