@@ -1,5 +1,17 @@
 ## [未发布]
 
+### 修复 · 安装时构建缺 `@types/node`（`package.json` / `docs/RELEASE.md`）
+
+`prepare` 在真实安装里跑起来了，但 16 个包全部编译失败：`TS2688 Cannot find type definition
+file for 'node'`。原因是 `tsconfig.base.json` 声明 `types: ["node"]`，而 devDependencies 只有
+`typescript`（git 依赖的 `prepare` 只拿得到 devDependencies，拿不到仓库根的 `node_modules`）。
+补 `@types/node`（^26.6.6，与本机 vendored 一致），并把"两者缺一都会让安装失败"写进
+`docs/RELEASE.md`。
+
+顺带清掉了探针遗留的 26MB `.pnpm-store`。
+
+## [未发布]
+
 ### 修复 · 宿主类探测与测试注入的竞态（`dsh-eng-core`）
 
 `context-error` 在模块加载时启动一次后台探测（默认 loader），它和调用方显式注入的 loader

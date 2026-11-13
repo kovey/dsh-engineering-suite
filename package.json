@@ -16,6 +16,7 @@
     "verify": "bash scripts/verify.sh"
   },
   "devDependencies": {
+    "@types/node": "^26.6.6",
     "typescript": "^5.9.3"
   },
   "license": "Apache-2.0"

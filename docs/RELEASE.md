@@ -23,6 +23,12 @@ profile/
    `from 'dsh-eng-core'`，干净检出没有这些链接就编不过）；
 2. **构建**：按 `scripts/package-order.py` 的依赖顺序，用安装到的 `typescript` 编译 16 个包的
    `dist/`；
+
+   > 编译器与类型声明都是 **devDependency**（`typescript` + `@types/node`）：`tsconfig.base.json`
+   > 声明了 `types: ["node"]`，pnpm 安装 git 依赖时只装 devDependencies、不装仓库根
+   > `node_modules` 里的其它东西。缺 `typescript` 会立刻报"找不到编译器"，缺 `@types/node`
+   > 会以 `TS2688: Cannot find type definition file for 'node'` 让 16 个包全部编译失败——
+   > 两者都属于安装失败，不是警告。
 3. **bundle 链接**：当本包位于某个 profile 的 `node_modules` 下时，为 16 个包名在**同级**
    `node_modules` 里建软链——dsh 的 bundle 是按裸名解析的。
 
