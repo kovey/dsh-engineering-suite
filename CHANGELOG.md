@@ -1,3 +1,20 @@
+## [未发布]
+
+### 构建 · `dist` 不入库：安装时由 `prepare` 生成（`package.json` / `scripts/prepare-install.mjs` / `docs/RELEASE.md`）
+
+`github:` 安装拿到的只有源码（`dist/` 在 `.gitignore` 里），而 dsh 的 bundle 按裸名解析、
+源码里又有 148 处 `from 'dsh-eng-core'` —— 干净检出既没有编译器也没有包间链接。
+`prepare` 现在补上这三步：建 `packages/<x>/node_modules/dsh-<y>`、按依赖顺序用安装到的
+`typescript` 编译 16 个包、在本包位于 profile 的 `node_modules` 下时把 16 个 bundle 名软链到
+同级目录。失败即非零退出并删除本次新建的 `dist/`（不留"看起来构建过"的半成品）。
+
+实测（`git archive` 出的干净副本）：无 `typescript` → exit 1 并提示安装依赖；有 `typescript`
+→ 16 个 `dist/index.js`、exit 0；放进 `<tmp>/node_modules/dsh-engineering-suite` 再跑 →
+父目录 16 条软链，`require.resolve('dsh-spec-gate')` 指向安装副本；重复运行幂等（新链接 0 条）。
+
+pnpm 10 默认不跑依赖构建脚本，profile 需声明 `pnpm.onlyBuiltDependencies`
+（或 `--allow-build`），见 `docs/RELEASE.md`。
+
 ## [0.8.9] — 2026-11-13
 
 ### 特性 · `project-config.sh` 的 `detect_lint()` 与 `suggestCommands()` 补齐语言面（lint 只在有约定时给）
