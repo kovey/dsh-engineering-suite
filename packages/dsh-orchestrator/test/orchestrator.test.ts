@@ -2005,7 +2005,17 @@ test('the standards gate requires a PASS from this round (regression)', async ()
 
     // A fresh PASS from this round lets the stage leave.
     await orchestrate(fake, { action: 'advance' }) // back into verify
-    store.recordGate(id, { source: 'dsh-standards-gate', state: 'PASS', reason: '本轮无新增违规', results: [] })
+    // The freshness rule is `checkedAt <= enteredAt` → stale, which is correct
+    // but makes this assertion depend on the clock advancing between two calls:
+    // on a fast machine both can land in the same millisecond and a genuinely
+    // fresh PASS is judged stale. Pin the clock forward instead of hoping.
+    const realNow = Date.now
+    try {
+        Date.now = () => realNow() + 5
+        store.recordGate(id, { source: 'dsh-standards-gate', state: 'PASS', reason: '本轮无新增违规', results: [] })
+    } finally {
+        Date.now = realNow
+    }
     const passed = await orchestrate(fake, { action: 'advance', verdict: 'PASS' })
     assert.match(passed, /规范门禁 .* PASS/)
     assert.equal(store.read(id)?.stage, 'done')

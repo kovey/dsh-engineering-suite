@@ -1,3 +1,14 @@
+## [未发布]
+
+### 修复 · 一条依赖毫秒推进的用例（`dsh-orchestrator`）
+
+"本轮 PASS 允许离开阶段"的用例在为阶段记录 PASS 时直接读 `Date.now()`；而门禁的陈旧判定是
+`checkedAt <= enteredAt`（fail-closed，产品语义保留）。两个调用落在同一毫秒时，真正新鲜的 PASS
+会被判陈旧，用例间歇失败——它是昨天到刚才"全绿却退出 1"的第二个真身。
+
+测试改为在记录 PASS 时把时钟前推 5ms（`try/finally` 复原），把"必然更晚"变成确定性事实而不是
+概率。单用例连跑 30 次、orchestrator 全量连跑 3 次、`verify.sh --quiet` 连跑 2 次全部通过。
+
 ## [0.8.11] — 2026-11-13
 
 ### 修复 · 可选 peer 改为运行时解析；安装方改用 profile postinstall（`dsh-eng-core` / `docs/RELEASE.md`）
