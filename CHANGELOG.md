@@ -1,4 +1,4 @@
-## [未发布]
+## [0.8.10] — 2026-11-13
 
 ### 构建 · `dist` 不入库：安装时由 `prepare` 生成（`package.json` / `scripts/prepare-install.mjs` / `docs/RELEASE.md`）
 
