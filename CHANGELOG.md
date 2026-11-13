@@ -1,4 +1,4 @@
-## [未发布]
+## [0.8.9] — 2026-11-13
 
 ### 特性 · `project-config.sh` 的 `detect_lint()` 与 `suggestCommands()` 补齐语言面（lint 只在有约定时给）
 
