@@ -1,4 +1,4 @@
-## [未发布]
+## [0.8.12] — 2026-11-17
 
 ### 新增 · 审批之后强制进入 implement（`dsh-orchestrator` / `dsh-spec-gate` / `docs/ARCHITECTURE.md` §5.37）
 
@@ -21,7 +21,6 @@
 测试：`packages/dsh-orchestrator/test/enter-implement.test.ts` 6 条、`packages/dsh-spec-gate/test/approval-advance.test.ts`
 7 条；两包全量 `node --test` 全绿（202 + 113），`tsc --noEmit` 与 `standards-check --quiet` 通过。
 
-## [未发布]
 
 ### 适配 · 入站附件不再"只有文本"（`.gitignore` / `docs/ARCHITECTURE.md` §5.36）
 
@@ -34,7 +33,6 @@
 实测边界：附件落地不改变 `policyVersion`（该目录不参与信任根指纹），不会把在飞 mission 的
 mandate 判过期。本机 `tui` 已装 0.3.8 且进程于 09:37:40 重载（插件 09:37:24 安装）。
 
-## [未发布]
 
 ### 新增 · `scripts/switch-tui-to-release.mjs`：把 profile 切到发布版
 
@@ -47,7 +45,6 @@ mandate 判过期。本机 `tui` 已装 0.3.8 且进程于 09:37:40 重载（插
 `require.resolve('dsh-spec-gate')` → `~/.dsh/profiles/tui/node_modules/dsh-engineering-suite/packages/dsh-spec-gate/dist/index.js`，
 20 个 `dsh-*` 软链指向安装副本；共享层的开发树软链保持不动（nvim-tui 继续当测试面）。
 
-## [未发布]
 
 ### 修复 · 一条依赖毫秒推进的用例（`dsh-orchestrator`）
 
