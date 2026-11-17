@@ -1,5 +1,18 @@
 ## [未发布]
 
+### 适配 · 入站附件不再"只有文本"（`.gitignore` / `docs/ARCHITECTURE.md` §5.36）
+
+上游 `dsh-chat-interaction` 0.3.8 起，`InboundMessage` 带 `files[]`（本地路径）与 `fileErrors[]`，
+图片继续走 `imagePaths`，附件落地在 `<cwd>/.dsh/chat-interaction/<channel>-media/`。本仓库随之：
+把 `/.dsh/chat-interaction/` 加进 `.gitignore`（二进制附件不进版本库、不产生未跟踪噪音），并把
+契约、落盘位置、"失败只记录不丢消息"、以及**旧的 `im/v1/messages` 自取绕行不再需要**写进
+`ARCHITECTURE` §5.36。
+
+实测边界：附件落地不改变 `policyVersion`（该目录不参与信任根指纹），不会把在飞 mission 的
+mandate 判过期。本机 `tui` 已装 0.3.8 且进程于 09:37:40 重载（插件 09:37:24 安装）。
+
+## [未发布]
+
 ### 新增 · `scripts/switch-tui-to-release.mjs`：把 profile 切到发布版
 
 把"tui 只消费发布产物"从口头约定变成可执行的一步：脚本备份 `package.json`/`pnpm-lock.yaml`，

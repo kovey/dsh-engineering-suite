@@ -1694,6 +1694,32 @@ rc.2 的三条路径由两类证据支撑：① 上面表格里的包内原文�
 届时重点看：`team_delegate` 的派发行、被委派子会话调用 `spec_approve` 的日志/结果、以及三处拒绝点在宿主
 结果面板里的分类。
 
+### 5.36 入站附件：由 chat-interaction 落地，套件只消费路径
+
+上游 `dsh-chat-interaction` **0.3.8**（2026-11-17）修掉了"入站消息只有文本"：观察者
+（`onInbound`）与 agent 提示词拿到的是**已经落地成本地文件**的同一个 `InboundMessage`：
+
+| 字段 | 含义 |
+|------|------|
+| `imagePaths?: string[]` | 图片的本地绝对路径（用 `read_image` 读），语义未变 |
+| `imageErrors?: string[]` | 单张图片下载失败的原因，消息照常投递 |
+| `files?: InboundFile[]` | 非图片附件（PDF / 文档 / 压缩包 / 语音…），每项 `{ path, name?, mime?, size?, kind? }` |
+| `fileErrors?: string[]` | 文件下载失败原因；**失败不会让消息丢失** |
+
+落盘位置：`<cwd>/.dsh/chat-interaction/<channel>-media/`（本仓库已加进 `.gitignore`，二进制附件
+不进版本库、也不产生未跟踪噪音）。提示词里对应 `文件: <本地路径>` 与 `文件名:` 两行。
+
+**这对套件意味着什么**：`dsh-interaction-gate` 的 IM 适配层**不订阅入站**（它只发送卡片、等待
+`onAnswer`/`onAnswerIgnored`），所以附件链路不在套件里——套件要做的只有两件：① 消费方（agent）
+用 `read_image`/`read` 读 `imagePaths`/`files[].path`；② 别把媒体目录当成信任根噪音（已忽略）。
+
+**已作废的绕行做法**：0.3.8 之前入站附件不会自动下发，只能拿 `message_id` 去调
+`GET /open-apis/im/v1/messages/{id}` + `/resources/{file_key}` 自取。**该做法不再需要**；
+只有在 `fileErrors` 出现（例如机器人缺 `im:resource` 权限）时才需要回到 API 层排查。
+
+**实测边界**：附件落地**不会**让 `policyVersion` 变化（`.dsh/chat-interaction/**` 不参与信任根
+指纹），所以收到附件不会把在飞 mission 的 mandate 判定为过期。
+
 ## 6. 为什么这样切分
 
 - **一个关注点一个插件**：门禁可以单独失效（例如先只上 quality-gate），不影响其它环节。

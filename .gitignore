@@ -17,6 +17,9 @@ coverage/
 # itself was never committed: a fresh clone had no gate config at all, and a diff
 # could not show a tightened or loosened rule.)
 /.dsh/memory/
+# chat-interaction（上游 >=0.3.8）把入站附件与状态落在这里：图片/PDF 是二进制，
+# 不该进版本库，也不该成为每次收到附件就冒出来的未跟踪噪音。
+/.dsh/chat-interaction/
 /.dsh/engineering-suite/missions/
 /.dsh/engineering-suite/specs/
 /.dsh/engineering-suite/audit/
