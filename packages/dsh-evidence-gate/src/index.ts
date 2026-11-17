@@ -89,12 +89,13 @@ export function apply(ctx: Context, config: unknown = {}): void {
         const stores = new MissionStoreRegistry({ ...resolved.layout, logger })
 
         const tools = registerTools(context as never, {
-            // Profile config is the ceiling; each workspace may refine the
-            // checklist through its own .dsh/evidence-gate.json.
+            // Profile config is the ceiling; each workspace may refine it.
             configFor: (cwd: string) => resolveEffectiveConfig(resolved, stores.for(cwd).layout, logger),
             stores,
-
+            logger,
             approval: () => context.get('approval') as never,
+            // Optional: no dsh-knowledge-base means "nothing to refresh" (kb-sync.ts).
+            knowledgeBase: () => context.get('knowledge-base') as never,
         })
 
         const disposers: (() => void)[] = [...tools.disposers]
@@ -105,8 +106,7 @@ export function apply(ctx: Context, config: unknown = {}): void {
                     order: resolved.prompt.order,
                     // Resolved per assembly: one dsh process serves several
                     // workspaces, and the section must state the checklist the
-                    // CALLING agent's workspace enforces (the profile config is
-                    // only the default). A prompt section must never throw:
+                    // CALLING agent's workspace enforces. It must never throw:
                     // without a workspace — or on any failure — the profile
                     // text is the safe answer.
                     text: (assembly?: unknown) => {

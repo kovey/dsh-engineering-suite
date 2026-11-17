@@ -39,6 +39,7 @@ import { MissionStoreRegistry, createLogger, expandHome, type AgentLike } from '
 import { resolveConfig, resolveEffectiveConfig, type EffectiveConfig, type KnowledgeBaseConfig } from './config.js'
 import { PROMPT_SECTION, sectionText } from './prompt.js'
 import { KB_COMMAND_NAME, registerKbCommand } from './command.js'
+import { registerKnowledgeBaseSurfaces } from './surface.js'
 import { registerTools, type ToolDeps } from './tools.js'
 
 export const name = 'dsh-knowledge-base'
@@ -58,6 +59,8 @@ interface ContextLike {
     tools: ToolRuntimeLike
     systemPrompt: PromptRuntimeLike
     get: (name: string) => unknown
+    /** Optional cordis reflection seam (`ctx.provide('knowledge-base', …)`). */
+    provide?: (name: string, value: unknown) => unknown
     effect: (execute: () => (() => void) | void) => void
 }
 
@@ -102,7 +105,12 @@ export function apply(ctx: Context, config: unknown = {}): void {
         const tools = registerTools(context as never, deps)
         if (tools.failed.length > 0) log.warn(`tools that failed to register: ${tools.failed.join(', ')}`)
 
-        const disposers: (() => void)[] = [...tools.disposers]
+        // The optional surfaces: the `knowledge-base` service other plugins look
+        // up instead of importing this package, and the `/kb` command inside an
+        // IM chat (registered only for an explicitly authorised chat list).
+        const surfaces = registerKnowledgeBaseSurfaces(context, { config: resolved, stores, logger: log })
+        if (surfaces.problem !== undefined) log.warn(surfaces.problem)
+        const disposers: (() => void)[] = [...tools.disposers, ...surfaces.disposers]
         // `/kb` is registered only when the host mounted the command registry:
         // the accessor is `ctx.get`, not `inject`, so a minimal host without
         // `@deepseek-ai/dsh-commands` still loads this plugin (see command.ts).
@@ -145,7 +153,7 @@ export function apply(ctx: Context, config: unknown = {}): void {
         })
 
         log.info(
-            `applied (tools: ${tools.registered.join(', ') || 'none'}; command: ${command.registered ? `/${KB_COMMAND_NAME}` : 'none'}; indexDir=${resolved.indexDir === '' ? '(布局根)/kb' : resolved.indexDir}; sources=${resolved.sources
+            `applied (tools: ${tools.registered.join(', ') || 'none'}; command: ${command.registered ? `/${KB_COMMAND_NAME}` : 'none'}; service: knowledge-base; im: ${surfaces.imCommand === undefined ? 'none' : `/${surfaces.imCommand}`}; indexDir=${resolved.indexDir === '' ? '(布局根)/kb' : resolved.indexDir}; sources=${resolved.sources
                 .filter((source) => source.enabled)
                 .map((source) => source.id)
                 .join(',')}; limit=${resolved.search.limit}/${resolved.search.maxLimit}; cjkBigrams=${resolved.tokenizer.cjkBigrams})`,

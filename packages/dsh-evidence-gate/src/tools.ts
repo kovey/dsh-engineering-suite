@@ -16,12 +16,14 @@ import {
     sessionIdOf,
     type AgentLike,
     type ApprovalLike,
+    type Logger,
     type MissionStore,
     type MissionStoreRegistry,
 } from 'dsh-eng-core'
 import { RECORDABLE_KINDS, type EffectiveEvidenceGateConfig } from './config.js'
 import { evaluateDelivery, finalizeDelivery, relaxForForce } from './delivery.js'
 import { captureEvidence, confirmationText } from './evidence.js'
+import { deliveryKnowledgeBaseNote, type KnowledgeBaseSyncDeps } from './kb-sync.js'
 import {
     buildReleaseNotes,
     deliveredMissions,
@@ -60,7 +62,7 @@ import {
 const TEXT_OUTPUT = { type: 'string' } as const
 
 /** Everything the tools close over. */
-export interface ToolDeps {
+export interface ToolDeps extends KnowledgeBaseSyncDeps {
     /**
      * Effective config for one workspace: the profile configuration overlaid
      * with that workspace's `.dsh/evidence-gate.json` (see
@@ -225,8 +227,7 @@ export function registerTools(
             output: { schema: TEXT_OUTPUT, render: (_args, value) => [{ type: 'text', text: value }] },
             async execute(args: RecordArgs = {} as RecordArgs, exec) {
                 const { store, agent, cwd } = storeFor(deps, exec)
-                // The checklist is the *workspace's* effective configuration:
-                // the profile overlaid with this repo's .dsh/evidence-gate.json.
+                // The checklist is the workspace's effective configuration (profile + its own file).
                 const config = deps.configFor(cwd).config
                 const mission = resolve(store, agent, args.missionId)
                 if (mission === undefined) throw new Error(noMissionError())
@@ -280,7 +281,7 @@ export function registerTools(
         defineTool({
             name: 'mission_complete',
             description:
-                'Deliver a mission: verify that the mission is not blocked, that the specification is approved, that the quality gate returned a genuine, complete, deterministic PASS covering the newest command/test evidence, that the working tree is still the one the gate observed, and that every configured evidence kind is satisfied by a successful row; then issue an immutable receipt and mark the mission delivered. A PASS is only accepted when its gate record has scope.full=true, a non-empty result list, and a matching ledger row (kind=gate with data.gateId) — a hand-written gates/*.json without its ledger row is treated as a forgery. Fail closed: a missing/WARN/BLOCK/partial/forged/stale gate, a blocked mission or missing evidence is refused with the exact next tool call, and the mission status is left untouched. `force` never bypasses the gate; it only downgrades the required-evidence-kinds check and leaves a manual override row. Delivery happens in the calling session\'s own workspace (`session.header.cwd`); a session that declared no workspace is refused instead of issuing a receipt for another project.',
+                'Deliver a mission: verify that the mission is not blocked, that the specification is approved, that the quality gate returned a genuine, complete, deterministic PASS covering the newest command/test evidence, that the working tree is still the one the gate observed, and that every configured evidence kind is satisfied by a successful row; then issue an immutable receipt and mark the mission delivered. A PASS is only accepted when its gate record has scope.full=true, a non-empty result list, and a matching ledger row (kind=gate with data.gateId) — a hand-written gates/*.json without its ledger row is treated as a forgery. Fail closed: a missing/WARN/BLOCK/partial/forged/stale gate, a blocked mission or missing evidence is refused with the exact next tool call, and the mission status is left untouched. `force` never bypasses the gate; it only downgrades the required-evidence-kinds check and leaves a manual override row. Delivery happens in the calling session\'s own workspace (`session.header.cwd`); a session that declared no workspace is refused instead of issuing a receipt for another project. AFTER the receipt is written, the optional knowledge-base service (`ctx.get(\'knowledge-base\')`) is asked to reindex that workspace, best effort: the outcome is one footnote line ("索引已更新 / 未变 / 更新失败：…"), a failure only logs a warning, and neither the receipt nor the mission status can be changed by it.',
             parameters: {
                 missionId: { type: 'string', description: 'Mission to deliver (default: the session mission).' },
                 summary: { type: 'string', description: 'Optional delivery note recorded on the report.' },
@@ -305,16 +306,14 @@ export function registerTools(
 
                 const evaluation = evaluateDelivery({ store, mission, config, cwd })
                 // The host decides whether the override exists at all: with the
-                // default `allowForceOverride: false`, asking for `force` is
-                // simply not honoured (and the report says so).
+                // default `allowForceOverride: false`, `force` is not honoured.
                 const forceRequested = args.force === true && config.allowForceOverride
                 const forceRefused = args.force === true && !config.allowForceOverride
                 const relaxation = relaxForForce(evaluation, forceRequested)
                 let deliveryApproval: { by: string; source: string; messageId: string } | undefined
-                // The human decision comes AFTER the deterministic checklist: a
-                // person may approve a delivery that the gates accepted, never one
-                // they refused. Asking first would invite rubber-stamping of a
-                // delivery that is about to be refused anyway.
+                // The human decision comes AFTER the deterministic checklist: a person
+                // may approve a delivery the gates accepted, never one they refused.
+                // Asking first would invite rubber-stamping a doomed delivery.
                 if (relaxation.failures.length === 0 && config.requireDeliveryApproval) {
                     const seam = deps.approval?.()
                     if (seam === undefined) {
@@ -387,8 +386,7 @@ export function registerTools(
                     evaluation,
                     cwd,
                     ...(relaxation.overrideNote === undefined ? {} : { overrideNote: relaxation.overrideNote }),
-                    // Who approved the delivery rides into the receipt: a receipt
-                    // that cannot name the approver is not an audit trail.
+                    // Who approved the delivery rides into the receipt: an anonymous receipt is no audit trail.
                     ...(deliveryApproval === undefined ? {} : { approval: deliveryApproval }),
                 })
                 return [
@@ -404,6 +402,8 @@ export function registerTools(
                               '',
                               `人工交付审批：by ${deliveryApproval.by}${deliveryApproval.source === '' ? '' : ` via ${deliveryApproval.source}`}${deliveryApproval.messageId === '' ? '' : ` #${deliveryApproval.messageId}`}`,
                           ]),
+                    // Best effort, AFTER the receipt: never part of the verdict (see kb-sync.ts).
+                    ...(await deliveryKnowledgeBaseNote(deps, cwd)),
                 ].join('\n')
             },
         }),

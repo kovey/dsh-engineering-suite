@@ -1,3 +1,51 @@
+## [未发布] — 2026-11-17
+
+### 新增 · 知识库可被交付自动重建，并能在 IM 里 `/kb` 搜索（`dsh-knowledge-base` / `dsh-evidence-gate`）
+
+背景：知识库原先只有工具与 TUI 的 `/kb`，**不会**在改动/交付时自动重建（没有事件监听、也没有别的插件调用它），
+而"改完代码就交付"恰恰是索引开始过时的那一刻；另外人希望**在 IM 里搜知识库、结果回到原会话**。三件事一起做：
+
+- **可选服务**：`dsh-knowledge-base` 通过 `ctx.provide('knowledge-base', …)` 暴露
+  `{ reindex(cwd, options?), search(input) }`（`src/service.ts`）。两个方法复用与工具**同一份**实现
+  （`src/operations.ts`：把原先写在 `tools.ts` 里的建索引/检索管线抽出来，`runIndex`/`runSearch` 改成调用它，
+  报告的每个字未变、既有 63 条断言一条未改），所以兄弟插件不必跨包 `import`，也不会因此把本插件变成硬依赖：
+  服务缺席时调用方拿到 `undefined`，照常工作。
+- **交付后 best-effort 重建**：`mission_complete` 在**签发回执与置 `delivered` 之后**通过
+  `ctx.get('knowledge-base')` 调一次 `reindex(cwd)`（`dsh-evidence-gate/src/kb-sync.ts`）。顺序是刻意的：
+  交付结论先定稿，重建才发生，因此重建抛错、服务缺席/版本过旧、超过 30 s 超时都不改变回执与 mission 状态，
+  只写 `logger.warn` 并在交付输出末尾加一行附注：`知识库：索引已更新（N 块）` / `索引未变（N 块）` /
+  `索引内容未变（仅刷新指纹）` / `更新失败：<原因>`。没有该服务时不加任何附注（不是"失败"）。
+- **IM 命令 `/kb`**（`src/im.ts` + `src/im-config.ts` + `src/im-probe.ts`）：宿主装配 `dsh-chat-interaction`
+  （≥ 0.3.8，`ctx.get('chatInteraction').api.registerCommand`）**且**配置了 `im.chatIds` 才注册，**默认关闭**；
+  每次调用再校验 `ctx.chatId`（不在白名单 → 拒绝 + `warn` 日志，含 chatId 与原因），`im.p2pOnly` 可再收紧到私聊。
+  回复每条带 `path:from-to` 引用与摘要（与 `kb_search` 同一个 `SearchOutcome`，不经过模型、不花 token、
+  不经任何门禁），超过 `im.maxChars` 按行截断并追加"更多结果请在 TUI 用 kb_search"；搜索失败返回
+  `搜索失败：<原因>` 而不是抛异常（抛出去只会被 IM 插件变成一句通用的"命令执行失败"）。
+  配置（profile 行；项目级 `<repo>/.dsh/knowledge-base.json` 只能收紧）：
+
+  ```yaml
+  im:
+    command: kb            # 默认 kb；非法命令名不注册并记警告
+    chatIds: []            # 为空 = 不注册（默认关闭）；非空 = 白名单即开关
+    p2pOnly: false
+    maxResults: 5
+    maxChars: 1800
+    workspace: ''          # IM handler 没有 agent 可读 session.cwd，必须显式指定要检索的仓库
+  ```
+
+  `im.workspace` 是必要的显式项：一个 dsh 进程服务多个仓库，IM 的 handler 又没有会话可读 cwd，猜一个就是搜错的仓库；
+  缺它时每条命令都返回"没有配置工作区"并指出该填的键。项目级只能删白名单、只能把 `p2pOnly` 打开、只能调低
+  `maxResults`/`maxChars`；`command`/`workspace` 是宿主决定，写了会被忽略并报告。
+
+测试：`packages/dsh-knowledge-base/test/im-service.test.ts` 12 条（服务形状与真实建索引/检索、无 `ctx.provide`
+时的降级、项目禁用时 `reindex` 报 `disabled` 而不是失败、注册条件（无 IM 服务 / 无白名单 / 有白名单注册一次）、
+白名单拒绝与日志、引用格式、截断与 TUI 提示、搜索失败可读、p2pOnly、缺 workspace、命令名校验、项目级收紧），
+`packages/dsh-evidence-gate/test/kb-sync.test.ts` 5 条（交付后调用且目标是交付工作区、`reindex` 抛错仍签发回执并输出"更新失败"、
+unchanged 不冒充"已更新"、无服务/老服务/已禁用都静默、访问器抛错/超时/异常结果都降级为一行附注）。两包全量
+`node --test` 全绿（75 / 66），两包 `tsc` 通过，`scripts/standards-check.sh --quiet` PASS（无新增/恶化；`tools.ts`
+的改动按"净零行"做，摘要抽出后行数只减不增）。**未跑** `scripts/verify.sh` 全量（本次按任务约定只跑受影响包 +
+`tsc` + standards）；交付门禁仍需完整 `verify.sh --quiet` 的 PASS。
+
 ## [0.8.12] — 2026-11-17
 
 ### 新增 · 审批之后强制进入 implement（`dsh-orchestrator` / `dsh-spec-gate` / `docs/ARCHITECTURE.md` §5.37）

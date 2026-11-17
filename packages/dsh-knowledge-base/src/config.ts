@@ -21,6 +21,7 @@
 import path from 'node:path'
 import { LEGACY_TRAIL_DIR, loadProjectConfig, relativeRootFile, type Layout, type LayoutOptions } from 'dsh-eng-core'
 import { effectivePatterns } from './sources.js'
+import { narrowImConfig, resolveImConfig, type KbImConfig } from './im-config.js'
 
 /** The six kinds of document the index knows. */
 export type KbKind = 'spec' | 'adr' | 'trail' | 'plan' | 'docs' | 'code'
@@ -92,6 +93,12 @@ export interface KnowledgeBaseConfig {
         maxLimit: number
         fieldBoosts: KbFieldBoosts
     }
+    /**
+     * The optional `/kb` command inside an IM chat: off by default (an empty
+     * `chatIds` never registers anything), narrowed — never widened — by a
+     * repository's own file. See `im-config.ts`.
+     */
+    im: KbImConfig
 }
 
 /** Untrusted configuration input. */
@@ -241,19 +248,12 @@ export function resolveConfig(input: unknown): KnowledgeBaseConfig {
                 body: Math.max(0.0001, num(boosts['body'], 1)),
             },
         },
+        im: resolveImConfig(raw['im']),
     }
 }
 
 /** Keys a target repository may override in `<repo>/.dsh/knowledge-base.json`. */
-export const PROJECT_OVERRIDABLE: readonly string[] = [
-    'enabled',
-    'indexDir',
-    'maxFileBytes',
-    'maxChunkLines',
-    'sources',
-    'tokenizer',
-    'search',
-]
+export const PROJECT_OVERRIDABLE: readonly string[] = ['enabled', 'indexDir', 'maxFileBytes', 'maxChunkLines', 'sources', 'tokenizer', 'search', 'im']
 
 /**
  * The workspace-relative index directory.
@@ -350,10 +350,7 @@ export function resolveEffectiveConfig(
     const base: KnowledgeBaseConfig = { ...host, sources: withWorkspaceDefaults(host.sources, layout) }
     if (raw === undefined) return { config: base, source: 'profile', file, problems }
 
-    const report = (message: string): void => {
-        problems.push(message)
-        logger?.warn(message)
-    }
+    const report = (message: string): void => { problems.push(message); logger?.warn(message) }
     for (const key of Object.keys(raw)) {
         if (!PROJECT_OVERRIDABLE.includes(key)) report(`${file}: 键 "${key}" 不允许在项目级配置里覆盖（profile 是上限），已忽略`)
     }
@@ -367,6 +364,9 @@ export function resolveEffectiveConfig(
         layout: { ...host.layout },
     }
     let applied = 0
+    // The IM block follows the same ceiling rule: fewer chats, p2p-only, tighter budgets.
+    const im = narrowImConfig(host.im, raw['im'], file, report)
+    if (im !== undefined) { next.im = im; applied += 1 }
 
     if (raw['enabled'] !== undefined) {
         if (raw['enabled'] === false) {

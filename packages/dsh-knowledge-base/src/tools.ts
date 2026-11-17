@@ -20,42 +20,28 @@
  * @module dsh-knowledge-base/tools
  */
 
-import path from 'node:path'
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import { type AgentLike, type Logger, type MissionStoreRegistry } from 'dsh-eng-core'
-import { KB_KINDS, type EffectiveConfig, type KnowledgeBaseConfig, type KbKind } from './config.js'
-import { buildIndex, indexDirOf, loadIndex, type LoadedIndex } from './index-store.js'
+import { type AgentLike } from 'dsh-eng-core'
+import { type KnowledgeBaseConfig } from './config.js'
+import { indexDirOf, loadIndex } from './index-store.js'
 import { indexFingerprint } from './fingerprint.js'
-import { displayPath, freshnessLines, missingIndexMessage, renderIndexReport, renderSearchReport, renderStatusReport, unusableProblems } from './report.js'
-import { idLikeTokens, searchIndex, tokenize } from './search.js'
+import { displayPath, freshnessLines, renderIndexReport, renderSearchReport, renderStatusReport } from './report.js'
+import { buildWorkspaceIndex, searchWorkspace, type IndexOptions, type OperationDeps, type SearchOptions } from './operations.js'
 
 const TEXT_OUTPUT = { type: 'string' } as const
 
 /** Everything the tools and the command close over. */
-export interface ToolDeps {
+export interface ToolDeps extends OperationDeps {
     config: KnowledgeBaseConfig
-    /** Resolved per-call configuration (profile row + `<repo>/.dsh/knowledge-base.json`). */
-    configFor: (agent: AgentLike | undefined) => EffectiveConfig
-    stores: MissionStoreRegistry
-    logger: Logger
     /** Injected clock (the manifest's `builtAt`). */
     now: () => number
 }
 
 /** Arguments of `kb_index` (and of `/kb index`). */
-export interface IndexArgs {
-    force?: boolean
-    only?: string[]
-}
+export type IndexArgs = IndexOptions
 
 /** Arguments of `kb_search` (and of `/kb search`). */
-export interface SearchArgs {
-    query?: string
-    limit?: number
-    kinds?: string[]
-    pathPrefix?: string
-    missionId?: string
-}
+export type SearchArgs = SearchOptions
 
 function agentOf(exec: unknown): AgentLike | undefined {
     return (exec as { agent?: AgentLike }).agent
@@ -73,11 +59,6 @@ function declaredCwdOf(agent: AgentLike | undefined): string {
     return cwd
 }
 
-/** The refusal every `kb_search` path shares when there is no usable index. */
-function refuseMissingIndex(dir: string, cwd: string, loaded?: LoadedIndex): never {
-    throw new Error(missingIndexMessage(dir, cwd, loaded))
-}
-
 /**
  * Build (or rebuild) the index and render the report.
  * Shared by `kb_index` and `/kb index`.
@@ -89,33 +70,9 @@ function refuseMissingIndex(dir: string, cwd: string, loaded?: LoadedIndex): nev
 export function runIndex(deps: ToolDeps, agent: AgentLike | undefined, args: IndexArgs = {}): string {
     const cwd = declaredCwdOf(agent)
     const effective = deps.configFor(agent)
-    const config = effective.config
-    if (!config.enabled) {
-        throw new Error(
-            'dsh-knowledge-base 已被宿主禁用（enabled=false）：不会索引也不会检索。下一步：由宿主在 profile 行里把 enabled 改回 true（项目级配置只能收紧，不能启用）。',
-        )
-    }
-    const only = Array.isArray(args.only) ? args.only.filter((id): id is string => typeof id === 'string' && id.trim() !== '').map((id) => id.trim()) : undefined
-    if (only !== undefined && only.length > 0) {
-        const known = config.sources.map((source) => source.id)
-        const unknown = only.filter((id) => !known.includes(id))
-        if (unknown.length > 0) {
-            throw new Error(
-                `only 里出现了未配置的来源：${unknown.join('、')}。可用来源：${known.join('、')}。` +
-                    '下一步：改用上列 id，或不带 only 构建完整索引（kb_index 不会把未知来源当成"没问题"跳过）。',
-            )
-        }
-    }
-    const store = deps.stores.for(cwd)
-    const result = buildIndex({
-        cwd,
-        layout: store.layout,
-        config,
-        now: deps.now(),
-        ...(args.force === true ? { force: true } : {}),
-        ...(only === undefined || only.length === 0 ? {} : { only }),
-        logger: deps.logger.for(cwd),
-    })
+    // The build itself lives in `operations.ts`: the service a sibling plugin
+    // reaches through `ctx.get('knowledge-base')` runs the same function.
+    const result = buildWorkspaceIndex({ cwd, effective, stores: deps.stores, logger: deps.logger, now: deps.now(), options: args })
     deps.logger.for(cwd).info(
         `kb_index: ${result.changeKind}；${result.manifest.totals.documents} 篇 / ${result.manifest.totals.chunks} 块；跳过 ${result.manifest.totals.skipped} 项`,
     )
@@ -133,67 +90,9 @@ export function runIndex(deps: ToolDeps, agent: AgentLike | undefined, args: Ind
 export function runSearch(deps: ToolDeps, agent: AgentLike | undefined, args: SearchArgs = {}): string {
     const cwd = declaredCwdOf(agent)
     const effective = deps.configFor(agent)
-    const config = effective.config
-    if (!config.enabled) {
-        throw new Error('dsh-knowledge-base 已被宿主禁用（enabled=false）：没有可检索的索引。下一步：由宿主把 profile 的 enabled 改回 true 并 kb_index。')
-    }
-    const query = typeof args.query === 'string' ? args.query.trim() : ''
-    if (query === '') {
-        throw new Error(
-            'kb_search 需要非空的 query。下一步：给出要查的关键词或 id，例如 `{ "query": "AC-003" }`、`{ "query": "发布流程" }`、`{ "query": "登录失败", "kinds": ["docs"] }`。',
-        )
-    }
-    const dir = indexDirOf(cwd, config)
-    const loaded = loadIndex(dir)
-    if (loaded.manifest === undefined || loaded.postings === undefined) refuseMissingIndex(dir, cwd, loaded)
-    if (unusableProblems(loaded).length > 0) refuseMissingIndex(dir, cwd, loaded)
-
-    let kinds: string[] | undefined
-    if (args.kinds !== undefined) {
-        if (!Array.isArray(args.kinds)) {
-            throw new Error(`kinds 必须是字符串数组。可用值：${KB_KINDS.join('、')}。`)
-        }
-        const wanted = args.kinds.filter((kind): kind is string => typeof kind === 'string' && kind.trim() !== '').map((kind) => kind.trim())
-        const unknown = wanted.filter((kind) => !KB_KINDS.includes(kind as KbKind))
-        if (unknown.length > 0) {
-            throw new Error(`kinds 里有未知类型：${unknown.join('、')}。可用值：${KB_KINDS.join('、')}。下一步：改用上列类型，或去掉 kinds 查全部来源。`)
-        }
-        if (wanted.length > 0) kinds = wanted
-    }
-    let limit = config.search.limit
-    if (args.limit !== undefined) {
-        if (typeof args.limit !== 'number' || !Number.isFinite(args.limit) || args.limit < 1) {
-            throw new Error(`limit 必须是不小于 1 的数（当前值 ${JSON.stringify(args.limit)}）。下一步：给一个 1..${config.search.maxLimit} 的整数，或去掉 limit 用默认 ${config.search.limit}。`)
-        }
-        limit = Math.floor(args.limit)
-    }
-    const current = indexFingerprint(cwd, dir)
-    const freshness = freshnessLines(loaded.manifest.fingerprint, current, displayPath(cwd, dir))
-    if (tokenize(query, config.tokenizer).length === 0 && idLikeTokens(query).length === 0) {
-        throw new Error(
-            `query 里没有可检索的内容（分词后为空："${query}"）。当前分词设置：CJK bigram ${config.tokenizer.cjkBigrams ? '开' : '关'}、minTokenLength=${config.tokenizer.minTokenLength}，` +
-                '标点与长度不足 1 的片段会被丢弃。下一步：换成有实际内容的词或 id（如 "登录"、"AC-003"、"docs/"），或由宿主调低 tokenizer.minTokenLength 后重建索引。',
-        )
-    }
-    // The mission filter matches the specification and mission directory by
-    // PATH, so it needs this workspace's trail root (namespace-first) rather
-    // than a literal legacy prefix.
-    const trailDir = path.relative(cwd, deps.stores.for(cwd).layout.rootDir).split(path.sep).join('/')
-    const outcome = searchIndex({
-        chunks: loaded.chunks,
-        postings: loaded.postings,
-        query,
-        limit,
-        maxLimit: config.search.maxLimit,
-        boosts: config.search.fieldBoosts,
-        tokenizer: config.tokenizer,
-        ...(kinds === undefined ? {} : { kinds }),
-        ...(typeof args.pathPrefix === 'string' && args.pathPrefix.trim() !== '' ? { pathPrefix: args.pathPrefix.trim() } : {}),
-        ...(typeof args.missionId === 'string' && args.missionId.trim() !== '' ? { missionId: args.missionId.trim() } : {}),
-        trailDir,
-    })
-    deps.logger.for(cwd).info(`kb_search: "${query}" → ${outcome.scored} 条命中（返回 ${outcome.hits.length}）${freshness.stale ? '；索引过期' : ''}`)
-    return renderSearchReport({ config, query, loaded: { ...loaded, manifest: loaded.manifest }, outcome, freshness })
+    const { config, loaded, outcome, freshness } = searchWorkspace({ cwd, effective, stores: deps.stores, options: args })
+    deps.logger.for(cwd).info(`kb_search: "${outcome.query}" → ${outcome.scored} 条命中（返回 ${outcome.hits.length}）${freshness.stale ? '；索引过期' : ''}`)
+    return renderSearchReport({ config, query: outcome.query, loaded, outcome, freshness })
 }
 
 /**

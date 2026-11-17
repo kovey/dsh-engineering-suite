@@ -45,6 +45,52 @@
 - **只读边界**：`search` / `status` / `help` 不写任何文件（测试用 `.dsh` 逐字节快照证明）；只有 `index` 会写索引目录。
 - 工具里的拒绝（缺索引、被宿主禁用、query 分词为空…）在这里变成**错误结果**，文字与工具端一模一样。
 
+## 通过 IM 搜索（`/kb`，默认关闭）
+
+宿主装配了官方 `dsh-chat-interaction`（≥ 0.3.8，通过 `ctx.get('chatInteraction').api` 暴露
+`registerCommand`）时，本插件可以把同一个检索搬到聊天窗口：`/kb <关键词>`，结果**发回原会话**，每条带
+`path:from-to` 引用与一句摘要。它走 IM 插件的**命令注册表**，不唤醒模型、不花 token，也不经过任何门禁
+（因此也无从绕过门禁——它只回答"索引里有什么"）。
+
+**默认关闭，且白名单就是开关**：只有同时满足「宿主有 `chatInteraction` 服务」与「`im.chatIds` 非空」
+才注册命令；没有白名单就一条命令都不注册（不是注册了再拒绝）。每个调用还会再校验一次
+`ctx.chatId` 是否在白名单里——**会话不在名单内时拒绝并把这次尝试写进日志**，不返回任何结果。
+
+```yaml
+    im:
+      command: kb            # 命令名（默认 kb；只接受 [a-z0-9][a-z0-9_-]{0,31}，非法则不注册并记警告）
+      chatIds: []            # 允许使用命令的会话 id；为空 = 不注册（默认关闭）
+      p2pOnly: false         # true 时只接受 p2p 会话（群聊一律拒绝并记录）
+      maxResults: 5          # 每条回复最多几条命中（1..50）
+      maxChars: 1800         # 单条回复的字符上限，超出按行截断并追加"更多结果请在 TUI 用 kb_search"
+      workspace: ''          # 要检索的仓库根目录（绝对路径或 ~/…）；IM 命令没有 agent 可读 cwd，必须显式给
+```
+
+handler 的行为（每一条都有测试）：
+
+| 情况 | 回复 |
+|---|---|
+| 没有参数 | 用法（`/<命令> <关键词…>`，并指向 TUI 的 `kb_search`） |
+| 会话不在白名单 | `该会话未授权搜索知识库（im.chatIds 白名单之外）…`，同时 `warn` 一行（含 chatId 与原因） |
+| `p2pOnly` 且不是 p2p | 同上拒绝并记录（`chatType=…`） |
+| `im.workspace` 为空 | 说明缺哪一项配置（`im.workspace`）与该填什么 |
+| 命中若干条 | `[n] path:from-to 「标题」` + `摘要：…`（与 `kb_search` 同一份 `SearchOutcome`） |
+| 索引里没有 | 说明这是词法索引（换词/换 id 可能命中），并指向 TUI |
+| 搜索失败（索引缺失 / 服务抛错） | `搜索失败：<原因>`——**不抛异常**（抛出去只会变成 IM 插件的通用"命令执行失败"，信息更少） |
+
+## 给其它插件的服务（`knowledge-base`）
+
+插件通过 `ctx.provide('knowledge-base', …)` 暴露一个**可选服务**，让兄弟插件不必跨包 `import`、也不会把
+本插件变成它们的硬依赖（宿主没挂载时 `ctx.get('knowledge-base')` 就是 `undefined`，调用方照常工作）：
+
+| 方法 | 作用 |
+|---|---|
+| `reindex(cwd, options?)` | 构建/刷新该工作区的索引（与 `kb_index` 同一个 `buildIndex`），返回 `{ changeKind, changed, dir, documents, chunks, skipped }`——调用方据此说"已更新 N 块 / 未变 / 仅刷新指纹"，不用猜 |
+| `search(input)` | `{ cwd, query, limit?, kinds?, pathPrefix?, missionId? }` → 与 `kb_search` 同一个 `SearchOutcome`（含 `path:from-to` 与摘要）；没有可用索引时**抛中文错误**（拒绝原因与工具端一致） |
+
+`cwd` 是显式参数：一个 dsh 进程服务多个仓库，服务不能猜。第一个接入方是 `dsh-evidence-gate`：
+`mission_complete` 签发回执后 best-effort 调 `reindex`（失败只记警告、只加一行附注，绝不影响回执与 mission 状态）。
+
 ## 配置（两层：profile 是上限，项目只能收紧）
 
 ```yaml
@@ -66,15 +112,24 @@
       - { id: code,  kind: code,  globs: ['**/*.ts', '**/*.tsx', '**/*.js', '**/*.mjs', '**/*.cjs', '**/*.go', '**/*.py'] }
     tokenizer: { cjkBigrams: true, minTokenLength: 2 }
     search: { limit: 10, maxLimit: 50, fieldBoosts: { title: 3, symbols: 2, body: 1 } }
+    im:                            # 可选：IM 里的 /kb（默认关闭，chatIds 为空就不注册）
+      command: kb
+      chatIds: []                  # 允许的会话 id，例如 ['oc_x']
+      p2pOnly: false
+      maxResults: 5
+      maxChars: 1800
+      workspace: ''                # 要检索的仓库根目录；IM 命令没有 agent 的 cwd，必须显式配置
 ```
 
 **项目级可覆盖**（`<repo>/.dsh/knowledge-base.json`）：`enabled`、`indexDir`、`maxFileBytes`、`maxChunkLines`、
-`sources`、`tokenizer`、`search` —— 且只能**收窄**：
+`sources`、`tokenizer`、`search`、`im` —— 且只能**收窄**：
 
 - 数值上限（`maxFileBytes`、`maxChunkLines`、`search.limit`、`search.maxLimit`）只能调低；
 - `tokenizer.minTokenLength` 只能调高；`tokenizer.cjkBigrams` 只能关掉（打开会更宽地召回）；
 - `sources` 只能停用来源或**删减**模式，不能新增来源、不能换 `kind`、不能加模式；
-- `enabled` 只能从开变关。`logFile` / `prompt` 属于宿主，项目改不了。
+- `enabled` 只能从开变关。`logFile` / `prompt` 属于宿主，项目改不了；
+- `im` 只能**收窄**：从白名单里删会话（不能新增）、`p2pOnly` 只能打开、`maxResults` / `maxChars` 只能调低；
+  `im.command` 与 `im.workspace`（"搜哪个仓库"）是宿主决定，项目级写了会被忽略并报告。
 
 每一个被拒绝的放宽都会在报告里逐条说明原因（"`maxLimit=100` 超过上限 50，已忽略"），
 所以"我以为改了"和"真的改了"不会长得一样。值本身不可用时**保留宿主的值**，同样上报。
@@ -164,12 +219,13 @@
 | 插件 | 关系 |
 |---|---|
 | `dsh-spec-gate` | 写 `.dsh/specs/<id>.md`（`spec` 来源）、保护 `.dsh/**`（模型改不了索引目录里的东西）、`adr_record` 写 `.dsh/adr/*.md` + `index.jsonl`（`adr` 来源）、`spec_create/spec_approve/spec_amend` 追加 `.dsh/plan.jsonl`（`plan` 来源） |
-| `dsh-evidence-gate` | `release_record` 追加 `.dsh/releases.jsonl`（`trail` 来源的发布文档）；交付侧可以把"索引是否覆盖本次改动"当作一条检查 |
+| `dsh-evidence-gate` | `release_record` 追加 `.dsh/releases.jsonl`（`trail` 来源的发布文档）；交付成功签发回执后 **best-effort 调用本插件的 `knowledge-base` 服务重建索引**（失败只记警告、只加一行附注，绝不影响回执与 mission 状态） |
 | `dsh-suite-doctor` | 可以读 `manifest.json` 报告索引新鲜度/来源覆盖（本插件不主动改别人的报告） |
 | `dsh-impact-gate` | 影响面给的是"改了哪些文件"，本插件能回答"这些文件在规格/决策/台账里被谁引用" |
 | `dsh-standards-gate` | 代码符号来自同一套提取器（`dsh-eng-core` 的 `scanWorkspace`），所以"符号"在两个插件里是同一个定义 |
 | `dsh-audit-trail` | 检索是**只读**的（测试用 `.dsh` 逐字节快照证明），不会污染审计轨迹 |
 | `@deepseek-ai/dsh-commands` | **可选**：装配了就多一条人类命令 `/kb …`（与三个工具共用同一份报告，不经模型、不花 token）；没装配不影响任何工具 |
+| `dsh-chat-interaction` | **可选**：装配了（≥ 0.3.8）且配置了 `im.chatIds` 才多一条 IM 命令 `/kb`（默认关闭；见上文） |
 
 ## 诚实的边界
 
@@ -183,7 +239,9 @@
 - **只索引列出的来源**：`.dsh/audit/**`、`.dsh/state/**`、`node_modules`、构建产物一律不在索引里（其中 `.dsh/**`
   不从目录树遍历，只有显式声明的来源目录会被读）。发布台账 `.dsh/releases.jsonl` 的文档归 `trail` 来源
   （一行一份发布记录），`plan` 只覆盖 `.dsh/plan.jsonl`——同一份台账不会被两个来源各索引一遍。
-- **索引会过期**：过期会**报告**，不会被自动修好；插件不会在 `kb_search` 里偷偷重建（写操作必须由 `kb_index` 触发）。
+- **索引会过期**：过期会**报告**，不会被悄悄修好；`kb_search` 里绝不会偷偷重建（写操作必须由显式入口触发）。
+  唯一的自动重建是**交付附带动作**：`mission_complete` 签发回执后由 `dsh-evidence-gate` best-effort 调服务的 `reindex`
+  ——它不阻塞交付、失败只记警告，结果作为交付输出末尾的一行附注（"索引已更新（N 块）/ 未变 / 更新失败：…"）。
 - **模型可能不照做**：prompt 段要求"先查再答、每条带引用"，但这是提示级的；机械保证只有"命中必带 `path:from-to`、
   索引里没有就不返回"。
 - **`only` 建出来的是局部索引**：它只包含被点名的来源，manifest 会记下这一点，检索报告也会转述——但**别把它当完整索引引用**。

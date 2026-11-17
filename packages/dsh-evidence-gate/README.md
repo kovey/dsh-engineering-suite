@@ -16,7 +16,7 @@
 |---|---|
 | `evidence_record` | 登记一条证据：`kind` = `command` / `test` / `artifact` / `diff` / `manual`。行内绑定当时的 Git 指纹、`sha256(output)` 与截断后的输出尾部（`maxOutputTail`）；`manual` 必须带 `note`；`gate` 不接受手工登记（由质量门禁写入）。失败的运行**照样可以登记**（有参考价值），但不会满足交付检查表——登记时会当场提示。工作区取 `session.header.cwd`，未声明时拒绝执行。 |
 | `evidence_status` | 输出整条链路现状：规格审批、各类型证据计数与最新 5 条、最新门禁裁决、已签发回执，以及 `mission_complete` 的 fail-closed 检查表与下一步。**用的是与交付路径完全相同的那份检查表**（报告与判定不分裂）；未能核对的项以 ⚠️ 标注。检查表是**本工作区**（`session.header.cwd`）的生效配置，未声明工作区时拒绝执行。 |
-| `mission_complete` | 验收并交付：逐项检查 mission 熔断状态 / 规格审批 / 门禁（完整、真实、覆盖最新证据）/ 必填证据（成功的行）/ 工作区指纹；全部通过才签发回执并把 mission 置为 `delivered`，否则返回 ❌ 清单且**不改状态、不写回执**。回执写在**本工作区**（`session.header.cwd`），未声明工作区时拒绝执行（绝不写进宿主目录）。 |
+| `mission_complete` | 验收并交付：逐项检查 mission 熔断状态 / 规格审批 / 门禁（完整、真实、覆盖最新证据）/ 必填证据（成功的行）/ 工作区指纹；全部通过才签发回执并把 mission 置为 `delivered`，否则返回 ❌ 清单且**不改状态、不写回执**。回执写在**本工作区**（`session.header.cwd`），未声明工作区时拒绝执行（绝不写进宿主目录）。签发回执之后**best-effort 刷新项目知识库索引**（`ctx.get('knowledge-base')`，可选服务）：结果只作为输出末尾一行附注，失败只记警告——它不参与判定，也绝不改变回执与 mission 状态。 |
 | `release_record` | 记录一次发布：把**已交付**（有回执）的 mission 绑到一个版本、tag 与当前 Git revision 上，写出发布说明并往发布台账追加一行（append-only）。**记录本身就是把"回执"和"版本/tag"绑起来的那一步**——只打 tag 不记录，台账里依然查不到"v1.2.0 里有什么"。fail closed：mission 不存在 / 没有回执、版本重复、mission 集合为空、非 git 工作区都会拒绝并给出下一步。 |
 | `release_notes` | **只读**生成发布说明（Markdown，或 `json: true` 的结构化投影）：需求与 id、验收标准条数、每个门禁来源最新一条裁决与它的 `scope`、回执绑定的证据类型、交付审批人、证据指到的文件。不写任何文件（落盘是 `release_record` 的事）；门禁没有 `scope`、证据没有 `artifactPath` 时照实写"未记录"，不推断。 |
 | `release_status` | **只读**查看发布台账：已记录的发布（最新在前：版本、日期、revision、mission 数）、**交付但未发布**的 mission（"我准备发什么"）、每个已交付 mission 的最新回执；`version` 可聚焦某一个版本。台账末尾被截断的行会被忽略并报出（其余记录照常可读）。 |
@@ -201,6 +201,12 @@ store 需要布局，所以**显式 `missionId` 也不能替代工作区**（同
 - **dsh-spec-gate**：共用同一个 `MissionStore` 文件契约；`spec.approvedAt` 是交付的第 1 项检查，未审批规格直接阻断并提示 `spec_create → spec_approve`。
 - **dsh-quality-gate**：`store.lastGate(missionId, { source: gateSource })` 是唯一授权来源；`PASS` 才放行，未跑 / `WARN` / `BLOCK` / 部分覆盖 / 伪造 / 陈旧全部阻断。门禁记录里的 `fingerprint` 供 `requireCleanTree` 比对。
 - 回执绑定门禁 id、全部证据 id、规格 digest 与门禁观测的 Git 指纹，可交给 `dsh-audit-trail` 或人工追溯。
+- **dsh-knowledge-base（可选）**：`mission_complete` 成功签发回执后，通过 `ctx.get('knowledge-base')` 调一次
+  `reindex(cwd)`，让索引不落后于刚交付的代码（交付正是索引开始过时的那一刻）。接口是**选项**：没有该服务、
+  服务是老版本（没有 `reindex`）、抛错、或超过 30 s 超时，都只写 `logger.warn` + 在交付输出末尾加一行
+  `知识库：更新失败：<原因>`——回执与 mission 状态在此之前已经定稿，索引失败**不可能**改变交付结论。
+  成功时附注写 `知识库：索引已更新（N 块）` / `知识库：索引未变（N 块）` / `知识库：索引内容未变（仅刷新指纹）`。这行附注是**附注**：
+  检查表、门禁记录与回执都不读它。
 - **回执 → 版本**：`release_record` 把回执 id 与版本、tag、revision 一起写进发布台账，`release_notes` 从规格 / 门禁 / 证据 / 回执生成说明，
   所以"v1.2.0 里有什么"由记录回答，而不是由 git 历史反推；`release_status` 每次回答"已发布什么、还差什么没发"。
 
@@ -225,4 +231,4 @@ store 需要布局，所以**显式 `missionId` 也不能替代工作区**（同
 node ../../node_modules/typescript/bin/tsc -p tsconfig.json && node --test test/*.test.ts
 ```
 
-测试从 `dist/` 导入，必须先 `tsc`。共 59 个用例：装配/卸载、证据捕获（digest、tail 截断、Git 指纹、`kind=diff`）、全部阻断路径、`force` 边界、回执不可变性、`requireCleanTree`（真实 git 仓库；环境无 git 时自动 skip），审计回归：解析不回退最新 mission、失败行 / manual 不能顶替必填类型、伪造门禁、部分覆盖与无 `scope` 旧记录、空 `results`、同毫秒陈旧、`blocked` 熔断、默认 `requireCleanTree` 下的"门禁后改动"与非 git 工作区的"无法核对"提示，项目级配置回归：一个 host 服务两个仓库时检查表互不影响、host-only 键（`enabled`/`allowForceOverride`/`logFile`/布局）被忽略、项目级 `requireCleanTree=false` 只放松自己的工作区、损坏文件回退 profile 且交付照常、坏类型值逐条记问题、`evidence_status` 显示配置来源与生效值，发布台账回归：拒绝没有回执的 mission（点名）、拒绝重复版本（给出已有记录日期）、默认取"上一条发布记录之后交付"的 mission、非 git 工作区拒绝、写出说明与台账行（revision / tag / mission / 回执）、说明渲染需求-验收标准-门禁-scope-证据-审批人且无 `scope` 时写"未记录"、手写需求不编造 id、`release_status` 的"交付但未发布"与最新回执、截断台账行被容忍、`requireTagFormat` 拒绝坏版本（消息含模式）、发布键的项目级覆盖与工作区外路径拒绝、两个只读工具**一个字节都不写**，以及工作区回归：提示词章节按本次装配的调用会话解析（同一注册、不同 cwd 得到不同文本，工作区改动下一次装配即生效，无工作区时回退 profile 文本且不抛异常）、未声明 `header.cwd` 时各工具一律拒绝且**不往宿主目录写任何工件**（含显式 `missionId`）。
+测试从 `dist/` 导入，必须先 `tsc`。共 66 个用例：装配/卸载、证据捕获（digest、tail 截断、Git 指纹、`kind=diff`）、全部阻断路径、`force` 边界、回执不可变性、`requireCleanTree`（真实 git 仓库；环境无 git 时自动 skip），审计回归：解析不回退最新 mission、失败行 / manual 不能顶替必填类型、伪造门禁、部分覆盖与无 `scope` 旧记录、空 `results`、同毫秒陈旧、`blocked` 熔断、默认 `requireCleanTree` 下的"门禁后改动"与非 git 工作区的"无法核对"提示，项目级配置回归：一个 host 服务两个仓库时检查表互不影响、host-only 键（`enabled`/`allowForceOverride`/`logFile`/布局）被忽略、项目级 `requireCleanTree=false` 只放松自己的工作区、损坏文件回退 profile 且交付照常、坏类型值逐条记问题、`evidence_status` 显示配置来源与生效值，发布台账回归：拒绝没有回执的 mission（点名）、拒绝重复版本（给出已有记录日期）、默认取"上一条发布记录之后交付"的 mission、非 git 工作区拒绝、写出说明与台账行（revision / tag / mission / 回执）、说明渲染需求-验收标准-门禁-scope-证据-审批人且无 `scope` 时写"未记录"、手写需求不编造 id、`release_status` 的"交付但未发布"与最新回执、截断台账行被容忍、`requireTagFormat` 拒绝坏版本（消息含模式）、发布键的项目级覆盖与工作区外路径拒绝、两个只读工具**一个字节都不写**，知识库附注回归：交付后调用 `reindex` 且目标是交付的工作区、`reindex` 抛错时回执照常签发且输出含"更新失败"、无服务/老服务静默交付、超时与异常结果都降级为一行附注而不是异常，以及工作区回归：提示词章节按本次装配的调用会话解析（同一注册、不同 cwd 得到不同文本，工作区改动下一次装配即生效，无工作区时回退 profile 文本且不抛异常）、未声明 `header.cwd` 时各工具一律拒绝且**不往宿主目录写任何工件**（含显式 `missionId`）。
