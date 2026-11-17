@@ -1,19 +1,16 @@
 /**
  * The reports, rendered once for every surface that shows them.
  *
- * The knowledge base has two human surfaces now — the model's tools
- * (`kb_index` / `kb_search` / `kb_status` in `tools.ts`) and the human command
- * (`/kb …` in `command.ts`) — and a citation line that drifts between them is a
- * citation a reviewer cannot trust. So the rendering lives here, as pure
- * functions over already-computed values: no IO, no clock, no configuration
- * lookup, no logger. The operations (which do the IO) call these; the tool and
- * the command call the operations.
+ * The model's tools (`kb_index` / `kb_search` / `kb_status`) and the human
+ * command (`/kb …`) share these renderers: a citation line that drifts between
+ * them is a citation a reviewer cannot trust. They are pure functions over
+ * already-computed values (no IO, no clock, no configuration lookup, no logger);
+ * the operations do the IO and call these.
  *
  * Two reports are deliberately loud rather than convenient:
  *
  *  - **Staleness.** The freshness line is printed BEFORE the hits, because an
- *    answer drawn from a stale index may be wrong about the present, and a
- *    silently-omitted warning is exactly how that goes unnoticed. The line
+ *    answer drawn from a stale index may be wrong about the present. The line
  *    names the index directory the comparison ignores, so an audit can see what
  *    "一致" was measured against.
  *  - **Gaps.** Skipped files, truncated walks and partial builds are printed,
@@ -44,6 +41,7 @@ import {
     SNIPPET_LINES,
     type SearchOutcome,
 } from './search.js'
+import { selfHealNotice, type SelfHealInfo } from './freshness.js'
 
 /** How many skipped entries one report details before it says "and N more". */
 export const SKIP_DETAIL_LIMIT = 20
@@ -82,9 +80,7 @@ export function fingerprintLine(fingerprint: GitFingerprint): string {
  * The rendering of one freshness comparison.
  * @param indexed - the fingerprint stored in the manifest.
  * @param current - the fingerprint captured now.
- * @param ignored - display path of the directory both fingerprints exclude
- *   (`indexFingerprint`'s `indexDir`), named in the line so a reader can see
- *   what "一致" does not cover.
+ * @param ignored - display path of the directory both fingerprints exclude.
  * @returns the lines to print and whether the index is stale.
  */
 export function freshnessLines(indexed: GitFingerprint, current: GitFingerprint, ignored: string): Freshness {
@@ -113,10 +109,8 @@ export function freshnessLines(indexed: GitFingerprint, current: GitFingerprint,
  * `indexed` is what the artifact ACTUALLY holds (the chunk kinds parsed from
  * `chunks.jsonl`); when it is given and a configured source has no row in the
  * manifest but does have chunks on disk, that disagreement is stated instead of
- * the convenient "not in this index"— a manifest is a claim, and the file next to
- * it is the fact. (An index built by an older version can really be in that
- * state: a partial → full transition used to leave the manifest claiming partial
- * coverage over a full chunk list.)
+ * the convenient "not in this index" — a manifest is a claim, and the file next
+ * to it is the fact (an older version could really leave that state).
  */
 export function sourceLines(manifest: KbManifest, config: KnowledgeBaseConfig, indexed?: ReadonlyMap<KbKind, number>): string[] {
     const lines: string[] = []
@@ -178,14 +172,10 @@ export function skippedLines(manifest: KbManifest, limit = SKIP_DETAIL_LIMIT): s
 }
 
 /**
- * What makes an index unusable for answering.
- *
- * `loadIndex` decides: a missing/unparsable file, an unexplained
- * postings/chunks mismatch and a format version this build does not speak are
- * fatal — there is no honest answer to give from them. A torn tail the loader
- * could account for is NOT fatal: it is warned about in the report and fixed by
- * the next build (the postings entry of a dropped chunk is simply never
- * visited, because scoring walks the chunks that are there).
+ * What makes an index unusable for answering: `loadIndex`'s fatal problems (a
+ * missing/unparsable file, an unexplained postings/chunks mismatch, a format
+ * version this build does not speak). A torn tail the loader could account for
+ * is NOT fatal — it is warned about and fixed by the next build.
  */
 export function unusableProblems(loaded: LoadedIndex): string[] {
     return loaded.problems.filter((problem) => problem.fatal).map((problem) => problem.message)
@@ -324,20 +314,29 @@ export interface SearchReportInput {
     /** The loaded index; `manifest` must be present (the caller refused otherwise). */
     loaded: LoadedIndex & { manifest: KbManifest }
     outcome: SearchOutcome
-    /** The freshness verdict the caller computed with `indexFingerprint`. */
+    /** The freshness verdict the caller computed with `indexFingerprint` (after any self-heal). */
     freshness: Freshness
+    /** The automatic rebuild the search path attempted, when it attempted one. */
+    selfHeal?: SelfHealInfo
+    /** The stale verdict that triggered it (its lines name WHY the rebuild ran). */
+    staleBefore?: Freshness
 }
 
 /**
  * The `kb_search` report.
- * @param input - query, loaded index, search outcome and freshness.
+ * @param input - query, loaded index, search outcome, freshness and the self-heal record.
  * @returns the report text (ends with a 下一步 line).
  */
 export function renderSearchReport(input: SearchReportInput): string {
-    const { config, query, loaded, outcome, freshness } = input
+    const { config, query, loaded, outcome, freshness, selfHeal, staleBefore } = input
     const manifest = loaded.manifest
-    const lines: string[] = []
+    const lines: string[] = [...selfHealNotice(selfHeal)]
     lines.push(`知识库检索：“${query}”`)
+    if (staleBefore !== undefined && selfHeal?.outcome === 'rebuilt') {
+        // The old warning stays visible — it names the change that caused the
+        // rebuild — but its advice (run kb_index) is replaced by what happened.
+        lines.push(...staleBefore.lines.map((line) => `${line.replace(/——.*$/, '')}——已在本次检索前自动重建，下面的结果来自更新后的索引。`))
+    }
     lines.push(...freshness.lines)
     lines.push(`索引：${manifest.totals.documents} 篇文档 / ${manifest.totals.chunks} 块；构建于 ${manifest.builtAt}；指纹 ${fingerprintLine(manifest.fingerprint)}`)
     const filterRows: string[] = []
@@ -390,11 +389,10 @@ export interface StatusReportInput {
 }
 
 /**
- * The `kb_status` report, in its two shapes: "never built" and "here is what
- * the artifact covers" (the second one carries the honest statement of what the
+ * The `kb_status` report, in its two shapes: "never built" and "here is what the
+ * artifact covers" (the second one carries the honest statement of what the
  * index is and is not).
- * @param input - configuration, loaded index and freshness.
- * @returns the report text (ends with a 下一步 line).
+ * @param input - configuration, loaded index, freshness and the current fingerprint.
  */
 export function renderStatusReport(input: StatusReportInput): string {
     const { cwd, effective, dir, loaded, freshness, current } = input
@@ -416,8 +414,7 @@ export function renderStatusReport(input: StatusReportInput): string {
     }
     const manifest = loaded.manifest
     // What is REALLY indexed (parsed out of chunks.jsonl) versus what the manifest
-    // claims: the two can disagree in an index built by an older version, and the
-    // difference must be visible instead of being resolved in favour of the claim.
+    // claims: a disagreement must be visible, never resolved in favour of the claim.
     const indexedKinds = indexedKindCounts(loaded.chunks)
     const unrecorded = unrecordedCoverage(manifest, config, indexedKinds)
     lines.push(`索引目录：${ignored}（${humanBytes(loaded.totalBytes)}；manifest.json / chunks.jsonl / postings.json）`)
@@ -466,11 +463,12 @@ export function renderStatusReport(input: StatusReportInput): string {
             `比较时索引目录（${ignored}）被排除——重建产物不会把索引自己判成过期。要确定就跑 \`kb_index\`：它按内容比对，内容未变、指纹也一致才明说"未变"且不重写任何文件；` +
             '内容未变但指纹变了（例如编辑了 `.gitignore` 这类没被索引的跟踪文件）则只刷新 manifest.json 的指纹与 builtAt，块列表与倒排索引的字节保持不动，上面的"陈旧"随之消失；' +
             '请求的来源覆盖和 manifest 记的不一样（`only` 局部构建、或改了来源的 `enabled`）时，manifest 会被改写成本次请求的覆盖（报告写"来源覆盖变了"），' +
-            '块列表与倒排索引只在文档集合真的变了时才跟着重写——所以"来源覆盖变了"既不是"未变"，也不是"仅刷新了指纹"。',
+            '块列表与倒排索引只在文档集合真的变了时才跟着重写——所以"来源覆盖变了"既不是"未变"，也不是"仅刷新了指纹"。' +
+            `检索路径会自愈：\`kb_search\` 与 IM 的 \`/kb\` 在冷却窗口（${config.freshness.cooldownMs} ms）允许时自动重建过期索引一次，成功者结果首行写"索引已自动更新"，失败者保留旧索引并把原因写在首行；\`kb_status\` 本身不写盘。`,
     )
     lines.push(
         freshness.stale
-            ? '下一步：先 `kb_index` 重建索引——内容真变了它按新内容重建，只是指纹变了它只刷新指纹，两种情况都会让上面的警告消失；然后 `kb_search` 引用。'
+            ? `下一步：先 \`kb_index\` 重建索引——内容真变了它按新内容重建，只是指纹变了它只刷新指纹，两种情况都会让上面的警告消失；下一次 \`kb_search\` / IM \`/kb\` 也会在冷却允许时自动重建（冷却 ${config.freshness.cooldownMs} ms）；然后引用。`
             : unrecorded.length > 0
               ? '下一步：跑一次 `kb_index`——它会按当前请求的来源覆盖改写 manifest，上面的"manifest 与产物不一致"随之消失（产物本身没问题）；然后 `kb_search` 引用。'
               : '下一步：`kb_search` 检索；改了规格/决策/文档/代码后重新 `kb_index`；引用时照抄 `path:from-to`。',

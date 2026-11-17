@@ -1,19 +1,14 @@
 /**
  * Plugin configuration.
  *
- * The knowledge base has one unusual property among the suite's plugins: it
- * indexes the repository it runs in, so "how much of this project may be read
- * into an artifact" is a boundary decision, not a preference. The profile row
- * is the CEILING — where the index lives, how large a file or a chunk may be,
- * which sources exist, how retrieval is bounded — and a repository's own
+ * The knowledge base indexes the repository it runs in, so "how much of this
+ * project may be read into an artifact" is a boundary decision, not a
+ * preference. The profile row is the CEILING — index location, size bounds,
+ * which sources exist, retrieval bounds — and a repository's own
  * `.dsh/knowledge-base.json` may only NARROW it: disable a source, drop
- * patterns, lower a bound, raise `minTokenLength`, turn CJK bigrams off. A
- * project may never point the index at a wider set of files than the host
- * allowed, because every widened pattern is a file whose content leaves the
- * repository's own reading path and lands in `.dsh/kb/`.
- *
- * Everything here is validated before use: an unusable value keeps the host's
- * value and is reported, never silently coerced.
+ * patterns, lower a bound, raise `minTokenLength`, lengthen the self-heal
+ * cooldown. Everything here is validated before use: an unusable value keeps the
+ * host's value and is reported, never silently coerced.
  *
  * @module dsh-knowledge-base/config
  */
@@ -21,6 +16,7 @@
 import path from 'node:path'
 import { LEGACY_TRAIL_DIR, loadProjectConfig, relativeRootFile, type Layout, type LayoutOptions } from 'dsh-eng-core'
 import { effectivePatterns } from './sources.js'
+import { narrowFreshness, resolveFreshness, type FreshnessControl } from './freshness.js'
 import { narrowImConfig, resolveImConfig, type KbImConfig } from './im-config.js'
 
 /** The six kinds of document the index knows. */
@@ -94,6 +90,11 @@ export interface KnowledgeBaseConfig {
         fieldBoosts: KbFieldBoosts
     }
     /**
+     * Editor-time self-heal: a query that finds the index stale rebuilds it, at
+     * most once per `cooldownMs`. A project may only lengthen the window.
+     */
+    freshness: FreshnessControl
+    /**
      * The optional `/kb` command inside an IM chat: off by default (it answers only
      * the conversation interaction-gate configured), narrowed — never widened — by
      * a repository's own file. See `im-config.ts`.
@@ -129,22 +130,16 @@ function positive(value: unknown, fallback: number): number {
  * The six default collectors, with their trail-anchored patterns resolved for
  * one workspace.
  *
- * Each row is the answer to "which files may this index quote". The trail
+ * Each row answers "which files may this index quote". The trail
  * (`spec`/`adr`/`trail`/`plan`) is never walked as a directory tree: each source
  * names its own files, so the index cannot grow a chunk of its own artifact, of a
- * log, or of the audit trail by accident.
- *
- * The trail patterns follow the LAYOUT ROOT — the namespace directory of a
- * migrated repository, the legacy `.dsh/` root of an un-migrated one — because a
- * literal `.dsh/specs/*.md` default indexed `.dsh/specs` while a migrated
- * repository's specifications live under `.dsh/engineering-suite/specs` (the
- * report then said "规格：未创建" next to the specification).
- *
+ * log, or of the audit trail by accident. The trail patterns follow the LAYOUT
+ * ROOT (namespace directory, or the legacy `.dsh/` root) — a literal default
+ * looked in `.dsh/specs` while a migrated repository's specifications live under
+ * `.dsh/engineering-suite/specs`.
  * Call it WITHOUT a workspace for the `.dsh/`-anchored form the profile row
- * stores: one profile serves several repositories, and
- * {@link resolveEffectiveConfig} resolves the defaults for the calling workspace
- * (and {@link effectivePatterns} re-anchors an explicit `.dsh/`-prefixed
- * pattern).
+ * stores (one profile serves several repositories); `resolveEffectiveConfig`
+ * resolves the defaults for the calling workspace.
  * @param cwd - the workspace to resolve the defaults for; omitted = anchored form.
  * @returns fresh collector rows (callers may mutate their own copy).
  */
@@ -159,7 +154,13 @@ export function defaultSources(cwd?: string): KbSourceConfig[] {
         {
             id: 'code',
             kind: 'code',
-            globs: ['**/*.ts', '**/*.tsx', '**/*.js', '**/*.mjs', '**/*.cjs', '**/*.go', '**/*.py'],
+            // The same eleven languages the gates measure (dsh-eng-core/languages):
+            // four have a symbol extractor, the rest are indexed as text and
+            // reported as such — never as "unsupported" (their text IS indexed).
+            globs: [
+                '**/*.ts', '**/*.tsx', '**/*.js', '**/*.mjs', '**/*.cjs', '**/*.go', '**/*.py',
+                '**/*.rb', '**/*.php', '**/*.rs', '**/*.java', '**/*.kt', '**/*.kts', '**/*.cs', '**/*.swift',
+            ],
             enabled: true,
         },
     ]
@@ -235,6 +236,7 @@ export function resolveConfig(input: unknown): KnowledgeBaseConfig {
         maxFileBytes: Math.min(4 * 1024 * 1024, Math.max(1024, positive(raw['maxFileBytes'], 256 * 1024))),
         maxChunkLines: Math.min(1_000, Math.max(1, positive(raw['maxChunkLines'], 60))),
         sources,
+        freshness: resolveFreshness(raw['freshness']),
         tokenizer: {
             cjkBigrams: bool(tokenizer['cjkBigrams'], true),
             minTokenLength: Math.max(1, Math.min(32, positive(tokenizer['minTokenLength'], 2))),
@@ -253,20 +255,17 @@ export function resolveConfig(input: unknown): KnowledgeBaseConfig {
 }
 
 /** Keys a target repository may override in `<repo>/.dsh/knowledge-base.json`. */
-export const PROJECT_OVERRIDABLE: readonly string[] = ['enabled', 'indexDir', 'maxFileBytes', 'maxChunkLines', 'sources', 'tokenizer', 'search', 'im']
+export const PROJECT_OVERRIDABLE: readonly string[] = ['enabled', 'indexDir', 'maxFileBytes', 'maxChunkLines', 'sources', 'tokenizer', 'freshness', 'search', 'im']
 
 /**
  * The workspace-relative index directory.
  *
  * An explicit `indexDir` always wins. Otherwise the default follows the LAYOUT
  * ROOT, like every other plugin in the suite: the namespace directory when it
- * exists (a migrated repository), the legacy `.dsh/` root when it does not. A
- * literal legacy default meant a migrated repository's index was read from
- * `.dsh/kb` while it was actually built at `.dsh/engineering-suite/kb` — the
- * tools then reported "no index" next to a perfectly good one.
- *
- * This is the RELATIVE form (what reports and the prompt quote);
- * `index-store.js`'s `indexDirOf` resolves it to an absolute path.
+ * exists, the legacy `.dsh/` root when it does not — a literal legacy default
+ * made the tools report "no index" next to a perfectly good one. This is the
+ * RELATIVE form (what reports quote); `index-store.js`'s `indexDirOf` resolves
+ * it to an absolute path.
  * @param cwd - workspace root.
  * @param config - resolved plugin configuration (or the part that carries `indexDir`).
  * @returns workspace-relative directory, POSIX separators.
@@ -298,13 +297,10 @@ function usableIndexDir(value: string): boolean {
  * A profile row serves every repository at once, so its defaults are stored in
  * the trail-anchored form (`LEGACY_TRAIL_DIR/…`); the effective row — the one a
  * manifest, a `kb_status` table or a prompt quotes — must name the files this
- * workspace actually has. A glob list that was declared explicitly (host or
- * project) is left exactly as written: only the untouched defaults are rewritten.
- *
- * The rewrite goes through {@link effectivePatterns} with the workspace's own
- * `layout`, so a host that relocates `layout.rootDir` is honoured too (resolving
- * the default from `cwd` alone would name the standard root and then get
- * re-anchored twice).
+ * workspace actually has. An explicitly declared glob list is left exactly as
+ * written: only the untouched defaults are rewritten, through
+ * {@link effectivePatterns} with the workspace's own `layout` (so a host that
+ * relocates `layout.rootDir` is honoured too).
  * @param sources - the profile's collectors.
  * @param layout - the calling workspace's layout.
  * @returns fresh rows (the caller's arrays are never mutated).
@@ -327,8 +323,7 @@ function withWorkspaceDefaults(sources: readonly KbSourceConfig[], layout: Layou
  * The rule is the suite's two-layer model, applied to a plugin that reads the
  * repository: the profile is the ceiling and a workspace may only narrow it.
  * Every refused widening is reported with its reason — a project file that
- * asked for a wider pattern than the host allowed must not look like it
- * succeeded.
+ * asked for more than the host allowed must not look like it succeeded.
  * @param host - the profile-resolved configuration.
  * @param layout - the workspace layout (for the file path and problem text).
  * @param logger - optional diagnostic sink.
@@ -344,12 +339,9 @@ export function resolveEffectiveConfig(
     const problems = [...declared.problems]
     for (const problem of problems) logger?.warn(problem)
     const raw = declared.value
-    // The profile's defaults are stored in the trail-anchored form (one profile
-    // serves every workspace); the EFFECTIVE row is the one the manifest, the
-    // reports and the prompt quote, so it names THIS workspace's layout root.
+    // The effective row must name THIS workspace's layout root.
     const base: KnowledgeBaseConfig = { ...host, sources: withWorkspaceDefaults(host.sources, layout) }
     if (raw === undefined) return { config: base, source: 'profile', file, problems }
-
     const report = (message: string): void => { problems.push(message); logger?.warn(message) }
     for (const key of Object.keys(raw)) {
         if (!PROJECT_OVERRIDABLE.includes(key)) report(`${file}: 键 "${key}" 不允许在项目级配置里覆盖（profile 是上限），已忽略`)
@@ -359,6 +351,7 @@ export function resolveEffectiveConfig(
         ...host,
         sources: base.sources.map((source) => ({ ...source, globs: [...source.globs] })),
         tokenizer: { ...host.tokenizer },
+        freshness: { ...host.freshness },
         search: { ...host.search, fieldBoosts: { ...host.search.fieldBoosts } },
         prompt: { ...host.prompt },
         layout: { ...host.layout },
@@ -367,6 +360,9 @@ export function resolveEffectiveConfig(
     // The IM block follows the same ceiling rule: fewer chats, p2p-only, tighter budgets.
     const im = narrowImConfig(host.im, raw['im'], file, report)
     if (im !== undefined) { next.im = im; applied += 1 }
+    // A project may only LENGTHEN the automatic-rebuild window, never shorten it.
+    const freshness = narrowFreshness(host.freshness, raw['freshness'], file, report)
+    if (freshness !== undefined) { next.freshness = freshness; applied += 1 }
 
     if (raw['enabled'] !== undefined) {
         if (raw['enabled'] === false) {
@@ -405,8 +401,7 @@ export function resolveEffectiveConfig(
             report(`${file}: ${key}=${wanted} 超过 profile 上限 ${host[key]}，已忽略（项目级只能收紧，不能放宽）`)
             return
         }
-        next[key] = wanted
-        applied += 1
+        next[key] = wanted; applied += 1
     }
     narrowBound('maxFileBytes')
     narrowBound('maxChunkLines')

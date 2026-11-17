@@ -3,30 +3,27 @@
  *
  * Six sources, each with one job, and one rule that binds them all: **what a
  * collector does not index, it reports**. A binary file, an oversized file, an
- * unreadable file, a language the extractors do not understand, a ledger row
- * that does not parse, a mission whose artifact is missing — every one of them
+ * unreadable file, a ledger row that does not parse, a missing artifact — each
  * becomes a `skipped` entry with a reason, because "the index has nothing about
  * X" and "the index silently never looked at X" are different answers and only
- * one of them is honest.
+ * one of them is honest. A language with no symbol extractor is NOT a gap: its
+ * text is indexed, and a note says exactly that.
  *
  * Two conventions matter for the citations the whole plugin exists to produce:
  *
- *  - **File documents keep their line numbers.** A `spec`, `adr`, `docs` or
- *    `code` document is the file's own text, so `path:from-to` is a real line
+ *  - **File documents keep their line numbers.** `path:from-to` is a real line
  *    range of a real file.
  *  - **Derived documents say so.** A mission summary, a release row, a plan
- *    aggregate and an ADR index row are written by this plugin from the
- *    mission store and the ledgers; their `path` names the authoritative
- *    artifact but `from`/`to` are the summary's own lines. Every fact in them
- *    carries the file a reader can check it against, and their `docId` carries
- *    a discriminator (`#<mission>`, `#<version>`, `#<line>`) so two derived
- *    documents of one ledger can never share a chunk id.
+ *    aggregate and an ADR index row are written by this plugin from the mission
+ *    store and the ledgers; their `path` names the authoritative artifact but
+ *    `from`/`to` are the summary's own lines. Every fact carries the file a
+ *    reader can check it against, and the `docId` has a discriminator
+ *    (`#<mission>`, `#<version>`, `#<line>`).
  *
- * Mission state is read through `MissionStore` — the suite's own API — never by
- * hand-parsing `mission.json`. The two JSONL ledgers (`plan.jsonl`,
- * `releases.jsonl`) have no core API of their own, so they are read here with a
- * tolerant line reader that keeps each row's line number (which is what makes
- * `releases.jsonl:7` a usable citation).
+ * Mission state is read through `MissionStore`, never by hand-parsing
+ * `mission.json`; the JSONL ledgers are read with a tolerant line reader that
+ * keeps each row's line number (which makes `releases.jsonl:7` a usable
+ * citation).
  *
  * @module dsh-knowledge-base/sources
  */
@@ -50,6 +47,7 @@ import {
     walkWorkspace,
     type CodeSymbol,
     type GateRecord,
+    type Language,
     type Layout,
     type Logger,
     type MissionRecord,
@@ -165,19 +163,16 @@ function rootPrefixOf(cwd: string, layout: Layout): string {
 /**
  * Rewrite a configured pattern against the resolved layout.
  *
- * A pattern anchored at the legacy trail directory (`LEGACY_TRAIL_DIR/…`)
- * follows `layout.rootDir`: the profile may relocate the engineering trail, and
- * an index that kept looking in the literal legacy directory would report "no
- * specifications" for a repository that has plenty. A pattern that is ALREADY
- * under the prefix (what {@link defaultSources} emits for a workspace) is left
- * alone — rewriting it again would append the namespace twice.
+ * A pattern anchored at the legacy trail directory follows `layout.rootDir`: an
+ * index that kept looking in the literal legacy directory would report "no
+ * specifications" for a repository that has plenty. A pattern ALREADY under the
+ * prefix (what {@link defaultSources} emits for a workspace) is left alone.
  */
 export function effectivePatterns(source: KbSourceConfig, cwd: string, layout: Layout): string[] {
     const prefix = rootPrefixOf(cwd, layout)
     const anchor = `${LEGACY_TRAIL_DIR}/`
     return source.globs.map((pattern) => {
-        // Already under the resolved root (the per-workspace defaults are emitted
-        // in this form): rewriting again would append the namespace twice.
+        // Already under the resolved root: rewriting again would double the namespace.
         if (prefix !== '' && (pattern === prefix || pattern.startsWith(`${prefix}/`))) return pattern
         if (pattern === LEGACY_TRAIL_DIR) return prefix === '' ? '.' : prefix
         if (!pattern.startsWith(anchor)) return pattern
@@ -197,16 +192,18 @@ function insideDir(target: string, relativePath: string): boolean {
     return relativePath === normalized || relativePath.startsWith(`${normalized}/`)
 }
 
+/** One skipped entry, built outside the collectors' nested blocks. */
+const skippedRow = (path: string, reason: string): KbSkipped => ({ path, reason })
+
 /** What reading one file for the index produced. */
 type FileRead = { text: string } | { reason: string }
 
 /**
  * Read a file that may be indexed, naming why it was not.
  *
- * The order matters: `stat` first (a 2 GiB file must never be read), then a NUL
- * scan on the raw bytes (a "markdown" file that is actually a JPEG decodes to
- * replacement characters and would otherwise be indexed as garbage), then the
- * UTF-8 decode.
+ * `stat` first (a 2 GiB file must never be read), then a NUL scan on the raw
+ * bytes (a "markdown" file that is actually a JPEG would otherwise be indexed as
+ * garbage), then the UTF-8 decode.
  */
 function readForIndex(absolute: string, maxFileBytes: number): FileRead {
     let size: number
@@ -288,8 +285,8 @@ function stringList(value: unknown): string[] {
  * Collapse a value that may contain newlines into one line.
  *
  * A derived summary is a list of facts, one per line: a gate reason or a ledger
- * note that carries newlines would otherwise split one fact across several
- * lines and make the summary's own line numbering impossible to follow.
+ * note carrying newlines would split one fact across several lines and make the
+ * summary's own line numbering impossible to follow.
  */
 function oneLine(value: string, max: number): string {
     return head(value.replace(/\s*\n\s*/g, ' ').trim(), max)
@@ -337,13 +334,14 @@ interface Context {
 }
 
 /**
- * Symbol extraction through core's existing extractors (go/ts/js/python only).
+ * Languages whose SYMBOLS the suite's existing extractor parses.
  *
- * This calls `scanWorkspace` rather than re-implementing the per-language
- * regexes: a second extractor would drift from the one the standards and impact
- * gates already measure with, and "the symbols come from the same place" is the
- * only claim this index can honestly make about code structure.
+ * `dsh-eng-core/scan.ts` keeps `SCANNED_LANGUAGES` private and this package may
+ * not grow a symbol parser, so the list is restated here and pinned by a test.
  */
+const SYMBOL_EXTRACTOR_LANGUAGES: ReadonlySet<Language> = new Set<Language>(['go', 'ts', 'js', 'python'])
+
+/** Symbol extraction through core's existing extractors (one source, not a second parser). */
 function collectSymbols(cwd: string, logger: Logger | undefined, maxFileBytes: number): Map<string, KbSymbol[]> {
     const result = scanWorkspace({ cwd, maxFiles: DEFAULT_MAX_FILES, maxFileBytes, ...(logger === undefined ? {} : { logger }) })
     const byPath = new Map<string, KbSymbol[]>()
@@ -369,7 +367,7 @@ function collectFiles(
     const skipped: KbSkipped[] = []
     const notes: string[] = []
     const symbolMap = options.symbols ? context.symbols() : new Map<string, KbSymbol[]>()
-    let textOnly = 0
+    const textOnly = new Map<string, number>()
     for (const relative of candidates) {
         const read = readForIndex(path.join(context.cwd, relative), context.maxFileBytes)
         if ('reason' in read) {
@@ -381,12 +379,11 @@ function collectFiles(
         let symbols: KbSymbol[] | undefined
         if (options.symbols) {
             const language = languageOf(relative)
-            if (language === undefined) {
-                textOnly += 1
-                skipped.push({
-                    path: relative,
-                    reason: 'unsupported-language（只做了文本索引，没有符号：现有提取器只支持 go/ts/js/python）',
-                })
+            if (language === undefined || !SYMBOL_EXTRACTOR_LANGUAGES.has(language)) {
+                // Indexed as text, and SAID so: only the four scanned languages can
+                // produce symbols, and "has no symbols" must not read as "skipped".
+                const label = language ?? '未知扩展名'
+                textOnly.set(label, (textOnly.get(label) ?? 0) + 1)
             } else {
                 const extracted = symbolMap.get(relative)
                 if (extracted !== undefined && extracted.length > 0) symbols = extracted
@@ -401,7 +398,10 @@ function collectFiles(
             ...(symbols === undefined ? {} : { symbols }),
         })
     }
-    if (textOnly > 0) notes.push(`${textOnly} 个文件的扩展名不在现有符号提取器支持的范围内：文本已索引，符号为空（见 skipped）`)
+    if (textOnly.size > 0) {
+        const counts = [...textOnly].map(([language, count]) => `${language} × ${count}`).join('、')
+        notes.push(`无符号提取器（文本索引）：${counts}——这些文件已作为文本块进入索引，没有符号信息`)
+    }
     return { documents, skipped, notes }
 }
 
@@ -652,11 +652,11 @@ function collectAdrIndex(source: KbSourceConfig, context: Context): { documents:
             const number = numberField(row.value['number'])
             const target = field(row.value['path'])
             if (number === undefined || target === undefined) {
-                skipped.push({ path: `${file}:${row.line}`, reason: 'incomplete-row（索引行缺少 number 或 path）' })
+                skipped.push(skippedRow(`${file}:${row.line}`, 'incomplete-row（索引行缺少 number 或 path）'))
                 continue
             }
             if (!exists(path.join(context.cwd, target))) {
-                skipped.push({ path: target, reason: `missing-file（${file} 第 ${row.line} 行指向的决策文件不存在）` })
+                skipped.push(skippedRow(target, `missing-file（${file} 第 ${row.line} 行指向的决策文件不存在）`))
             }
             const lines: string[] = []
             lines.push(`ADR ${String(number).padStart(4, '0')}｜${field(row.value['title']) ?? '（未记录标题）'}（索引 ${file} 第 ${row.line} 行）`)
@@ -757,7 +757,7 @@ function collectPlan(source: KbSourceConfig, context: Context): { documents: KbD
         for (const row of ledger.rows) {
             const missionId = field(row.value['missionId'])
             if (missionId === undefined) {
-                skipped.push({ path: `${file}:${row.line}`, reason: 'incomplete-row（规划行缺少 missionId）' })
+                skipped.push(skippedRow(`${file}:${row.line}`, 'incomplete-row（规划行缺少 missionId）'))
                 continue
             }
             const bucket = byMission.get(missionId) ?? []

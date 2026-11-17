@@ -45,6 +45,7 @@ import { probeImCommandApi, type ImCommandApiLike, type ImCommandInvocationLike,
 import { IM_NOT_P2P, IM_NOT_TARGET, IM_NO_TARGET, IM_NO_TARGET_PROBLEM, imTargetOf, type ImTargetResolver } from './im-target.js'
 import type { KnowledgeBaseService } from './service.js'
 import type { SearchOutcome } from './search.js'
+import { selfHealNotice } from './freshness.js'
 
 /** Discovery text the IM plugin shows for the command. */
 export const IM_COMMAND_DESCRIPTION = '项目知识库检索：/kb <关键词> 返回带 path:from-to 引用的前 N 条（不经过模型、不写盘）'
@@ -117,13 +118,18 @@ function deny(deps: ImDeps, invocation: ImCommandInvocationLike, chatId: string,
  */
 export function formatSearchReply(query: string, outcome: SearchOutcome, im: KbImConfig): string {
     const hits = outcome.hits.slice(0, im.maxResults)
+    // The self-heal notice is the FIRST line on purpose: an answer that silently
+    // came from an index the command could not refresh is exactly the failure the
+    // warning exists to prevent.
+    const notice = selfHealNotice(outcome.selfHeal)
     if (hits.length === 0) {
         return [
+            ...notice,
             `知识库检索“${query}”：索引里没有匹配的块（候选 ${outcome.candidates} / 共 ${outcome.totalChunks} 块）。`,
             '这是词法索引（BM25 + CJK 二元组），换个说法或 id 可能就命中；要看完整报告请在 TUI 用 kb_search。',
         ].join('\n')
     }
-    const lines = [`知识库检索“${query}”（命中 ${outcome.scored} 条，返回前 ${hits.length} 条）`]
+    const lines = [...notice, `知识库检索“${query}”（命中 ${outcome.scored} 条，返回前 ${hits.length} 条）`]
     hits.forEach((hit, index) => {
         const chunk = hit.chunk
         lines.push(`[${index + 1}] ${chunk.path}:${chunk.from}-${chunk.to} 「${chunk.title}」`)

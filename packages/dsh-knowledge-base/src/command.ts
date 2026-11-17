@@ -77,9 +77,9 @@ export function usageText(config: KnowledgeBaseConfig): string {
     return [
         '/kb —— 项目知识库（人直接敲的命令：不经过模型，报告与 kb_index / kb_search / kb_status 是同一份）',
         '用法：',
-        `  /kb index [--force] [--source <id>]…                 构建/重建索引（唯一会写盘的子命令，写 ${config.indexDir === '' ? '<布局根>/kb/' : `${config.indexDir}/`}）`,
-        '  /kb search <关键词…> [--limit N] [--kind <kind>] [--prefix <path>]   检索（只读）',
-        '  /kb status                                           索引状态与新鲜度（只读）',
+        `  /kb index [--force] [--source <id>]…                 显式构建/重建索引（写 ${config.indexDir === '' ? '<布局根>/kb/' : `${config.indexDir}/`}）`,
+        '  /kb search <关键词…> [--limit N] [--kind <kind>] [--prefix <path>]   检索（索引过期时先自动重建一次）',
+        '  /kb status                                           索引状态与新鲜度（只读，不写盘）',
         '  /kb help                                             这条用法',
         `来源 id：${ids}（--source 可重复；不带就是全部启用的来源）`,
         `kind：${KB_KINDS.join('、')}（--kind 可重复；不带就是全部来源）`,

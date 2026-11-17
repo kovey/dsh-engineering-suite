@@ -90,9 +90,25 @@ export function runIndex(deps: ToolDeps, agent: AgentLike | undefined, args: Ind
 export function runSearch(deps: ToolDeps, agent: AgentLike | undefined, args: SearchArgs = {}): string {
     const cwd = declaredCwdOf(agent)
     const effective = deps.configFor(agent)
-    const { config, loaded, outcome, freshness } = searchWorkspace({ cwd, effective, stores: deps.stores, options: args })
-    deps.logger.for(cwd).info(`kb_search: "${outcome.query}" → ${outcome.scored} 条命中（返回 ${outcome.hits.length}）${freshness.stale ? '；索引过期' : ''}`)
-    return renderSearchReport({ config, query: outcome.query, loaded, outcome, freshness })
+    const { config, loaded, outcome, freshness, selfHeal, staleBefore } = searchWorkspace({
+        cwd,
+        effective,
+        stores: deps.stores,
+        options: args,
+        logger: deps.logger,
+        now: deps.now,
+    })
+    const healed = selfHeal === undefined ? (freshness.stale ? '；索引过期' : '') : `；自愈=${selfHeal.outcome}`
+    deps.logger.for(cwd).info(`kb_search: "${outcome.query}" → ${outcome.scored} 条命中（返回 ${outcome.hits.length}）${healed}`)
+    return renderSearchReport({
+        config,
+        query: outcome.query,
+        loaded,
+        outcome,
+        freshness,
+        ...(selfHeal === undefined ? {} : { selfHeal }),
+        ...(staleBefore === undefined ? {} : { staleBefore }),
+    })
 }
 
 /**
@@ -142,7 +158,7 @@ export function registerTools(
         defineTool({
             name: 'kb_index',
             description:
-                'Build (or rebuild) the project knowledge base: a deterministic lexical index of this repository\'s own specifications (.dsh/specs), architecture decisions (.dsh/adr), delivery trail (missions and releases, summarised through the mission store), planning ledger (.dsh/plan.jsonl), repository markdown and source code (with symbols extracted by the existing go/ts/js/python extractors). Writes .dsh/kb/{manifest.json,chunks.jsonl,postings.json}; every write is atomic and ids are content-addressed, so rebuilding an unchanged repository produces byte-identical chunks and reports "unchanged" instead of pretending to have rebuilt. Three facts are judged separately and never merged, in this precedence: a missing manifest (first build); the COVERAGE the caller asked for (the enabled sources, `only`) differing from the coverage the manifest records — reported as 来源覆盖变了, which rewrites the manifest and, when the document set really differs, the two content artifacts (a partial → full transition can never be reported as "nothing changed", and the manifest always ends up recording what was just requested); a moved content/fingerprint (see below). When the indexed content is unchanged but the recorded git fingerprint no longer matches the workspace (a tracked file no source covers was edited, e.g. .gitignore), it refreshes ONLY manifest.json\'s fingerprint and builtAt — reported as its own change kind, never as "unchanged" and never as a forced rebuild — so kb_search/kb_status stop calling the index stale without pretending the content moved. Reports per-source document/chunk counts, every file it skipped WITH the reason, the git fingerprint and what the index itself knows it is missing. No network, no embeddings, no model.',
+                'Build (or rebuild) the project knowledge base: a deterministic lexical index of this repository\'s own specifications (.dsh/specs), architecture decisions (.dsh/adr), delivery trail (missions and releases, summarised through the mission store), planning ledger (.dsh/plan.jsonl), repository markdown and source code in the eleven languages the suite measures (ts/tsx/js/mjs/cjs/go/py/rb/php/rs/java/kt/kts/cs/swift; symbols are extracted for go/ts/js/python by the suite\'s existing extractors, the other seven are indexed as TEXT and reported as 「无符号提取器（文本索引）」 — never as skipped, because their text IS indexed). Writes .dsh/kb/{manifest.json,chunks.jsonl,postings.json}; every write is atomic and ids are content-addressed, so rebuilding an unchanged repository produces byte-identical chunks and reports "unchanged" instead of pretending to have rebuilt. Three facts are judged separately and never merged, in this precedence: a missing manifest (first build); the COVERAGE the caller asked for (the enabled sources, `only`) differing from the coverage the manifest records — reported as 来源覆盖变了, which rewrites the manifest and, when the document set really differs, the two content artifacts (a partial → full transition can never be reported as "nothing changed", and the manifest always ends up recording what was just requested); a moved content/fingerprint (see below). When the indexed content is unchanged but the recorded git fingerprint no longer matches the workspace (a tracked file no source covers was edited, e.g. .gitignore), it refreshes ONLY manifest.json\'s fingerprint and builtAt — reported as its own change kind, never as "unchanged" and never as a forced rebuild — so kb_search/kb_status stop calling the index stale without pretending the content moved. Reports per-source document/chunk counts, every file it skipped WITH the reason, the git fingerprint and what the index itself knows it is missing. No network, no embeddings, no model.',
             parameters: {
                 force: { type: 'boolean', description: 'Rewrite the artifact even when nothing changed (default false: an unchanged repository — same coverage, same content, same fingerprint — is reported as unchanged and nothing is written; a moved fingerprint is refreshed on its own, without force).' },
                 only: {
@@ -164,7 +180,7 @@ export function registerTools(
         defineTool({
             name: 'kb_search',
             description:
-                'Answer a project question from the built index: deterministic lexical retrieval (BM25 k1=1.2 b=0.75 with field boosts title>symbols>body, CJK bigrams, and an exact-id bonus so AC-003/R-7/ADR-0002/TC-001/GATE-…/RCP-… are found verbatim). Returns ranked hits with a `path:from-to` citation, a bounded snippet, the score and WHY each hit matched (which tokens hit which fields). READ-ONLY. Refuses when the index is missing (naming kb_index) and warns when the index is stale relative to the current git fingerprint — a stale answer may miss recent changes, so the warning is part of the answer, not a footnote. Filters: kinds, pathPrefix, missionId; limit is capped by the configured maxLimit.',
+                'Answer a project question from the built index: deterministic lexical retrieval (BM25 k1=1.2 b=0.75 with field boosts title>symbols>body, CJK bigrams, and an exact-id bonus so AC-003/R-7/ADR-0002/TC-001/GATE-…/RCP-… are found verbatim). Returns ranked hits with a `path:from-to` citation, a bounded snippet, the score and WHY each hit matched (which tokens hit which fields). SELF-HEALING: when the index is stale relative to the current git fingerprint it is rebuilt once BEFORE ranking (the same incremental/atomic pipeline as kb_index, at most once per `freshness.cooldownMs` per workspace), and the first line says 「索引已自动更新（N 块）」; when that rebuild fails the answer still comes from the old index, but the first line says 「索引过期且自动重建失败：<原因>；结果可能缺少最近改动」 — never silently. Refuses when the index is missing (naming kb_index). Filters: kinds, pathPrefix, missionId; limit is capped by the configured maxLimit.',
             parameters: {
                 query: { type: 'string', required: true, description: 'What to look for: keywords, a phrase, or an id (AC-002, R-7, ADR-0001, TC-001, GATE-…, RCP-…, a mission id).' },
                 limit: { type: 'number', description: 'Maximum hits (default from config; clamped to the configured maxLimit, which is stated in the report).' },

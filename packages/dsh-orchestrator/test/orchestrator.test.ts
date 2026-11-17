@@ -2520,7 +2520,13 @@ test('metrics bounds the in-flight list oldest first and reports how many are hi
 test('metrics is read-only: the mission trail and ledgers it reads are byte-identical before and after', async () => {
     disposeHosts()
     const cwd = tempWorkspace('orchestrator-metrics-readonly-')
-    const fake = host({ cwd })
+    // Freeze the clock through the service seam the plugin already reads. The
+    // report embeds "现在 <time>" at SECOND precision, so two calls that straddle
+    // a second boundary produced different text and the final byte-identity
+    // assertion failed about once in thirty runs — an assertion that depended on
+    // how fast the machine was, not on whether metrics wrote anything.
+    const FROZEN = Date.now()
+    const fake = host({ cwd, services: { clock: { now: () => FROZEN } } })
     const store = storeFor(cwd)
     const now = Date.now()
     seedMission(store, cwd, {

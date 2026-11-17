@@ -20,7 +20,7 @@
 | 工具 | 作用 |
 |---|---|
 | `kb_index({ force?, only? })` | （重）建索引：按来源报告文档/块数、**每个被跳过文件的原因**、git 指纹，以及"变了没有"。**未改动时明说"索引已是最新，未变"并且不重写任何文件**；内容未变而工作区指纹变了（例如编辑了 `.gitignore` 这类没被索引的跟踪文件）时**只刷新 manifest 的指纹**，报告写"内容未变，仅刷新了指纹"——块列表与倒排索引的字节原样不动，`kb_search` / `kb_status` 的"陈旧"警告随之消失。**请求的来源覆盖和 manifest 记的不一样时**（`only` 局部构建、或改了来源的 `enabled`）报告写"**来源覆盖变了**"：manifest 按本次请求改写，块列表与倒排索引只在文档集合真的变了时才重写——所以 局部→完整（或完整→局部）**永远不会**被说成"未变"。`force: true` 才强制重写全部三个文件（那是"调用方要求重建"，与指纹刷新、覆盖改写是三件事）。未知来源 id 直接拒绝，不静默跳过、不写任何文件。 |
-| `kb_search({ query, limit?, kinds?, pathPrefix?, missionId? })` | 检索：返回排序后的命中（引用、摘要、分数、命中原因）。索引不存在时**拒绝**并点名 `kb_index`；相对当前 git 指纹**过期**时在报告最前面警告（"最近改动可能没进索引"），不会静默作答。`limit` 受 `maxLimit` 硬上限约束，被截断时报告里说明。 |
+| `kb_search({ query, limit?, kinds?, pathPrefix?, missionId? })` | 检索：返回排序后的命中（引用、摘要、分数、命中原因）。索引不存在时**拒绝**并点名 `kb_index`。索引相对当前 git 指纹**过期**时先**自动重建一次**（与 `mission_complete` 同一个 `reindex` 管线；同一工作区受 `freshness.cooldownMs` 冷却窗口约束），成功则首行写「索引已自动更新（N 块）」；重建失败则**照常返回旧索引的结果**，但首行必须写「索引过期且自动重建失败：<原因>；结果可能缺少最近改动」并 `logger.warn` —— 绝不静默。`limit` 受 `maxLimit` 硬上限约束，被截断时报告里说明。 |
 | `kb_status()` | 只读状态：manifest 摘要、产物大小、逐来源覆盖与跳过原因、与当前指纹的新鲜度、索引自己声明的不完整之处，以及"这个索引是什么/不是什么"的诚实声明。**来源覆盖按产物核对**：manifest 没记、但 `chunks.jsonl` 里确实有这个来源的块时，报告"manifest 与产物不一致（以产物为准）"并点名 `kb_index`，而不是照着 manifest 说"这个来源不在索引里"。 |
 
 报告全部是中文，以「下一步：…」结尾；每个拒绝都给出可执行的修法。
@@ -32,9 +32,9 @@
 同一个跳过原因，不会一个说法给模型、另一个说法给人。
 
 ```
-/kb index [--force] [--source <id>]…                 构建/重建索引（唯一会写盘的子命令）
-/kb search <关键词…> [--limit N] [--kind <kind>] [--prefix <path>]   检索（只读）
-/kb status                                           状态与新鲜度（只读）
+/kb index [--force] [--source <id>]…                 显式构建/重建索引（写索引产物）
+/kb search <关键词…> [--limit N] [--kind <kind>] [--prefix <path>]   检索（索引过期时先自动重建一次）
+/kb status                                           状态与新鲜度（只读，不写盘）
 /kb help                                             用法（空的 `/kb` 同样打印用法）
 ```
 
@@ -102,8 +102,8 @@ handler 的行为（每一条都有测试）：
 
 | 方法 | 作用 |
 |---|---|
-| `reindex(cwd, options?)` | 构建/刷新该工作区的索引（与 `kb_index` 同一个 `buildIndex`），返回 `{ changeKind, changed, dir, documents, chunks, skipped }`——调用方据此说"已更新 N 块 / 未变 / 仅刷新指纹"，不用猜 |
-| `search(input)` | `{ cwd, query, limit?, kinds?, pathPrefix?, missionId? }` → 与 `kb_search` 同一个 `SearchOutcome`（含 `path:from-to` 与摘要）；没有可用索引时**抛中文错误**（拒绝原因与工具端一致） |
+| `reindex(cwd, options?)` | 构建/刷新该工作区的索引（与 `kb_index` 同一个 `buildIndex`），返回 `{ changeKind, changed, dir, documents, chunks, skipped }`——调用方据此说"已更新 N 块 / 未变 / 仅刷新指纹"，不用猜。`kb_search` / IM `/kb` 的自愈走的也是这一条路径 |
+| `search(input)` | `{ cwd, query, limit?, kinds?, pathPrefix?, missionId? }` → 与 `kb_search` 同一个 `SearchOutcome`（含 `path:from-to` 与摘要）；索引过期时会先自愈一次，`SearchOutcome.selfHeal` 记录这次自动重建（成功/失败/冷却跳过）；没有可用索引时**抛中文错误**（拒绝原因与工具端一致） |
 
 `cwd` 是显式参数：一个 dsh 进程服务多个仓库，服务不能猜。第一个接入方是 `dsh-evidence-gate`：
 `mission_complete` 签发回执后 best-effort 调 `reindex`（失败只记警告、只加一行附注，绝不影响回执与 mission 状态）。
@@ -126,9 +126,11 @@ handler 的行为（每一条都有测试）：
       - { id: trail, kind: trail, globs: ['.dsh/missions/**', '.dsh/releases.jsonl'] }
       - { id: plan,  kind: plan,  globs: ['.dsh/plan.jsonl'] }
       - { id: docs,  kind: docs,  globs: ['*.md', 'docs/**/*.md'] }
-      - { id: code,  kind: code,  globs: ['**/*.ts', '**/*.tsx', '**/*.js', '**/*.mjs', '**/*.cjs', '**/*.go', '**/*.py'] }
+      - { id: code,  kind: code,  globs: ['**/*.ts', '**/*.tsx', '**/*.js', '**/*.mjs', '**/*.cjs', '**/*.go', '**/*.py',
+                                         '**/*.rb', '**/*.php', '**/*.rs', '**/*.java', '**/*.kt', '**/*.kts', '**/*.cs', '**/*.swift'] }
     tokenizer: { cjkBigrams: true, minTokenLength: 2 }
     search: { limit: 10, maxLimit: 50, fieldBoosts: { title: 3, symbols: 2, body: 1 } }
+    freshness: { cooldownMs: 10000 }   # 同一工作区两次自动重建之间的最小间隔（0 = 每次过期检索都重建）
     im:                            # 可选：IM 里的 /kb（默认关闭；没有 interaction-gate 的 IM 目标就不注册）
       command: kb
       maxResults: 5
@@ -139,11 +141,12 @@ handler 的行为（每一条都有测试）：
 会话与 p2p 要求不在这里：它们是 `dsh-interaction-gate` 的 `im.approvalChatId` / `im.p2pOnly`（唯一来源）。
 
 **项目级可覆盖**（`<repo>/.dsh/knowledge-base.json`）：`enabled`、`indexDir`、`maxFileBytes`、`maxChunkLines`、
-`sources`、`tokenizer`、`search`、`im` —— 且只能**收窄**：
+`sources`、`tokenizer`、`freshness`、`search`、`im` —— 且只能**收窄**：
 
 - 数值上限（`maxFileBytes`、`maxChunkLines`、`search.limit`、`search.maxLimit`）只能调低；
 - `tokenizer.minTokenLength` 只能调高；`tokenizer.cjkBigrams` 只能关掉（打开会更宽地召回）；
 - `sources` 只能停用来源或**删减**模式，不能新增来源、不能换 `kind`、不能加模式；
+- `freshness.cooldownMs` 只能**调大**（项目级不能缩短冷却窗口——那会让每次"读"都更容易变成一次"写"）；
 - `enabled` 只能从开变关。`logFile` / `prompt` 属于宿主，项目改不了；
 - `im` 只能**收窄**：`maxResults` / `maxChars` 只能调低；`im.command` 与 `im.workspace`（"搜哪个仓库"）是宿主决定，
   项目级写了会被忽略并报告；`im.chatIds` / `im.p2pOnly` **已经不是知识库的配置**（会话与 p2p 要求只有一个来源：
@@ -186,15 +189,29 @@ handler 的行为（每一条都有测试）：
 
 ## 覆盖与新鲜度
 
-- **覆盖**：六个来源各自的文档/块数与**跳过明细**（`binary` / `oversized` / `unreadable` / `unsupported-language` /
+- **覆盖**：六个来源各自的文档/块数与**跳过明细**（`binary` / `oversized` / `unreadable` /
   `excluded-path` / `missing-file` / `unparsable` / `summary-cap` / `incomplete-row`）都进 manifest。跳过 ≠ 不存在：
-  报告里两者绝不会长得一样。`kb_status` 的逐来源表**按磁盘上的 `chunks.jsonl` 核对** manifest 的声明：
+  报告里两者绝不会长得一样。**没有符号提取器的语言不是"跳过"**：它的文本照样进索引，报告在来源说明里写
+  「无符号提取器（文本索引）：ruby × 2、rust × 1…」（`skipped` 只留真正的跳过：二进制/超限/不可读/索引目录自身等）。
+  `kb_status` 的逐来源表**按磁盘上的 `chunks.jsonl` 核对** manifest 的声明：
   两边的说法不一致时（老版本留下的索引可能真是这样）以产物为准，并把"manifest 与产物不一致"说出来。
 - **索引自己知道的不完整**：`manifest.staleness.reason` 记录局部构建（`only`）、遍历达到 `maxFiles` 上限、
   来源自身读不到产物等情况，`kb_search` / `kb_status` 都会转述。局部构建的声明**不是永久的**：下一次请求完整覆盖时，
   manifest 会按请求改写成完整覆盖（`changeKind: coverage`），这条"局部索引"的自我声明随之消失。
 - **新鲜度（相对当前工作区）**：`kb_search` / `kb_status` 用 git 指纹判定 —— HEAD、分支、`git diff HEAD` 摘要、
   改动数任一不同即**过期**，并在报告最前面说明原因；不是 git 仓库时报告"**无法判定**"而不是假装新鲜。
+- **检索期自愈（编辑期也能搜到最新内容）**：`kb_search` 与 IM `/kb` 在检索**之前**用同一枚指纹判断是否过期，
+  过期就调用与 `mission_complete` 相同的 `reindex`（增量、原子写、内容寻址），然后才排序：
+  - **成功**：结果**首行**写「索引已自动更新（N 块）」；触发它的那条陈旧原因仍然保留（"为什么重建"是可审计的），
+    但原来的建议（先跑 `kb_index`）被"已在本次检索前自动重建"取代；
+  - **失败**：**照常返回旧索引的结果**（一次维护失败不该让检索报错），但**首行**必须写
+    「索引过期且自动重建失败：<原因>；结果可能缺少最近改动」，同时 `logger.warn` —— **绝不静默**；
+  - **冷却**：同一工作区在 `freshness.cooldownMs`（默认 10 s）内只重建一次；**任何**一次真实构建（显式 `kb_index`、
+    `/kb index`、交付后的 `reindex`、以及自动重建本身）都会重置这个窗口，所以"刚构建完又马上改一行"只会看到陈旧警告，
+    不会每次检索都重写一遍索引；
+  - **并发**：同一工作区同时只允许一个自动重建（先占位再构建），加上 `buildIndex` 本身的原子写，
+    并发检索不会写出半份索引、也不会写第二份。
+  `kb_status` **不**自愈（它是只读入口），它只报告陈旧并说明检索路径会在冷却允许时自动重建。
 - **索引目录不进指纹**：构建与比较都用 `indexFingerprint(cwd, indexDir)`（`index-store.ts` 导出，包根也导出），
   它用 git pathspec `:(top,exclude,literal)<indexDir>` 把索引目录从 status 与 diff 摘要里排除，`dirty` 与改动数同步跟进。
   否则刚建好的索引会被自己的产物判成过期（真实现场：`.dsh/kb/` 没写进 `.gitignore`，`kb_index` 之后 `kb_search` 报
@@ -241,7 +258,7 @@ handler 的行为（每一条都有测试）：
 | `dsh-suite-doctor` | 可以读 `manifest.json` 报告索引新鲜度/来源覆盖（本插件不主动改别人的报告） |
 | `dsh-impact-gate` | 影响面给的是"改了哪些文件"，本插件能回答"这些文件在规格/决策/台账里被谁引用" |
 | `dsh-standards-gate` | 代码符号来自同一套提取器（`dsh-eng-core` 的 `scanWorkspace`），所以"符号"在两个插件里是同一个定义 |
-| `dsh-audit-trail` | 检索是**只读**的（测试用 `.dsh` 逐字节快照证明），不会污染审计轨迹 |
+| `dsh-audit-trail` | 检索不改写审计轨迹；索引过期时它只重写**知识库自己的产物**（`.dsh/kb/`），fresh 时逐字节不写（有测试快照证明） |
 | `@deepseek-ai/dsh-commands` | **可选**：装配了就多一条人类命令 `/kb …`（与三个工具共用同一份报告，不经模型、不花 token）；没装配不影响任何工具 |
 | `dsh-chat-interaction` | **可选**：装配了（≥ 0.3.8）**且** interaction-gate 发布了 IM 目标（`im.approvalChatId`）才多一条 IM 命令 `/kb`（默认关闭；见上文） |
 | `dsh-interaction-gate` | **可选**：IM 目标的唯一来源——本插件只读 `ctx.get('interaction').imTarget()`；没装配就没有 IM 命令（不是回退到第二份配置） |
@@ -250,16 +267,17 @@ handler 的行为（每一条都有测试）：
 
 - **词法召回**：同义/转述检索不到（文档只写"鉴权"时搜"登录"没有结果）。缓解手段是 id、字段过滤和"换个关键词再搜"，
   而不是假装语义。要语义就得引入模型/嵌入——那是另一个决定，不是这个插件的默认。
-- **符号只覆盖 go/ts/js/python**：扩展名不在现有提取器范围内的文件**只做文本索引**，并在 `skipped` 里如实标注
-  （不是"跳过"，是"没有符号"）。
+- **符号只覆盖 go/ts/js/python**：其余七种语言（rb/php/rs/java/kt/kts/cs/swift）**只做文本索引**，报告在来源说明
+  里写「无符号提取器（文本索引）：<语言> × N」，不谎称有符号、也不把它们算成 `skipped`（文本**确实**在索引里）。
 - **`trail` / `plan` 是摘要，不是原文**：它们的 `path` 指向台账文件，但 `from-to` 是**摘要自己的行号**；
   摘要里每条门禁/回执都带自己的文件路径，引用前请用 id（`GATE-…`/`RCP-…`/`R-…`）复核原文。文件类来源
   （spec / adr / docs / code）的 `from-to` 是**文件真实行号**。
 - **只索引列出的来源**：`.dsh/audit/**`、`.dsh/state/**`、`node_modules`、构建产物一律不在索引里（其中 `.dsh/**`
   不从目录树遍历，只有显式声明的来源目录会被读）。发布台账 `.dsh/releases.jsonl` 的文档归 `trail` 来源
   （一行一份发布记录），`plan` 只覆盖 `.dsh/plan.jsonl`——同一份台账不会被两个来源各索引一遍。
-- **索引会过期**：过期会**报告**，不会被悄悄修好；`kb_search` 里绝不会偷偷重建（写操作必须由显式入口触发）。
-  唯一的自动重建是**交付附带动作**：`mission_complete` 签发回执后由 `dsh-evidence-gate` best-effort 调服务的 `reindex`
+- **索引会过期，过期在检索期自愈**：`kb_search` / IM `/kb` 发现过期会先重建一次（冷却与并发规则见上），
+  成功/失败都写在结果**首行**——失败时答案仍来自旧索引，但绝不静默。`kb_status` 只报告、不修。
+  另有一条**交付附带的 best-effort 重建**：`mission_complete` 签发回执后由 `dsh-evidence-gate` 调服务的 `reindex`
   ——它不阻塞交付、失败只记警告，结果作为交付输出末尾的一行附注（"索引已更新（N 块）/ 未变 / 更新失败：…"）。
 - **模型可能不照做**：prompt 段要求"先查再答、每条带引用"，但这是提示级的；机械保证只有"命中必带 `path:from-to`、
   索引里没有就不返回"。

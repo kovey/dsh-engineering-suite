@@ -1,19 +1,15 @@
 /**
  * The workspace-bound operations behind every knowledge-base surface.
  *
- * Three surfaces exist — the model tools (`kb_index` / `kb_search`), the
- * person's TUI command (`/kb …`) and the optional `knowledge-base` service other
- * plugins reach through `ctx.get('knowledge-base')` — and they must all run the
- * SAME pipeline. What may differ is the rendering (`report.ts`) and the grammar
- * (`command.ts`); what must not differ is which configuration is read, which
- * refusals fire, how the artifact is built and how a query is ranked. That part
- * lives here so a citation, a refusal or a freshness warning cannot say one
- * thing to a model, another to a person and a third to a sibling plugin.
- *
- * Nothing here decides policy: the configuration is already resolved (profile
- * row narrowed by the workspace's own file) and the caller passes it in. These
- * functions refuse by throwing — the tools turn that into a tool error and the
- * IM command turns it into a readable reply.
+ * The model tools (`kb_index` / `kb_search`), the person's TUI command (`/kb …`)
+ * and the optional `knowledge-base` service all run the SAME pipeline: what may
+ * differ is the rendering (`report.ts`) and the grammar (`command.ts`); what
+ * must not differ is which configuration is read, which refusals fire, how the
+ * artifact is built, how a stale index is healed and how a query is ranked. That
+ * part lives here so a citation, a refusal or a freshness warning cannot say one
+ * thing to a model, another to a person and a third to a sibling plugin. Nothing
+ * here decides policy: the configuration is already resolved and the caller
+ * passes it in; refusals throw, and each surface renders them its own way.
  *
  * @module dsh-knowledge-base/operations
  */
@@ -25,6 +21,7 @@ import { buildIndex, indexDirOf, loadIndex, type BuildResult, type KbManifest, t
 import { indexFingerprint } from './fingerprint.js'
 import { displayPath, freshnessLines, missingIndexMessage, unusableProblems, type Freshness } from './report.js'
 import { idLikeTokens, searchIndex, tokenize, type SearchOutcome } from './search.js'
+import { claimAutoRebuild, finishAutoRebuild, noteBuildCompleted, type SelfHealInfo } from './freshness.js'
 
 /** What the operations need from the plugin (the tools add their clock). */
 export interface OperationDeps {
@@ -55,6 +52,10 @@ export interface SearchResult {
     loaded: LoadedIndex & { manifest: KbManifest }
     outcome: SearchOutcome
     freshness: Freshness
+    /** The automatic rebuild attempted before ranking (absent when fresh). */
+    selfHeal?: SelfHealInfo
+    /** The stale verdict that triggered it (names WHY the rebuild ran). */
+    staleBefore?: Freshness
 }
 
 /** The work of one build: the workspace, its effective configuration and the clock. */
@@ -62,7 +63,8 @@ export interface IndexBuildInput {
     cwd: string
     effective: EffectiveConfig
     stores: MissionStoreRegistry
-    logger: Logger
+    /** Absent is a diagnostic sink-less build (the auto-rebuild path may have none). */
+    logger?: Logger
     now: number
     options?: IndexOptions
 }
@@ -70,6 +72,10 @@ export interface IndexBuildInput {
 /** The work of one query: the workspace, its effective configuration and the arguments. */
 export interface SearchInput extends Pick<IndexBuildInput, 'cwd' | 'effective' | 'stores'> {
     options?: SearchOptions
+    /** Diagnostic sink: a failed automatic rebuild is warned about here. */
+    logger?: Logger
+    /** Injected clock for the freshness/cooldown decision (defaults to `Date.now`). */
+    now?: () => number
 }
 
 /** The refusal every surface shares when the host disabled the plugin. */
@@ -109,15 +115,19 @@ export function buildWorkspaceIndex(input: IndexBuildInput): BuildResult {
     if (!config.enabled) disabledRefusal('index')
     const options = input.options ?? {}
     const only = onlyOption(options, config)
-    return buildIndex({
+    const result = buildIndex({
         cwd,
         layout: stores.for(cwd).layout,
         config,
         now,
         ...(options.force === true ? { force: true } : {}),
         ...(only === undefined ? {} : { only }),
-        logger: logger.for(cwd),
+        ...(logger === undefined ? {} : { logger: logger.for(cwd) }),
     })
+    // ANY real build restarts the self-heal cooldown: a search right after a full
+    // build has nothing to heal, and must not rebuild again just to learn that.
+    noteBuildCompleted(cwd, now)
+    return result
 }
 
 /** The query, refusing an empty one with the fix (shared by every search surface). */
@@ -154,42 +164,121 @@ function limitOption(options: SearchOptions, config: KnowledgeBaseConfig): numbe
     return Math.floor(options.limit)
 }
 
-/**
- * Load the workspace's index and rank one query against it.
- *
- * Refusals are the tool surface's own: a missing/unusable artifact names
- * `kb_index`, an unknown kind names the known ones, a limit below one names the
- * default, and a query with nothing tokenisable explains the tokenizer in force.
- * @param input - workspace, effective configuration, stores and query arguments.
- * @returns the loaded artifact, the ranked outcome and the freshness verdict.
- */
-export function searchWorkspace(input: SearchInput): SearchResult {
-    const { cwd, effective, stores } = input
-    const config = effective.config
-    if (!config.enabled) disabledRefusal('search')
-    const options = input.options ?? {}
+/** The query and filters, validated BEFORE anything is read or written. */
+function searchOptions(options: SearchOptions, config: KnowledgeBaseConfig): { query: string; kinds?: string[]; limit: number } {
     const query = requiredQuery(options)
-    const dir = indexDirOf(cwd, config)
-    const loaded = loadIndex(dir)
-    if (loaded.manifest === undefined || loaded.postings === undefined) throw new Error(missingIndexMessage(dir, cwd, loaded))
-    if (unusableProblems(loaded).length > 0) throw new Error(missingIndexMessage(dir, cwd, loaded))
     const kinds = kindsOption(options)
     const limit = limitOption(options, config)
-    const current = indexFingerprint(cwd, dir)
-    const freshness = freshnessLines(loaded.manifest.fingerprint, current, displayPath(cwd, dir))
     if (tokenize(query, config.tokenizer).length === 0 && idLikeTokens(query).length === 0) {
         throw new Error(
             `query 里没有可检索的内容（分词后为空："${query}"）。当前分词设置：CJK bigram ${config.tokenizer.cjkBigrams ? '开' : '关'}、minTokenLength=${config.tokenizer.minTokenLength}，` +
                 '标点与长度不足 1 的片段会被丢弃。下一步：换成有实际内容的词或 id（如 "登录"、"AC-003"、"docs/"），或由宿主调低 tokenizer.minTokenLength 后重建索引。',
         )
     }
-    // The mission filter matches the specification and mission directory by
-    // PATH, so it needs this workspace's trail root (namespace-first) rather
-    // than a literal legacy prefix.
+    return { query, limit, ...(kinds === undefined ? {} : { kinds }) }
+}
+
+/** A loaded index that is guaranteed answerable (manifest AND postings present). */
+type UsableIndex = LoadedIndex & { manifest: KbManifest; postings: NonNullable<LoadedIndex['postings']> }
+
+/** Load the workspace's index, refusing when it cannot be answered from. */
+function usableIndex(cwd: string, dir: string): UsableIndex {
+    const loaded = loadIndex(dir)
+    if (loaded.manifest === undefined || loaded.postings === undefined) throw new Error(missingIndexMessage(dir, cwd, loaded))
+    if (unusableProblems(loaded).length > 0) throw new Error(missingIndexMessage(dir, cwd, loaded))
+    return { ...loaded, manifest: loaded.manifest, postings: loaded.postings }
+}
+
+/**
+ * The ONE automatic rebuild (the `service.reindex` pipeline, incremental and
+ * atomic), behind the cooldown/exclusivity claim. Failures are returned, never
+ * thrown: a read must not fail because a maintenance step it did not ask for
+ * failed.
+ */
+function autoRebuild(input: { cwd: string; effective: EffectiveConfig; stores: MissionStoreRegistry; logger?: Logger; now: number }): SelfHealInfo {
+    const claim = claimAutoRebuild(input.cwd, input.effective.config.freshness.cooldownMs, input.now)
+    if (!claim.ok) return { outcome: 'skipped', reason: claim.reason }
+    let built: BuildResult
+    try {
+        built = buildWorkspaceIndex(input)
+    } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error)
+        try {
+            input.logger?.for(input.cwd).warn(`kb_search: 索引过期且自动重建失败：${reason}；返回旧索引的结果（可能缺少最近改动）`)
+        } catch {
+            // A log sink that throws must not turn a readable answer into a tool error.
+        }
+        return { outcome: 'failed', error: reason }
+    } finally {
+        finishAutoRebuild(input.cwd, input.now)
+    }
+    try {
+        input.logger?.for(input.cwd).info(`kb_search: 索引过期，已自动重建（${built.manifest.totals.chunks} 块；${built.changeKind}）`)
+    } catch {
+        // Same for the success line: the answer is what matters.
+    }
+    return { outcome: 'rebuilt', changeKind: built.changeKind, chunks: built.manifest.totals.chunks }
+}
+
+/** What one search path observed about the artifact's age (and what it did about it). */
+interface IndexView {
+    loaded: UsableIndex
+    freshness: Freshness
+    selfHeal?: SelfHealInfo
+    staleBefore?: Freshness
+}
+
+/**
+ * Compare the index with the workspace, REBUILDING once when it is stale.
+ *
+ * The rebuild happens before ranking, so a successful heal means the answer
+ * includes the edit that made the index stale. A failed rebuild keeps the old
+ * artifact (a warned answer beats a tool error) and names the reason.
+ */
+function viewOf(input: SearchInput, initial: UsableIndex, dir: string): IndexView {
+    const ignored = displayPath(input.cwd, dir)
+    const staleBefore = freshnessLines(initial.manifest.fingerprint, indexFingerprint(input.cwd, dir), ignored)
+    if (!staleBefore.stale) return { loaded: initial, freshness: staleBefore }
+    const now = (input.now ?? Date.now)()
+    const logger = input.logger
+    const selfHeal = autoRebuild({ cwd: input.cwd, effective: input.effective, stores: input.stores, ...(logger === undefined ? {} : { logger }), now })
+    if (selfHeal.outcome !== 'rebuilt') return { loaded: initial, freshness: staleBefore, selfHeal, staleBefore }
+    let rebuilt: UsableIndex
+    try {
+        rebuilt = usableIndex(input.cwd, dir)
+    } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error)
+        return { loaded: initial, freshness: staleBefore, selfHeal: { outcome: 'failed', error: `重建后索引仍不可用：${reason}` }, staleBefore }
+    }
+    const freshness = freshnessLines(rebuilt.manifest.fingerprint, indexFingerprint(input.cwd, dir), ignored)
+    return { loaded: rebuilt, freshness, selfHeal, staleBefore }
+}
+
+/**
+ * Load the workspace's index and rank one query against it.
+ *
+ * Refusals are the tool surface's own: a missing/unusable artifact names
+ * `kb_index`, an unknown kind names the known ones, a limit below one names the
+ * default, and a query with nothing tokenisable explains the tokenizer in force.
+ * A stale index is rebuilt before ranking (see {@link viewOf}); the result says
+ * which happened so every surface can print it.
+ * @param input - workspace, effective configuration, stores, logger, clock and query arguments.
+ * @returns the artifact, the ranked outcome, the freshness verdict and the self-heal report.
+ */
+export function searchWorkspace(input: SearchInput): SearchResult {
+    const { cwd, effective, stores } = input
+    const config = effective.config
+    if (!config.enabled) disabledRefusal('search')
+    const options = input.options ?? {}
+    const { query, kinds, limit } = searchOptions(options, config)
+    const dir = indexDirOf(cwd, config)
+    const view = viewOf(input, usableIndex(cwd, dir), dir)
+    // The mission filter matches the specification and mission directory by PATH,
+    // so it needs this workspace's trail root (namespace-first).
     const trailDir = path.relative(cwd, stores.for(cwd).layout.rootDir).split(path.sep).join('/')
     const outcome = searchIndex({
-        chunks: loaded.chunks,
-        postings: loaded.postings,
+        chunks: view.loaded.chunks,
+        postings: view.loaded.postings,
         query,
         limit,
         maxLimit: config.search.maxLimit,
@@ -200,5 +289,12 @@ export function searchWorkspace(input: SearchInput): SearchResult {
         ...(typeof options.missionId === 'string' && options.missionId.trim() !== '' ? { missionId: options.missionId.trim() } : {}),
         trailDir,
     })
-    return { config, loaded: { ...loaded, manifest: loaded.manifest }, outcome, freshness }
+    return {
+        config,
+        loaded: view.loaded,
+        outcome,
+        freshness: view.freshness,
+        ...(view.selfHeal === undefined ? {} : { selfHeal: view.selfHeal }),
+        ...(view.staleBefore === undefined ? {} : { staleBefore: view.staleBefore }),
+    }
 }

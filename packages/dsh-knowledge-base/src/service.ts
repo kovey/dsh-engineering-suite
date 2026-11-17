@@ -130,11 +130,14 @@ export function createKnowledgeBaseService(deps: KnowledgeBaseServiceDeps): Know
         search(input: KnowledgeBaseSearchInput): SearchOutcome {
             const workspace = requireCwd(input?.cwd)
             const effective = configAt(deps, workspace)
-            const { outcome, freshness } = searchWorkspace({ cwd: workspace, effective, stores: deps.stores, options: input })
+            const result = searchWorkspace({ cwd: workspace, effective, stores: deps.stores, options: input, logger: deps.logger, now })
+            const selfHeal = result.selfHeal === undefined ? '' : `；自愈=${result.selfHeal.outcome}`
             deps.logger
                 .for(workspace)
-                .info(`knowledge-base.search: "${outcome.query}" → ${outcome.scored} 条命中（返回 ${outcome.hits.length}）${freshness.stale ? '；索引过期' : ''}`)
-            return outcome
+                .info(`knowledge-base.search: "${result.outcome.query}" → ${result.outcome.scored} 条命中（返回 ${result.outcome.hits.length}）${result.freshness.stale ? '；索引过期' : ''}${selfHeal}`)
+            // The outcome is what every caller already renders; the self-heal record
+            // rides along so the IM reply can quote it on its first line too.
+            return result.selfHeal === undefined ? result.outcome : { ...result.outcome, selfHeal: result.selfHeal }
         },
     }
 }

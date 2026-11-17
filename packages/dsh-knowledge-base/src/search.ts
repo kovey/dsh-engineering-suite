@@ -7,7 +7,6 @@
  * an answer auditable after the fact.
  *
  * The choices, and their trade-offs:
- *
  *  - **Tokenisation.** ASCII/Latin words are case-folded and dropped when
  *    shorter than `minTokenLength`. CJK text is indexed as **overlapping
  *    bigrams** (`登录失败` → `登录`, `录失`, `失败`) when `cjkBigrams` is on:
@@ -20,9 +19,7 @@
  *  - **Scoring: BM25** with `k1 = 1.2`, `b = 0.75`, IDF = `ln(1 + (N - df +
  *    0.5)/(df + 0.5))`, and field boosts folded into the term frequency
  *    (BM25F-style: `tf = 3·tf_title + 2·tf_symbols + 1·tf_body` by default)
- *    before the usual saturation. A separate BM25 per field and a linear
- *    combination was the alternative; folding keeps one length normalisation
- *    and one saturation, so a long file cannot win by repeating one word.
+ *    before the usual saturation: one length normalisation, one saturation.
  *  - **Exact-id bonus.** `AC-003`, `R-7`, `ADR-0002`, `TC-001`, `GATE-…`,
  *    `RCP-…` and mission ids are how this suite addresses things. Such a token
  *    is looked up as a literal (case-insensitive, boundary-checked) and a chunk
@@ -46,6 +43,7 @@
 import { LEGACY_TRAIL_DIR } from 'dsh-eng-core'
 import type { KbChunk, KbPostings } from './index-store.js'
 import type { KbFieldBoosts } from './config.js'
+import type { SelfHealInfo } from './freshness.js'
 
 /** BM25 term-frequency saturation. */
 export const BM25_K1 = 1.2
@@ -240,6 +238,8 @@ export interface SearchOutcome {
         pathPrefix?: string
         missionId?: string
     }
+    /** Set by the OPERATION that ran the query (never by `searchIndex`): the self-heal it attempted. */
+    selfHeal?: SelfHealInfo
 }
 
 /** Inputs of {@link searchIndex}. */

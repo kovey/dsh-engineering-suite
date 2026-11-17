@@ -634,7 +634,7 @@ test('a project may narrow the index but never widen it', async () => {
         maxFileBytes: 10_000_000,
         maxChunkLines: 5,
         tokenizer: { cjkBigrams: true },
-        sources: [{ id: 'docs', enabled: false }, { id: 'code', globs: ['**/*.rs'] }, { id: 'nope', enabled: true }],
+        sources: [{ id: 'docs', enabled: false }, { id: 'code', globs: ['**/*.exotic'] }, { id: 'nope', enabled: true }],
       })}\n`,
     )
     const effective = resolveEffectiveConfig(hostConfig, layout)
@@ -645,7 +645,7 @@ test('a project may narrow the index but never widen it', async () => {
     assert.equal(effective.config.maxChunkLines, 5, 'a project may lower maxChunkLines')
     assert.equal(effective.config.sources.find((source) => source.id === 'docs')?.enabled, false)
     const codeGlobs = effective.config.sources.find((source) => source.id === 'code')?.globs ?? []
-    assert.ok(!codeGlobs.includes('**/*.rs'), 'a project may not add a pattern the profile did not authorise')
+    assert.ok(!codeGlobs.includes('**/*.exotic'), 'a project may not add a pattern the profile did not authorise')
     assert.ok(effective.problems.some((problem) => problem.includes('maxLimit=100 超过')))
     assert.ok(effective.problems.some((problem) => problem.includes('maxFileBytes=10000000 超过')))
     assert.ok(effective.problems.some((problem) => problem.includes('新增了 profile 未授权的模式')))

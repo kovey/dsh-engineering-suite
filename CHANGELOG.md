@@ -1,5 +1,33 @@
 ## [未发布] — 2026-11-17
 
+### 新增 · 知识库检索期自愈，代码来源扩到 11 种语言（`dsh-knowledge-base`）
+
+背景：知识库是构建产物，编辑期的一次检索常常落在"刚改完、还没重建"的窗口里；此前 `kb_search` / IM `/kb`
+只会在报告里说"索引可能过期，先 `kb_index`"，把重建留给人。另外 code 来源的默认 globs 只覆盖
+ts/tsx/js/mjs/cjs/go/py，而门禁已支持 11 种语言——`.rb`、`.rs`、`.java` 等文件既不被索引，也无从说明。
+
+- **检索期自愈**（`src/freshness.ts` + `src/operations.ts`）：`kb_search` 与 IM `/kb`（经服务的 `search`）在排序前
+  用现有 git 指纹判断过期；过期则调用**与 `mission_complete` 同一个** `reindex` 管线（`buildIndex` 增量、原子写、内容寻址），
+  成功时结果**首行**写「索引已自动更新（N 块）」；失败时照常返回旧索引的结果、**首行**写
+  「索引过期且自动重建失败：<原因>；结果可能缺少最近改动」并 `logger.warn`——失败不抛异常，也绝不静默。
+  触发它的那条陈旧原因仍保留在报告里（"为什么重建"可审计），但原来的建议（先跑 `kb_index`）被"已在本次检索前自动重建"取代。
+- **冷却与并发**：新增配置 `freshness.cooldownMs`（默认 `10000`，`0` = 关闭冷却；profile 是上限，项目级只能调大）。
+  同一工作区冷却窗口内只重建一次；**任何**真实构建（显式 `kb_index`、`/kb index`、交付后 `reindex`、自动重建本身）
+  都重置窗口；同一工作区同时只允许一个自动重建（先占位再构建），配合既有原子写，并发检索不会写出半份索引或第二份。
+  `/kb search` 不再被描述成"只读"：过期时它会重写 `.dsh/kb/`；`/kb status` 仍然只读、不自愈。
+- **代码来源扩到 11 种语言**（`src/config.ts`）：code 默认 globs 增加 `rb/php/rs/java/kt/kts/cs/swift`
+  （共 15 个扩展名、11 种语言，与 `dsh-eng-core/languages.ts` 的语言表对齐）。
+- **"无符号提取器"从 skipped 改成 note**（`src/sources.ts`）：没有符号提取器的语言（ruby/rust/java/kotlin/csharp/php/swift）
+  此前被写进 `skipped`（`unsupported-language` 理由），容易被读成"没进索引"；现在文本照常进 chunks，报告在来源说明里
+  聚合写「无符号提取器（文本索引）：<语言> × N」，`skipped` 只留真正的跳过（二进制/超限/不可读/索引目录自身等）。
+- **测试**（`test/self-heal-languages.test.ts`，8 条）：15 个扩展名各一个文件全部进 chunks 且 code 来源 `skipped` 为空、
+  报告含无符号提取器 note、`.rb`/`.rs` 可被检索；过期 → 自动重建 → 首行"索引已自动更新"并命中新内容；
+  索引目录只读 → 首行"索引过期且自动重建失败"、旧结果仍返回、manifest 字节未动、日志有 warn；
+  注入时钟断言冷却窗口（20 s 重建、25 s 跳过、40 s 再重建）；两次并发检索只出现一次重建；IM `/kb` 同样自愈；
+  `freshness.cooldownMs` 默认值与项目级只能调大。
+- **文档**：`docs/ARCHITECTURE.md` §5.17（编辑期自愈 + 语言面）、`docs/KNOWN-LIMITS.md` 附一之十六、
+  本包 README（配置项、工具语义、诚实的边界）。
+
 ### 新增 · 知识库可被交付自动重建，并能在 IM 里 `/kb` 搜索（`dsh-knowledge-base` / `dsh-evidence-gate`）
 
 背景：知识库原先只有工具与 TUI 的 `/kb`，**不会**在改动/交付时自动重建（没有事件监听、也没有别的插件调用它），
