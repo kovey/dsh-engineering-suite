@@ -65,6 +65,7 @@ import {
 } from './drafting.js'
 import type { SpecGateConfig } from './config.js'
 import type { WriteGuard } from './guard.js'
+import { enterImplementLines, type OrchestratorServiceLike } from './approval-advance.js'
 import { describeConstraints } from './constraints.js'
 import {
     buildSpec,
@@ -177,6 +178,12 @@ export interface ToolDeps {
     testDesignMounted: () => boolean
     /** The approval seam, read at call time (`ctx.get('approval')`). */
     approval: () => ApprovalLike | undefined
+    /**
+     * The orchestrator's OPTIONAL service (`ctx.get('orchestrator')`), read at
+     * call time. `spec_approve` asks it to enter `implement`; absent or failing
+     * only means "no automatic advance", never a failed approval.
+     */
+    orchestrator: () => OrchestratorServiceLike | undefined
     /** Plugin logger; `deps.logger.for(cwd)` routes a line to that workspace's file. */
     logger: Logger
     /**
@@ -1186,6 +1193,9 @@ export function registerTools(
                               '下一步：由允许清单内的审批人在新 mission 上重新审批——同一 mission 的 mandate 不可改写。',
                           ]
                         : ['写操作现已放行。下一步：按规格实现 → evidence_record 登记验证输出 → quality_gate_run 跑门禁 → mission_complete 交付。']),
+                    // AC-005 best effort: the approval above already stands. A
+                    // missing/throwing orchestrator changes nothing here.
+                    ...(await enterImplementLines(deps, approved)),
                 ].join('\n')
             },
         }),

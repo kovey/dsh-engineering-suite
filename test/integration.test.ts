@@ -11,6 +11,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import test from 'node:test'
 import { MissionStoreRegistry } from 'dsh-eng-core'
+import { appendDelegation } from 'dsh-eng-core/delegations'
 import { createFakeHost, runText, tempWorkspace, type FakeHost } from 'dsh-eng-core/testing'
 
 import { apply as applyAudit } from '../packages/dsh-audit-trail/dist/index.js'
@@ -140,10 +141,22 @@ test('the full pipeline runs from spec creation to a signed receipt', async () =
     assert.match(review, /✅/)
     assert.equal(stores.read(mission.id)?.testDesign?.passed, true)
 
-    // ⑥ human approval through the seam unlocks writes
+    // ⑥ human approval through the seam advances the mission into `implement`
+    //    (the orchestrator service). CODE writes there need the delegated
+    //    developer — the stage-role rule from §5.33; documents do not.
     const approved = await fake.runTool('spec_approve', { note: 'ready' })
     assert.equal(approved.isError, false, runText(approved))
-    assert.equal(stores.read(mission.id)?.status, 'spec-approved')
+    assert.equal(stores.read(mission.id)?.status, 'implementing')
+    assert.equal(stores.read(mission.id)?.stage, 'implement')
+    const undelegated = fake.guardReason({ name: 'write', arguments: { file_path: 'src/health.ts' }, agent: fake.agent })
+    assert.match(undelegated ?? '', /team_delegate/, '未经委派的代码写入必须被拒')
+    appendDelegation(fake.cwd, {
+        missionId: mission.id,
+        role: 'developer',
+        childSessionId: 'session-1',
+        stage: 'implement',
+        at: Date.now(),
+    })
     assert.equal(fake.guardReason({ name: 'write', arguments: { file_path: 'src/health.ts' }, agent: fake.agent }), undefined)
 
     // ⑦ the audited write path: turn context → snapshot → execute → result
@@ -192,7 +205,7 @@ test('the full pipeline runs from spec creation to a signed receipt', async () =
     assert.match(incomplete, /❌/)
     assert.match(incomplete, /command/)
     assert.match(incomplete, /早于最新证据/)
-    assert.equal(stores.read(mission.id)?.status, 'spec-approved')
+    assert.equal(stores.read(mission.id)?.status, 'implementing')
 
     await fake.runTool('evidence_record', {
         kind: 'command',

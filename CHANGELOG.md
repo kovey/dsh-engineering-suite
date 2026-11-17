@@ -1,5 +1,28 @@
 ## [未发布]
 
+### 新增 · 审批之后强制进入 implement（`dsh-orchestrator` / `dsh-spec-gate` / `docs/ARCHITECTURE.md` §5.37）
+
+修掉一个真实事故：审批完规格后 agent 直接改代码，所有门禁全绿。根因是**角色强制只在 mission 处于
+声明了角色的阶段时生效**，而 `spec_approve` 只记录审批、不推进阶段——mission 停在 `spec-clarify`，
+角色规则"按设计"不管。两处修补：
+
+- `dsh-orchestrator` 新增可选服务 `ctx.provide('orchestrator', { enterImplement(missionId, cwd?) })`：
+  复用 `orchestrate advance` 的代码路径**逐级**推进到 `implement`（每次只结算一个阶段，硬上限 4 步，
+  不跳级、不派发子代理），入口门禁不满足就以 `{ ok: false, stage, message }` 停下并说明缺什么。
+- `spec_approve` 成功后 best-effort 调用它：成功时返回文本写明"已进入 implement + team_delegate"，
+  推进不了时写"停在 `<stage>`：`<原因>`"；服务缺席/形状不对/抛错都只记日志，**绝不影响审批**。
+- `dsh-spec-gate` 写守卫新增独立于角色的规则：mission 已审批但实现阶段尚未开始时拒绝**代码路径**写入
+  （`packages/**`、`src/**`、`app/**`、`lib/**`、`tests/**` 与常见源码扩展名），文案含当前阶段、
+  目标路径、`orchestrate advance 到 implement` 与 `team_delegate({ role: 'developer' })`；
+  文档/配置/台账（`docs/**`、`*.md`、`.dsh/**`、`CHANGELOG*`、`package.json` 等）不受影响，
+  未审批 mission 的既有拒绝文案优先。兼容边界见 §5.37：`mission.stage` 缺失、以及 `implement`
+  之后的标准阶段（`quality-verify`/`delivery`）不受这条规则影响，既有断言未改动。
+
+测试：`packages/dsh-orchestrator/test/enter-implement.test.ts` 6 条、`packages/dsh-spec-gate/test/approval-advance.test.ts`
+7 条；两包全量 `node --test` 全绿（202 + 113），`tsc --noEmit` 与 `standards-check --quiet` 通过。
+
+## [未发布]
+
 ### 适配 · 入站附件不再"只有文本"（`.gitignore` / `docs/ARCHITECTURE.md` §5.36）
 
 上游 `dsh-chat-interaction` 0.3.8 起，`InboundMessage` 带 `files[]`（本地路径）与 `fileErrors[]`，

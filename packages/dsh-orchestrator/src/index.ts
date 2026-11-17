@@ -25,8 +25,9 @@
 import path from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import { MissionStoreRegistry, createDelegationPresets, createLogger, expandHome, sessionIdOf } from 'dsh-eng-core'
-import type { AgentLike } from 'dsh-eng-core'
+import type { AgentLike, Logger } from 'dsh-eng-core'
 import { resolveConfig } from './config.js'
+import { ORCHESTRATOR_SERVICE, createOrchestratorService } from './enter-implement.js'
 import { AutoAdvanceSessions, autoAdvanceStages, createAutoAdvanceHook } from './hooks.js'
 import { createProbes, mergeProbes } from './probes.js'
 import { PROMPT_SECTION, sectionText } from './prompt.js'
@@ -52,6 +53,8 @@ interface ContextLike {
     on: (event: string, listener: (...args: never[]) => unknown) => () => void
     get: (name: string) => unknown
     effect: (execute: () => (() => void) | void) => void
+    /** cordis service registration (optional: an older runtime may not have it). */
+    provide?: (name: string, value: unknown) => unknown
 }
 
 /** Wire the plugin into a host context. */
@@ -125,13 +128,7 @@ export function apply(ctx: Context, config: unknown = {}): void {
             },
         }
 
-        const clockFromHost = (context as unknown as { get?: (name: string) => unknown }).get?.('clock') as
-            | { now?: () => number }
-            | undefined
-        const clockService =
-            clockFromHost !== undefined && typeof clockFromHost.now === 'function'
-                ? (): number => (clockFromHost.now as () => number).call(clockFromHost)
-                : undefined
+        const clockService = clockFrom(context)
 
         const tools = registerTools(context as never, {
             config: resolved,
@@ -148,6 +145,12 @@ export function apply(ctx: Context, config: unknown = {}): void {
         })
 
         const disposers: (() => void)[] = [...tools.disposers]
+        // The optional `orchestrator` service: `spec_approve` asks it to walk the
+        // mission up to `implement` (AC-001). It is provided, never injected, so a
+        // runtime without `provide` — or a sibling plugin that never asks — is not
+        // an error; `enterImplement` reuses the `advance` code path, no dispatching.
+        const service = createOrchestratorService({ config: resolved, stores, probesFor: () => createProbes(context, resolved.probes, undefined) })
+        disposers.push(provideOptionalService(context, ORCHESTRATOR_SERVICE, service, logger))
         // The automatic transition (docs.md §4.2 自动触发下一阶段): opt-in per
         // stage, gate-driven, and a no-op — one array check — when no stage
         // declares `autoAdvance: true`.
@@ -206,5 +209,46 @@ export function apply(ctx: Context, config: unknown = {}): void {
         )
     } catch (error) {
         logger.error('apply failed:', error)
+    }
+}
+
+/**
+ * The host clock, when it provides one (see `SequenceDeps.now`).
+ *
+ * Extracted from `apply` so the assembly function keeps its accepted size; the
+ * behaviour is unchanged (absent/failing clock = undefined = wall clock).
+ * @param context - host context (`ctx.get('clock')`).
+ * @returns a millisecond clock, or `undefined` when the host has none.
+ */
+function clockFrom(context: ContextLike): (() => number) | undefined {
+    const host = context.get('clock') as { now?: () => number } | undefined
+    if (host === undefined || typeof host.now !== 'function') return undefined
+    return (): number => (host.now as () => number).call(host)
+}
+
+/**
+ * Provide an OPTIONAL service; never a reason to fail the assembly.
+ *
+ * A runtime without `ctx.provide` is reported once and skipped: the consumer
+ * (spec-gate) treats the service as optional and a missing one only means
+ * "no automatic advance", not "approval failed".
+ * @param context - host context.
+ * @param serviceName - cordis service name.
+ * @param service - the value to register.
+ * @param logger - diagnostics sink.
+ * @returns the disposer (never throws).
+ */
+function provideOptionalService(context: ContextLike, serviceName: string, service: unknown, logger: Logger): () => void {
+    if (typeof context.provide !== 'function') {
+        logger.info(`service ${serviceName}: unavailable (no ctx.provide) — enterImplement 不可用`)
+        return () => undefined
+    }
+    try {
+        const dispose = context.provide(serviceName, service)
+        logger.info(`service ${serviceName}: on (enterImplement 可用)`)
+        return typeof dispose === 'function' ? (dispose as () => void) : () => undefined
+    } catch (error) {
+        logger.warn(`service ${serviceName}: registration failed (${(error as Error).message}) — enterImplement 不可用`)
+        return () => undefined
     }
 }

@@ -24,6 +24,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import { MissionStoreRegistry, createDelegationPresets, createLogger, expandHome } from 'dsh-eng-core'
 import type { AgentLike, Logger } from 'dsh-eng-core'
 import { resolveConfig, resolveEffectiveConfig, type SpecGateConfig } from './config.js'
+import type { OrchestratorServiceLike } from './approval-advance.js'
 import { createWriteGuard } from './guard.js'
 import { PROMPT_SECTION, sectionText } from './prompt.js'
 import { registerTools, type ApprovalLike } from './tools.js'
@@ -100,6 +101,10 @@ export function apply(ctx: Context, config: unknown = {}): void {
             guard,
             testDesignMounted: () => context.tools.get('test_design_review') !== undefined,
             approval: () => context.get('approval') as ApprovalLike | undefined,
+            // Optional: dsh-orchestrator's service (published with ctx.provide).
+            // Read per call, so plugin load order does not matter and a missing
+            // service is simply "no automatic advance", never a failed approval.
+            orchestrator: () => context.get('orchestrator') as OrchestratorServiceLike | undefined,
             questions: () => context.get('userQuestions') as never,
             nvimTui: () => context.get('nvim-tui') as never,
             // Drafting dispatches a READ-ONLY child agent (`spec_bootstrap`);

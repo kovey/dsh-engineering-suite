@@ -15,6 +15,7 @@ import { matchesShellAllow } from './shell.js'
 import { mandateState, pathMatchesAny, pathMatchesPattern, resolvePath, type Mandate, type MissionRecord, type MissionStore, type MissionStoreRegistry } from 'dsh-eng-core'
 import path from 'node:path'
 import type { AgentLike } from 'dsh-eng-core'
+import { codeStageWriteRefusal } from './code-writes.js'
 import { evaluateConstraints } from './constraints.js'
 import {
     boundaryReason,
@@ -192,14 +193,21 @@ function authorisationRefusal(mission: MissionRecord): { refusal: string } | { s
 /**
  * Build the write guard.
  *
- * Three deterministic checks, in order:
- *  1. the mission has an approved specification (docs.md §3.2) **and its mandate
+ * The deterministic checks, in the order the code applies them:
+ *  1. the trust root is unchanged (the runtime fallback, checked before any
+ *     mission is even resolved);
+ *  2. the mission has an approved specification (docs.md §3.2) **and its mandate
  *     satisfies this gate** — an `inferred` approval is recorded but does not
  *     authorise writes (see `dsh-eng-core/mandate.ts`; fail closed);
- *  2. the target path is inside the specification's declared **file
+ *  3. the target is not a CODE write while implementation has not started
+ *     (`code-writes.ts`; independent of roles — an approved spec in
+ *     `spec-clarify` no longer authorises editing the implementation);
+ *  4. a stage that declares a role only lets its delegated child write
+ *     (`stage-roles.ts`);
+ *  5. the target path is inside the specification's declared **file
  *     boundaries** (docs.md §1.2/§9 — a boundary the host never checks is a
- *     comment, not a constraint);
- *  3. the target is outside the engineering trail (the gate's trust root).
+ *     comment, not a constraint), and the target is outside the engineering
+ *     trail (the gate's trust root).
  *
  * A shell command is gated only when it actually WRITES something the analyser
  * could attribute: `ls`, `git status`, `npm test` and other read-only or
@@ -341,6 +349,15 @@ export function createWriteGuard(deps: WriteGuardDeps): WriteGuard {
             return authorisation.refusal
         }
         const spec = authorisation.spec
+        // An approved mission may not take CODE writes while implementation has
+        // not started (AC-006, `code-writes.ts`). Independent of any role: the
+        // stage is the fact, not the caller's identity. Documentation/config/
+        // trail writes pass through untouched.
+        const stageRefusal = codeStageWriteRefusal({ mission, targets: declaredTargets, cwd, workspaceRoot: store.layout.cwd })
+        if (stageRefusal !== undefined) {
+            bump(store.layout.rootDir)
+            return stageRefusal
+        }
         // A stage that declares a role belongs to the child delegated for it.
         // Checked BEFORE the boundary rules (and independently of
         // `enforceBoundaries`): "the target is inside my spec" is not a reason

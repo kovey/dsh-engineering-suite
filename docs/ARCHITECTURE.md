@@ -1595,6 +1595,8 @@ stage 取 `mission.stage`，`role` 与 `childSessionId` 用入参 —— 与 `te
 「自动派发会被角色门禁拦住」这条旧边界已消除。② 记录是运行时状态，不是授权：它只回答"这个
 阶段派过谁"，不改变任何角色的工具白名单。③ 手工调用 `subagent`/官方 teammate 派发不会被记录，因此
 也不能满足角色阶段——这是"必须用 `team_delegate`"这条规则的落点，不是遗漏。
+④ 这条规则只在"阶段声明了角色"时说话：审批后 mission 还停在 `spec-clarify` 的情况由 §5.37 的
+写守卫阶段规则兜住（它不依赖角色），两处合起来才是"代码只在实现阶段被写"。
 
 ### 5.34 flaky 的判定顺序：先抓名字，再分单独/并发，再修
 
@@ -1719,6 +1721,73 @@ rc.2 的三条路径由两类证据支撑：① 上面表格里的包内原文�
 
 **实测边界**：附件落地**不会**让 `policyVersion` 变化（`.dsh/chat-interaction/**` 不参与信任根
 指纹），所以收到附件不会把在飞 mission 的 mandate 判定为过期。
+
+### 5.37 审批之后必须真的进入 implement：服务推进 + 写守卫的阶段规则
+
+§5.33 让"阶段角色"变成了约束，但那条约束只在 mission **正处于声明了角色的阶段**时才生效。
+兄弟项目 che-card-repo 上真实发生过：agent 审批完规格后直接改代码——`spec_approve` 只记录审批、
+**不推进阶段**，mission 还停在 `spec-clarify`，于是角色规则"按设计"不管，门禁全绿。这一节把
+"审批完就能写代码"这条路堵死，分两半：
+
+**A. `dsh-orchestrator` 提供可选服务 `orchestrator.enterImplement(missionId, cwd?)`**
+
+- 注册方式：`ctx.provide('orchestrator', service)`（**provide 而非 inject**：没有消费者、或运行时
+  没有 `provide` 都不算错误；插件卸载时同时撤掉服务）。
+- 推进方式：**复用 `orchestrate` 的 `advance` 代码路径**（`runOrchestrate({ action: 'advance' })`），
+  不在这里重写阶段机——入口门禁、插件探测、尝试预算、角色委派检查全部是既有的那一套。
+- 循环：每次只结算 **一个** 阶段，然后重读 mission 记录；下一轮再检查新进入阶段的入口门禁。
+  默认流水线从 `spec-clarify` 到 `implement` 需要 3 次结算，硬上限 4 步（多了只报错，不跳级）。
+- 停下条件与文案：当前阶段的入口门禁不满足 → `{ ok: false, stage: '<当前阶段>', message: '<缺什么 + 修复>' }`；
+  推进被其它原因拒绝（插件未挂载 / 熔断 / 尝试上限）→ 把 `advance` 报告的第一段作为原因；
+  mission 没有 stage（从未进入流水线）→ 明确说"先 orchestrate start"，**不猜**一个阶段去结算。
+- **不派发**：服务不接 `dispatch`（`autoDispatch` 只在普通 `advance` 时生效）。到达 implement 后由
+  调用方用 `team_delegate` 派发；否则"审批成功"会顺手花掉一次子代理预算。
+- 失败是结果不是异常：服务内部 try/catch 把任何错误变成 `ok: false`（`spec_approve` 侧还会再兜一层）。
+
+**B. `spec_approve` 成功后 best-effort 调用**
+
+顺序是：审批写入 → 渲染规格工件 → 调用 `ctx.get('orchestrator')?.enterImplement(mission.id, mission.cwd)`
+→ 在返回文本里追加一句。成功：`已进入 implement：请用 team_delegate({ role: 'developer', … }) 派发实现`；
+没推进：`停在 <stage>：<原因>`。**服务不存在、形状不对、抛错都只记日志**——审批早在调用之前就
+已经生效，不能让一个可选服务把"已批准"变成"报错"。（`cwd` 作为第二个参数传入是因为可选服务的
+调用方是另一个插件、没有自己的会话可读；省略时服务回落到 `process.cwd()`，与 `orchestrate` 工具一致。）
+
+**C. 写守卫新增一条独立于角色的规则**（`packages/dsh-spec-gate/src/code-writes.ts`）
+
+在"mission 存在、规格已审批、mandate 成立"之后、角色规则与文件边界之前判定，且**不受
+`enforceBoundaries: false` 影响**：mission 已审批、实现阶段还没开始、而写入目标是**代码路径** → 拒绝。
+文案含当前阶段、目标路径、`先 orchestrate advance 到 implement`、`team_delegate({ role: 'developer' })`。
+
+| 路径 | 判定 | 原因 |
+|------|------|------|
+| `.dsh/**`、`docs/**`、`*.md`、`CHANGELOG*`、`LICENSE*`、`README*` | 文档/台账 | 不受此规则影响（否则小改动无法交付） |
+| `*.json`/`*.yml`/`*.toml`/`*.ini`/`*.txt`/`*.lock`… | 配置 | 同上；`packages/**` 下的 `package.json` 也是配置 |
+| `*.ts`/`*.tsx`/`*.js`/`*.mjs`/`*.cjs`/`*.go`/`*.py`/`*.rs`/`*.java`/`*.kt`/`*.cs`/`*.php`/`*.rb`/`*.swift` | 代码 | 源码扩展名 |
+| 路径段含 `packages`/`src`/`app`/`lib`/`tests` | 代码 | 源码目录 |
+| 其它 | 不判定 | 交给既有规则 |
+
+"实现阶段已经开始"只认**durable facts**（orchestrator 写入 mission 记录的事实）：阶段是 `implement`
+或标准流水线中 `implement` 之后的阶段（`quality-verify`/`delivery`）；或 `mission.status` 已经是
+`implementing`/`verified`/`delivered`；或 mission 已用过 `developer` 角色（自定义流水线的等价阶段）。
+后两条是为了不把**改名/自定义的流水线**推进死循环（否则每次写代码都被要求 advance 到一个不存在的阶段）。
+
+两条刻意的兼容边界，都是既有契约的落点：① `mission.stage` 缺失（纯 `dsh-spec-gate` 部署、或
+mission 从未进入流水线）→ 这条规则不判定，"已审批"就足以放行（`spec-gate.test.ts` 的既有断言）；
+② `implement` 之后的标准阶段不受影响（`stage-role-guard.test.ts` TC-1556：非角色阶段的代码写入照常
+按文件边界判定）。未审批 mission 的"尚未审批"拒绝**先于**这条规则（文案不变）。
+
+**D. 测试与可复核证据**
+
+- `packages/dsh-orchestrator/test/enter-implement.test.ts`：服务形状（provide/dispose）、入口门禁满足 →
+  逐级到 implement（4 个阶段工件、`mission.stage=implement`、状态 `implementing`）、测试设计缺失 →
+  停在 `test-design-review` 且说明缺 `testDesign`、规格未审批 → 停在 `spec-approve`、从未进入流水线 →
+  提示 `orchestrate start`、未知 mission → 结果而非异常。
+- `packages/dsh-spec-gate/test/approval-advance.test.ts`：审批后调用服务（missionId + mission.cwd）、
+  服务抛错不影响审批成功、服务返回不可推进时文本含 `停在 <stage>：<原因>`、`spec-clarify` 写 `src/a.ts`
+  被拒且文案含 `orchestrate advance`/`team_delegate`、写 `docs/a.md`/`CHANGELOG.md`/`package.json`/
+  `packages/x/package.json` 放行、`implement` 阶段有委派记录时写代码放行、未审批时保持"尚未审批"文案。
+- 两包 `node --test test/*.test.ts` 全绿（spec-gate 202、orchestrator 113），`tsc --noEmit` 通过，
+  `bash scripts/standards-check.sh --quiet` 无新增/恶化违规。
 
 ## 6. 为什么这样切分
 
