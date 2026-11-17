@@ -35,8 +35,9 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis'
-import { MissionStoreRegistry, createLogger, expandHome, type AgentLike } from 'dsh-eng-core'
+import { MissionStoreRegistry, createLogger, expandHome, type AgentLike, type Logger } from 'dsh-eng-core'
 import { resolveConfig, resolveEffectiveConfig, type EffectiveConfig, type KnowledgeBaseConfig } from './config.js'
+import { removedImKeys, removedImKeysProblem } from './im-config.js'
 import { PROMPT_SECTION, sectionText } from './prompt.js'
 import { KB_COMMAND_NAME, registerKbCommand } from './command.js'
 import { registerKnowledgeBaseSurfaces } from './surface.js'
@@ -71,6 +72,21 @@ function workspaceOf(agent: AgentLike | undefined): string | undefined {
 }
 
 /**
+ * Say out loud that `im.chatIds` / `im.p2pOnly` were removed from this plugin.
+ *
+ * The IM target is interaction-gate's single source now, so a profile that
+ * still writes the old keys must not be silently ignored: an operator would
+ * believe a chat allow list is in force while the command answers the
+ * interaction-gate conversation instead.
+ * @param config - the loader row's raw `config` (untrusted).
+ * @param log - the plugin's logger.
+ */
+function warnRemovedImKeys(config: unknown, log: Logger): void {
+    const removed = removedImKeys((config as { im?: unknown } | undefined)?.im)
+    if (removed.length > 0) log.warn(removedImKeysProblem(removed))
+}
+
+/**
  * Register the plugin.
  * @param ctx - the cordis context.
  * @param config - the loader row's `config` (untrusted).
@@ -85,6 +101,7 @@ export function apply(ctx: Context, config: unknown = {}): void {
     })
     try {
         const context = ctx as unknown as ContextLike
+        warnRemovedImKeys(config, log)
         const stores = new MissionStoreRegistry({ ...resolved.layout, logger: log })
         const deps: ToolDeps = {
             config: resolved,

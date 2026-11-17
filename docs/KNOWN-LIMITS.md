@@ -428,10 +428,13 @@ bash scripts/e2e-mission.sh          # 建立隔离 profile、起 stub、跑一�
 - **陈旧索引只报告、不自动修**：`kb_search` 会说明索引早于当前 git 指纹；重建是显式动作（幂等且可比对）。
   唯一的自动重建是**交付附带的 best-effort**：`mission_complete` 成功签发回执后 `dsh-evidence-gate` 调服务 `reindex`，
   它不阻塞交付、失败只记警告（附注一行），也不会让任何门禁结论依赖索引。
-- **IM 命令（`/kb`）的三条边界**：① 必须显式配置 `im.workspace`——IM 的 handler 没有 agent 可读 `session.cwd`，
-  一个进程又服务多个仓库，猜一个就是索引错的仓库；② 鉴权单位是**会话 id**（`im.chatIds`），不区分同会话里的发送者，
-  群聊里谁能发命令由平台与 `im.p2pOnly` 决定，不是本插件能验证的；③ 回复有长度上限（`maxChars`，默认 1800），
-  被截断时只保留前若干条并提示去 TUI——**截断只限制这一条消息的长度，不改变命中的范围**，完整列表仍可用 `kb_search` 取。
+- **IM 命令（`/kb`）的四条边界**：① 必须显式配置 `im.workspace`——IM 的 handler 没有 agent 可读 `session.cwd`，
+  一个进程又服务多个仓库，猜一个就是索引错的仓库；② **会话来源只有一个**：interaction-gate 的 `im.approvalChatId`
+  （通过 `ctx.get('interaction').imTarget()` 只读发布），知识库没有自己的 `im.chatIds`——所以 `/kb` 只在那一个会话
+  可用，想加到别的会话必须改 interaction-gate 的配置，不是本插件的设置；③ 鉴权单位是**会话 id**，不区分同会话里的
+  发送者，群聊里谁能发命令由平台与 interaction-gate 的 `im.p2pOnly` 决定，不是本插件能验证的；④ 回复有长度上限
+  （`maxChars`，默认 1800），被截断时只保留前若干条并提示去 TUI——**截断只限制这一条消息的长度，不改变命中的范围**，
+  完整列表仍可用 `kb_search` 取。
 - **不索引会话历史与审计行**：`audit/*.jsonl`、`session/*` 不在来源里——它们是行为记录，不是知识；需要时按路径直接读。
 - **回答仍由模型组织**：本插件只保证"给到的是有出处的段落"，不保证模型不越界；引用与"索引里没有"的说法是提示词层的约定，
   最终仍需人核对引用。

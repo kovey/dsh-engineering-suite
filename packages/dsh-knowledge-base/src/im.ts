@@ -7,12 +7,16 @@
  * question asked from a phone is answered from the project's own index instead
  * of from the model's memory — with the same `path:from-to` citations.
  *
- * Four deliberate properties:
+ * Five deliberate properties:
  *
- *  - **OFF unless the host authorised chats.** Registration happens only when a
- *    `chatInteraction` service exists AND `im.chatIds` is non-empty; the handler
- *    re-checks the exact `chatId` of every invocation (a command name is not an
- *    authorisation). A project file can narrow that list, never widen it.
+ *  - **ONE source for the IM target.** Which conversation may talk to the suite
+ *    is `dsh-interaction-gate`'s decision (`im.approvalChatId` / `im.p2pOnly`),
+ *    published read-only as `ctx.get('interaction').imTarget()`. This package
+ *    keeps NO chat allow list of its own: two copies of "the allowed chat"
+ *    drift the moment an operator changes one of them. No target = the command
+ *    is never registered ("not configured" is the default, not a permissive
+ *    fallback), and the handler re-reads the target on every invocation — a
+ *    command name is not an authorisation.
  *  - **No agent turn.** The command is handled by the IM plugin's command
  *    registry, which runs a handler instead of waking the model: the reply costs
  *    one round trip and no tokens, and the suite's approval channels are not
@@ -24,7 +28,11 @@
  *  - **Readable failures.** A missing index, an unknown kind or a throwing
  *    upstream becomes `搜索失败：<原因>` in the chat. The handler never throws:
  *    an exception here would be reported by the IM plugin as a generic command
- *    failure, which says less than the actual reason.
+ *    failure, which says less than the actual reason. A refusal names the
+ *    interaction-gate key to change, because that is where the target lives.
+ *  - **`im.workspace` is explicit.** IM has no agent whose `session.cwd` could
+ *    be read, and one process serves several repositories, so the searched
+ *    workspace is a host decision — guessing it means indexing the wrong one.
  *
  * @module dsh-knowledge-base/im
  */
@@ -34,6 +42,7 @@ import { expandHome, type Logger, type MissionStoreRegistry } from 'dsh-eng-core
 import { resolveEffectiveConfig, type KnowledgeBaseConfig } from './config.js'
 import { IM_COMMAND_PATTERN, type KbImConfig } from './im-config.js'
 import { probeImCommandApi, type ImCommandApiLike, type ImCommandInvocationLike, type ImReplyLike } from './im-probe.js'
+import { IM_NOT_P2P, IM_NOT_TARGET, IM_NO_TARGET, IM_NO_TARGET_PROBLEM, imTargetOf, type ImTargetResolver } from './im-target.js'
 import type { KnowledgeBaseService } from './service.js'
 import type { SearchOutcome } from './search.js'
 
@@ -43,7 +52,7 @@ export const IM_COMMAND_DESCRIPTION = '项目知识库检索：/kb <关键词> �
 /** Appended when a reply had to be cut (so the cut is stated, not silent). */
 export const IM_TRUNCATED_SUFFIX = '\n…（更多结果请在 TUI 用 kb_search）'
 
-/** The refusal when the host authorised chats but never named a workspace. */
+/** The refusal when the host configured no workspace to search. */
 export const IM_NO_WORKSPACE =
     'IM 检索没有配置工作区：请在宿主 profile 的 dsh-knowledge-base 配置行里设置 im.workspace（要检索的仓库根目录，绝对路径或 ~/…），然后重试。'
 
@@ -84,8 +93,8 @@ export function imUsageText(name: string): string {
 }
 
 /** One denial: the same text to the chat, the audited line to the logs. */
-function deny(deps: ImDeps, invocation: ImCommandInvocationLike, chatId: string, command: string, why: string): ImReplyLike {
-    const line = `IM 命令 /${command}：会话 ${chatId === '' ? '(空 chatId)' : chatId} ${why}，已拒绝`
+function deny(deps: ImDeps, invocation: ImCommandInvocationLike, chatId: string, why: string, reply: string): ImReplyLike {
+    const line = `IM 命令 /${deps.config.im.command}：会话 ${chatId === '' ? '(空 chatId)' : chatId} ${why}，已拒绝`
     try {
         deps.logger.warn(line)
     } catch {
@@ -96,7 +105,7 @@ function deny(deps: ImDeps, invocation: ImCommandInvocationLike, chatId: string,
     } catch {
         // Same for the host's own sink.
     }
-    return { text: '该会话未授权搜索知识库（im.chatIds 白名单之外）；由宿主把该会话 id 加入 dsh-knowledge-base 的 im.chatIds 后重试。' }
+    return { text: reply }
 }
 
 /**
@@ -156,26 +165,38 @@ function effectiveIm(deps: ImDeps, cwd: string): KbImConfig {
 
 /**
  * Run one `/kb` invocation. Never throws: every failure is a readable reply.
+ *
+ * The authorisation check re-reads the target on EVERY call (`imTarget`), so a
+ * chat that is not the interaction-gate conversation is refused even if it
+ * reached the handler by another path (a stale registration, a replayed card).
  * @param invocation - what the IM plugin hands the handler.
- * @param runtime - the profile configuration, stores, logger and the index service.
+ * @param runtime - configuration, stores, logger, the index service, and the single IM target resolver.
  * @returns the reply to send to the chat.
  */
-export async function runImQuery(invocation: ImCommandInvocationLike, runtime: { deps: ImDeps; service: KnowledgeBaseService }): Promise<ImReplyLike> {
+export async function runImQuery(
+    invocation: ImCommandInvocationLike,
+    runtime: { deps: ImDeps; service: KnowledgeBaseService; imTarget?: ImTargetResolver },
+): Promise<ImReplyLike> {
     const { deps, service } = runtime
     const profile = deps.config.im
     const chatId = typeof invocation.chatId === 'string' ? invocation.chatId : ''
     const query = Array.isArray(invocation.args) ? invocation.args.join(' ').trim() : ''
     if (query === '') return { text: imUsageText(profile.command) }
-    // The registration gate's list first: a chat outside the host's whitelist is
-    // refused before anything about the workspace is looked up.
-    if (!profile.chatIds.includes(chatId)) return deny(deps, invocation, chatId, profile.command, '不在 im.chatIds 白名单内')
+    // The single source first: without an interaction-gate target there is no
+    // conversation this command may answer at all.
+    const target = runtime.imTarget?.()
+    if (target === undefined || target.chatId === '') return deny(deps, invocation, chatId, '没有可用的 IM 目标（interaction-gate 的 im.approvalChatId 为空）', IM_NO_TARGET)
+    if (target.chatId !== chatId) {
+        return deny(deps, invocation, chatId, `不是 interaction-gate 配置的审批会话（im.approvalChatId=${target.chatId}）`, IM_NOT_TARGET)
+    }
+    if (target.p2pOnly && invocation.message?.chatType !== 'p2p') {
+        return deny(deps, invocation, chatId, `所在会话不是 p2p（chatType=${invocation.message?.chatType ?? '未知'}），而 interaction-gate 配置了 im.p2pOnly`, IM_NOT_P2P)
+    }
     const cwd = workspaceOf(profile)
     if (cwd === '') return { text: IM_NO_WORKSPACE }
+    // The project file may only tighten the reply budgets; the target above is
+    // the host's and is not narrowed per repository (there is nothing to narrow).
     const im = effectiveIm(deps, cwd)
-    if (!im.chatIds.includes(chatId)) return deny(deps, invocation, chatId, profile.command, '被项目级配置移出 im.chatIds 白名单')
-    if (im.p2pOnly && invocation.message?.chatType !== 'p2p') {
-        return deny(deps, invocation, chatId, profile.command, `所在会话不是 p2p（chatType=${invocation.message?.chatType ?? '未知'}）`)
-    }
     try {
         const outcome = service.search({ cwd, query, limit: im.maxResults })
         return { text: truncateReply(formatSearchReply(query, outcome, im), im.maxChars) }
@@ -200,6 +221,7 @@ export async function runImQuery(invocation: ImCommandInvocationLike, runtime: {
  * @param im - the settings in force (name, workspace).
  * @param deps - profile configuration, stores and logger.
  * @param service - the knowledge-base service the handler searches through.
+ * @param imTarget - reads the single IM target at call time (interaction-gate's `imTarget()`).
  * @returns the registration report.
  */
 function registerWith(
@@ -207,6 +229,7 @@ function registerWith(
     im: KbImConfig,
     deps: ImDeps,
     service: KnowledgeBaseService,
+    imTarget: ImTargetResolver,
 ): ImRegistration {
     let registration: unknown
     try {
@@ -214,7 +237,7 @@ function registerWith(
             name: im.command,
             description: IM_COMMAND_DESCRIPTION,
             usage: imUsageText(im.command),
-            handler: (invocation) => runImQuery(invocation, { deps, service }),
+            handler: (invocation) => runImQuery(invocation, { deps, service, imTarget }),
         })
     } catch (error) {
         return { registered: false, problem: `注册 IM 命令 /${im.command} 失败（工具与 TUI 的 /kb 不受影响）：${reasonOf(error)}` }
@@ -236,8 +259,12 @@ function registerWith(
 
 /**
  * Register the IM command when — and only when — the host mounted the IM
- * service AND authorised at least one chat. Both conditions are re-checked here
- * (not at the call site) so no caller can register an ungated command.
+ * service AND `dsh-interaction-gate` published an IM target.
+ *
+ * The target is re-read from `ctx.get('interaction')` here (not taken from a
+ * caller) so no caller can register an ungated command, and the handler
+ * re-reads it again on every invocation. The chat allow list is NOT a
+ * knowledge-base setting: `im.chatIds` / `im.p2pOnly` were removed.
  * @param context - the host context (only `get` is used).
  * @param deps - profile configuration, stores and logger.
  * @param service - the knowledge-base service the handler searches through.
@@ -249,12 +276,17 @@ export function registerImCommand(
     service: KnowledgeBaseService,
 ): ImRegistration {
     const im = deps.config.im
-    // Default off: no allow list means no command, and that is not a problem.
-    if (im.chatIds.length === 0) return { registered: false }
+    // Default off: the host never said which conversation may ask, and that is
+    // not a problem. A host that DID configure a workspace clearly expects the
+    // command, so the missing target is worth one line (it names the key).
+    const imTarget: ImTargetResolver = () => imTargetOf(context.get)
+    if (imTarget() === undefined) {
+        return { registered: false, ...(im.workspace === '' ? {} : { problem: IM_NO_TARGET_PROBLEM }) }
+    }
     if (!IM_COMMAND_PATTERN.test(im.command)) {
         return { registered: false, problem: `im.command=${JSON.stringify(im.command)} 不是合法命令名（${String(IM_COMMAND_PATTERN)}）：IM 命令未注册，工具与 TUI 的 /kb 不受影响` }
     }
     const probe = probeImCommandApi(context.get)
-    if (probe.api === undefined) return { registered: false, problem: `im.chatIds 已配置，但 ${probe.reason}：IM 命令 /${im.command} 未注册` }
-    return registerWith(probe.api, im, deps, service)
+    if (probe.api === undefined) return { registered: false, problem: `${probe.reason}：IM 命令 /${im.command} 未注册（interaction-gate 已配置 IM 目标）` }
+    return registerWith(probe.api, im, deps, service, imTarget)
 }

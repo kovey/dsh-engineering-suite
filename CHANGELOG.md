@@ -16,35 +16,50 @@
   只写 `logger.warn` 并在交付输出末尾加一行附注：`知识库：索引已更新（N 块）` / `索引未变（N 块）` /
   `索引内容未变（仅刷新指纹）` / `更新失败：<原因>`。没有该服务时不加任何附注（不是"失败"）。
 - **IM 命令 `/kb`**（`src/im.ts` + `src/im-config.ts` + `src/im-probe.ts`）：宿主装配 `dsh-chat-interaction`
-  （≥ 0.3.8，`ctx.get('chatInteraction').api.registerCommand`）**且**配置了 `im.chatIds` 才注册，**默认关闭**；
-  每次调用再校验 `ctx.chatId`（不在白名单 → 拒绝 + `warn` 日志，含 chatId 与原因），`im.p2pOnly` 可再收紧到私聊。
-  回复每条带 `path:from-to` 引用与摘要（与 `kb_search` 同一个 `SearchOutcome`，不经过模型、不花 token、
-  不经任何门禁），超过 `im.maxChars` 按行截断并追加"更多结果请在 TUI 用 kb_search"；搜索失败返回
+  （≥ 0.3.8，`ctx.get('chatInteraction').api.registerCommand`）**且** `dsh-interaction-gate` 发布了 IM 目标
+  （`ctx.get('interaction').imTarget()`，来自宿主的 `im.approvalChatId` / `im.p2pOnly`）才注册，**默认关闭**；
+  每次调用再重读目标并校验 `ctx.chatId === imTarget().chatId`（不等 → 拒绝 + `warn` 日志，含 chatId 与原因，
+  文案指向 interaction-gate 的 `im.approvalChatId`），`im.p2pOnly` 为真而会话不是 p2p 时同样拒绝并指向
+  `im.p2pOnly`。回复每条带 `path:from-to` 引用与摘要（与 `kb_search` 同一个 `SearchOutcome`，不经过模型、
+  不花 token、不经任何门禁），超过 `im.maxChars` 按行截断并追加"更多结果请在 TUI 用 kb_search"；搜索失败返回
   `搜索失败：<原因>` 而不是抛异常（抛出去只会被 IM 插件变成一句通用的"命令执行失败"）。
-  配置（profile 行；项目级 `<repo>/.dsh/knowledge-base.json` 只能收紧）：
+  配置（profile 行；项目级 `<repo>/.dsh/knowledge-base.json` 只能收紧预算）：
 
   ```yaml
   im:
     command: kb            # 默认 kb；非法命令名不注册并记警告
-    chatIds: []            # 为空 = 不注册（默认关闭）；非空 = 白名单即开关
-    p2pOnly: false
     maxResults: 5
     maxChars: 1800
     workspace: ''          # IM handler 没有 agent 可读 session.cwd，必须显式指定要检索的仓库
   ```
 
-  `im.workspace` 是必要的显式项：一个 dsh 进程服务多个仓库，IM 的 handler 又没有会话可读 cwd，猜一个就是搜错的仓库；
-  缺它时每条命令都返回"没有配置工作区"并指出该填的键。项目级只能删白名单、只能把 `p2pOnly` 打开、只能调低
+  会话与 p2p 要求**不在**知识库这边（见下一条：唯一来源是 interaction-gate 的 `im.approvalChatId` /
+  `im.p2pOnly`）。`im.workspace` 是必要的显式项：一个 dsh 进程服务多个仓库，IM 的 handler 又没有会话可读 cwd，
+  猜一个就是搜错的仓库；缺它时每条命令都返回"没有配置工作区"并指出该填的键。项目级只能调低
   `maxResults`/`maxChars`；`command`/`workspace` 是宿主决定，写了会被忽略并报告。
+- **移除了知识库自己的 `im.chatIds` / `p2pOnly`（重复配置）**：上一版把它们当成"白名单即开关"，但
+  `dsh-interaction-gate` 早就用 `im.approvalChatId` / `im.p2pOnly` 决定同一个会话——**同一件事两份配置必然漂移**
+  （有人改了审批会话，知识库还在回答旧会话）。现在只有一个来源：
+  - `dsh-interaction-gate` 的注册表新增只读访问器 `imTarget(): { channel, chatId, p2pOnly } | undefined`
+    （接口与实现在 `src/channels.ts`，形状与推导在 `src/im-target.ts`；数据来自它已解析的 `im.channel` /
+    `im.approvalChatId` / `im.p2pOnly`，未配置或全空白 →
+    `undefined`，**不新增任何配置键**；解析器抛错也只记一条缺陷并返回 `undefined`，绝不猜一个会话）；
+  - 知识库改为消费它：没有 `interaction` 服务 / `imTarget()` 为 `undefined` / `chatId` 为空 → **不注册** `/kb`
+    （配了 `im.workspace` 时日志点名缺的是 interaction-gate 的 `im.approvalChatId`）；handler 每次调用重读目标，
+    拒绝文案指向 interaction-gate 的键；`im.chatIds` / `im.p2pOnly` 从类型、解析、项目级覆盖规则、README 与文档中
+    删除，profile 或项目级文件里残留的写法会被**报告为已移除并忽略**（不是静默丢弃——否则会以为白名单还在生效）；
+  - 知识库只剩 `im.command` / `im.maxResults` / `im.maxChars` / `im.workspace`。
 
-测试：`packages/dsh-knowledge-base/test/im-service.test.ts` 12 条（服务形状与真实建索引/检索、无 `ctx.provide`
-时的降级、项目禁用时 `reindex` 报 `disabled` 而不是失败、注册条件（无 IM 服务 / 无白名单 / 有白名单注册一次）、
-白名单拒绝与日志、引用格式、截断与 TUI 提示、搜索失败可读、p2pOnly、缺 workspace、命令名校验、项目级收紧），
-`packages/dsh-evidence-gate/test/kb-sync.test.ts` 5 条（交付后调用且目标是交付工作区、`reindex` 抛错仍签发回执并输出"更新失败"、
-unchanged 不冒充"已更新"、无服务/老服务/已禁用都静默、访问器抛错/超时/异常结果都降级为一行附注）。两包全量
-`node --test` 全绿（75 / 66），两包 `tsc` 通过，`scripts/standards-check.sh --quiet` PASS（无新增/恶化；`tools.ts`
-的改动按"净零行"做，摘要抽出后行数只减不增）。**未跑** `scripts/verify.sh` 全量（本次按任务约定只跑受影响包 +
-`tsc` + standards）；交付门禁仍需完整 `verify.sh --quiet` 的 PASS。
+测试：`packages/dsh-knowledge-base/test/im-service.test.ts` 13 条（服务形状与真实建索引/检索、无 `ctx.provide`
+时的降级、项目禁用时 `reindex` 报 `disabled` 而不是失败、注册条件（无 interaction 服务 / 无 IM 目标 / 无命令 api /
+有目标时注册一次）、目标会话回答且带 `path:from-to` 引用、非目标会话拒绝且文案含 `im.approvalChatId`、
+`p2pOnly` 群会话拒绝且文案含 `im.p2pOnly`、截断与 TUI 提示、搜索失败可读、缺 workspace、命令名校验、
+`im.chatIds`/`p2pOnly` 已移除且项目级残留被报告、项目级只收紧预算），
+`packages/dsh-interaction-gate/test/interaction-gate.test.ts` 新增 1 条（`imTarget()` 的形状与取值来源、
+未配置时的 `undefined`、解析器抛错的降级）。本轮实测：`node --test packages/dsh-knowledge-base/test/*.test.ts`
+76 条全绿、`node --test packages/dsh-interaction-gate/test/*.test.ts` 137 条全绿，两包 `tsc` 通过，
+`scripts/standards-check.sh --quiet` PASS。**未跑** `scripts/verify.sh` 全量（按任务约定只跑受影响包 + `tsc` +
+standards）；交付门禁仍需完整 `verify.sh --quiet` 的 PASS。
 
 ## [0.8.12] — 2026-11-17
 

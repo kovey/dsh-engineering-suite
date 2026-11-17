@@ -52,18 +52,34 @@
 `path:from-to` 引用与一句摘要。它走 IM 插件的**命令注册表**，不唤醒模型、不花 token，也不经过任何门禁
 （因此也无从绕过门禁——它只回答"索引里有什么"）。
 
-**默认关闭，且白名单就是开关**：只有同时满足「宿主有 `chatInteraction` 服务」与「`im.chatIds` 非空」
-才注册命令；没有白名单就一条命令都不注册（不是注册了再拒绝）。每个调用还会再校验一次
-`ctx.chatId` 是否在白名单里——**会话不在名单内时拒绝并把这次尝试写进日志**，不返回任何结果。
+**默认关闭，而"哪个会话可以问"只有一个来源**：`dsh-interaction-gate` 从宿主配置解析出的 IM 目标
+（`im.approvalChatId` / `im.p2pOnly`），通过它注册表上的只读访问器 `ctx.get('interaction').imTarget()`
+发布（`{ channel, chatId, p2pOnly }`；未配置时是 `undefined`）。本插件**没有**自己的会话白名单——
+早先的 `im.chatIds` / `im.p2pOnly` 已删除：同一件事两份配置必然漂移（改了审批会话，第二份还在回答旧会话）。
+只有「宿主有 `interaction` 服务且它发布了 IM 目标」**且**「宿主有 `chatInteraction` 命令 api」时才注册命令
+（不是注册了再拒绝）；没注册时若宿主配了 `im.workspace`，日志会说明缺的是 interaction-gate 的 `im.approvalChatId`。
+
+handler 每次调用都会**重读**目标（命令名不是授权）：`ctx.chatId` 不等于 `imTarget().chatId` 就拒绝，
+`p2pOnly` 为真而会话不是 p2p 也拒绝，并把这次尝试写进日志——**拒绝文案指向 interaction-gate 的配置键**，
+因为知识库这边已经没有可改的会话配置了。profile 里残留的 `im.chatIds` / `im.p2pOnly`（以及项目级文件里的）
+会被**报告为已移除并忽略**，不会被当成"还在生效的白名单"。
 
 ```yaml
     im:
       command: kb            # 命令名（默认 kb；只接受 [a-z0-9][a-z0-9_-]{0,31}，非法则不注册并记警告）
-      chatIds: []            # 允许使用命令的会话 id；为空 = 不注册（默认关闭）
-      p2pOnly: false         # true 时只接受 p2p 会话（群聊一律拒绝并记录）
       maxResults: 5          # 每条回复最多几条命中（1..50）
       maxChars: 1800         # 单条回复的字符上限，超出按行截断并追加"更多结果请在 TUI 用 kb_search"
       workspace: ''          # 要检索的仓库根目录（绝对路径或 ~/…）；IM 命令没有 agent 可读 cwd，必须显式给
+```
+
+会话与 p2p 要求是 `dsh-interaction-gate` 的配置，不在这里：
+
+```yaml
+- id: interaction-gate
+  config:
+    im:
+      approvalChatId: oc_…  # /kb 唯一允许回答的会话（也用审批卡片的发送目标）
+      p2pOnly: true         # 为真时只接受 p2p 会话（群聊里的 /kb 一律拒绝）
 ```
 
 handler 的行为（每一条都有测试）：
@@ -71,8 +87,9 @@ handler 的行为（每一条都有测试）：
 | 情况 | 回复 |
 |---|---|
 | 没有参数 | 用法（`/<命令> <关键词…>`，并指向 TUI 的 `kb_search`） |
-| 会话不在白名单 | `该会话未授权搜索知识库（im.chatIds 白名单之外）…`，同时 `warn` 一行（含 chatId 与原因） |
-| `p2pOnly` 且不是 p2p | 同上拒绝并记录（`chatType=…`） |
+| 调用时读不到 IM 目标（interaction 缺席/被撤下） | `knowledge-base 没有可用的 IM 目标…`，同时 `warn` 一行；不返回任何结果 |
+| 会话不是 `imTarget().chatId` | `该会话不是 interaction-gate 配置的审批会话；要开放请改 interaction-gate 的 im.approvalChatId…`，同时 `warn` 一行（含 chatId 与原因） |
+| `im.p2pOnly` 为真且不是 p2p | `该会话是群聊，而 interaction-gate 配置了 im.p2pOnly=true…` 并记录（`chatType=…`） |
 | `im.workspace` 为空 | 说明缺哪一项配置（`im.workspace`）与该填什么 |
 | 命中若干条 | `[n] path:from-to 「标题」` + `摘要：…`（与 `kb_search` 同一份 `SearchOutcome`） |
 | 索引里没有 | 说明这是词法索引（换词/换 id 可能命中），并指向 TUI |
@@ -112,14 +129,14 @@ handler 的行为（每一条都有测试）：
       - { id: code,  kind: code,  globs: ['**/*.ts', '**/*.tsx', '**/*.js', '**/*.mjs', '**/*.cjs', '**/*.go', '**/*.py'] }
     tokenizer: { cjkBigrams: true, minTokenLength: 2 }
     search: { limit: 10, maxLimit: 50, fieldBoosts: { title: 3, symbols: 2, body: 1 } }
-    im:                            # 可选：IM 里的 /kb（默认关闭，chatIds 为空就不注册）
+    im:                            # 可选：IM 里的 /kb（默认关闭；没有 interaction-gate 的 IM 目标就不注册）
       command: kb
-      chatIds: []                  # 允许的会话 id，例如 ['oc_x']
-      p2pOnly: false
       maxResults: 5
       maxChars: 1800
       workspace: ''                # 要检索的仓库根目录；IM 命令没有 agent 的 cwd，必须显式配置
 ```
+
+会话与 p2p 要求不在这里：它们是 `dsh-interaction-gate` 的 `im.approvalChatId` / `im.p2pOnly`（唯一来源）。
 
 **项目级可覆盖**（`<repo>/.dsh/knowledge-base.json`）：`enabled`、`indexDir`、`maxFileBytes`、`maxChunkLines`、
 `sources`、`tokenizer`、`search`、`im` —— 且只能**收窄**：
@@ -128,8 +145,9 @@ handler 的行为（每一条都有测试）：
 - `tokenizer.minTokenLength` 只能调高；`tokenizer.cjkBigrams` 只能关掉（打开会更宽地召回）；
 - `sources` 只能停用来源或**删减**模式，不能新增来源、不能换 `kind`、不能加模式；
 - `enabled` 只能从开变关。`logFile` / `prompt` 属于宿主，项目改不了；
-- `im` 只能**收窄**：从白名单里删会话（不能新增）、`p2pOnly` 只能打开、`maxResults` / `maxChars` 只能调低；
-  `im.command` 与 `im.workspace`（"搜哪个仓库"）是宿主决定，项目级写了会被忽略并报告。
+- `im` 只能**收窄**：`maxResults` / `maxChars` 只能调低；`im.command` 与 `im.workspace`（"搜哪个仓库"）是宿主决定，
+  项目级写了会被忽略并报告；`im.chatIds` / `im.p2pOnly` **已经不是知识库的配置**（会话与 p2p 要求只有一个来源：
+  `dsh-interaction-gate` 的 `im.approvalChatId` / `im.p2pOnly`），项目级写了会被当作"已移除"报告并忽略。
 
 每一个被拒绝的放宽都会在报告里逐条说明原因（"`maxLimit=100` 超过上限 50，已忽略"），
 所以"我以为改了"和"真的改了"不会长得一样。值本身不可用时**保留宿主的值**，同样上报。
@@ -225,7 +243,8 @@ handler 的行为（每一条都有测试）：
 | `dsh-standards-gate` | 代码符号来自同一套提取器（`dsh-eng-core` 的 `scanWorkspace`），所以"符号"在两个插件里是同一个定义 |
 | `dsh-audit-trail` | 检索是**只读**的（测试用 `.dsh` 逐字节快照证明），不会污染审计轨迹 |
 | `@deepseek-ai/dsh-commands` | **可选**：装配了就多一条人类命令 `/kb …`（与三个工具共用同一份报告，不经模型、不花 token）；没装配不影响任何工具 |
-| `dsh-chat-interaction` | **可选**：装配了（≥ 0.3.8）且配置了 `im.chatIds` 才多一条 IM 命令 `/kb`（默认关闭；见上文） |
+| `dsh-chat-interaction` | **可选**：装配了（≥ 0.3.8）**且** interaction-gate 发布了 IM 目标（`im.approvalChatId`）才多一条 IM 命令 `/kb`（默认关闭；见上文） |
+| `dsh-interaction-gate` | **可选**：IM 目标的唯一来源——本插件只读 `ctx.get('interaction').imTarget()`；没装配就没有 IM 命令（不是回退到第二份配置） |
 
 ## 诚实的边界
 

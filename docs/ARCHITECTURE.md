@@ -829,10 +829,15 @@ IM 侧的职责（不在本仓库）：卡片按钮不可伪造且一次性、�
   （`索引已更新（N 块）` / `索引未变` / `内容未变（仅刷新指纹）` / `更新失败：<原因>`）+ 一条日志。
   服务本身是**可选服务**（`ctx.provide('knowledge-base', …)`）：宿主没挂这个插件时调用方拿到 `undefined`，照常交付。
 - **IM 里的 `/kb`**：同一份检索通过 `dsh-chat-interaction` 的**命令注册表**进入聊天窗口（不唤醒模型、不花 token）。
-  默认**关闭**且白名单即开关：只有 `im.chatIds` 非空、且宿主确实暴露了 `chatInteraction` 服务时才注册命令；
-  每次调用再校验 `ctx.chatId`，不在名单内就拒绝并记录。IM 的 handler 没有 agent 可读 `session.cwd`，所以
-  `im.workspace` 必须由宿主显式指定——"哪个仓库"不能猜。回复里的引用格式与 `kb_search` 完全一致（同一个
-  `SearchOutcome`），超出 `maxChars` 按行截断并指向 TUI；搜索失败返回 `搜索失败：<原因>` 而不是抛异常。
+  默认**关闭**，而"哪个会话可以问"只有**一个来源**：`dsh-interaction-gate` 从宿主配置解析出的 IM 目标
+  （`im.approvalChatId` / `im.p2pOnly`），通过它注册表上的只读访问器 `ctx.get('interaction').imTarget()`
+  发布（返回 `{ channel, chatId, p2pOnly }`，未配置时为 `undefined`）。知识库**没有**自己的会话白名单：
+  早先那套 `im.chatIds` / `im.p2pOnly` 已删除——同一件事两份配置必然漂移（改了审批会话，第二份还在回答旧会话）。
+  没有目标（或没有 `interaction` 服务）时命令**不注册**；每次调用再重读一次目标，`ctx.chatId` 不等于
+  `imTarget().chatId` 就拒绝，拒绝文案指向 interaction-gate 的 `im.approvalChatId`，`p2pOnly` 为真而会话不是
+  p2p 时指向 `im.p2pOnly`。IM 的 handler 没有 agent 可读 `session.cwd`，所以 `im.workspace` 必须由宿主显式指定——
+  "哪个仓库"不能猜。回复里的引用格式与 `kb_search` 完全一致（同一个 `SearchOutcome`），超出 `maxChars`
+  按行截断并指向 TUI；搜索失败返回 `搜索失败：<原因>` 而不是抛异常。
 
 **它不是什么**：不是嵌入检索（词法召回会漏掉同义改写）、不是聊天机器人（回答由模型基于引用组织）、
 不是 git 历史（只索引上述明确的来源）、更不是决策依据——决策的依据仍是门禁记录与回执。

@@ -94,9 +94,9 @@ export interface KnowledgeBaseConfig {
         fieldBoosts: KbFieldBoosts
     }
     /**
-     * The optional `/kb` command inside an IM chat: off by default (an empty
-     * `chatIds` never registers anything), narrowed — never widened — by a
-     * repository's own file. See `im-config.ts`.
+     * The optional `/kb` command inside an IM chat: off by default (it answers only
+     * the conversation interaction-gate configured), narrowed — never widened — by
+     * a repository's own file. See `im-config.ts`.
      */
     im: KbImConfig
 }

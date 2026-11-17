@@ -747,6 +747,31 @@ test('配置校验：不可用的数值回退默认值并报告；注册表对�
     assert.equal(registry.unregister('nope'), false)
 })
 
+test('TC-1841/TC-1846 注册表把唯一的 IM 目标发布出去；没配目标时是 undefined（绝不猜一个会话）', () => {
+    // 直接构造：访问器是注入的，不是一个新配置键。
+    const published = createInteractionRegistry({ now: () => 1_000, imTarget: () => ({ channel: 'required', chatId: 'oc_x', p2pOnly: true }) })
+    assert.deepEqual(published.imTarget(), { channel: 'required', chatId: 'oc_x', p2pOnly: true })
+    assert.equal(createInteractionRegistry({ now: () => 1_000 }).imTarget(), undefined, '没有解析器 = 没有目标')
+
+    // 解析器抛错不能让兄弟插件的 apply 崩掉：按"没有目标"处理并记录缺陷。
+    const broken = createInteractionRegistry({
+        now: () => 1_000,
+        imTarget: () => {
+            throw new Error('配置坏了')
+        },
+    })
+    assert.equal(broken.imTarget(), undefined)
+    assert.ok(broken.problems().some((problem) => problem.includes('IM 目标解析失败')), broken.problems().join(' | '))
+
+    // 真插件：字段来自它自己解析的 IM 配置（im.channel / im.approvalChatId / im.p2pOnly）。
+    const configured = host(tempWorkspace('interaction-gate-imtarget-'), { im: { approvalChatId: ' oc_x ', p2pOnly: true } })
+    assert.deepEqual(configured.registry.imTarget(), { channel: 'auto', chatId: 'oc_x', p2pOnly: true })
+
+    // 没配 approvalChatId（或只有空白）= 没有目标。
+    assert.equal(host(tempWorkspace('interaction-gate-imtarget-'), {}).registry.imTarget(), undefined)
+    assert.equal(host(tempWorkspace('interaction-gate-imtarget-'), { im: { approvalChatId: '   ' } }).registry.imTarget(), undefined)
+})
+
 test('dispose 之后无残留：工具、提示词段与服务都被撤下', () => {
     const cwd = tempWorkspace('interaction-gate-')
     const fake = host(cwd)

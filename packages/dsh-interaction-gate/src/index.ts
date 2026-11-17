@@ -42,14 +42,14 @@ import type { Context } from '@deepseek-ai/cordis'
 import { MissionStoreRegistry, createLogger, expandHome, type AgentLike } from 'dsh-eng-core'
 import { installApprovalAnswerer } from './approval.js'
 import { attentionFileOf, createAttentionSource, missionFactsOf, type AttentionSource } from './attention.js'
-import { createInteractionRegistry } from './channels.js'
+import { createInteractionRegistry, type InteractionRegistry } from './channels.js'
 import { ledgerFileOf, resolveConfig, resolveEffectiveConfig, type EffectiveConfig, type InteractionGateConfig } from './config.js'
 import { installImChannel, type ImBinding, type ImInject } from './im-binding.js'
+import { imTargetOf } from './im-target.js'
 import { createOutbox, describeReplay, outboxFileOf, type Outbox } from './outbox.js'
 import { PROMPT_SECTION, sectionText } from './prompt.js'
 import { approvalRoutingOf, mappingReportOf } from './workspace-mapping.js'
 import { artifactPathOf, hostApproverReportOf, registerTools, type ToolDeps } from './tools.js'
-import type { InteractionRegistry } from './channels.js'
 
 export const name = 'dsh-interaction-gate'
 
@@ -174,12 +174,12 @@ export function apply(ctx: Context, config: unknown = {}): void {
             ...(resolved.logFileTemplate === undefined ? {} : { template: resolved.logFileTemplate }),
         })
         const stores = new MissionStoreRegistry({ ...resolved.layout, logger })
-        // P3.2: `im()` is process-wide while the workspace mapping is per
-        // workspace, so the registry is handed a RESOLVER and the caller says
-        // which workspace it is asking about (the doctor passes its own).
+        // P3.2: `im()` is process-wide while the workspace mapping is per workspace,
+        // so the registry is handed a RESOLVER and the caller says which one it asks about.
         const registry = createInteractionRegistry({
             logger,
             workspaceMapping: (workspace) => mappingReportOf(approvalRoutingOf(workspace, resolved.im)),
+            imTarget: () => imTargetOf(resolved.im),
         })
         // A workspace-independent ledger (an absolute profile path) can be read
         // without a session context, so `interaction.pending()` reports asks

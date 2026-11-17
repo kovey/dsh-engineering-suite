@@ -3,16 +3,22 @@
  *
  * The command is OFF by default — a plugin that indexes a whole repository must
  * not start answering strangers on a chat platform because it happened to load.
- * Enabling it takes an explicit allow list: without `im.chatIds` the command is
- * never registered at all, and `chatIds` is therefore both the switch and the
- * authorisation (`handler` re-checks the exact `chatId` of every invocation).
+ * It is enabled by a fact this plugin does NOT own: the IM target that
+ * `dsh-interaction-gate` already resolved from the host (`im.approvalChatId` /
+ * `im.p2pOnly`, published read-only as `ctx.get('interaction').imTarget()`).
+ * There is exactly ONE source for "which conversation may talk to the suite",
+ * because two copies drift: an operator changes the approval chat in the profile
+ * and the second copy keeps answering the old one. This module therefore holds
+ * only what is genuinely the knowledge base's own: the command name, the reply
+ * budget and the workspace to search.
  *
  * Two-layer model, like the rest of this package: the profile row is the ceiling
  * and a repository's own `.dsh/knowledge-base.json` may only NARROW it. Narrowing
- * means removing an allowed chat, turning `p2pOnly` ON, lowering `maxResults` or
- * `maxChars` — never adding a chat the host did not authorise, never raising a
- * bound, never renaming the command and never pointing it at another workspace
- * (which workspace is searched is a host decision).
+ * means lowering `maxResults` or `maxChars` — never raising a bound, never
+ * renaming the command and never pointing it at another workspace (which
+ * workspace is searched is a host decision). The chat allow list is NOT here at
+ * all: a project file that still writes `im.chatIds` / `im.p2pOnly` is reported
+ * as removed and ignored, and the message names interaction-gate's keys.
  *
  * Every refused widening is REPORTED by the caller, never silently dropped.
  *
@@ -23,10 +29,6 @@
 export interface KbImConfig {
     /** Command name without the leading `/` (default `kb`). */
     command: string
-    /** Chat ids allowed to run the command. EMPTY = the command is not registered. */
-    chatIds: string[]
-    /** Restrict the command to person-to-person chats (default false). */
-    p2pOnly: boolean
     /** Hits returned to the chat (default 5, at most the search `maxLimit`). */
     maxResults: number
     /** Character cap of one reply (default 1800); longer results are truncated. */
@@ -47,12 +49,21 @@ export const IM_MAX_RESULTS_DEFAULT = 5
 /** Default reply budget, in characters. */
 export const IM_MAX_CHARS_DEFAULT = 1800
 
+/**
+ * Keys this package used to read and no longer does.
+ *
+ * They are the duplicated half of "where may `/kb` answer": the IM target and
+ * the p2p requirement now come from `dsh-interaction-gate` alone. Kept as a
+ * named list so a stale profile row (or a project file) is REPORTED instead of
+ * silently ignored — an operator who thinks their chat list is still in force
+ * would otherwise believe the command is more restricted than it is.
+ */
+export const IM_REMOVED_KEYS = ['chatIds', 'p2pOnly'] as const
+
 /** The settings in force when the host declares no `im` block at all. */
 export function defaultImConfig(): KbImConfig {
     return {
         command: IM_COMMAND_DEFAULT,
-        chatIds: [],
-        p2pOnly: false,
         maxResults: IM_MAX_RESULTS_DEFAULT,
         maxChars: IM_MAX_CHARS_DEFAULT,
         workspace: '',
@@ -66,22 +77,32 @@ function isRecord(value: unknown): value is Raw {
     return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
-/** A clean list of chat ids (trimmed, de-duplicated, non-strings dropped). */
-function chatIdsOf(value: unknown): string[] {
-    if (!Array.isArray(value)) return []
-    const ids: string[] = []
-    for (const entry of value) {
-        if (typeof entry !== 'string') continue
-        const id = entry.trim()
-        if (id !== '' && !ids.includes(id)) ids.push(id)
-    }
-    return ids
-}
-
 /** A positive integer inside `[min, max]`, or the fallback. */
 function boundedInt(value: unknown, fallback: number, min: number, max: number): number {
     if (typeof value !== 'number' || !Number.isFinite(value) || value < min) return fallback
     return Math.min(Math.floor(value), max)
+}
+
+/**
+ * One line naming the removed keys and where they went.
+ * @param keys - the removed `im.*` keys found in a configuration file.
+ * @returns the Chinese explanation (without a file prefix).
+ */
+export function removedImKeysProblem(keys: readonly string[]): string {
+    return (
+        `im.${keys.join(' / im.')} 已不再是知识库的配置（IM 目标只有一个来源：interaction-gate 的 im.approvalChatId 与 im.p2pOnly），` +
+        '已忽略；要开放或收紧会话请改 interaction-gate 的配置'
+    )
+}
+
+/**
+ * The removed keys a raw `im` value still declares.
+ * @param value - the raw `im` value (untrusted).
+ * @returns the removed key names that are present (`[]` when none).
+ */
+export function removedImKeys(value: unknown): string[] {
+    if (!isRecord(value)) return []
+    return IM_REMOVED_KEYS.filter((key) => value[key] !== undefined)
 }
 
 /**
@@ -90,7 +111,8 @@ function boundedInt(value: unknown, fallback: number, min: number, max: number):
  * Unusable values keep the default (the profile row is the host's own file and
  * there is no log sink at resolution time); an invalid `command` is kept as
  * written so registration can refuse it out loud instead of silently answering
- * under a different name.
+ * under a different name. `im.chatIds` / `im.p2pOnly` are not read at all —
+ * {@link removedImKeys} lets the caller say so instead of dropping them silently.
  * @param value - the raw `im` value (untrusted).
  * @returns the resolved settings with every default applied.
  */
@@ -100,8 +122,6 @@ export function resolveImConfig(value: unknown): KbImConfig {
     const workspace = typeof raw['workspace'] === 'string' && raw['workspace'].trim() !== '' ? raw['workspace'].trim() : ''
     return {
         command,
-        chatIds: chatIdsOf(raw['chatIds']),
-        p2pOnly: raw['p2pOnly'] === true,
         maxResults: boundedInt(raw['maxResults'], IM_MAX_RESULTS_DEFAULT, 1, 50),
         maxChars: boundedInt(raw['maxChars'], IM_MAX_CHARS_DEFAULT, 100, 20_000),
         workspace,
@@ -110,6 +130,11 @@ export function resolveImConfig(value: unknown): KbImConfig {
 
 /**
  * Overlay a workspace's own `im` block, allowing it to NARROW the host's values.
+ *
+ * Only the reply budgets are narrowable: the command name and the searched
+ * workspace are host decisions, and the chat allow list is no longer a
+ * knowledge-base setting at all (it belongs to interaction-gate). Those keys are
+ * reported, not applied.
  * @param host - the profile-resolved settings (the ceiling).
  * @param value - the project file's `im` value (untrusted).
  * @param file - the project file path, for the reports.
@@ -122,35 +147,15 @@ export function narrowImConfig(host: KbImConfig, value: unknown, file: string, r
         report(`${file}: im 必须是对象，已忽略（继续使用 profile 的 IM 设置）`)
         return undefined
     }
-    const next: KbImConfig = { ...host, chatIds: [...host.chatIds] }
+    const next: KbImConfig = { ...host }
     let applied = false
     for (const key of Object.keys(value)) {
-        if (['chatIds', 'p2pOnly', 'maxResults', 'maxChars'].includes(key)) continue
+        if (key === 'maxResults' || key === 'maxChars') continue
+        if ((IM_REMOVED_KEYS as readonly string[]).includes(key)) {
+            report(`${file}: ${removedImKeysProblem([key])}`)
+            continue
+        }
         report(`${file}: im.${key} 不允许在项目级配置里覆盖（命令名与检索工作区由宿主决定），已忽略`)
-    }
-    if (value['chatIds'] !== undefined) {
-        if (!Array.isArray(value['chatIds'])) {
-            report(`${file}: im.chatIds 必须是字符串数组，已忽略`)
-        } else {
-            const wanted = chatIdsOf(value['chatIds'])
-            const widened = wanted.filter((id) => !host.chatIds.includes(id))
-            if (widened.length > 0) {
-                report(`${file}: im.chatIds 新增了 profile 未授权的会话 ${widened.map((id) => JSON.stringify(id)).join(', ')}，已忽略（项目级只能收紧白名单）`)
-            }
-            const kept = host.chatIds.filter((id) => wanted.includes(id))
-            if (kept.length !== host.chatIds.length) {
-                next.chatIds = kept
-                applied = true
-            }
-        }
-    }
-    if (value['p2pOnly'] !== undefined) {
-        if (value['p2pOnly'] !== true) {
-            if (host.p2pOnly) report(`${file}: im.p2pOnly 不能被项目级关闭（profile 只允许 p2p 会话），已忽略`)
-        } else if (!host.p2pOnly) {
-            next.p2pOnly = true
-            applied = true
-        }
     }
     if (value['maxResults'] !== undefined) {
         const wanted = boundedInt(value['maxResults'], host.maxResults, 1, 50)

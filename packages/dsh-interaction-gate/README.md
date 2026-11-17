@@ -61,8 +61,10 @@ ctx.get('interaction').register(channel)                       // 返回 dispose
 - **推送型通道**（webhook 送达答案，没有可 await 的 `wait`）在收到点击后调用
   `ctx.get('interaction').submit(questionId, { value, by, messageId })`；令牌未知/已作废的答案会被丢弃并计数。
 - 服务面（`ctx.provide('interaction', …)`）：`register` / `unregister` / `get` / `list` / `describeAll` /
-  `pending` / `trackLedger` / `ledgers` / `droppedAnswers` / `problems` / `im` / `setIm` / `reportProblem` 见 `src/channels.ts`。**任何方法都不向调用方抛错**：
+  `pending` / `trackLedger` / `ledgers` / `droppedAnswers` / `problems` / `im` / `imTarget` / `setIm` / `reportProblem` 见 `src/channels.ts`。**任何方法都不向调用方抛错**：
   重复注册、坏通道、读不了的台账都降级成 `problems()` 里的一条原因 + 一个安全值（空列表 / `false`）。
+  `imTarget()` 是只读的 IM 目标（`{ channel, chatId, p2pOnly }`，未配置 `im.approvalChatId` 时为 `undefined`）：
+  兄弟插件（知识库的 `/kb`）用它当**唯一**的会话来源，而不是再声明一份自己的白名单。
 
 ## 可选 IM 通道：把提问接到 `dsh-chat-interaction`
 

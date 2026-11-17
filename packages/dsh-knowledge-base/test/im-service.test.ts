@@ -7,13 +7,19 @@
  *  - the service is the SAME pipeline as the tools (a real index is built and
  *    searched through it, with `path:from-to` citations), and it is optional —
  *    a host without `ctx.provide` loses the service, not the plugin;
- *  - the IM command is OFF unless a chat allow list is configured AND the host
- *    mounted `chatInteraction`; the handler re-checks the chat id, answers an
- *    unauthorised chat with a readable refusal (and logs it), truncates long
- *    answers with a pointer to the TUI, and turns a throwing search into
- *    `搜索失败：…` instead of an exception;
- *  - a project file can narrow the IM settings (fewer chats, tighter budgets)
- *    and never widen them — the profile stays the ceiling.
+ *  - the IM command has ONE source for "which conversation may ask":
+ *    `dsh-interaction-gate`'s `im.approvalChatId` / `im.p2pOnly`, read through
+ *    `ctx.get('interaction').imTarget()`. No target = no command (default off
+ *    is the absence of a target, not a permissive fallback), and the handler
+ *    re-reads the target on every call: a grant that is not the configured
+ *    conversation is refused with a message naming the interaction-gate key,
+ *    never a second allow list kept here;
+ *  - the duplicated keys (`im.chatIds` / `im.p2pOnly`) are GONE from the
+ *    configuration surface: parsing ignores them, a project file that still
+ *    writes them is reported, and only `command` / `maxResults` / `maxChars` /
+ *    `workspace` remain;
+ *  - the handler stays readable: truncation points at the TUI, a missing
+ *    workspace names `im.workspace`, a throwing search becomes `搜索失败：…`.
  */
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
@@ -23,7 +29,8 @@ import { MissionStoreRegistry, createLogger } from 'dsh-eng-core'
 import { createFakeHost, tempWorkspace, type FakeHost } from 'dsh-eng-core/testing'
 import { apply } from '../dist/index.js'
 import { resolveConfig, resolveEffectiveConfig } from '../dist/config.js'
-import { narrowImConfig, resolveImConfig } from '../dist/im-config.js'
+import { defaultImConfig, narrowImConfig, removedImKeys, resolveImConfig } from '../dist/im-config.js'
+import { IM_NOT_P2P, IM_NOT_TARGET, type ImTargetLike } from '../dist/im-target.js'
 import {
     IM_TRUNCATED_SUFFIX,
     imUsageText,
@@ -91,6 +98,21 @@ function fakeChat(): {
     return { layer: { api }, registrations, disposed: () => disposals, api }
 }
 
+/** A target as `dsh-interaction-gate` publishes it (`registry.imTarget()`). */
+function target(chatId: string, p2pOnly = false): ImTargetLike {
+    return { channel: 'auto', chatId, p2pOnly }
+}
+
+/** A fake `interaction` service: `imTarget()` is the ONE method the KB reads. */
+function fakeInteraction(value: ImTargetLike | undefined): Record<string, unknown> {
+    return { imTarget: () => value }
+}
+
+/** What the host context looks like to these tests: `ctx.get` over a fixed service map. */
+function contextOf(services: Record<string, unknown>): { get: (name: string) => unknown } {
+    return { get: (name) => services[name] }
+}
+
 /** The deps a handler/registration test needs (a real store layout, a memory logger). */
 function imDeps(config: Record<string, unknown>): {
     config: ReturnType<typeof resolveConfig>
@@ -148,27 +170,46 @@ test('a workspace that disabled the index reports "disabled", never a failed reb
     assert.equal(fs.existsSync(path.join(cwd, '.dsh', 'kb')), false, 'a disabled workspace writes no index')
 })
 
-test('TC-1834 the IM command is not registered without the IM service, nor without an allow list', () => {
+test('TC-1843/TC-1846 no interaction service, or no target published, means the command is not registered', () => {
     const cwd = workspace()
     const service = serviceOf(host(cwd)) as KnowledgeBaseService
-
-    // (a) no chatInteraction service at all — even with an allow list configured.
-    const withoutService = registerImCommand({ get: () => undefined }, imDeps({ im: { chatIds: ['oc_x'], workspace: cwd } }), service)
-    assert.equal(withoutService.registered, false)
-    assert.match(withoutService.problem ?? '', /IM 服务未装配/)
-
-    // (b) the service exists, but the host configured no chat ids: default off.
     const chat = fakeChat()
-    const withoutList = registerImCommand({ get: (name) => (name === 'chatInteraction' ? chat.layer : undefined) }, imDeps({}), service)
-    assert.equal(withoutList.registered, false)
-    assert.equal(withoutList.problem, undefined, 'the default (off) is not a problem worth warning about')
-    assert.equal(chat.registrations.length, 0, 'nothing may be registered without an allow list')
+
+    // (a) no `interaction` service at all: the knowledge base has no chat list of
+    // its own any more, so there is nothing to authorise a command with.
+    const withoutInteraction = registerImCommand(contextOf({ chatInteraction: chat.layer }), imDeps({ im: { workspace: cwd } }), service)
+    assert.equal(withoutInteraction.registered, false)
+    assert.match(withoutInteraction.problem ?? '', /im\.approvalChatId/)
+    assert.doesNotMatch(withoutInteraction.problem ?? '', /im\.chatIds/, 'the removed key must not be suggested')
+    assert.equal(chat.registrations.length, 0, 'nothing may be registered without a target')
+
+    // (b) interaction is mounted but publishes no target (`imTarget()` is undefined).
+    const withoutTarget = registerImCommand(
+        contextOf({ chatInteraction: chat.layer, interaction: fakeInteraction(undefined) }),
+        imDeps({ im: { workspace: cwd } }),
+        service,
+    )
+    assert.equal(withoutTarget.registered, false)
+    assert.match(withoutTarget.problem ?? '', /im\.approvalChatId/)
+    assert.equal(chat.registrations.length, 0)
+
+    // (c) no IM intent at all: off is the default and is not a problem worth logging.
+    const silent = registerImCommand(contextOf({}), imDeps({}), service)
+    assert.equal(silent.registered, false)
+    assert.equal(silent.problem, undefined)
+
+    // (d) a target exists but the IM plugin's command api does not: refused with
+    // the reason, and the message says the target was there.
+    const withoutApi = registerImCommand(contextOf({ interaction: fakeInteraction(target('oc_x')) }), imDeps({ im: { workspace: cwd } }), service)
+    assert.equal(withoutApi.registered, false)
+    assert.match(withoutApi.problem ?? '', /IM 服务未装配/)
+    assert.match(withoutApi.problem ?? '', /interaction-gate 已配置 IM 目标/)
 })
 
-test('TC-1832 apply registers the IM command once for an allow list, and a query returns citations', async () => {
+test('TC-1842 apply registers one command for the target from interaction, and a query from it returns citations', async () => {
     const cwd = workspace()
     const chat = fakeChat()
-    const fake = host(cwd, { im: { chatIds: ['oc_x'], workspace: cwd } }, { chatInteraction: chat.layer })
+    const fake = host(cwd, { im: { workspace: cwd } }, { chatInteraction: chat.layer, interaction: fakeInteraction(target('oc_x')) })
     const service = serviceOf(fake) as KnowledgeBaseService
     await service.reindex(cwd)
 
@@ -179,7 +220,9 @@ test('TC-1832 apply registers the IM command once for an allow list, and a query
     assert.match(spec.description ?? '', /path:from-to/)
     assert.match(spec.usage ?? '', /kb_search/)
 
-    const reply = (await spec.handler({ chatId: 'oc_x', args: ['发布流程'], log: () => undefined })) as { text: string }
+    // The configured target is answered — `p2pOnly: false` places no requirement
+    // on the chat type, so a group conversation is fine here.
+    const reply = (await spec.handler({ chatId: 'oc_x', args: ['发布流程'], message: { chatType: 'group' }, log: () => undefined })) as { text: string }
     assert.match(reply.text, /docs\/.+:\d+-\d+/, `expected a path:from-to citation, got: ${reply.text.slice(0, 200)}`)
     assert.match(reply.text, /摘要：/)
 
@@ -188,25 +231,64 @@ test('TC-1832 apply registers the IM command once for an allow list, and a query
     assert.equal(chat.disposed(), 1)
 })
 
-test('TC-1835 a chat outside the allow list is refused and logged, without any result', async () => {
+test('TC-1844 a chat that is not the configured target is refused, and the refusal names im.approvalChatId', async () => {
     const cwd = workspace()
     const service = serviceOf(host(cwd)) as KnowledgeBaseService
     const logged: string[] = []
-    const deps = imDeps({ im: { chatIds: ['oc_x'], workspace: cwd } })
     const reply = await runImQuery(
         { chatId: 'oc_other', args: ['发布流程'], log: (level, ...message) => logged.push(`${level}:${message.join(' ')}`) },
-        { deps, service },
+        { deps: imDeps({ im: { workspace: cwd } }), service, imTarget: () => target('oc_x') },
     )
-    assert.match(reply.text, /未授权搜索知识库/)
+    assert.match(reply.text, /该会话不是 interaction-gate 配置的审批会话/)
+    assert.match(reply.text, /interaction-gate/)
+    assert.match(reply.text, /im\.approvalChatId/)
+    assert.doesNotMatch(reply.text, /im\.chatIds/, 'the refusal must name the key that actually exists')
     assert.doesNotMatch(reply.text, /:\d+-\d+/, 'an unauthorised chat must not receive a citation')
     assert.ok(logged.some((line) => line.startsWith('warn:') && line.includes('oc_other') && line.includes('已拒绝')), logged.join('\n'))
+
+    // A registration cannot be trusted forever: the handler re-reads the target,
+    // and "no target any more" refuses instead of answering (fail closed).
+    const stale = await runImQuery(
+        { chatId: 'oc_x', args: ['发布流程'] },
+        { deps: imDeps({ im: { workspace: cwd } }), service, imTarget: () => undefined },
+    )
+    assert.match(stale.text, /没有可用的 IM 目标/)
+    assert.match(stale.text, /im\.approvalChatId/)
+    assert.doesNotMatch(stale.text, /:\d+-\d+/)
+})
+
+test('TC-1845 a group chat is refused when the target requires p2p, and the refusal names im.p2pOnly', async () => {
+    const cwd = workspace()
+    const service = serviceOf(host(cwd)) as KnowledgeBaseService
+    await service.reindex(cwd)
+    const logged: string[] = []
+    const p2pOnly = () => target('oc_x', true)
+
+    const group = await runImQuery(
+        { chatId: 'oc_x', args: ['发布流程'], message: { chatType: 'group' }, log: (level, ...message) => logged.push(`${level}:${message.join(' ')}`) },
+        { deps: imDeps({ im: { workspace: cwd } }), service, imTarget: p2pOnly },
+    )
+    assert.match(group.text, /群聊/)
+    assert.match(group.text, /im\.p2pOnly/)
+    assert.doesNotMatch(group.text, /:\d+-\d+/, 'a refused chat must not receive a citation')
+    assert.ok(logged.some((line) => line.includes('im.p2pOnly')), logged.join('\n'))
+
+    // The SAME target answers a p2p conversation.
+    const direct = await runImQuery(
+        { chatId: 'oc_x', args: ['发布流程'], message: { chatType: 'p2p' } },
+        { deps: imDeps({ im: { workspace: cwd } }), service, imTarget: p2pOnly },
+    )
+    assert.match(direct.text, /docs\/.+:\d+-\d+/)
 })
 
 test('TC-1836 a long answer is truncated at the configured budget and points at the TUI', async () => {
     const cwd = workspace()
     const service = serviceOf(host(cwd)) as KnowledgeBaseService
     await service.reindex(cwd)
-    const long = await runImQuery({ chatId: 'oc_x', args: ['发布流程'] }, { deps: imDeps({ im: { chatIds: ['oc_x'], workspace: cwd, maxChars: 120 } }), service })
+    const long = await runImQuery(
+        { chatId: 'oc_x', args: ['发布流程'] },
+        { deps: imDeps({ im: { workspace: cwd, maxChars: 120 } }), service, imTarget: () => target('oc_x') },
+    )
     assert.ok(long.text.length <= 120, `reply must respect maxChars=120, got ${long.text.length}`)
     assert.ok(long.text.endsWith(IM_TRUNCATED_SUFFIX), `expected the truncation suffix, got: ${long.text}`)
     assert.match(long.text, /更多结果请在 TUI 用 kb_search/)
@@ -228,31 +310,23 @@ test('a throwing search becomes a readable error instead of an exception', async
     }
     const reply = await runImQuery(
         { chatId: 'oc_x', args: ['发布流程'] },
-        { deps: imDeps({ im: { chatIds: ['oc_x'], workspace: cwd } }), service: failing },
+        { deps: imDeps({ im: { workspace: cwd } }), service: failing, imTarget: () => target('oc_x') },
     )
     assert.ok(reply.text.startsWith('搜索失败：'), reply.text)
     assert.match(reply.text, /索引不存在或不可用/)
 })
 
-test('an empty argument list answers with the usage, and a group chat is refused when p2pOnly', async () => {
+test('an empty argument list answers with the usage', async () => {
     const cwd = workspace()
     const service = serviceOf(host(cwd)) as KnowledgeBaseService
-    const usage = await runImQuery({ chatId: 'oc_x', args: [] }, { deps: imDeps({ im: { chatIds: ['oc_x'], workspace: cwd } }), service })
+    const usage = await runImQuery({ chatId: 'oc_x', args: [] }, { deps: imDeps({ im: { workspace: cwd } }), service, imTarget: () => target('oc_x') })
     assert.equal(usage.text, imUsageText('kb'))
-
-    const logged: string[] = []
-    const group = await runImQuery(
-        { chatId: 'oc_x', args: ['发布流程'], message: { chatType: 'group' }, log: (level, ...message) => logged.push(`${level}:${message.join(' ')}`) },
-        { deps: imDeps({ im: { chatIds: ['oc_x'], workspace: cwd, p2pOnly: true } }), service },
-    )
-    assert.match(group.text, /未授权搜索知识库/)
-    assert.ok(logged.some((line) => line.includes('p2p')), logged.join('\n'))
 })
 
 test('a missing im.workspace is refused with the configuration it needs', async () => {
     const cwd = workspace()
     const service = serviceOf(host(cwd)) as KnowledgeBaseService
-    const reply = await runImQuery({ chatId: 'oc_x', args: ['发布流程'] }, { deps: imDeps({ im: { chatIds: ['oc_x'] } }), service })
+    const reply = await runImQuery({ chatId: 'oc_x', args: ['发布流程'] }, { deps: imDeps({}), service, imTarget: () => target('oc_x') })
     assert.match(reply.text, /没有配置工作区/)
     assert.match(reply.text, /im\.workspace/)
 })
@@ -261,62 +335,74 @@ test('the command name is configurable, and an illegal name is refused instead o
     const cwd = workspace()
     const service = serviceOf(host(cwd)) as KnowledgeBaseService
     const chat = fakeChat()
-    const custom = registerImCommand({ get: () => chat.layer }, imDeps({ im: { command: 'kbase', chatIds: ['oc_x'], workspace: cwd } }), service)
+    const services = contextOf({ chatInteraction: chat.layer, interaction: fakeInteraction(target('oc_x')) })
+    const custom = registerImCommand(services, imDeps({ im: { command: 'kbase', workspace: cwd } }), service)
     assert.equal(custom.registered, true)
     assert.equal(custom.name, 'kbase')
     assert.equal(chat.registrations[0]?.name, 'kbase')
 
-    const illegal = registerImCommand({ get: () => chat.layer }, imDeps({ im: { command: 'KB!', chatIds: ['oc_x'], workspace: cwd } }), service)
+    const illegal = registerImCommand(services, imDeps({ im: { command: 'KB!', workspace: cwd } }), service)
     assert.equal(illegal.registered, false)
     assert.match(illegal.problem ?? '', /不是合法命令名/)
 })
 
-test('a project file may narrow the IM settings but never widen them', () => {
+test('im.chatIds / im.p2pOnly are gone: parsing ignores them and a stale project file is reported', () => {
+    // The duplicated keys are not part of the configuration surface any more.
+    const resolved = resolveConfig({ im: { chatIds: ['oc_x'], p2pOnly: true, maxResults: 3, workspace: '/tmp/x' } })
+    assert.equal('chatIds' in resolved.im, false)
+    assert.equal('p2pOnly' in resolved.im, false)
+    assert.equal(resolved.im.maxResults, 3, 'the keys that remain are still read')
+    assert.deepEqual(Object.keys(resolved.im).sort(), ['command', 'maxChars', 'maxResults', 'workspace'])
+    assert.deepEqual(Object.keys(defaultImConfig()).sort(), ['command', 'maxChars', 'maxResults', 'workspace'])
+    // The removed keys are NAMED when a file still declares them, so a stale
+    // allow list is not mistaken for one that is in force.
+    assert.deepEqual(removedImKeys({ chatIds: ['oc_x'], p2pOnly: true }), ['chatIds', 'p2pOnly'])
+    assert.deepEqual(removedImKeys({ maxResults: 2 }), [])
+
     const cwd = workspace()
     fs.mkdirSync(path.join(cwd, '.dsh'), { recursive: true })
     fs.writeFileSync(
         path.join(cwd, '.dsh', 'knowledge-base.json'),
         `${JSON.stringify({
             im: {
-                chatIds: ['oc_a', 'oc_c'],
+                chatIds: ['oc_a'],
+                p2pOnly: true,
                 maxResults: 2,
                 maxChars: 300,
-                p2pOnly: true,
                 command: 'other',
                 workspace: '/tmp/elsewhere',
             },
         })}\n`,
     )
     const layout = new MissionStoreRegistry().for(cwd).layout
-    const hostConfig = resolveConfig({ im: { chatIds: ['oc_a', 'oc_b'], workspace: cwd, maxResults: 5 } })
+    const hostConfig = resolveConfig({ im: { workspace: cwd, maxResults: 5 } })
     const effective = resolveEffectiveConfig(hostConfig, layout)
     assert.equal(effective.source, 'project')
-    assert.deepEqual(effective.config.im.chatIds, ['oc_a'], 'a project may remove an allowed chat, never add one')
-    assert.equal(effective.config.im.maxResults, 2)
-    assert.equal(effective.config.im.maxChars, 300)
-    assert.equal(effective.config.im.p2pOnly, true)
-    assert.equal(effective.config.im.command, 'kb', 'the command name is a host decision')
-    assert.equal(effective.config.im.workspace, cwd, 'the searched workspace is a host decision')
+    assert.deepEqual(effective.config.im, { command: 'kb', maxResults: 2, maxChars: 300, workspace: cwd })
     const problems = effective.problems.join('\n')
-    assert.match(problems, /im\.chatIds 新增了 profile 未授权的会话/)
-    assert.match(problems, /im\.command 不允许在项目级配置里覆盖/)
-    assert.match(problems, /im\.workspace 不允许在项目级配置里覆盖/)
+    assert.match(problems, /im\.chatIds 已不再是知识库的配置/, problems)
+    assert.match(problems, /im\.p2pOnly 已不再是知识库的配置/, problems)
+    assert.match(problems, /interaction-gate 的 im\.approvalChatId/, problems)
+    assert.match(problems, /im\.command 不允许在项目级配置里覆盖/, problems)
+    assert.match(problems, /im\.workspace 不允许在项目级配置里覆盖/, problems)
 
-    // Widening a bound is refused (and reported), not silently applied.
+    // A project file may still tighten the reply budgets — and may never widen them.
+    assert.equal(narrowImConfig(resolveImConfig({ maxResults: 5, maxChars: 1800 }), { maxResults: 2, maxChars: 300 }, 'x.json', () => undefined)?.maxResults, 2)
     const reports: string[] = []
-    const narrowed = narrowImConfig(
+    const widened = narrowImConfig(
         resolveImConfig({ maxResults: 2, maxChars: 300 }),
         { maxResults: 9, maxChars: 9000 },
         'x.json',
         (message) => reports.push(message),
     )
-    assert.equal(narrowed, undefined, 'nothing was applied, so the host values stay in force')
+    assert.equal(widened, undefined, 'nothing was applied, so the host values stay in force')
     assert.equal(reports.length, 2)
     assert.match(reports.join('\n'), /im\.maxResults=9 超过 profile/)
     assert.match(reports.join('\n'), /im\.maxChars=9000 超过 profile/)
 
-    // Unusable values keep the defaults; the command is off unless configured.
-    assert.equal(resolveImConfig({ im: { maxResults: 0 } }).maxResults, 5)
-    assert.equal(resolveConfig({}).im.chatIds.length, 0)
+    // Unusable values keep the defaults.
+    assert.equal(resolveImConfig({ maxResults: 0 }).maxResults, 5)
     assert.equal(resolveConfig({}).im.command, 'kb')
+    assert.match(IM_NOT_TARGET, /im\.approvalChatId/)
+    assert.match(IM_NOT_P2P, /im\.p2pOnly/)
 })

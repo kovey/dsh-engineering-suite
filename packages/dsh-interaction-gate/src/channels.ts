@@ -36,33 +36,15 @@ import type { Attention, AttentionSource } from './attention.js'
 import type { ApprovalVia } from './config.js'
 import { readLedger, summarizeLedger } from './ledger.js'
 import type { WorkspaceMappingReport } from './workspace-mapping.js'
+import { safeImTarget, type ImAskTarget, type ImTarget } from './im-target.js'
+
+// The per-ask target shape lives in `im-target.ts` (one definition, one
+// derivation); re-exported because every existing consumer names this module.
+// `ImTarget` is deliberately not re-exported: it is this registry's own view.
+export type { ImAskTarget } from './im-target.js'
 
 /** What the suite is sending. */
 export type InteractionKind = 'ask' | 'notify' | 'progress'
-
-/**
- * The explicit IM target of ONE ask (P0: never "whoever DMs the bot").
- *
- * Computed where the workspace is known (`tools.ts`, from `im.approvalChatId`
- * plus that repository's approver list), then carried on the message so:
- *
- *  - the channel adapter sends the card to exactly this conversation and tells
- *    the IM plugin which platform user ids may answer it (`chatId` / `from`);
- *  - a REPLAY of the same question re-sends it to the same conversation (the
- *    message, not a process-global "active chat", is the target);
- *  - the post-answer check in `tools.ts` compares the answer's provenance
- *    against the very target this ask was sent with.
- *
- * Absent = today's behaviour (the IM plugin resolves its own active chat).
- */
-export interface ImAskTarget {
-    /** The one conversation this card may go to. */
-    chatId: string
-    /** Platform user ids allowed to answer (`from`); non-empty by construction. */
-    from: string[]
-    /** Whether the answer chat must be proven p2p (`im.p2pOnly`). */
-    p2pOnly: boolean
-}
 
 /** One outgoing message. */
 export interface InteractionMessage {
@@ -600,6 +582,8 @@ export interface InteractionRegistry {
     withdrawQuestion(questionId: string, reason: string): boolean
     /** Channel defects observed so far (bounded), for the doctor. */
     problems(): string[]
+    /** The ONE configured IM conversation, or `undefined` (see {@link ImTarget}). */
+    imTarget(): ImTarget | undefined
     /**
      * The optional IM channel's verdict (registered or not, and why).
      *
@@ -688,15 +672,13 @@ export function createInteractionRegistry(options: {
     now?: () => number
     logger?: { warn: (message: string) => void }
     /**
-     * P3.2: the workspace mapping of ONE workspace, for the `im()` report.
-     *
-     * The mapping is per workspace while this report is process-wide, so the
-     * consumer (`suite_status`, `interaction_status`) says WHICH workspace it is
-     * asking about and the plugin answers for that one. Absent = this build does
-     * not resolve mappings (an older runtime), which is `unknown` for the caller,
-     * never "no mapping".
+     * P3.2: ONE workspace's mapping for the `im()` report (per workspace while
+     * the report is process-wide). Absent = this build does not resolve them,
+     * which the caller reads as `unknown`, never "no mapping".
      */
     workspaceMapping?: (workspace: string) => WorkspaceMappingReport
+    /** The ONE configured IM conversation to publish (see {@link ImTarget}); absent = none published. */
+    imTarget?: () => ImTarget | undefined
 } = {}): InteractionRegistry {
     const now = options.now ?? ((): number => Date.now())
     const channels = new Map<string, InteractionChannel>()
@@ -1151,6 +1133,8 @@ export function createInteractionRegistry(options: {
         problems(): string[] {
             return [...problems]
         },
+
+        imTarget: () => safeImTarget(options.imTarget, note),
 
         im(workspace?: string): ImChannelReport {
             const report = { ...imReport }
