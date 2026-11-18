@@ -13,6 +13,13 @@
       "command": "bash scripts/typecheck-all.sh",
       "required": false,
       "phase": "lint"
-    }
+    },
+	{ 
+	  "id": "standards",
+	  "name": "结构规范（棘轮）",
+	  "command": "bash scripts/standards-check.sh --quiet",
+	  "gate": true,
+	  "required": true
+	}
   ]
 }
