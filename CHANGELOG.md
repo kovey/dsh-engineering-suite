@@ -1,5 +1,39 @@
 ## [未发布] — 2026-11-18
 
+### 变更 · 把宿主审计阶段抽成 `scripts/host-audit-stage.sh`，用 C21 的反证钉住 SKIP 分支
+
+上个 mission 把宿主 API 审计接进了 `verify.sh`，但那段 `if command -v dsh … else SKIP` 是**内联**的：
+没有任何测试执行过 else 分支。有人改掉判定、或把 SKIP 写成一个通过，验收流水线的含义就变了而测试不会喊。
+这次把它变成可独立执行的脚本并用反证覆盖两条分支；顺带把同类"找不到环境就跳过/拒绝"的分支查了一遍。
+
+- **新增 `scripts/host-audit-stage.sh`**（无参数）：`command -v dsh` 为空 → 打印
+  `SKIP host API audit: 没有检测到 dsh 安装（command -v dsh 为空），无法定位宿主包——这不是通过` 并 **exit 0**；
+  有 `dsh` → `exec bash <同目录>/check-host-api.sh --quiet`，**退出码原样透传**
+  （1 = 成员缺失 / 2 = 找不到宿主树，都不折叠成 0）。SKIP 路径不需要任何外部命令（`command -v` 是内建），
+  脚本自身位置用参数展开而不是 `dirname`，所以"没有宿主"的机器上它连 coreutils 都不依赖。
+- **`scripts/verify.sh`**：内联判定替换为 `run_stage "host API audit" bash "$ROOT/scripts/host-audit-stage.sh"`；
+  `run_stage` 的 quiet 捕获在成功时若输出首行以 `SKIP ` 开头，打印该句并把阶段标成 **SKIP**（而不是 `ok`）——
+  "没查"和"查过且成立"仍然必须显示为两句话。
+- **`scripts/selftest-ops.sh` 新增 C21**，三条反证：
+  ① PATH 里没有 `dsh`（用"本机 PATH 去掉一个名字"的符号链接夹具）→ exit 0，首行 `SKIP host API audit:`，
+  且带原因 `command -v dsh 为空`；
+  ② 夹具里放一个可执行的假 `dsh`（宿主树不完整）→ 审计真的跑起来并失败，脚本 **exit 1**（审计自己的退出码）；
+  另一种假 `dsh`（它上面找不到宿主树）→ **exit 2** 透传（不是 0，也不是把 2 改写成 1）；
+  ③ SKIP 输出必须含 `这不是通过`，且不得出现 ok/PASS 字样；
+  外加一条端到端断言：无 `dsh` 的 `verify.sh --changed --quiet` 必须 exit 0、输出含 SKIP 句、
+  阶段行是 `host API audit … SKIP` 且不是 `ok`（防 `run_stage` 把 SKIP 吞掉）。
+- **同类排查（AC-003）**：`grep -n "SKIP\|command -v" scripts/verify.sh scripts/*.sh` 命中 5 处 `command -v`
+  与 3 处 SKIP：`verify.sh` 的 dsh（C21 覆盖）与 git、`check-host-api.sh` 的 dsh 与 optional 包 SKIP、
+  `repair-profile-closure.sh` 的 dsh、`standards-check.sh` 的 node、`flaky-hunt.sh` 的 node。
+  其中 optional 包 SKIP 已有 C12 覆盖；其余几处"缺工具"分支原先只有代码、没有反证，这一轮一并补上：
+  `repair-profile-closure` 无 dsh → exit 2、`check-host-api` 无 dsh → exit 2、`verify.sh --changed` 无 git 二进制
+  → exit 2、`standards-check` 无 node → exit 1；`flaky-hunt` 无 node 是诊断降级，补"跳过单独重跑"仍 **exit 1**
+  且 `本次失败仍然成立`。
+- **证据**：`bash scripts/host-audit-stage.sh` → exit 0（本机 dsh 0.2.2-rc.2，7 条假设 0 条不成立）；
+  `bash scripts/selftest-ops.sh` → OPS SELFTEST GREEN（C21 全过）；
+  `bash scripts/verify.sh --quiet` → exit 0；`bash scripts/standards-check.sh --quiet` → PASS。
+- **文档**：`docs/RC4-COMPAT.md` §2.3 附注补上抽取后的文件名/退出码语义与 C21 的反证。
+
 ### 变更 · 宿主 API 审计接进 `verify.sh`，删掉 role-guard 对一个不存在 API 的探测
 
 两件事同一个病根：**审计的对象是记忆，不是宿主**。上个 mission 刚把 `check-host-api.sh` 的表修对，

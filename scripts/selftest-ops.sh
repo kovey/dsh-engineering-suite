@@ -63,6 +63,42 @@ expect_rc() {
   fi
 }
 
+# make_path_without <dir> <tool…>: a PATH that is THIS machine's PATH minus the
+# named tools. A branch guarded by `command -v <tool>` cannot be exercised on a
+# machine where that tool is installed, so "the branch exists" used to mean "read
+# it and trust it". Handing the script a PATH where that one name cannot be
+# resolved runs the branch for its own reason; everything else stays usable, so a
+# failure means the branch misbehaves rather than the box being bare.
+make_path_without() {
+  local dir="$1" entry name target
+  shift
+  local omit=" $* "
+  rm -rf "$dir"
+  mkdir -p "$dir"
+  local IFS=:
+  for entry in $PATH; do
+    [ -d "$entry" ] || continue
+    for target in "$entry"/*; do
+      [ -f "$target" ] && [ -x "$target" ] || continue
+      name="${target##*/}"
+      case "$omit" in *" $name "*) continue ;; esac
+      [ -e "$dir/$name" ] && continue
+      ln -s "$target" "$dir/$name"
+    done
+  done
+}
+
+# Three "this machine, minus one tool" fixtures, shared by the sections below.
+# Eager on purpose: each is a plain directory of symlinks (no network, no build),
+# and a missing/broken fixture should fail loudly at the top rather than halfway
+# through whichever section happens to use it first.
+NO_DSH_BIN="$TMP/bin-no-dsh"
+NO_NODE_BIN="$TMP/bin-no-node"
+NO_GIT_BIN="$TMP/bin-no-git"
+make_path_without "$NO_DSH_BIN" dsh
+make_path_without "$NO_NODE_BIN" node
+make_path_without "$NO_GIT_BIN" git
+
 # A workspace with one delivered, archivable mission (the C4/C5 fixture).
 make_missions_ws() { # make_missions_ws <dir>
   local ws="$1"
@@ -258,6 +294,16 @@ expect_rc 0 "apply converges" bash "$ROOT/scripts/repair-profile-closure.sh" --c
 [ -e "$CLOSURE/gone" ] && fail "the dangling link was not removed" || pass "the dangling link is gone"
 [ -e "$CLOSURE/gamma" ] && pass "the missing package was linked" || fail "gamma was not linked"
 expect_rc 0 "a second apply is a no-op" bash "$ROOT/scripts/repair-profile-closure.sh" --closure "$CLOSURE" --dsh-root "$TMP/fake-dsh" --apply
+# AC-003 of the host-audit-skip mission: the script's `command -v dsh` branch (used
+# when --dsh-root is omitted) had no counter-test. On a machine without `dsh` it
+# must refuse with exit 2 — "0 dangling" from a tree it could not locate is the
+# false green this whole file exists to prevent.
+expect_rc 2 "repair-profile-closure: no dsh on PATH is a usage error (exit 2), never '0 dangling'" \
+  env PATH="$NO_DSH_BIN" bash "$ROOT/scripts/repair-profile-closure.sh" --closure "$CLOSURE"
+case "$LAST_OUT" in
+  *'no `dsh` on PATH'*) pass "repair-profile-closure: the no-dsh refusal names the missing dsh" ;;
+  *) fail "repair-profile-closure: the no-dsh refusal does not explain itself — $LAST_OUT" ;;
+esac
 
 # ---------------------------------------------------------------------------
 # C12 — check-host-api: an assumption table is only worth having if a missing
@@ -302,6 +348,15 @@ run_rc bash "$ROOT/scripts/check-host-api.sh" --harness-root "$HOST_TREE" --quie
 printf 'export declare class R { startActivation(s: never): never; }\n' > "$HOST_TREE/dsh-subagent/lib/types/index.d.ts"
 expect_rc 1 "one renamed member (the real 0.2.1 incident) fails the whole check" bash "$ROOT/scripts/check-host-api.sh" --harness-root "$HOST_TREE" --quiet
 expect_rc 2 "a tree that does not exist is a usage error (exit 2)" bash "$ROOT/scripts/check-host-api.sh" --harness-root "$TMP/no-such-tree"
+# AC-003 of the host-audit-skip mission: the OTHER `command -v dsh` branch (no
+# --harness-root given) had no counter-test. With no dsh to locate the host with,
+# "could not look" must be exit 2 — never 0 with zero assumptions checked.
+expect_rc 2 "check-host-api: no dsh on PATH and no --harness-root is a usage error (exit 2)" \
+  env PATH="$NO_DSH_BIN" bash "$ROOT/scripts/check-host-api.sh" --quiet
+case "$LAST_OUT" in
+  *'no `dsh` on PATH'*) pass "check-host-api: the no-dsh refusal names the missing dsh" ;;
+  *) fail "check-host-api: the no-dsh refusal does not explain itself — $LAST_OUT" ;;
+esac
 
 # ---------------------------------------------------------------------------
 # C13 — verify.sh --changed: the iteration mode must SELECT the touched packages,
@@ -349,6 +404,15 @@ esac
 # Not a git work tree: refuse (exit 2), never print green.
 rm -rf "$CHANGED_TREE/.git"
 expect_rc 2 "changed: a tree without git is refused" bash "$CHANGED_TREE/scripts/verify.sh" --changed
+# AC-003 of the host-audit-skip mission: the `command -v git` probe above needs its own
+# counter-test too — the case just above removes .git, which is a different refusal.
+# No git BINARY at all must still be exit 2 with a reason, never "no changes, exit 0".
+expect_rc 2 "changed: no git binary on PATH is a refusal (exit 2), not 'no changes'" \
+  env PATH="$NO_GIT_BIN" bash "$ROOT/scripts/verify.sh" --changed
+case "$LAST_OUT" in
+  *"无法判定改动集"*) pass "changed: the no-git-binary refusal explains itself" ;;
+  *) fail "changed: the no-git-binary refusal does not explain itself — $LAST_OUT" ;;
+esac
 
 # C14 — wait-quiet: quiescence detection is what stops the "gate while the agent
 # is still writing" collision (a 2-minute acceptance run thrown away).
@@ -432,6 +496,15 @@ expect_rc 0 "standards-check: a clean tree passes (exit 0)" bash "$FIX/scripts/s
 case "$LAST_OUT" in
   *"PASS"*) pass "standards-check: --quiet prints a PASS summary" ;;
   *) fail "standards-check: --quiet did not report PASS — $LAST_OUT" ;;
+esac
+# AC-003 of the host-audit-skip mission: the `command -v node` branch had no
+# counter-test. Without node the engine cannot be measured at all, so the verdict
+# must be exit 1 ("无法检查"), never 0 — a skipped check is not a pass.
+expect_rc 1 "standards-check: no node on PATH is exit 1 (cannot check is not a pass)" \
+  env PATH="$NO_NODE_BIN" bash "$STANDARDS_CHECK" --quiet
+case "$LAST_OUT" in
+  *"找不到 node"*) pass "standards-check: the no-node failure names the missing node" ;;
+  *) fail "standards-check: the no-node failure does not explain itself — $LAST_OUT" ;;
 esac
 
 # 一行一个数组元素：只触发 maxFileLines（不额外触发导出面/函数行数），让计数可断言。
@@ -629,6 +702,21 @@ esac
 case "$LAST_OUT" in
   *"$HUNT_LOGS_REAL"*) pass "flaky-hunt: the log directory under TMPDIR is printed (nothing lands in the repo)" ;;
   *) fail "flaky-hunt: the log path was not printed — $LAST_OUT" ;;
+esac
+# AC-003 of the host-audit-skip mission: the `command -v node` branch ("node 不可用：
+# 跳过单独重跑") had no counter-test. It is a diagnostic skip, not a verdict, so
+# the failure conclusion must survive it — exit 1 and "本次失败仍然成立" (a missing
+# tool must never turn a failed sample into a pass).
+expect_rc 1 "flaky-hunt: without node the isolated rerun is skipped, the failure still exits 1" \
+  env TMPDIR="$HUNT_LOGS" PATH="$NO_NODE_BIN" bash "$FLAKY_HUNT" --runs 1 \
+  --command "printf '==> dsh-alpha (exit 1)\\n'; exit 1"
+case "$LAST_OUT" in
+  *"node 不可用：跳过单独重跑"*) pass "flaky-hunt: the no-node skip is announced with its reason" ;;
+  *) fail "flaky-hunt: the no-node skip was silent — $LAST_OUT" ;;
+esac
+case "$LAST_OUT" in
+  *"本次失败仍然成立"*) pass "flaky-hunt: the skip keeps the failure conclusion (never a pass)" ;;
+  *) fail "flaky-hunt: the skip does not keep the failure conclusion — $LAST_OUT" ;;
 esac
 
 # C19 — migrate-layout.sh: 迁移一个仓库的布局是"数据搬家"，所以这里钉住的不是"搬成功了"
@@ -959,6 +1047,129 @@ else
 fi
 expect_rc 2 "fix-profile-install: --apply with --check is a usage error" \
   node "$FIX_INSTALL" --profile "$PROFILE20B" --apply --check
+
+# ---------------------------------------------------------------------------
+# C21 — host-audit-stage.sh: the SKIP branch has to be PROVEN, not trusted.
+# verify.sh used to decide inline whether it could run check-host-api.sh, and no
+# test ever executed the "there is no dsh" side: deleting the probe, or rewriting
+# the skip as a green, would have changed the acceptance run's meaning silently.
+# The stage is now scripts/host-audit-stage.sh, and this section drives it:
+#   ① no `dsh` on PATH          → exit 0, first line `SKIP host API audit:` + reason;
+#   ② a `dsh` whose audit FAILS → non-zero, and the audit's OWN code (1 / 2) passes
+#                                 through unchanged — a 0 here is the swallowed
+#                                 verdict this file exists to prevent;
+#   ③ the skip sentence must say it is NOT a pass (`这不是通过`), never ok/PASS;
+# plus the verify.sh side — run_stage's quiet capture must print that sentence as
+# SKIP, not hide it behind `ok`.
+section "C21 — host-audit-stage.sh: SKIP is announced, an audit failure is not swallowed"
+HOST_AUDIT_STAGE="$ROOT/scripts/host-audit-stage.sh"
+if [ -f "$HOST_AUDIT_STAGE" ]; then
+  pass "host-audit-stage: scripts/host-audit-stage.sh exists"
+else
+  fail "host-audit-stage: scripts/host-audit-stage.sh is missing"
+fi
+expect_rc 0 "host-audit-stage: the script parses (bash -n)" bash -n "$HOST_AUDIT_STAGE"
+# Fixture sanity first: if the "no dsh" PATH still resolved dsh, ① would run the
+# audit instead of the skip branch, still exit 0, and prove nothing.
+if (PATH="$NO_DSH_BIN"; command -v dsh >/dev/null 2>&1); then
+  fail "host-audit-stage fixture: $NO_DSH_BIN still resolves dsh (case ① would prove nothing)"
+else
+  pass "host-audit-stage fixture: no dsh is resolvable under $NO_DSH_BIN"
+fi
+
+# ① PATH without dsh: exit 0 (a skip is not a failure) with the reason on the
+# FIRST line, because that is the line run_stage keys on.
+run_rc env PATH="$NO_DSH_BIN" bash "$HOST_AUDIT_STAGE"
+if [ "$LAST_RC" = "0" ]; then
+  pass "host-audit-stage: no dsh is exit 0 (skip is not a failure)"
+else
+  fail "host-audit-stage: no dsh must exit 0, got $LAST_RC — $LAST_OUT"
+fi
+case "$LAST_OUT" in
+  'SKIP host API audit:'*) pass "host-audit-stage: the first line is the SKIP sentence" ;;
+  *) fail "host-audit-stage: output does not start with 'SKIP host API audit:' — $LAST_OUT" ;;
+esac
+case "$LAST_OUT" in
+  *"command -v dsh 为空"*) pass "host-audit-stage: the skip carries its reason (no dsh on PATH)" ;;
+  *) fail "host-audit-stage: the skip reason is missing — $LAST_OUT" ;;
+esac
+
+# ③ The skip must read as "not checked", never as a pass. This is the wording
+# regression the whole case exists for: SKIP rewritten as ok/PASS stays green.
+case "$LAST_OUT" in
+  *"这不是通过"*) pass "host-audit-stage: the skip says it is NOT a pass" ;;
+  *) fail "host-audit-stage: the skip does not say it is not a pass — $LAST_OUT" ;;
+esac
+if printf '%s\n' "$LAST_OUT" | grep -qiE '(^|[[:space:]])(ok|pass)([[:space:]]|$)'; then
+  fail "host-audit-stage: the skip output marks ok/PASS — $LAST_OUT"
+else
+  pass "host-audit-stage: the skip output marks no ok/PASS"
+fi
+
+# ② A fake dsh makes the audit run; an incomplete host tree makes it fail. The
+# stage must pass that FAILURE through. A wrapper returning 0 here would be
+# "looked, did not like the answer, reported green".
+C21_HOST="$TMP/c21-host"
+mkdir -p "$C21_HOST/node_modules/@deepseek-ai/dsh/bin"
+printf '#!/bin/sh\nexit 0\n' > "$C21_HOST/node_modules/@deepseek-ai/dsh/bin/dsh"
+chmod +x "$C21_HOST/node_modules/@deepseek-ai/dsh/bin/dsh"
+printf '{"version":"0.0.0-fake"}\n' > "$C21_HOST/node_modules/@deepseek-ai/dsh/package.json"
+run_rc env PATH="$C21_HOST/node_modules/@deepseek-ai/dsh/bin:$NO_DSH_BIN" bash "$HOST_AUDIT_STAGE"
+if [ "$LAST_RC" = "1" ]; then
+  pass "host-audit-stage: a fake dsh whose audit fails exits 1 (the audit's own code)"
+else
+  fail "host-audit-stage: a failing audit under a fake dsh must exit 1, got $LAST_RC — $LAST_OUT"
+fi
+case "$LAST_OUT" in
+  *"条服务假设"*) pass "host-audit-stage: the audit really ran (its summary is in the output)" ;;
+  *) fail "host-audit-stage: the output does not look like a real audit — $LAST_OUT" ;;
+esac
+# The other passthrough: dsh exists but no host tree can be resolved above it.
+# check-host-api exits 2; the stage must hand verify.sh that 2 (not 1, not 0).
+C21_BARE="$TMP/c21-bare-dsh"
+mkdir -p "$C21_BARE/bin"
+printf '#!/bin/sh\nexit 0\n' > "$C21_BARE/bin/dsh"
+chmod +x "$C21_BARE/bin/dsh"
+run_rc env PATH="$C21_BARE/bin:$NO_DSH_BIN" bash "$HOST_AUDIT_STAGE"
+if [ "$LAST_RC" = "2" ]; then
+  pass "host-audit-stage: an unresolvable host tree passes the audit's exit 2 through"
+else
+  fail "host-audit-stage: expected the audit's exit 2 passthrough, got $LAST_RC — $LAST_OUT"
+fi
+
+# verify.sh side (AC-001): the stage is called through run_stage, and run_stage's
+# quiet capture must not eat the SKIP sentence. A stub tree — same trick as C13 —
+# runs the real verify.sh with no `dsh`; only the host-audit stage is real.
+C21_TREE="$TMP/c21-verify-tree"
+mkdir -p "$C21_TREE/scripts" "$C21_TREE/packages/dsh-alpha/src" "$C21_TREE/test"
+cp "$ROOT/scripts/verify.sh" "$C21_TREE/scripts/verify.sh"
+cp "$HOST_AUDIT_STAGE" "$C21_TREE/scripts/host-audit-stage.sh"
+for stub in build-all typecheck-all test-all e2e-mission; do
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$C21_TREE/scripts/$stub.sh"
+done
+printf 'export {};\n' > "$C21_TREE/test/noop.test.ts"
+(cd "$C21_TREE" && git init -q . && git config user.email selftest@example.com && git config user.name selftest && \
+  git add -A >/dev/null 2>&1 && git commit -qm base >/dev/null 2>&1 && printf 'x\n' > packages/dsh-alpha/src/index.ts)
+run_rc env PATH="$NO_DSH_BIN" bash "$C21_TREE/scripts/verify.sh" --changed --quiet
+if [ "$LAST_RC" = "0" ]; then
+  pass "host-audit-stage in verify: the no-dsh run stays green (skip != failure)"
+else
+  fail "host-audit-stage in verify: the no-dsh run must be green, got $LAST_RC — $LAST_OUT"
+fi
+case "$LAST_OUT" in
+  *"SKIP host API audit:"*) pass "host-audit-stage in verify: the SKIP sentence survives run_stage" ;;
+  *) fail "host-audit-stage in verify: run_stage swallowed the SKIP sentence — $LAST_OUT" ;;
+esac
+if printf '%s\n' "$LAST_OUT" | grep -q '^host API audit *SKIP$'; then
+  pass "host-audit-stage in verify: the stage line says SKIP"
+else
+  fail "host-audit-stage in verify: the stage line does not say SKIP — $LAST_OUT"
+fi
+if printf '%s\n' "$LAST_OUT" | grep -q '^host API audit *ok$'; then
+  fail "host-audit-stage in verify: the skipped stage is reported as ok — $LAST_OUT"
+else
+  pass "host-audit-stage in verify: the skipped stage is never reported as ok"
+fi
 
 section "summary"
 if [ "$FAILURES" = "0" ]; then

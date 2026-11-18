@@ -307,6 +307,14 @@ $ bash scripts/check-host-api.sh          # rc.2，修后
 > 该阶段真跑、失败即 verify 失败；`command -v dsh` 为空时打印
 > `SKIP host API audit: 没有检测到 dsh 安装（command -v dsh 为空）…` 并继续（退出码 0）——
 > "没查"和"查过且成立"是两句话，只有后者算绿。
+>
+> **同日的后续**（mission `skip-host-audit-stage-sh-selftes-20261118-162921`）：这段内联判定已抽成
+> `scripts/host-audit-stage.sh`——`command -v dsh` 为空 → 首行 `SKIP host API audit: …这不是通过` + exit 0；
+> 有 `dsh` → 执行 `scripts/check-host-api.sh --quiet` 并**透传其退出码**（1 = 成员缺失，2 = 找不到宿主树，
+> 都不折叠成 0）。`verify.sh` 通过 `run_stage "host API audit"` 调用它，`run_stage` 的 quiet 捕获遇到首行
+> `SKIP ` 会打印该句并把阶段标成 SKIP（不再被 `ok` 吞掉）。抽出来的目的就是让它有反证：
+> `scripts/selftest-ops.sh` C21 用「PATH 无 dsh」「假 dsh + 审计必失败」「SKIP 文案不得说成通过」三条钉住，
+> 另加一条端到端断言（无 dsh 的 `verify.sh --changed --quiet` 必须打印 SKIP 句且阶段行是 SKIP 而非 ok）。
 
 ---
 

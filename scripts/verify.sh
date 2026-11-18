@@ -106,7 +106,17 @@ run_stage() {
   # no temp file: the target would have to be attributed to the workspace.
   local output
   if output="$("$@" 2>&1)"; then
-    printf '%-46s ok\n' "$label"
+    # A stage that cannot look says so in a sentence starting with `SKIP ` and
+    # exits 0 (host-audit-stage.sh on a machine without `dsh`). Printing `ok`
+    # over that sentence is how "not checked" quietly becomes "checked and
+    # green": show the stage's own words and mark the stage SKIP, not ok.
+    case "$output" in
+      'SKIP '*)
+        printf '%-46s SKIP\n' "$label"
+        printf '%s\n' "$output"
+        ;;
+      *) printf '%-46s ok\n' "$label" ;;
+    esac
     return
   fi
   printf '%-46s FAILED\n' "$label"
@@ -155,17 +165,14 @@ run_stage "the tooling's own self-test (no dsh, no build, no network)" bash "$RO
 # fine and throws at runtime. That has happened twice (`subagents.start`; an
 # `agentTeams` row pointing at a package no host installs), which is why the
 # check belongs in the acceptance run and not in a document someone remembers to
-# run. The probe is `command -v dsh` — the same lookup the script does — so a
-# machine without a host install reports a SKIP with the reason, and a test can
-# simulate that by running with a PATH that has no `dsh` on it. It is never a
-# silent pass: "we could not look" and "we looked and it held" are different
-# sentences, and only the second one is green.
-if command -v dsh >/dev/null 2>&1; then
-  run_stage "host API audit (dsh installed)" bash "$ROOT/scripts/check-host-api.sh" --quiet
-else
-  printf '%-46s SKIP\n' "host API audit (no dsh)"
-  printf 'SKIP host API audit: 没有检测到 dsh 安装（command -v dsh 为空），无法定位宿主包——这不是通过\n'
-fi
+# run. The stage lives in scripts/host-audit-stage.sh rather than inline here so
+# its SKIP branch can be driven for real: C21 in selftest-ops.sh runs it with a
+# PATH that has no `dsh` (SKIP sentence + exit 0) and with a fake `dsh` whose
+# audit must fail (non-zero, code passed through). It is never a silent pass —
+# run_stage prints its leading `SKIP …` sentence as SKIP, never as `ok`, because
+# "we could not look" and "we looked and it held" are different sentences and
+# only the second one is green.
+run_stage "host API audit" bash "$ROOT/scripts/host-audit-stage.sh"
 
 echo
 echo "all green."
