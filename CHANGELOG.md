@@ -1,5 +1,25 @@
 ## [未发布] — 2026-11-18
 
+### 文档 · dsh 0.2.2-rc.4 兼容核实：16 个包无需改动（`docs/RC4-COMPAT.md`）
+
+背景：npm 上已有 `@deepseek-ai/dsh@0.2.2-rc.3` / `rc.4`，本机装的是 `rc.2`；先核实"要不要改"，再决定升不升。
+
+- **结论**：**不需要改任何代码**。rc.2→rc.4 的升级指南**没有 `v0.2.2-rc.2` 段**（= rc.2→rc.3 无破坏性变更），
+  只有 `v0.2.2-rc.3` 一条：DeepSeek 拒答（`stop_reason: "refusal"`）的错误码由 `MALFORMED_RESPONSE`
+  改为 `CONTENT_REFUSED`——而本套件没有任何代码对 LLM 错误终止块或 `turn/end` 错误分类（`grep` 无命中）。
+- **证据**：7 个接缝（`dsh-tools` / `dsh-user-approval` / `dsh-user-questions` / `dsh-subagent` / `dsh-commands` /
+  `dsh-agent` / `dsh-plugin-manager`）的 `lib` + `src` + 全部 `.d.ts` 在 rc.2 与 rc.4 之间**逐字节相同**；
+  rc.4 依赖闭包 165 个 `@deepseek-ai/*` 包比对：159 个相同、5 个不同（都是同一个错误码 + 新 bundle 清单）、
+  1 个新增（`dsh-deepseek-chat-import`，可选的 Web 聊天记录导入，与本套件无关）；宿主主包 `lib` 无差异。
+  rc.4 的 `evaluatePluginCompatibility` 对我们 16 个包判 **16/16 兼容**；用 rc.4 的 `.d.ts` 编译
+  `packages/*/src` **282 个文件，`tsc` 退出 0**。
+- **新能力**：rc.4 没有为本套件提供可用的新接缝；`CONTENT_REFUSED` 与 chat-import bundle 都**不采用**，
+  理由写在 `docs/RC4-COMPAT.md` §5（AC-003 走"说明为何不采用"这一支）。
+- **两条既有问题（与本 mission 无关，建议另开）**：`scripts/check-host-api.sh` 里 `subagents … list` 的期望已过期
+  （宿主声明的是 `listDescendants`，且该脚本在 rc.2 上同样 `exit 1`），`agentTeams` 那一行的包名
+  `dsh-experimental-agent-team` 两版宿主都不存在（应为 `dsh-agent-team`），导致该行永远 SKIP。
+- 本机 dsh 宿主未升级（仍是 `0.2.2-rc.2`），`.tmp` 解包物已清理。
+
 ### 修复 · 升级后 profile 一个 dist 都没有：一个占位符 + 一条静默设置（`scripts/fix-profile-install.mjs`）
 
 背景：`dsh plugin --profile tui update` 升到 0.8.13 后，包与 bundle 软链都在，`packages/*/dist` 却是 **0 个**，
