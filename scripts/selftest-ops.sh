@@ -269,14 +269,36 @@ printf '{"version":"9.9.9"}' > "$HOST_TREE/dsh/package.json"
 printf 'export interface S { request(r: R): Promise<O>; }\n' > "$HOST_TREE/dsh-user-approval/lib/types/index.d.ts"
 expect_rc 1 "a member that the host does not declare fails the check" bash "$ROOT/scripts/check-host-api.sh" --harness-root "$HOST_TREE"
 # Same tree, but now the member exists: the required rows we can satisfy must pass.
-for pkg in dsh-subprocess dsh-subagent dsh-agent-preset-registry dsh-user-questions dsh-workspace-changes; do mkdir -p "$HOST_TREE/$pkg/lib/types"; done
+for pkg in dsh-subprocess dsh-subagent dsh-agent-preset-registry dsh-user-questions dsh-workspace-changes dsh-agent-team; do mkdir -p "$HOST_TREE/$pkg/lib/types"; done
 printf 'export declare class R { spawn(s: never): never; }\n' > "$HOST_TREE/dsh-subprocess/lib/types/index.d.ts"
-printf 'export declare class R { startActivation(s: never): never; getProvider(n: string): unknown; list(): string[]; registerProvider(p: never): unknown; prompt(r: never, s: never): never; sendMessage(a: never, b: never, c: never, d: never): never; }\n' > "$HOST_TREE/dsh-subagent/lib/types/index.d.ts"
+# listDescendants, not the pre-0.2.2 `list`: the fixture tracks the surface the
+# host really declares, otherwise this test would pin our stale memory instead.
+printf 'export declare class R { startActivation(s: never): never; getProvider(n: string): unknown; listDescendants(r: never, s?: never): never; registerProvider(p: never): unknown; prompt(r: never, s: never): never; sendMessage(a: never, b: never, c: never, d: never): never; }\n' > "$HOST_TREE/dsh-subagent/lib/types/index.d.ts"
 printf 'export declare class R { register(d: unknown): unknown; mount(c: never, i: string): never; }\n' > "$HOST_TREE/dsh-agent-preset-registry/lib/types/index.d.ts"
 printf 'export declare class R { ask(r: never): never; askTimed(r: never): never; }\n' > "$HOST_TREE/dsh-user-questions/lib/types/index.d.ts"
 printf 'export interface W { summary: string; diff: string; }\n' > "$HOST_TREE/dsh-workspace-changes/lib/types/index.d.ts"
+# The optional row: the package exists and its six members are audited like any
+# other. An optional row that is never exercised is how `dsh-experimental-agent-team`
+# stayed SKIP across the rc.2 → rc.4 check while we called a method it did not have.
+AGENT_TEAM_OK='export declare class R { isEnabled(c: never): boolean; setEnabled(c: never, e: boolean): never; createTask(c: never, r: never): never; getTask(c: never, i: never): never; listTasks(c: never): never; updateTask(c: never, r: never): never; }'
+AGENT_TEAM_SHORT='export declare class R { isEnabled(c: never): boolean; setEnabled(c: never, e: boolean): never; createTask(c: never, r: never): never; getTask(c: never, i: never): never; listTasks(c: never): never; }'
+printf '%s\n' "$AGENT_TEAM_OK" > "$HOST_TREE/dsh-agent-team/lib/types/index.d.ts"
 run_rc bash "$ROOT/scripts/check-host-api.sh" --harness-root "$HOST_TREE" --quiet
 [ "$LAST_RC" = "0" ] && pass "a fully-declared host passes (exit 0)" || fail "a declared host should pass, got $LAST_RC — $LAST_OUT"
+# `optional` excuses "not installed", never "renamed": with the package present, a
+# member we call but the host no longer declares must fail AND name the member.
+printf '%s\n' "$AGENT_TEAM_SHORT" > "$HOST_TREE/dsh-agent-team/lib/types/index.d.ts"
+run_rc bash "$ROOT/scripts/check-host-api.sh" --harness-root "$HOST_TREE" --quiet
+if [ "$LAST_RC" = "1" ] && printf '%s' "$LAST_OUT" | grep -q 'updateTask'; then
+  pass "an installed optional package is still audited (renamed member → exit 1, named)"
+else
+  fail "a renamed member in an installed optional package must exit 1 and name it, got $LAST_RC — $LAST_OUT"
+fi
+# The other half of `optional`: a package that is NOT installed is a skip, not a
+# failure (the real profile may not ship it).
+rm -rf "$HOST_TREE/dsh-agent-team"
+run_rc bash "$ROOT/scripts/check-host-api.sh" --harness-root "$HOST_TREE" --quiet
+[ "$LAST_RC" = "0" ] && pass "an optional package that is not installed is skipped, not failed" || fail "a missing optional package must not fail, got $LAST_RC — $LAST_OUT"
 printf 'export declare class R { startActivation(s: never): never; }\n' > "$HOST_TREE/dsh-subagent/lib/types/index.d.ts"
 expect_rc 1 "one renamed member (the real 0.2.1 incident) fails the whole check" bash "$ROOT/scripts/check-host-api.sh" --harness-root "$HOST_TREE" --quiet
 expect_rc 2 "a tree that does not exist is a usage error (exit 2)" bash "$ROOT/scripts/check-host-api.sh" --harness-root "$TMP/no-such-tree"

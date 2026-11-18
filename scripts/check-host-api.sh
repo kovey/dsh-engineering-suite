@@ -10,8 +10,11 @@
 #
 # The table below is the audit, written down: for each service we reach through
 # `ctx.get(...)`, the package that declares it and the members we actually use.
-# Optional entries are marked `optional:` and their absence is reported but does
-# not fail — everything else is a dependency.
+# Optional entries are marked `|optional` and their *package* may be absent (a
+# SKIP, not a failure) — everything else is a dependency. `optional` excuses
+# "not installed", never "renamed": a member missing from an INSTALLED package
+# always fails, otherwise the next rename would be skipped in silence, which is
+# the same blind spot this script exists to close.
 #
 # usage:
 #   check-host-api.sh [--harness-root <dir>] [--quiet]
@@ -76,16 +79,25 @@ printf 'host: %s (dsh %s)\n' "${harness_root}" "${version:-(unknown)}"
 printf 'packages: %s\n' "${packages_dir}"
 
 # service|package|member[,member…]|optional?
-# A member is written as `name` for a method/property declaration. Members we use
-# only when present are listed under a package line ending in `|optional`.
+# A member is written as `name` for a method/property declaration. A line ending
+# in `|optional` means the PACKAGE is expected to be missing on some installs;
+# its members are still audited whenever the package is there.
+#
+# Keep this table on the surface the installed host actually declares, not the
+# one we remember: `subagents` lost `list` (rc.2 declares `listDescendants`) and
+# `agentTeams` moved package (`dsh-experimental-agent-team` → `dsh-agent-team`,
+# whose six members are isEnabled/setEnabled/createTask/getTask/listTasks/
+# updateTask — there is no `spawnTeammate`). Both went unnoticed across the
+# rc.2 → rc.4 check (docs/RC4-COMPAT.md §2.3) for one reason: one row failed
+# forever, the other skipped forever.
 TABLE='
 approval|dsh-user-approval|request
 subprocess|dsh-subprocess|spawn
-subagents|dsh-subagent|startActivation,getProvider,list,registerProvider,prompt,sendMessage
+subagents|dsh-subagent|startActivation,getProvider,listDescendants,registerProvider,prompt,sendMessage
 agentPresets|dsh-agent-preset-registry|register,mount
 userQuestions|dsh-user-questions|ask,askTimed
 workspaceChanges|dsh-workspace-changes|summary,diff
-agentTeams|dsh-experimental-agent-team|spawnTeammate|optional
+agentTeams|dsh-agent-team|isEnabled,setEnabled,createTask,getTask,listTasks,updateTask|optional
 '
 
 failures=0
@@ -118,10 +130,10 @@ while IFS='|' read -r service package members optional; do
         fi
     done
     if [ -n "$missing" ]; then
-        if [ "$optional" = "optional" ]; then
-            [ "$quiet" = 1 ] || printf '  SKIP %-18s 缺可选成员:%s\n' "$service" "$missing"
-            continue
-        fi
+        # No `optional` exemption here on purpose: the package IS installed, so a
+        # member we call is missing from the surface we depend on. Skipping this
+        # is how `agentTeams` went un-audited for two upgrades — it pointed at a
+        # package name that never existed, so its row never got this far.
         report_fail "$service: 缺少成员${missing}（宿主可能删除或改名了它；先查 $package 的 lib/types 再改我们的结构类型）"
         continue
     fi

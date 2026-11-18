@@ -1,5 +1,27 @@
 ## [未发布] — 2026-11-18
 
+### 修复 · 宿主 API 审计表与 rc.2 的真实接口对齐（`scripts/check-host-api.sh`）
+
+背景：这张表是"我们通过 `ctx.get(...)` 用到的宿主服务与成员"的书面假设，但其中两行早已与宿主脱节——
+一行**永远 FAIL**（`subagents … list`），另一行**永远 SKIP**（`agentTeams` 指向的包名
+`dsh-experimental-agent-team` 两版宿主都不存在）。一条恒红的审计会被当成噪音，一条恒跳的审计等于没有：
+rc.2 与 rc.4 的升级核实里这两条都被写成"与本 mission 无关的既有问题"，却没有任何东西会替我们修它。
+
+- `subagents|dsh-subagent|startActivation,getProvider,list,registerProvider,prompt,sendMessage`
+  → `…,listDescendants,…`。rc.2 的 `SubagentRuntime` 声明的是 `listDescendants(rootSessionId, signal?)`
+  （`dsh-subagent/lib/types/index.d.ts:241`），**没有 `list`**。
+- `agentTeams|dsh-experimental-agent-team|spawnTeammate|optional`
+  → `agentTeams|dsh-agent-team|isEnabled,setEnabled,createTask,getTask,listTasks,updateTask|optional`。
+  该服务由 `dsh-agent-team` 提供（`lib/index.js:752` 附近 `super(ctx, "agentTeams")`），暴露的正是这 6 个方法，
+  **没有 `spawnTeammate`**——所以旧表审计的是一个不存在的方法，而真实方法一个都没被审计过。
+- `|optional` 的语义同时**收紧**（不是放宽）：只允许"**包未安装**"跳过；**装着的包缺成员一律失败并点名**。
+  旧实现把"缺成员"也当成可选，于是即使包名写对，下一次改名仍会被静默吞掉——那正是这次要消除的盲区。
+- 验收：`bash scripts/check-host-api.sh` → **exit 0**，`agentTeams` 行输出 `ok … isEnabled,setEnabled,…`
+  （不再是 SKIP）；反证（AC-003）：把 `listTasks` 临时改成 `listTaskz` → **exit 1** 并点名 `listTaskz`，改回后复绿。
+- `scripts/selftest-ops.sh` C12：夹具的 `list()` 同步改为 `listDescendants(...)`（否则它钉住的是我们的旧记忆），
+  并新增两条断言——"装着的可选包缺成员 → exit 1 且点名"、"可选包未安装 → 跳过不失败"；原有三条断言未改动。
+- 文档：`docs/RC4-COMPAT.md` §2.3 的两条"既有问题"标记为已修并附修后输出。
+
 ### 文档 · dsh 0.2.2-rc.4 兼容核实：16 个包无需改动（`docs/RC4-COMPAT.md`）
 
 背景：npm 上已有 `@deepseek-ai/dsh@0.2.2-rc.3` / `rc.4`，本机装的是 `rc.2`；先核实"要不要改"，再决定升不升。

@@ -273,15 +273,34 @@ $ bash scripts/check-host-api.sh --harness-root .tmp/rc4/hostroot   # rc.4
 **rc.2 与 rc.4 的审计结论逐字相同**，即升级没有带来**新的**失败项。但这里有两条**与本 mission 无关的既有问题**
 （rc.2 上就存在，`dsh-subagent` 又是逐字节相同的，所以绝不是 rc.4 回归），列出来交给 Lead 决定是否另开 mission：
 
-1. `subagents … list` 这条期望过期：rc.2/rc.4 的 `dsh-subagent` 的 `SubagentRuntime` 声明的是
+1. 【已修，见下方「后续」】`subagents … list` 这条期望过期：rc.2/rc.4 的 `dsh-subagent` 的 `SubagentRuntime` 声明的是
    `listDescendants(...)`，**没有 `list`**（`grep -n "    list" …/dsh-subagent/lib/types/*.d.ts` 只命中
    `index.d.ts:241: listDescendants(`）。我们的代码自己也把它当可选：`packages/dsh-eng-core/src/delegation.ts:593`
    `if (typeof subagents.list !== 'function') return undefined`。所以脚本表里应把 `list` 标成可选（或改成真实成员），
    否则这条 `FAIL` 会永远在。
-2. `agentTeams|dsh-experimental-agent-team` 的**包名过期**：rc.2 与 rc.4 的宿主都只装 `dsh-agent-team`
+2. 【已修，见下方「后续」】`agentTeams|dsh-experimental-agent-team` 的**包名过期**：rc.2 与 rc.4 的宿主都只装 `dsh-agent-team`
    （两条宿主的 `node_modules/@deepseek-ai/` 里都没有 `dsh-experimental-agent-team`；npm 上这个旧名字停在
    `0.1.5-alpha.2`，与 0.2.2 线无关），
    于是这一行 **永远 SKIP**，`agentTeams` 的 `spawnTeammate` 从没被真正审计过。建议改成 `dsh-agent-team`。
+
+**后续（2026-11-18，mission `check-host-api-sh-subagents-list-20261118-151907`）：两条都已修**，且修的方式不是把
+"缺成员"降级成跳过，而是让表与宿主真实接口一致：
+
+```text
+$ bash scripts/check-host-api.sh          # rc.2，修后
+  ok   subagents          startActivation,getProvider,listDescendants,registerProvider,prompt,sendMessage
+  ok   agentTeams         isEnabled,setEnabled,createTask,getTask,listTasks,updateTask
+7 条服务假设，0 条不成立。   EXIT 0
+```
+
+- `subagents` 行：`list` → `listDescendants`（`dsh-subagent/lib/types/index.d.ts:241`）。
+- `agentTeams` 行：包名 `dsh-experimental-agent-team` → `dsh-agent-team`，成员改为该服务真实暴露的
+  `isEnabled/setEnabled/createTask/getTask/listTasks/updateTask`——**没有 `spawnTeammate`**（所以上面"从没被真正
+  审计过"的方法其实并不存在；真正该审计的是这 6 个）。
+- `|optional` 的语义同时收紧：只允许"**包未安装**"跳过，**装着的包缺成员一律失败并点名**。旧实现把"缺成员"也
+  当可选，于是即使包名写对了，下一次改名仍会被静默吞掉。
+- 反证：把某一行的成员临时改成宿主不声明的名字 → `exit 1` 并点名该成员；`scripts/selftest-ops.sh` 的 C12 夹具
+  同步改为 `listDescendants`，并新增"装着的可选包缺成员 → exit 1 且点名""可选包未安装 → 跳过不失败"两条断言。
 
 > 附：这条审计脚本**不在** `scripts/verify.sh` 的流水线里（`grep -n "check-host-api" scripts/verify.sh` 无命中），
 > 所以它的 `EXIT 1` 不影响 AC-004 的 verify 全绿；但它作为"我们承诺过的审计"应当修。
@@ -402,7 +421,8 @@ rc.4 的文档 diff 全部是这三处（+ 升级指南），**没有任何已�
 | peer 版本校验 | 是（加载时强制） | `>=0.2.0-rc.1 <0.2.3-0` 与 `cordis ^4.0.4` 都覆盖 rc.4；rc.4 的 `evaluatePluginCompatibility` 判 16/16 兼容 |
 
 **必须改的：无。** 本 mission 因此只产出本文件（+ 一条 CHANGELOG 记录）。
-两条**建议另开 mission** 的既有问题见 §2.3 末尾（`check-host-api.sh` 的 `list` 与 `agentTeams` 包名）。
+两条**建议另开 mission** 的既有问题见 §2.3 末尾（`check-host-api.sh` 的 `list` 与 `agentTeams` 包名）；**两条都已于
+2026-11-18 修复**（mission `check-host-api-sh-subagents-list-20261118-151907`，改法与验证见 §2.3 末尾的「后续」）。
 
 ---
 
