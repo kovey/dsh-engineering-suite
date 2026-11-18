@@ -259,16 +259,16 @@ export function apply(ctx: Context, config: unknown = {}): void {
         }
 
         // --- Agent Teams composition (a collaboration surface, never authority) ---
-        // The official capability (`agentTeams`, harness 0.2.0-rc.1) is
-        // coordination state: its tools carry no persona, tool whitelist, model
-        // route or permission parameter, and a teammate created through it
-        // inherits the Lead's entire tool surface. It must therefore neither
-        // receive our authorisation decisions nor hand us any. Concretely:
-        //  - `team_delegate` REFUSES its spawn path by name and stays on this
-        //    plugin's own `ctx.subagents.start()` path (`agent-teams.ts`);
-        //  - every teammate the roster journals is recorded as `ungoverned`, so
-        //    a reader can tell a role-policed child from a peer that carries no
-        //    role policy at all (`teammates.ts`).
+        // The host capability (`agentTeams`, `@deepseek-ai/dsh-agent-team`) is
+        // coordination state: an on/off Team selection + a shared task board, with
+        // **no operation that creates a teammate**. The model-face tools that do
+        // create one carry no persona / tool whitelist / model route, and the child
+        // inherits the Lead's whole tool surface. So it is neither authority nor a
+        // dispatch channel, and it must neither receive our authorisation decisions
+        // nor hand us any. Concretely:
+        //  - `team_delegate` says why it is not a dispatch channel and stays on our
+        //    own `startActivation` path (`agent-teams.ts`);
+        //  - every teammate the roster journals is recorded as `ungoverned` (`teammates.ts`).
         // Nothing below reads a teammate's message, task or report as evidence,
         // and nothing in this plugin can be cleared by one.
         const teams = resolved.composeWithAgentTeams === 'off' ? undefined : safeGet(context, 'agentTeams')

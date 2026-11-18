@@ -799,22 +799,42 @@ test('the service binds the child so the skill whitelist applies (regression)', 
 // --- Agent Teams composition (a collaboration surface, never authority) ------
 
 /**
- * A fake `agentTeams` service, shaped like the one harness 0.2.0-rc.1 mounts
- * (`TeamService`: `spawnTeammate` + roster/mailbox reads). `spawns()` counts
- * calls, so a test can prove the official path was NOT used.
+ * A fake `agentTeams` service, shaped like the one harness 0.2.2-rc.2 mounts
+ * (`@deepseek-ai/dsh-agent-team`'s `TeamService`: an on/off Team selection plus
+ * a shared task board — `isEnabled`/`setEnabled`/`createTask`/`getTask`/
+ * `listTasks`/`updateTask`, and **no operation that creates a teammate**).
+ * `calls()` counts every member invocation, so a test can prove the service was
+ * read for its shape only and never used as a dispatch channel.
  */
-function fakeAgentTeams(): { service: Record<string, unknown>; spawns: () => number } {
-    let spawns = 0
+function fakeAgentTeams(): { service: Record<string, unknown>; calls: () => number } {
+    let calls = 0
     return {
         service: {
-            spawnTeammate: async () => {
-                spawns += 1
-                return { member: { id: 'teammate-1', name: 'peer', role: 'teammate', status: 'active', diagnostics: [] } }
+            isEnabled: () => {
+                calls += 1
+                return true
             },
-            listMembers: () => [],
-            tryMembership: () => undefined,
+            setEnabled: async () => {
+                calls += 1
+            },
+            createTask: async () => {
+                calls += 1
+                return { id: 'task-1' }
+            },
+            getTask: () => {
+                calls += 1
+                return undefined
+            },
+            listTasks: () => {
+                calls += 1
+                return []
+            },
+            updateTask: async () => {
+                calls += 1
+                return { id: 'task-1' }
+            },
         },
-        spawns: () => spawns,
+        calls: () => calls,
     }
 }
 
@@ -841,20 +861,24 @@ function teamMemberEvent(member: Record<string, unknown>, teamId = 'session-1'):
     }
 }
 
-test('a team-style dispatch is refused by name and served by the governed path (regression)', async () => {
+test('a team-style dispatch is answered by name and served by the governed path (regression)', async () => {
     const cwd = tempWorkspace('role-guard-teams-')
     const teams = fakeAgentTeams()
     const fake = hostWithTeams(cwd, teams.service)
     const run = await fake.runTool('team_delegate', { role: 'reviewer', task: '审查 src/server.ts', dispatch: 'team' })
     assert.equal(run.isError, false)
     const text = runText(run)
-    // Which path was used, and exactly why the official one was not.
+    // Which path was used, and exactly why the host one was not: the mounted
+    // service is the documented task graph, and it has no teammate-creation API.
     assert.match(text, /dispatch path: subagents/)
-    assert.match(text, /spawnTeammate/)
+    assert.match(text, /不是派发通道/)
+    assert.match(text, /没有创建 teammate 的 API/)
+    assert.match(text, /isEnabled\/setEnabled\/createTask\/getTask\/listTasks\/updateTask/)
     assert.match(text, /persona 影子段/)
     assert.match(text, /工具白名单/)
-    // The official spawn was never called: no teammate exists that we did not govern.
-    assert.equal(teams.spawns(), 0)
+    // The service was never called: its shape was read, and no task or teammate
+    // was created through it.
+    assert.equal(teams.calls(), 0)
     // …and the delegation carries every guarantee it carried before.
     assert.equal(fake.subagentStarts.length, 1)
     const start = fake.subagentStarts[0] as { provider: string; request: Record<string, unknown> }
@@ -900,8 +924,9 @@ test('the persona guarantee is structural: a role that declares nothing still ne
     const role = parseRole(['---', 'id: bare', 'mode: write', 'tools: []', 'deny: []', 'skills: []', '---', '只声明了 persona。'].join('\n'), 'test')
     assert.ok(!('error' in role))
     // No tool filter, no route, no skills: the persona alone is unexpressible,
-    // because every loadable role has one and `SpawnTeammateRequest` has no
-    // persona field. That is why the official path is refused for EVERY role.
+    // because every loadable role has one and no host surface for creating a
+    // teammate takes a persona field. That is why the host path is not a
+    // dispatch channel for ANY role.
     const missing = unexpressibleGuarantees(role, { filter: {}, dropped: [] }, {})
     assert.equal(missing.length, 1)
     assert.match(missing[0] ?? '', /persona 影子段/)
@@ -926,7 +951,7 @@ test("composeWithAgentTeams: 'off' reproduces the previous dispatch exactly (reg
     // …and the same output: a delegation that did not ask for a team gains no line.
     assert.equal(runText(plainOff), runText(plainAuto))
     assert.doesNotMatch(runText(plainOff), /dispatch path/)
-    // No observer is installed under 'off': the official roster is never read.
+    // No observer is installed under 'off': the roster is never read.
     assert.equal(off.listeners.has('session/event'), false)
     assert.equal(auto.listeners.has('session/event'), true)
 
@@ -934,7 +959,8 @@ test("composeWithAgentTeams: 'off' reproduces the previous dispatch exactly (reg
     const refused = runText(await off.runTool('team_delegate', { role: 'cheap', task: 't', dispatch: 'team' }))
     assert.match(refused, /dispatch path: subagents/)
     assert.match(refused, /composeWithAgentTeams: off/)
-    assert.equal(teamsOff.spawns(), 0)
+    // …and the service is not even read for its shape under 'off'.
+    assert.equal(teamsOff.calls(), 0)
 
     // …and the prompt section is the one from before this capability existed:
     // 'off' adds no paragraph, 'auto' explains the composition.
@@ -944,7 +970,7 @@ test("composeWithAgentTeams: 'off' reproduces the previous dispatch exactly (reg
 
 test('a partial, hostile or missing agentTeams service never breaks a delegation (regression)', async () => {
     const cwd = tempWorkspace('role-guard-teams-partial-')
-    // Mounted, but with no programmatic spawn: only the model-facing tools' backing store.
+    // Mounted, but not the documented shape (none of the TeamService members).
     const partial = await hostWithTeams(cwd, { listMembers: () => [], tryMembership: () => undefined }).runTool('team_delegate', {
         role: 'reviewer',
         task: 'x',
@@ -952,13 +978,23 @@ test('a partial, hostile or missing agentTeams service never breaks a delegation
     })
     assert.equal(partial.isError, false)
     assert.match(runText(partial), /dispatch path: subagents/)
-    assert.match(runText(partial), /programmatic spawn/)
+    assert.match(runText(partial), /不是「开关 \+ 任务图」的服务形状/)
 
-    // A service whose probe throws is treated as "no programmatic spawn".
-    const hostile = { get spawnTeammate(): never { throw new Error('boom') } }
+    // A service whose shape probe throws is treated the same way: not a
+    // dispatch channel, and nothing thrown escapes into the delegation.
+    const hostile = { get createTask(): never { throw new Error('boom') } }
     const probed = await hostWithTeams(cwd, hostile).runTool('team_delegate', { role: 'reviewer', task: 'x', dispatch: 'team' })
     assert.equal(probed.isError, false)
-    assert.match(runText(probed), /programmatic spawn/)
+    assert.match(runText(probed), /dispatch path: subagents/)
+    assert.match(runText(probed), /不是「开关 \+ 任务图」的服务形状/)
+
+    // The documented task-graph service is mounted fine — and is STILL not a
+    // dispatch channel, for the stated reason: it has no teammate-creation API.
+    const shapedTeams = fakeAgentTeams()
+    const shaped = await hostWithTeams(cwd, shapedTeams.service).runTool('team_delegate', { role: 'reviewer', task: 'x', dispatch: 'team' })
+    assert.equal(shaped.isError, false)
+    assert.match(runText(shaped), /没有创建 teammate 的 API/)
+    assert.equal(shapedTeams.calls(), 0)
 
     // Nothing mounted at all.
     const absent = await hostWithTeams(cwd, undefined).runTool('team_delegate', { role: 'reviewer', task: 'x', dispatch: 'team' })

@@ -149,5 +149,23 @@ fi
 # adversarial audit — and fails if any of them stops being refused.
 run_stage "the tooling's own self-test (no dsh, no build, no network)" bash "$ROOT/scripts/e2e-mission.sh" --selftest
 
+# The host API table is the written form of every `ctx.get(...)` assumption this
+# suite makes, and it CANNOT be checked by the compiler: our structural types are
+# hand-written copies of the host's service surfaces, so a renamed member compiles
+# fine and throws at runtime. That has happened twice (`subagents.start`; an
+# `agentTeams` row pointing at a package no host installs), which is why the
+# check belongs in the acceptance run and not in a document someone remembers to
+# run. The probe is `command -v dsh` — the same lookup the script does — so a
+# machine without a host install reports a SKIP with the reason, and a test can
+# simulate that by running with a PATH that has no `dsh` on it. It is never a
+# silent pass: "we could not look" and "we looked and it held" are different
+# sentences, and only the second one is green.
+if command -v dsh >/dev/null 2>&1; then
+  run_stage "host API audit (dsh installed)" bash "$ROOT/scripts/check-host-api.sh" --quiet
+else
+  printf '%-46s SKIP\n' "host API audit (no dsh)"
+  printf 'SKIP host API audit: 没有检测到 dsh 安装（command -v dsh 为空），无法定位宿主包——这不是通过\n'
+fi
+
 echo
 echo "all green."

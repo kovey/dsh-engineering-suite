@@ -1,5 +1,38 @@
 ## [未发布] — 2026-11-18
 
+### 变更 · 宿主 API 审计接进 `verify.sh`，删掉 role-guard 对一个不存在 API 的探测
+
+两件事同一个病根：**审计的对象是记忆，不是宿主**。上个 mission 刚把 `check-host-api.sh` 的表修对，
+但它仍不在验收流水线里（文档里一句"够用了"）；`dsh-role-guard` 也还在探测宿主**没有**的
+`agentTeams` spawn 方法——探测永远返回同一个值，于是那段代码是死分支，文案一直在描述一个不存在的 API。
+
+- **`scripts/verify.sh` 新增阶段**（工具链自检之后、`all green.` 之前）：
+  `command -v dsh` 成功 → `run_stage "host API audit (dsh installed)" bash scripts/check-host-api.sh --quiet`，
+  该阶段失败即 verify 失败；`command -v dsh` 为空 → 打印
+  `SKIP host API audit: 没有检测到 dsh 安装（command -v dsh 为空），无法定位宿主包——这不是通过` 并继续（退出码 0）。
+  探测就是审计脚本自己用的那一句 `command -v dsh`，所以"没有宿主"可以用 PATH 精确模拟；SKIP 永远带原因，
+  不把"没查"说成"通过"。
+- **证据（AC-004）**：本机（dsh 0.2.2-rc.2）`bash scripts/verify.sh --quiet` →
+  `host API audit (dsh installed) ok`，整体 **exit 0**；把 `dsh` 从 PATH 里去掉
+  （`PATH=<无 dsh 的 bin>:/usr/bin:/bin`，本机 node 与 dsh 同目录，故用 node wrapper 补回 node）再跑 →
+  `host API audit (no dsh) SKIP` + 上面那行原因，整体 **exit 0**。
+- **`dsh-role-guard`**：删掉 `agentTeams` 的 `spawnTeammate` 探测与 `programmatic-spawn` 分支。宿主真实的服务是
+  `@deepseek-ai/dsh-agent-team` 的 `TeamService`，公开面只有
+  `isEnabled/setEnabled/createTask/getTask/listTasks/updateTask`（Team 开关 + 共享任务图），
+  **没有任何创建 teammate 的操作**；teammate 由模型面工具（`@deepseek-ai/dsh-tool-agent-team`）创建。
+  现在按真实形状分类（`task-graph` / `unrecognised`，两者都不是派发通道），请求 `team` 时仍走本插件
+  `subagents` 路径，并逐条点名角色需要、而宿主这一层表达不了的保证（persona 影子段 / 工具白名单 /
+  模型路由 / 技能白名单）；`composeWithAgentTeams: 'off'` 的行为与文案未变。
+- **测试**：`packages/dsh-role-guard/test/role-guard.test.ts` 的假服务改成真实形状（六个方法 + 调用计数，
+  `calls()` 证明服务只被读形状、从未被调用），删除只针对探测分支的断言，改写为"服务即使按文档挂载
+  也不被当作派发通道，且文案说明原因"（另加"形状不认识""形状探测抛错"两种情形）；其余断言未改。
+  `node --test packages/dsh-role-guard/test/*.test.ts` → **58 个用例全过**。
+- **包内残留引用清零**：`grep -rn "dsh-experimental-agent-team\|spawnTeammate\|programmatic-spawn" packages/dsh-role-guard`
+  → **无命中**（`dist/` 已重建）。
+- **文档**：`packages/dsh-role-guard/README.md` 的合成章节、`config.ts` / `teammates.ts` / `index.ts` 的说明按真实
+  服务重写；`docs/ARCHITECTURE.md` §5.16 的能力表、`docs/RC4-COMPAT.md` §2.3 末尾"审计脚本不在 verify
+  流水线里"的附注同步更新。`bash scripts/standards-check.sh --quiet` → **PASS**（无新增/恶化违规）。
+
 ### 修复 · 宿主 API 审计表与 rc.2 的真实接口对齐（`scripts/check-host-api.sh`）
 
 背景：这张表是"我们通过 `ctx.get(...)` 用到的宿主服务与成员"的书面假设，但其中两行早已与宿主脱节——

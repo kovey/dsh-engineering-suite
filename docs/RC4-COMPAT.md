@@ -302,8 +302,11 @@ $ bash scripts/check-host-api.sh          # rc.2，修后
 - 反证：把某一行的成员临时改成宿主不声明的名字 → `exit 1` 并点名该成员；`scripts/selftest-ops.sh` 的 C12 夹具
   同步改为 `listDescendants`，并新增"装着的可选包缺成员 → exit 1 且点名""可选包未安装 → 跳过不失败"两条断言。
 
-> 附：这条审计脚本**不在** `scripts/verify.sh` 的流水线里（`grep -n "check-host-api" scripts/verify.sh` 无命中），
-> 所以它的 `EXIT 1` 不影响 AC-004 的 verify 全绿；但它作为"我们承诺过的审计"应当修。
+> 附：当时这条审计脚本**不在** `scripts/verify.sh` 的流水线里，所以它的 `EXIT 1` 不影响 AC-004 的 verify 全绿。
+> 2026-11-18 已接进 `verify.sh`（mission `check-host-api-sh-verify-dsh-ski-20261118-154419`）：检测到 `dsh` 时
+> 该阶段真跑、失败即 verify 失败；`command -v dsh` 为空时打印
+> `SKIP host API audit: 没有检测到 dsh 安装（command -v dsh 为空）…` 并继续（退出码 0）——
+> "没查"和"查过且成立"是两句话，只有后者算绿。
 
 ---
 

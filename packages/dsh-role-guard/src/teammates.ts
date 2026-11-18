@@ -1,14 +1,17 @@
 /**
  * Teammates this plugin did NOT create: the durable "ungoverned" record.
  *
- * The official Agent Teams surface (`spawn_teammate`, and any plugin calling
- * `agentTeams.spawnTeammate` directly) creates teammates with no role policy:
- * no persona shadow, no host-enforced tool whitelist, no model route (see
- * `agent-teams.ts` for the exact API gap). This plugin cannot prevent that —
- * a programmatic `spawnTeammate` never passes a tool guard, so a
- * `ctx.tools.guard` denial would cover only the model-facing tool and would
- * make the block look complete while it is not. What it CAN do is refuse to
- * treat such a teammate as governed, and say so durably:
+ * The host's Agent Teams capability creates teammates with no role policy: the
+ * model-facing tools of `@deepseek-ai/dsh-tool-agent-team` take no persona, tool
+ * whitelist, model route or permission parameter, so a teammate starts with the
+ * Lead's entire tool surface under the deployment persona (see `agent-teams.ts`
+ * for the surface itself — its service has no operation that creates a teammate,
+ * which is why there is no programmatic path to intercept either). This plugin
+ * cannot prevent that — those tools are not this plugin's to guard, and a
+ * `ctx.tools.guard` denial would cover only the model-facing tool while the same
+ * ungoverned teammate could be created another way, making the block look
+ * complete while it is not. What it CAN do is refuse to treat such a teammate as
+ * governed, and say so durably:
  *
  *  - the roster write the official service journals into the Team Lead's log
  *    (`session/event` → `event.type === 'team/member'`) is observed;

@@ -40,14 +40,16 @@ export interface RoleGuardConfig {
     /** Tool names that load a skill; only these are gated. */
     skillTools: readonly string[]
     /**
-     * How this plugin composes with the official Agent Teams capability
-     * (`@deepseek-ai/dsh-experimental-agent-team`, service `agentTeams`).
+     * How this plugin composes with the host's Agent Teams capability
+     * (`@deepseek-ai/dsh-agent-team`, service `agentTeams`).
      *
      * - `'auto'` (default): `team_delegate` answers a team-style dispatch
-     *   request with a named refusal (the official spawn cannot carry a role's
-     *   persona / tool whitelist / model route — see `agent-teams.ts`), and the
-     *   plugin records every teammate the official surface creates as
-     *   `ungoverned`;
+     *   request by naming why that service is not a dispatch channel — it
+     *   exposes only the on/off Team selection and a shared task board, with no
+     *   operation that creates a teammate, while the model-facing tools that do
+     *   create one carry none of a role's persona / tool whitelist / model
+     *   route (see `agent-teams.ts`) — and the plugin records every teammate
+     *   created outside `team_delegate` as `ungoverned`;
      * - `'off'`: the service is never read, no roster observer is installed, and
      *   the plugin behaves exactly as it did before this key existed.
      */
