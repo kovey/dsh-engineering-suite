@@ -781,6 +781,163 @@ else
   fail "migrate-layout: expected 2 repo sections — $LAST_OUT"
 fi
 
+# ---------------------------------------------------------------------------
+# C20 — fix-profile-install: the 0.8.13 incident was an install that exited 0
+# with zero dist. Three things must hold: the config is repaired (placeholder ->
+# explicit boolean, `strictDepBuilds: false` removed, the suite's repo-URL
+# approval kept), the repair is a fixed point (a second run writes nothing), and
+# the acceptance checks refuse a profile whose artifacts are missing — exit 0 is
+# never evidence that dist exists.
+section "C20 — fix-profile-install: config converges, no dist is a failure"
+FIX_INSTALL="$ROOT/scripts/fix-profile-install.mjs"
+PROFILE20="$TMP/c20-profile"
+SUITE20="$PROFILE20/node_modules/dsh-engineering-suite"
+mkdir -p "$SUITE20/packages/dsh-alpha/dist" "$PROFILE20/node_modules/dsh-spec-gate"
+printf '{"name":"dsh-engineering-suite","version":"9.9.9"}\n' > "$SUITE20/package.json"
+printf '{"name":"dsh-alpha"}\n' > "$SUITE20/packages/dsh-alpha/package.json"
+printf 'export {}\n' > "$SUITE20/packages/dsh-alpha/dist/index.js"
+printf '{"name":"dsh-spec-gate","main":"index.js"}\n' > "$PROFILE20/node_modules/dsh-spec-gate/package.json"
+printf 'module.exports = {}\n' > "$PROFILE20/node_modules/dsh-spec-gate/index.js"
+printf '{"name":"dsh-profile-fake","private":true}\n' > "$PROFILE20/package.json"
+cat > "$PROFILE20/pnpm-workspace.yaml" <<'YAML'
+packages:
+  - .
+
+nodeLinker: hoisted
+allowBuilds:
+  'dsh-engineering-suite@git+https://github.com/kovey/dsh-engineering-suite.git': true
+  protobufjs: set this to true or false
+strictDepBuilds: false
+YAML
+BEFORE20="$(cat "$PROFILE20/pnpm-workspace.yaml")"
+expect_rc 0 "fix-profile-install: a dry run plans the fix without writing" node "$FIX_INSTALL" --profile "$PROFILE20"
+if [ "$(cat "$PROFILE20/pnpm-workspace.yaml")" = "$BEFORE20" ]; then
+  pass "fix-profile-install: the dry run left the config byte-identical"
+else
+  fail "fix-profile-install: the dry run wrote to pnpm-workspace.yaml"
+fi
+if printf '%s\n' "$LAST_OUT" | grep -qF 'protobufjs: set this to true or false'; then
+  pass "fix-profile-install: the dry run names the placeholder it will replace"
+else
+  fail "fix-profile-install: the dry run did not report the placeholder — $LAST_OUT"
+fi
+expect_rc 0 "fix-profile-install: --apply --skip-install converges (checks run, pnpm skipped)" \
+  node "$FIX_INSTALL" --profile "$PROFILE20" --apply --skip-install
+CFG20="$(cat "$PROFILE20/pnpm-workspace.yaml")"
+printf '%s\n' "$CFG20" | grep -qx '  protobufjs: false' \
+  && pass "fix-profile-install: the placeholder became an explicit false" \
+  || fail "fix-profile-install: protobufjs is not an explicit boolean — $CFG20"
+printf '%s\n' "$CFG20" | grep -q '^strictDepBuilds' \
+  && fail "fix-profile-install: strictDepBuilds survived (it silences the blocked build)" \
+  || pass "fix-profile-install: strictDepBuilds is gone (pnpm default true restored)"
+printf '%s\n' "$CFG20" | grep -qF "'dsh-engineering-suite@git+https://github.com/kovey/dsh-engineering-suite.git': true" \
+  && pass "fix-profile-install: the suite's repository-URL approval is kept" \
+  || fail "fix-profile-install: the suite's allowBuilds entry was dropped — $CFG20"
+case "$LAST_OUT" in
+  *"dist 1/1"*) pass "fix-profile-install: the acceptance checks ran and passed on the fixture" ;;
+  *) fail "fix-profile-install: the three checks did not report dist 1/1 — $LAST_OUT" ;;
+esac
+BAK20="$(ls "$PROFILE20"/pnpm-workspace.yaml.bak-* 2>/dev/null | wc -l | tr -d ' ')"
+expect_rc 0 "fix-profile-install: a second --apply --skip-install is a no-op" \
+  node "$FIX_INSTALL" --profile "$PROFILE20" --apply --skip-install
+if [ "$(ls "$PROFILE20"/pnpm-workspace.yaml.bak-* 2>/dev/null | wc -l | tr -d ' ')" = "$BAK20" ]; then
+  pass "fix-profile-install: the second run wrote no new backup (a fixed point)"
+else
+  fail "fix-profile-install: the second run rewrote the config"
+fi
+expect_rc 0 "fix-profile-install: --check passes on a complete profile" node "$FIX_INSTALL" --profile "$PROFILE20" --check
+rm "$SUITE20/packages/dsh-alpha/dist/index.js"
+expect_rc 1 "fix-profile-install: a profile without dist can never pass" node "$FIX_INSTALL" --profile "$PROFILE20" --check
+case "$LAST_OUT" in
+  *"dist 0/1"*) pass "fix-profile-install: the failure names the missing dist" ;;
+  *) fail "fix-profile-install: the no-dist failure did not name the count — $LAST_OUT" ;;
+esac
+expect_rc 1 "fix-profile-install: --skip-install still refuses a profile without dist" \
+  node "$FIX_INSTALL" --profile "$PROFILE20" --apply --skip-install
+printf 'export {}\n' > "$SUITE20/packages/dsh-alpha/dist/index.js"
+expect_rc 1 "fix-profile-install: --expect-version catches a stale install" \
+  node "$FIX_INSTALL" --profile "$PROFILE20" --check --expect-version 0.0.0
+rm -rf "$PROFILE20/node_modules/dsh-spec-gate"
+mkdir -p "$TMP/c20-external"
+printf '{"name":"dsh-spec-gate","main":"index.js"}\n' > "$TMP/c20-external/package.json"
+printf 'module.exports = {}\n' > "$TMP/c20-external/index.js"
+ln -s "$TMP/c20-external" "$PROFILE20/node_modules/dsh-spec-gate"
+expect_rc 1 "fix-profile-install: a bundle resolving outside the profile is a failure" \
+  node "$FIX_INSTALL" --profile "$PROFILE20" --check
+# The explicit prepare must be what creates dist: a fake pnpm (no network here)
+# exits 0 and builds nothing, a stub prepare-install.mjs writes the artifact.
+PROFILE20C="$TMP/c20-explicit-prepare"
+SUITE20C="$PROFILE20C/node_modules/dsh-engineering-suite"
+mkdir -p "$SUITE20C/scripts" "$SUITE20C/packages/dsh-alpha" "$PROFILE20C/node_modules/dsh-spec-gate"
+printf '{"name":"dsh-engineering-suite","version":"9.9.9"}\n' > "$SUITE20C/package.json"
+printf '{"name":"dsh-alpha"}\n' > "$SUITE20C/packages/dsh-alpha/package.json"
+cat > "$SUITE20C/scripts/prepare-install.mjs" <<'JS'
+import fs from 'node:fs'
+import path from 'node:path'
+const dist = path.join(import.meta.dirname, '..', 'packages', 'dsh-alpha', 'dist')
+fs.mkdirSync(dist, { recursive: true })
+fs.writeFileSync(path.join(dist, 'index.js'), 'export {}\n')
+console.log('stub prepare-install: built 1 package')
+JS
+printf '{"name":"dsh-spec-gate","main":"index.js"}\n' > "$PROFILE20C/node_modules/dsh-spec-gate/package.json"
+printf 'module.exports = {}\n' > "$PROFILE20C/node_modules/dsh-spec-gate/index.js"
+printf '{"name":"dsh-profile-fake","private":true}\n' > "$PROFILE20C/package.json"
+printf "allowBuilds:\n  'dsh-engineering-suite@git+https://github.com/kovey/dsh-engineering-suite.git': true\n" > "$PROFILE20C/pnpm-workspace.yaml"
+FAKE_PNPM="$TMP/c20-bin"
+mkdir -p "$FAKE_PNPM"
+printf '#!/bin/sh\nprintf "fake pnpm %%s\\n" "$*"\nexit 0\n' > "$FAKE_PNPM/pnpm"
+chmod +x "$FAKE_PNPM/pnpm"
+expect_rc 0 "fix-profile-install: the explicit prepare is what creates dist" \
+  env PATH="$FAKE_PNPM:$PATH" node "$FIX_INSTALL" --profile "$PROFILE20C" --apply
+case "$LAST_OUT" in
+  *"fake pnpm install"*) pass "fix-profile-install: pnpm install really ran (not silently skipped)" ;;
+  *) fail "fix-profile-install: pnpm install was not invoked — $LAST_OUT" ;;
+esac
+if [ -f "$SUITE20C/packages/dsh-alpha/dist/index.js" ]; then
+  pass "fix-profile-install: dist exists even though pnpm built nothing"
+else
+  fail "fix-profile-install: dist was not created by the explicit prepare-install.mjs"
+fi
+printf '#!/bin/sh\nprintf "fake pnpm: registry unreachable\\n" >&2\nexit 1\n' > "$FAKE_PNPM/pnpm"
+rm -f "$SUITE20C/packages/dsh-alpha/dist/index.js"
+expect_rc 1 "fix-profile-install: a failed install stops before prepare (exit non-zero)" \
+  env PATH="$FAKE_PNPM:$PATH" node "$FIX_INSTALL" --profile "$PROFILE20C" --apply
+if [ -f "$SUITE20C/packages/dsh-alpha/dist/index.js" ]; then
+  fail "fix-profile-install: prepare ran after a failed install and reported dist anyway"
+else
+  pass "fix-profile-install: prepare did not run after a failed install"
+fi
+case "$LAST_OUT" in
+  *"回滚"*) pass "fix-profile-install: the failure carries the rollback hint" ;;
+  *) fail "fix-profile-install: no rollback hint on failure — $LAST_OUT" ;;
+esac
+# A fresh profile may have no pnpm-workspace.yaml at all: creating it must work,
+# and the created file must still approve the suite's build.
+PROFILE20D="$TMP/c20-created-config"
+cp -R "$PROFILE20C" "$PROFILE20D"
+rm -f "$PROFILE20D/pnpm-workspace.yaml" "$PROFILE20D"/pnpm-workspace.yaml.bak-*
+printf '#!/bin/sh\nprintf "fake pnpm %%s\\n" "$*"\nexit 0\n' > "$FAKE_PNPM/pnpm"
+expect_rc 0 "fix-profile-install: a profile without pnpm-workspace.yaml gets one" \
+  env PATH="$FAKE_PNPM:$PATH" node "$FIX_INSTALL" --profile "$PROFILE20D" --apply
+if grep -qF "'dsh-engineering-suite@git+" "$PROFILE20D/pnpm-workspace.yaml"; then
+  pass "fix-profile-install: the created config approves the suite build"
+else
+  fail "fix-profile-install: the created config does not approve the suite — $(cat "$PROFILE20D/pnpm-workspace.yaml")"
+fi
+PROFILE20B="$TMP/c20-no-allowbuilds"
+mkdir -p "$PROFILE20B"
+printf '{"name":"dsh-profile-fake","private":true}\n' > "$PROFILE20B/package.json"
+printf 'nodeLinker: hoisted\n' > "$PROFILE20B/pnpm-workspace.yaml"
+expect_rc 0 "fix-profile-install: a missing allowBuilds block is planned, not refused" \
+  node "$FIX_INSTALL" --profile "$PROFILE20B"
+if grep -qF "'dsh-engineering-suite@git+" "$PROFILE20B/pnpm-workspace.yaml"; then
+  fail "fix-profile-install: the dry run created the block it was only supposed to plan"
+else
+  pass "fix-profile-install: the missing block stays unwritten in a dry run"
+fi
+expect_rc 2 "fix-profile-install: --apply with --check is a usage error" \
+  node "$FIX_INSTALL" --profile "$PROFILE20B" --apply --check
+
 section "summary"
 if [ "$FAILURES" = "0" ]; then
   printf '  \033[32mOPS SELFTEST GREEN\033[0m — every finding above is still refused.\n'

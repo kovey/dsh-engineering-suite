@@ -100,3 +100,54 @@ allowBuilds:
 `node_modules/dsh-engineering-suite/packages/dsh-spec-gate/dist/index.js`、
 `node_modules` 下出现 **16 条 bundle 软链**（含套件包本身共 17 个 `dsh-*` 条目）。
 
+## 六、装完之后：确认 `dist` 真的存在
+
+**症状**（2026-11-17 的真实故障）：`dsh plugin --profile tui update` 升到 0.8.13 后，包在、bundle 软链在，
+`packages/*/dist` 却是 **0 个**，启动报"找不到 10 多个内部插件"——而安装本身的**退出码是 0**。
+手动执行一次 `node node_modules/dsh-engineering-suite/scripts/prepare-install.mjs` 后，16 个 `dist` 立刻生成。
+
+**为什么不能靠"安装成功"，也不能靠 `strictDepBuilds: false`**：当时 profile 的 `pnpm-workspace.yaml`
+里有这样两行——
+
+```yaml
+allowBuilds:
+  'dsh-engineering-suite@git+https://github.com/kovey/dsh-engineering-suite.git': true
+  protobufjs: set this to true or false   # pnpm 自动插入、没人填写的占位值
+strictDepBuilds: false                    # 把"构建被拦"降级成一条警告
+```
+
+`allowBuilds` 里的占位值**不是批准**（pnpm 无法判断这个构建脚本该不该执行）；`strictDepBuilds: false`
+则让"套件的 `prepare` 被拦"只剩一条警告。两者叠加的结果是**安装成功、工件为零**，而日志里没有任何一行说失败。
+`strictDepBuilds` 的默认值是 `true`：被拦的构建必须让安装**失败并点名**那个依赖，这才是能发现问题的行为。
+所以不要用 `false` 换"安装能过"；同理也不要让 `allowBuilds` 留占位符。
+
+**三条确认（缺一条就是没有装好）**：
+
+```bash
+PROFILE=~/.dsh/profiles/tui
+ls "$PROFILE"/node_modules/dsh-engineering-suite/packages/*/dist/index.js | wc -l   # 期望 16
+node -e "console.log(require.resolve('dsh-spec-gate', {paths:['$PROFILE']}))"     # 必须落在 $PROFILE/node_modules 下
+node "$PROFILE"/node_modules/dsh-engineering-suite/scripts/prepare-install.mjs     # 期望 exit 0（幂等，可随时重跑）
+```
+
+**一条命令做完全部**（默认 dry-run，`--apply` 才写；`--check` 只读）：
+
+```bash
+node scripts/fix-profile-install.mjs --profile ~/.dsh/profiles/tui            # 先看修复计划与当前状态
+node scripts/fix-profile-install.mjs --profile ~/.dsh/profiles/tui --apply    # 改配置 → pnpm install → prepare → 三条验收
+node scripts/fix-profile-install.mjs --profile ~/.dsh/profiles/tui --check    # 只读验收
+```
+
+它做的事与失败语义：
+
+- 修正 `pnpm-workspace.yaml`：`allowBuilds` 里任何非布尔值改成显式布尔（套件的仓库 URL 条目保持 `true`，
+  其它未知依赖一律 `false`，并在输出里点名"这些依赖不会被构建"）、删除 `strictDepBuilds` 行
+  （恢复默认 `true`）、保留（缺了就补上）套件的仓库 URL 条目。写入前备份
+  `pnpm-workspace.yaml.bak-<时间戳>`；已是目标状态时不写文件，修复结果会被再规划一次以证明幂等。
+- `pnpm install` 之后**显式**执行一次 `prepare-install.mjs`：不依赖 pnpm 是否执行了依赖的 `prepare`，
+  也不依赖根 `postinstall` 是否被缓存跳过。
+- 三条验收（版本 / `packages/*/dist/index.js` 数量 = 包数 / `dsh-spec-gate` 解析在 profile 内）任一不过
+  → **非零退出**，并打印备份路径与回滚命令：
+  `cp <备份> <profile>/pnpm-workspace.yaml && cd <profile> && pnpm install`。
+  没有 `dist` 的安装不会被当成成功——这是本脚本存在的理由。
+

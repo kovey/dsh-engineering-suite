@@ -1,3 +1,35 @@
+## [未发布] — 2026-11-18
+
+### 修复 · 升级后 profile 一个 dist 都没有：一个占位符 + 一条静默设置（`scripts/fix-profile-install.mjs`）
+
+背景：`dsh plugin --profile tui update` 升到 0.8.13 后，包与 bundle 软链都在，`packages/*/dist` 却是 **0 个**，
+启动报"找不到 10 多个内部插件"——而安装本身**退出码是 0**。根因是 profile 的 `pnpm-workspace.yaml` 里两行叠加：
+`allowBuilds` 有一条 pnpm 自动插入却没填写的占位值（`protobufjs: set this to true or false`），
+以及 `strictDepBuilds: false`。前者让 pnpm 无法判断是否放行该构建脚本，后者把"套件的 `prepare` 被拦"
+降级成警告，于是安装报成功、工件为零。手动执行一次
+`node node_modules/dsh-engineering-suite/scripts/prepare-install.mjs` 后，16 个 `dist` 立刻生成。
+
+- **新增 `scripts/fix-profile-install.mjs`**（默认 dry-run，`--apply` 才写，`--check` 只读验收）：
+  修正 `allowBuilds` 里的非布尔值为显式布尔（套件仓库 URL 条目保持 `true`，未知依赖一律 `false` 并在输出里
+  点名"这些依赖不会被构建"）、删除 `strictDepBuilds` 行（恢复默认 `true`：被拦的构建必须让安装失败并点名）、
+  保留并在缺失时补上 `'dsh-engineering-suite@git+https://github.com/kovey/dsh-engineering-suite.git': true`；
+  写入走临时文件 + rename，先备份 `pnpm-workspace.yaml.bak-<时间戳>`，已是目标状态时不写文件
+  （修复结果会被再规划一次，以证明它是不动点）。随后执行 `pnpm install`，**显式**再跑一次
+  `prepare-install.mjs`（不依赖 pnpm 是否执行依赖的 `prepare`，也不依赖根 `postinstall` 是否被缓存跳过），
+  最后做三条验收：版本（`--expect-version`，默认取已安装版本）、`packages/*/dist/index.js` 数量等于包数、
+  `dsh-spec-gate` 在 profile 的 `node_modules` 内解析。任一不过 → **非零退出**并打印备份与回滚命令：
+  没有 `dist` 的安装不会被当成成功。配置解析与验收分别在
+  `scripts/profile-install-workspace.mjs`、`scripts/profile-install-checks.mjs`（均无副作用），
+  CLI 只负责 I/O 与报告。
+- **回归自测**（`scripts/selftest-ops.sh` 新增 C20，27 条断言）：dry-run 零写盘且点名占位符、
+  占位符→显式 `false`、`strictDepBuilds` 消失、套件 URL 条目保留、第二次运行不再写（固定点）、
+  无 dist 的 `--check` 与 `--apply --skip-install` 必失败（并点名计数）、`--expect-version` 不匹配失败、
+  bundle 解析到 profile 之外失败、假 pnpm 装不出东西时**显式 prepare 仍造出 dist**、
+  install 失败时**不执行** prepare 且打印回滚提示、缺失的 `pnpm-workspace.yaml` 会被创建且仍放行套件构建、
+  缺 `allowBuilds` 只计划不写、`--apply --check` 是用法错误。
+- **文档**：`docs/RELEASE.md` §六「装完之后：确认 `dist` 真的存在」——三条确认命令、脚本用法，
+  以及为什么不能用 `strictDepBuilds: false` 换"安装能过"（默认 `true` 才会让被拦的构建失败并点名）。
+
 ## [0.8.13] — 2026-11-17
 
 ### 新增 · 知识库检索期自愈，代码来源扩到 11 种语言（`dsh-knowledge-base`）
