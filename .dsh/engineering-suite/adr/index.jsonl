@@ -1,1 +1,4 @@
 {"at":1794366932032,"number":1,"slug":"vs","path":".dsh/engineering-suite/adr/0001-vs.md","title":"门禁审批：一个授权内核 + 两种呈现面（富审阅 vs 二元裁决）"}
+{"at":1795053577204,"number":2,"slug":"mission-git-worktree","path":".dsh/engineering-suite/adr/0002-mission-git-worktree.md","title":"任务拆分：单 mission + git worktree 并行 + 人工审核拆分结果","missionId":"design-task-split-20261118"}
+{"at":1795054978585,"number":3,"slug":"p1","path":".dsh/engineering-suite/adr/0003-p1.md","title":"任务拆分 P1 的写入模型与粒度配置","missionId":"design-task-split-20261118","supersedes":2}
+{"at":1795054978585,"number":2,"slug":"mission-git-worktree","path":".dsh/engineering-suite/adr/0002-mission-git-worktree.md","title":"任务拆分：单 mission + git worktree 并行 + 人工审核拆分结果","missionId":"design-task-split-20261118","supersededBy":3}
