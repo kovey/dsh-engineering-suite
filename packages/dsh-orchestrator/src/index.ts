@@ -31,7 +31,8 @@ import { ORCHESTRATOR_SERVICE, createOrchestratorService } from './enter-impleme
 import { AutoAdvanceSessions, autoAdvanceStages, createAutoAdvanceHook } from './hooks.js'
 import { createProbes, mergeProbes } from './probes.js'
 import { PROMPT_SECTION, sectionText } from './prompt.js'
-import { registerTools } from './sequence.js'
+import { registerTools, type SequenceDeps } from './sequence.js'
+import { registerSplitPlanTool } from './split-plan-tool.js'
 
 export const name = 'dsh-orchestrator'
 
@@ -131,7 +132,7 @@ export function apply(ctx: Context, config: unknown = {}): void {
         const clockService = clockFrom(context)
         const approvalSeam = approvalSeamOf(context)
 
-        const tools = registerTools(context as never, {
+        const sequenceDeps: SequenceDeps = {
             config: resolved,
             stores,
             // Probes are scope-aware, so they are rebuilt per call: the registry
@@ -139,12 +140,12 @@ export function apply(ctx: Context, config: unknown = {}): void {
             probesFor: (agent) => createProbes(context, resolved.probes, agent),
             dispatch: dispatchDeps,
             approval: approvalSeam,
-            // A host MAY provide a `clock` service; a real deployment does not, so
-            // metrics keep using the wall clock. Tests provide a frozen one, which
-            // is what makes "two runs are byte-identical" a provable property
-            // rather than a lucky one (the report rounds durations to 0.1 day).
+            // A host MAY provide a `clock`; tests freeze it so two runs are byte-identical.
             ...(clockService === undefined ? {} : { now: clockService }),
-        })
+        }
+        const tools = registerTools(context as never, sequenceDeps)
+        // AC-001: the CHECKED write entry of the split plan, into the same sink.
+        registerSplitPlanTool(context as never, sequenceDeps, tools)
 
         const disposers: (() => void)[] = [...tools.disposers]
         disposers.push(registerOrchestratorService(context, resolved, stores, approvalSeam, logger))

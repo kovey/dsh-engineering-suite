@@ -1171,6 +1171,88 @@ else
   pass "host-audit-stage in verify: the skipped stage is never reported as ok"
 fi
 
+# ---------------------------------------------------------------------------
+section "C22 — split-smoke: the SKIP branch is pinned, and 'real' without the channel is refused"
+# ---------------------------------------------------------------------------
+# The smoke test's whole value is that it can run the split workflow WITHOUT a
+# host and says so. Two ways to destroy that: delete the SKIP branch (the script
+# then claims a dispatch it never did) or trust whatever a `dsh` on PATH says
+# (a fake binary that does nothing would look green). Both are driven here.
+SPLIT_SMOKE="$ROOT/scripts/split-smoke.sh"
+
+# ① default: the five steps run, dispatch is SKIPPED with its reason, exit 0.
+run_rc bash "$SPLIT_SMOKE"
+if [ "$LAST_RC" = "0" ]; then
+  pass "split-smoke: the no-channel run is exit 0 (stated SKIP, not a failure)"
+else
+  fail "split-smoke: the no-channel run must be exit 0, got $LAST_RC — $LAST_OUT"
+fi
+case "$LAST_OUT" in
+  *"SKIP: 没有可用的真实子代理通道"*) pass "split-smoke: the SKIP sentence names the missing channel" ;;
+  *) fail "split-smoke: the SKIP sentence is gone — $LAST_OUT" ;;
+esac
+case "$LAST_OUT" in
+  *"未验证派发"*) pass "split-smoke: the skip says the dispatch was NOT verified" ;;
+  *) fail "split-smoke: the skip does not say 未验证派发 — $LAST_OUT" ;;
+esac
+if printf '%s\n' "$LAST_OUT" | grep -qE '(^|[[:space:]])(PASS|GREEN|已验证派发)([[:space:]]|$)'; then
+  fail "split-smoke: the skip path marks a pass — $LAST_OUT"
+else
+  pass "split-smoke: the skip path never marks a pass"
+fi
+# The other steps must be REAL (a script that only prints SKIP verifies nothing).
+case "$LAST_OUT" in
+  *"plan: "*"split/plan.json"*) pass "split-smoke: the plan was written through the checked writer" ;;
+  *) fail "split-smoke: no plan.json was written — $LAST_OUT" ;;
+esac
+case "$LAST_OUT" in
+  *"import T-001: 1 条"*) pass "split-smoke: the importer really imported the simulated worker's row" ;;
+  *) fail "split-smoke: the import step did not run — $LAST_OUT" ;;
+esac
+case "$LAST_OUT" in
+  *"cleanup T-001: removed=true"*) pass "split-smoke: the worktree was cleaned up after the import" ;;
+  *) fail "split-smoke: the cleanup step did not run — $LAST_OUT" ;;
+esac
+
+# ② asked for a REAL dispatch, no `dsh` on PATH: non-zero, and it names what is
+#    missing. Treating "I was asked to really run this" as "skip" would be the
+#    same lie in the opposite direction.
+run_rc env PATH="$NO_DSH_BIN" DSH_SMOKE_REAL=1 DSH_SMOKE_PROFILE=fake DSH_SMOKE_MODEL=fake/model bash "$SPLIT_SMOKE"
+if [ "$LAST_RC" = "2" ]; then
+  pass "split-smoke: DSH_SMOKE_REAL=1 without dsh exits 2 (asked for real, cannot provide it)"
+else
+  fail "split-smoke: expected exit 2 for a real run without dsh, got $LAST_RC — $LAST_OUT"
+fi
+case "$LAST_OUT" in
+  *"PATH 上没有 dsh"*) pass "split-smoke: the refusal names the missing dsh" ;;
+  *) fail "split-smoke: the refusal does not name dsh — $LAST_OUT" ;;
+esac
+
+# ③ a `dsh` that exists but dispatches NOTHING must not be reported as verified:
+#    the real branch asserts split/run.json, not the process exit code.
+C22_BIN="$TMP/c22-bin"
+mkdir -p "$C22_BIN"
+printf '#!/bin/sh\nexit 0\n' > "$C22_BIN/dsh"
+chmod +x "$C22_BIN/dsh"
+run_rc env PATH="$C22_BIN:$NO_DSH_BIN" DSH_SMOKE_REAL=1 DSH_SMOKE_PROFILE=fake DSH_SMOKE_MODEL=fake/model bash "$SPLIT_SMOKE"
+if [ "$LAST_RC" = "1" ]; then
+  pass "split-smoke: a no-op dsh exits 1 (exit 0 plus no run.json is not a dispatch)"
+else
+  fail "split-smoke: a no-op dsh must fail verification, got $LAST_RC — $LAST_OUT"
+fi
+case "$LAST_OUT" in
+  *"真实派发没有留下"*) pass "split-smoke: the failure names the missing run.json" ;;
+  *) fail "split-smoke: the failure does not name run.json — $LAST_OUT" ;;
+esac
+
+# ④ an unrecognised switch is refused instead of silently meaning "skip".
+run_rc env DSH_SMOKE_REAL=yes bash "$SPLIT_SMOKE"
+if [ "$LAST_RC" = "2" ]; then
+  pass "split-smoke: DSH_SMOKE_REAL=yes is refused (a typo cannot become a skip)"
+else
+  fail "split-smoke: an unknown DSH_SMOKE_REAL must exit 2, got $LAST_RC — $LAST_OUT"
+fi
+
 section "summary"
 if [ "$FAILURES" = "0" ]; then
   printf '  \033[32mOPS SELFTEST GREEN\033[0m — every finding above is still refused.\n'

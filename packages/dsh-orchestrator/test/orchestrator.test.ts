@@ -345,7 +345,10 @@ test('assembly logs the effective probe map so a misconfiguration is visible in 
     const log = fs.readFileSync(path.join(fake.cwd, 'orchestrator.log'), 'utf8')
     assert.match(log, /probes: dsh-role-guard\(team_delegate\), dsh-spec-gate\(spec_create\)/)
     assert.match(log, /dsh-audit-trail\(auditTrail\)/)
-    assert.match(log, /applied \(tool: orchestrate; stages: spec-clarify → test-design-review/)
+    // Both tools are named: `orchestrate` drives the pipeline and `split_plan`
+    // (AC-001) is the checked write entry — a plugin that lost one of them must
+    // be visible in the log rather than in a missing tool call later.
+    assert.match(log, /applied \(tool: orchestrate, split_plan; stages: spec-clarify → test-design-review/)
 })
 
 // --- 4. start -------------------------------------------------------------

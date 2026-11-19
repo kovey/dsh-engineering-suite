@@ -31,6 +31,10 @@ export interface SplitTaskRun {
     commit?: string
     /** Dispatch attempts (0 = never started). */
     attempts: number
+    /** When the dispatch of this task started (epoch ms, absent = never dispatched). */
+    startedAt?: number
+    /** When it stopped being in flight (epoch ms; filled even for a timeout). */
+    finishedAt?: number
     /** Which model class the worker ran on (planner = escalated, AC-011). */
     modelClass?: 'worker' | 'planner'
     model?: string
@@ -72,6 +76,8 @@ export interface SplitRunResult {
     warnings: string[]
     /** Absolute path of `split/run.json` (absent when nothing was written). */
     file?: string
+    /** Absolute path of `split/report.json` (AC-005; written with `run.json`). */
+    reportFile?: string
 }
 
 /** What one worktree's HEAD says. */
@@ -162,6 +168,20 @@ export interface SplitRunBook {
     seam: SplitWorktrees
     /** Run start (epoch ms). */
     at: number
+    /**
+     * The clock used for `at` and for per-task durations (tests freeze it).
+     *
+     * Kept on the book because the report's `durationMs` must come from the same
+     * clock as everything else in the run: mixing `Date.now()` into a run whose
+     * `at` is frozen makes two identical runs differ by a few milliseconds.
+     * @returns milliseconds since the epoch.
+     */
+    now: () => number
+    /**
+     * The groups actually handed to the scheduler, in execution order (AC-005
+     * asks the report's parallelism to be the REAL one, not the plan's text).
+     */
+    groups: string[][]
     /** One record per plan task, in plan order (even tasks that never started). */
     tasks: SplitTaskRun[]
     problems: string[]
@@ -172,4 +192,9 @@ export interface SplitRunBook {
 /** `missions/<id>/split/run.json` — the durable record of one dispatch. */
 export function splitRunFile(layout: Layout, missionId: string): string {
     return path.join(layout.missionsDir, missionId, 'split', 'run.json')
+}
+
+/** `missions/<id>/split/report.json` — the read-only cost/quality report (AC-005). */
+export function splitReportFile(layout: Layout, missionId: string): string {
+    return path.join(layout.missionsDir, missionId, 'split', 'report.json')
 }

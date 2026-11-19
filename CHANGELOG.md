@@ -1,5 +1,51 @@
 ## [未发布]
 
+### 新增 · P2：让拆分**可写、可装、可控、可读**（`split_plan` / prepare / 超时 / status / report / 冒烟）
+
+P1 把"已审核的 plan"变成了工作，但入口仍是"调用方把 planner 的 JSON 落盘"，worktree 建好却装不上依赖，
+派发超时不可配、运行结果只有一份给机器看的 `run.json`。这一轮补五个可用性缺口，**没有改变任何判定权威**：
+plan 仍要过三道校验与人工审核，主树门禁仍只由 lead 跑，报表与 status 都不参与交付。
+
+- **`split_plan` 工具**（`packages/dsh-orchestrator/src/split-plan-tool.ts`，AC-001）：读当前 mission 的 spec →
+  `validateSplitPlan` 三道（每任务映射真实 AC / 同组路径不相交 / AC 全覆盖）→ 合格才写
+  `missions/<id>/split/plan.json` 并返回摘要；不合格**拒绝写入**并逐条列出 problems。已有 plan 且新内容
+  **摘要变化**时拒绝，提示"改动需要重新审核"（审核记录会失效）；`force: true` 才写。省略 `parallelGroups`
+  时按任务顺序一组一个（默认串行）。`coverage` 由任务的 `acceptance` 派生。与 `orchestrate` 注册到同一个
+  sink（一行日志、一次 dispose）。
+- **worktree prepare**（`packages/dsh-eng-core/src/worktree-prepare.ts`，从 `worktree.ts` 再导出，AC-002）：
+  `prepareTaskWorktree({ mainTree, missionId, taskId })` 复用主树 `pnpm store path`，在 worktree 内
+  `pnpm install --prefer-offline --store-dir …`；worktree 里已有 `node_modules` 时跳过（幂等）；store 探测失败
+  用主树 `node_modules/.pnpm-store`，都没有就不带 store 参数并说明；**失败保留目录**并返回 problems。
+- **worktree 检查范围**（`packages/dsh-eng-core/src/worktree-check.ts`，AC-002）：`runTaskChecks({ worktree,
+  changedPaths })` 把改动映射到包 + 依赖闭包（按构建顺序），只跑
+  `scripts/test-all.sh --quiet <pkgs>` 与 `scripts/typecheck-all.sh <pkgs>`；**不跑** `verify.sh`（跨包 + 工具自检）
+  与 `standards-check.sh`（全仓扫描）；工具链/根配置改动才扩到全部包并注明原因。
+- **`split.taskTimeoutMs`**（`models.ts` + `split-dispatch.ts` + `split-worker.ts`，AC-003）：优先级
+  `models.json` → `autoDispatch.timeoutMs` → 600000；`models.ts` 不给内建默认值（否则会切断"跟随宿主"），
+  非法值点名后忽略。超时用可区分的 `DeadlineError` 判定，任务记 `state:'failed'`、`signals:['timeout']`
+  （`rework.ts` 新增一等信号），**保留 worktree 与本地台账**（收尾跳过该任务的 cleanup 并写明），不再把
+  1ms 抬到 1000ms。`signals` 进返工率，超阈值后续任务仍按 AC-011 升级 planner。
+- **`orchestrate status` 的 `## 拆分`**（`packages/dsh-orchestrator/src/split-status.ts`，AC-004）：plan 摘要前
+  12 位、审核状态（approved/rejected/缺失/stale）、每任务 `id/state/commit 前 8 位/导入条数/cleanedUp`、
+  返工率与是否升级、待导入条数与是否可清理。没有 plan 时整段不出现（旧输出不变）；纯读，测试用 `.dsh`
+  前后快照断言（连 `gates/` 都不产生）。
+- **`split/report.json`**（`packages/dsh-orchestrator/src/split-run-report.ts`，与 `run.json` 同时写，AC-005）：
+  每任务 `{id, modelClass, model, durationMs, attempts, reworkReasons[], imported}`，整体
+  `{rework:{ratio,threshold,escalate}, parallelism:{maxParallel, groups}}`；`groups` 是调度器**实际**使用的
+  分组顺序，`durationMs` 取自 run 自己的时钟。报表是投影：没有任何门禁/导入器/回执读它。
+- **冒烟命令**（`scripts/split-smoke.sh`，AC-006）：`mktemp -d` 造临时 git 仓，跑"写 plan（split_plan 的
+  校验路径）→ 审核 → 派发 → 导入 → 清理"。没有真实子代理通道时派发分支**实测拒绝**（`state=refused`）并打印
+  `SKIP: 没有可用的真实子代理通道` 与"未验证派发"（exit 0，且绝不标记通过）；导入/清理由脚本造一个
+  `simulated worker`（worktree + commit + 本地 evidence + 合并）走真实导入器与清理器。`DSH_SMOKE_REAL=1`
+  时才用真实 `dsh --profile` 会话派发，并以 `split/run.json` 的 `state=ran` 为判据（不看 dsh 退出码）。
+  `scripts/selftest-ops.sh` C22 钉住 SKIP 句 + 三条反证（缺 `dsh` → exit 2；假 `dsh` 无 run.json → exit 1；
+  未知开关 → exit 2）。
+- **测试**：`dsh-eng-core` 329→346 例（345 过 / 1 skip，宿主无 `ps` 的环境项）；`dsh-orchestrator` 149→179 例
+  （新增 split_plan 13 例、split status 10 例、timeout/report 5 例、dispatch 超时 2 例）；
+  `bash scripts/verify.sh --quiet` → exit 0；`bash scripts/standards-check.sh --quiet` → PASS。
+- **文档**：`docs/ARCHITECTURE.md` §5.38.1（plan 入口、prepare/检查范围、超时语义、只读 status、report、
+  冒烟与它的诚实边界）；`docs/PLUGIN-CONVENTIONS.md` 工具面表补 `split_plan`。
+
 ### 新增 · P1 拆分派发执行器：审核过的计划现在真的会派出 worker（`split-runner`）
 
 上一轮把拆分的**判定**做完了（配置、三道校验、门槛、人工审核、worktree 库、返工率、导入器），

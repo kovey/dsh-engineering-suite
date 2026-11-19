@@ -2,10 +2,11 @@
  * The rework ratio and the escalation it triggers (AC-011).
  *
  * 返工率 = 需要重做的子任务数 ÷ 已开始子任务数. A task counts as reworked when the
- * caller marks it — a merge conflict, a failed acceptance check or a gate that
- * rolled the work back are the three facts that mean "this task was done
- * twice". The caller supplies them because only the runner sees them; this
- * module does not guess from commit messages.
+ * caller marks it — a merge conflict, a failed acceptance check, a gate that
+ * rolled the work back, or a worker stopped at `split.taskTimeoutMs` (AC-003)
+ * are the facts that mean "this task was done twice / never finished". The
+ * caller supplies them because only the runner sees them; this module does not
+ * guess from commit messages.
  *
  * Above `quality.maxReworkRatio` the mission is NOT stopped: the remaining tasks
  * are dispatched on the PLANNER model instead, because the failures are usually a
@@ -25,17 +26,21 @@ import { writeJsonAtomic } from './io.js'
 import { DEFAULT_MODELS_CONFIG, type ModelClassConfig } from './models.js'
 import { missionDir, type Layout } from './paths.js'
 
-/** The three facts that mean "this task had to be done again". */
-export type ReworkSignal = 'merge-conflict' | 'acceptance-failed' | 'gate-rollback'
+/** The four facts that mean "this task had to be done again". */
+export type ReworkSignal = 'merge-conflict' | 'acceptance-failed' | 'gate-rollback' | 'timeout'
 
 /** Every signal, in report order. */
-export const REWORK_SIGNALS: readonly ReworkSignal[] = ['merge-conflict', 'acceptance-failed', 'gate-rollback']
+export const REWORK_SIGNALS: readonly ReworkSignal[] = ['merge-conflict', 'acceptance-failed', 'gate-rollback', 'timeout']
 
 /** One-line label per signal (Chinese, for reports). */
 export const REWORK_SIGNAL_LABEL: Record<ReworkSignal, string> = {
     'merge-conflict': '合并冲突',
     'acceptance-failed': '验收不过',
     'gate-rollback': '门禁回退',
+    // AC-003: a worker that ran past `split.taskTimeoutMs` was stopped, not
+    // finished — the worktree and its local ledger stay behind for the import
+    // and cleanup steps, and the ratio counts it as rework.
+    timeout: '派发超时',
 }
 
 /** One task's outcome as the caller observed it. */

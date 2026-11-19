@@ -55,13 +55,30 @@ function describeTasks(result: SplitRunResult): string {
 }
 
 /**
+ * The per-worker deadline of this run (AC-003).
+ *
+ * Precedence: the project's `models.json` (`split.taskTimeoutMs`), then the
+ * host's `autoDispatch.timeoutMs`, then the documented 600000. The chain lives
+ * HERE because only this module sees both configurations; `models.ts` cannot
+ * express "follow the host" without pinning a value.
+ */
+export function splitTaskTimeoutMs(config: DispatchDeps['config'], models: { split: { taskTimeoutMs?: number } }): number {
+    const usable = (value: unknown): number | undefined =>
+        typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.floor(value) : undefined
+    // An unusable project value falls to the NEXT layer (the host), not straight
+    // to the built-in default: a hand-wired `0` must not discard a configured
+    // 90s deadline just because the project layer said something wrong.
+    return usable(models.split.taskTimeoutMs) ?? usable(config.autoDispatch?.timeoutMs) ?? 600_000
+}
+
+/**
  * Turn a run result into the stage dispatcher's outcome (never a settlement).
  *
  * The per-task detail and the rework numbers live in `split/run.json`
  * (`outputFile`); the report carries one compact line so a stage entry does not
  * turn into a wall of text.
  */
-function outcomeOf(result: SplitRunResult, modelProblems: readonly string[]): DispatchOutcome {
+function outcomeOf(result: SplitRunResult, modelProblems: readonly string[], timeoutMs: number): DispatchOutcome {
     const modelNotes = modelProblems.length === 0 ? '' : `；models.json 有 ${modelProblems.length} 条回退/忽略（首条：${modelProblems[0] ?? ''}）`
     if (result.state === 'refused') {
         return {
@@ -75,7 +92,7 @@ function outcomeOf(result: SplitRunResult, modelProblems: readonly string[]): Di
         runId: `split-${(result.planDigest ?? '').slice(0, 12) || 'plan'}`,
         ...(result.file === undefined ? {} : { outputFile: result.file }),
         stopReason: result.ok ? 'completed' : 'error',
-        roleNote: `${headline}；每个子任务一个 worktree + worker 角色（模型 ${describeRoutes(result)}；orchestrate 已从 worker 作用域剔除）${modelNotes}`,
+        roleNote: `${headline}；每个子任务一个 worktree + worker 角色（模型 ${describeRoutes(result)}；单任务超时 ${timeoutMs}ms；orchestrate 已从 worker 作用域剔除）${modelNotes}`,
         ...(result.ok ? {} : { error: result.problems.length === 0 ? '部分子任务未完成（见 run.json）' : result.problems.join('；') }),
     }
 }
@@ -103,6 +120,7 @@ export async function splitDispatch(deps: DispatchDeps, input: SplitDispatchInpu
     }
     const models = loadModelsConfig(layout, { profile: deps.config.split.models })
     if (decideSplit(stored.plan, models.config.split).decision !== 'split') return undefined
+    const taskTimeoutMs = splitTaskTimeoutMs(deps.config, models.config)
     const result = await runSplitPlan({
         layout,
         missionId: input.mission.id,
@@ -117,9 +135,9 @@ export async function splitDispatch(deps: DispatchDeps, input: SplitDispatchInpu
         ...(input.agent === undefined ? {} : { agent: input.agent }),
         ...(input.signal === undefined ? {} : { signal: input.signal }),
         maxDepth: deps.config.autoDispatch.maxDepth,
-        taskTimeoutMs: deps.config.autoDispatch.timeoutMs,
+        taskTimeoutMs,
     })
-    const outcome = outcomeOf(result, models.problems)
+    const outcome = outcomeOf(result, models.problems, taskTimeoutMs)
     // The attempt rides along like it does for the ordinary stage dispatch, so the
     // stage artifact names which entry produced this run.
     return input.attempt === undefined ? outcome : { ...outcome, attempt: input.attempt }

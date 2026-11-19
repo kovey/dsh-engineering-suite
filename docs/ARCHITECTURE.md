@@ -1921,8 +1921,99 @@ worker 在自己的 worktree 里跑的门禁是**部分 scope**：它只看到�
 - 合并是 runner 做的（AC-008 要求"合并后导入"），但**主树完整门禁与回执仍是 lead 的**；本节的接线
   只覆盖到"派发 + 收尾记录"。
 - 子任务失败**不会自动重试**：`attempts` 记 1，下一轮从 `split` 重新拆分/审核（返工率会把它记进去）。
-- plan.json 的生产写入路径仍是"调用方把 planner 的 JSON 落盘"（`saveSplitPlan` 目前只有测试在用）；
-  runner/门禁/导入器都按**磁盘上的 plan 与摘要**工作，所以这条路径不影响一致性，但没有专门的写入工具。
+- plan.json 的生产写入路径在本轮之前只有"调用方把 planner 的 JSON 落盘"（`saveSplitPlan` 只有测试在用）；
+  §5.38.1 的 `split_plan` 补上了这个缺口，runner/门禁/导入器仍只按**磁盘上的 plan 与摘要**工作。
+
+### 5.38.1 P2：plan 入口、prepare、超时、status、report（把 P1 的库变成可用的一步）
+
+P1 交付后 `grep` 仍能看到三个"只有测试在调"的缺口：没有任何工具写 plan、worktree 建好却装不上依赖、
+派发超时不可配也没有可读的运行报告。P2 补的正是这五件，且每一件都不改变既有的判定权威。
+
+**A. `split_plan`：校验收口的唯一写入口（AC-001）**
+
+`packages/dsh-orchestrator/src/split-plan-tool.ts` 把"写 plan"从库调用变成工具：
+
+```
+读当前 mission 的 spec（AC 是判据）→ validateSplitPlan 三道 → 不合格：拒绝写入并列出 problems
+                                                          → 合格：saveSplitPlan 写 split/plan.json 并返回摘要
+```
+
+- **三道校验不可绕过**：工具内部调用的就是 `split-plan` 的 `validateSplitPlan`（每任务映射真实 AC /
+  同组路径不相交 / AC 全覆盖），没有第二份实现；写入用 `saveSplitPlan`，摘要就是审核记录要引用的那个。
+- **摘要变化需 `force`**：已有 plan 且新内容摘要不同时拒绝，并把"改动需要重新审核、审核记录会失效"说清楚。
+  审核记录**不被工具改写**（它是历史），失效由"摘要不匹配"在 `split-review` 与 runner 两处确定性判定。
+- **默认不并行**：省略 `parallelGroups` 时按任务顺序一组一个（串行），因为"planner 忘了写并行组"不该被理解成
+  "这些任务可以同时改同一批文件"。`coverage` 由任务的 `acceptance` 派生，plan 自描述。
+- 工具在插件装配时与 `orchestrate` 注册到同一个 sink（一行日志、一次 dispose 同时撤掉两个工具）。
+
+**B. worktree 的依赖与检查范围（AC-002）**
+
+- `prepareTaskWorktree`（`worktree-prepare.ts`，从 `worktree.ts` 再导出）：worktree 里已有 `node_modules`
+  就跳过（幂等）；否则先探主树的 `pnpm store path` 并 `pnpm install --prefer-offline --store-dir …`，
+  探测失败时用主树 `node_modules/.pnpm-store`，两者都没有就**不带 store 参数**并在 notes 里说明。
+  **失败保留目录**：失败的 worktree 可能是这个子任务唯一的证据副本，绝不"清理干净"。
+- `runTaskChecks`（`worktree-check.ts`）：把改动路径映射到 `packages/<name>`，取**依赖闭包**并按构建顺序
+  调 `scripts/test-all.sh --quiet <pkgs>` 与 `scripts/typecheck-all.sh <pkgs>`；工具链/根配置改动无法收窄时
+  才跑全部包并说明原因。**不调** `verify.sh`（含跨包测试与工具自检）与 `standards-check.sh`（全仓扫描）——
+  这两条都是仓库级契约，用它们就等于把"只跑受影响包"变成一句假话。
+
+**C. `split.taskTimeoutMs` 与超时的语义（AC-003）**
+
+- 优先级：`models.json` 的 `split.taskTimeoutMs` → 宿主 `autoDispatch.timeoutMs` → 600000。`models.ts` 里该
+  字段**没有内建默认值**（否则会钉死超时、切断"跟随宿主"这条链）；非法值点名后忽略。
+- 超时不是"失败"的一种模糊说法：`DeadlineError` 与 worker 自己的失败可区分，超时记 `signals: ['timeout']`
+  （`rework.ts` 的一等信号），并**保留 worktree 与本地台账**——收尾阶段跳过该任务的 cleanup，日志写明
+  "供后续导入/清理"。`withDeadline` 不再把 1ms 抬到 1000ms：超时是部署决定，改它会让"超时真的生效"不可证。
+
+**D. `orchestrate status` 的只读拆分段（AC-004）**
+
+`split-status.ts` 渲染 `## 拆分`：plan 摘要前 12 位、审核状态（approved/rejected/缺失/stale）、
+每任务 `id/state/commit 前 8 位/导入条数/cleanedUp`、返工率与是否升级、待导入条数与是否可清理。
+两条硬性质：**没有 plan 时整段不出现**（旧输出逐字节不变），且状态视图**没有任何写路径**——测试用
+`.dsh` 前后快照断言（连 gates/ 目录都不会出现）。
+
+**E. `split/report.json`：只读的每任务成本与质量报表（AC-005）**
+
+与 `run.json` 同时写、来自同一个 book：每任务 `{id, modelClass, model, durationMs, attempts,
+reworkReasons[], imported}`，整体 `{rework:{ratio,threshold,escalate}, parallelism:{maxParallel, groups}}`。
+`parallelism.groups` 是**调度器实际使用的分组顺序**（不是 plan 文本）；`durationMs` 用 run 自己的时钟
+（测试冻结它 → 两次运行字节相同）。报表不被任何门禁、导入器或回执读取——它是投影，不是证据。
+
+**F. 冒烟命令与它的诚实边界（AC-006）**
+
+`scripts/split-smoke.sh` 在 `mktemp -d` 的仓库里跑：写 plan（走 `split_plan` 的校验路径）→ 审核 →
+派发 → 导入 → 清理。派发需要真实子代理通道：默认分支**实测拒绝**（`runSplitPlan` 无 `ctx.subagents` 时
+`state=refused`）并打印 `SKIP: 没有可用的真实子代理通道` 与"未验证派发"，退出码 0；
+`DSH_SMOKE_REAL=1` 时才用真实 `dsh --profile` 会话派发，并以 `split/run.json` 的 `state=ran` 作为
+"派发真的发生"的判据（不看 dsh 退出码）。导入/清理在两种分支下都真实执行：默认分支由脚本造一个
+"simulated worker"（worktree + commit + 本地 evidence + 合并），走真实导入器与清理器，并在输出里标明。
+`scripts/selftest-ops.sh` C22 钉住四条：SKIP 句与"未验证派发"、要求真派发却没有 `dsh` → 非 0、
+假 `dsh` 退出 0 但没留下 run.json → 非 0、不认识的开关 → 非 0（拼写错误不能变成跳过）。
+
+**G. 测试**
+
+- `split-plan-tool.test.ts`（13 例）：合格写入与摘要返回、三道校验各自失败（写入文件不存在）、摘要变化拒绝
+  （磁盘摘要与目标未变）、`force` 放行并声明旧审核失效、相同内容无需 force、无 mission/无 spec 拒绝、
+  默认并行组、注册存在。
+- `split-status.test.ts`（10 例）：无 plan 时旧输出不变、完整渲染（摘要/审核/每任务/返工率/待导入）、
+  rejected、stale、可清理（剩余未导入 0）、待导入阻止清理、升级标记、**只读快照**、report.json 不被读取。
+- `split-runner.test.ts` 追加 5 例：1ms 超时 → 两任务 `failed` + `signals:['timeout']` + worktree 与本地
+  文件仍在、worker 自己报"超时"不算 timeout、report 字段与真实并行度/耗时、升级后的 modelClass、
+  refused 运行也写 report。
+- `split-dispatch.test.ts` 追加 2 例：`models.json` 的 `taskTimeoutMs` 进入派发报告、优先级链与非法回退。
+- `worktree-prepare.test.ts`（8 例，真实 git + 假 pnpm）：store 复用、幂等、store 探测失败的两条兜底、
+  install 失败保留目录、缺 worktree、无 manifest、清理后不可 prepare。
+- `worktree-check.test.ts`（7 例，假脚本）：只含受影响包 + 依赖闭包与顺序、文档改动零命令、工具链改动全包、
+  失败透传、缺脚本是问题、缺 worktree 拒绝、纯函数映射。
+- `split-workflow.test.ts` 补 `taskTimeoutMs` 的解析/非法值/缺省三态；`rework.test.ts` 补 `timeout` 是已知信号。
+
+**诚实边界（P2）**
+
+- `split_plan` 只做结构与映射校验："这个拆分好不好"仍是审核者的判断。
+- `prepareTaskWorktree` 证明的是 pnpm 的调用形状（store/幂等/失败保留），不证明真实 registry 的安装一定成功。
+- `report.json` 是投影：删掉它不影响任何判定；反过来，它也不能用来证明"子任务做对了"。
+- 冒烟的 `simulated worker` 证明了导入器/清理器的真实行为，但**不证明真 worker 会写出合格 commit**；
+  真派发分支需要本机 `dsh` + 打开 `split.enabled` 的 profile，本仓库的验收跑只覆盖 SKIP 与反证。
 
 ## 6. 为什么这样切分
 

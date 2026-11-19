@@ -21,6 +21,7 @@
 
 import { writeJsonAtomic } from 'dsh-eng-core'
 import { importTaskEvidence, pendingImports, splitTaskBranch, type ReworkReport, type ReworkSignal } from 'dsh-eng-core/split'
+import { writeSplitRunReport } from './split-run-report.js'
 import { planNextSplitTask } from './split-rework.js'
 import { splitRunFile, type SplitRunBook, type SplitRunResult, type SplitRunState, type SplitTaskRun } from './split-run-types.js'
 
@@ -91,10 +92,22 @@ function importTasks(book: SplitRunBook): void {
     }
 }
 
-/** Remove every worktree — only after the import, and a refusal is reported as-is. */
+/**
+ * Remove every worktree — only after the import, and a refusal is reported as-is.
+ *
+ * A task stopped by `split.taskTimeoutMs` is SKIPPED (AC-003): its worktree is
+ * the only copy of whatever the worker had written when the deadline fired, and
+ * the mission's rule is that a timeout keeps the worktree and the local ledger
+ * for the import/cleanup flow to handle later — not that it quietly deletes
+ * them because "no rows were imported yet".
+ */
 function cleanupTasks(book: SplitRunBook): void {
     for (const record of book.tasks) {
         if (record.worktree === undefined) continue
+        if (record.signals.includes('timeout')) {
+            book.log(`子任务 ${record.id}：派发超时，worktree 与本地台账保留（本次不清理）：${record.worktree}`)
+            continue
+        }
         const result = book.seam.cleanup({ mainTree: book.mainTree, missionId: book.missionId, taskId: record.id })
         record.cleanedUp = result.removed || result.alreadyGone
         for (const problem of result.problems) note(book, `子任务 ${record.id}：${problem}`)
@@ -131,7 +144,7 @@ function resultOf(book: SplitRunBook, state: SplitRunState, rework: ReworkReport
     }
 }
 
-/** Write `split/run.json` (one shape for every outcome) and return it with `file`. */
+/** Write `split/run.json` and `split/report.json` (one shape for every outcome) and return it with `file`. */
 function writeRunRecord(book: SplitRunBook, result: SplitRunResult): SplitRunResult {
     const file = splitRunFile(book.layout, book.missionId)
     writeJsonAtomic(file, {
@@ -148,7 +161,9 @@ function writeRunRecord(book: SplitRunBook, result: SplitRunResult): SplitRunRes
         problems: result.problems,
         warnings: result.warnings,
     })
-    return { ...result, file }
+    // AC-005: written WITH the run record, from the same book. Nothing reads it —
+    // the report is a projection, never delivery evidence.
+    return { ...result, file, reportFile: writeSplitRunReport(book, result) }
 }
 
 /**

@@ -161,6 +161,32 @@ test('a malformed models.json is reported and the defaults still apply', () => {
     assert.equal(resolved.problems.filter((problem) => problem.includes('已回退宿主默认')).length, 4)
 })
 
+test('split.taskTimeoutMs is parsed, an unusable value is named, and absence means "follow the host" (AC-003)', () => {
+    const declared = loadModelsConfig(workspace({ split: { taskTimeoutMs: 9000 } }).layout)
+    assert.equal(declared.config.split.taskTimeoutMs, 9000)
+
+    // 0/negative/non-integer are not deadlines: the value is reported and left
+    // out so the caller's autoDispatch.timeoutMs can still supply one.
+    for (const bad of [0, -1, 1.5, '9000']) {
+        const resolved = loadModelsConfig(workspace({ split: { taskTimeoutMs: bad } }).layout)
+        assert.equal(resolved.config.split.taskTimeoutMs, undefined, `taskTimeoutMs=${JSON.stringify(bad)} must be ignored`)
+        assert.ok(
+            resolved.problems.some((problem) => problem.includes('taskTimeoutMs')),
+            `missing problem for taskTimeoutMs=${JSON.stringify(bad)}: ${resolved.problems.join(' | ')}`,
+        )
+    }
+
+    // No built-in default on purpose: an absent value must stay absent so the
+    // host's autoDispatch.timeoutMs remains the fallback (a pinned default here
+    // would silently stop following it).
+    const absent = loadModelsConfig(workspace().layout)
+    assert.equal(absent.config.split.taskTimeoutMs, undefined)
+    // No fallback line either: nothing was replaced, so nothing may be reported
+    // as "回退默认". (The section hint lists the field name — that is the shape,
+    // not a fallback.)
+    assert.equal(absent.problems.some((problem) => /taskTimeoutMs (必须|未配置)/.test(problem)), false)
+})
+
 // --- the three automatic checks (AC-004) ----------------------------------
 
 test('a plan that satisfies all three checks is sendable', () => {

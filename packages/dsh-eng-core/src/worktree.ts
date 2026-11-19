@@ -19,6 +19,11 @@
  * need the same function an operator would run; `scripts/split-worktree.sh` is
  * the thin CLI over it for manual use.
  *
+ * The dependency step ({@link prepareTaskWorktree}, AC-002) lives in
+ * `worktree-prepare.ts` and is RE-EXPORTED here: it is the same lifecycle (one
+ * worktree), and every caller that already imports this module should keep
+ * finding it — the split is for the file-size ratchet, not for the reader.
+ *
  * @module dsh-eng-core/worktree
  */
 
@@ -282,3 +287,9 @@ export function cleanupTaskWorktree(input: CleanupWorktreeInput): CleanupWorktre
     }
     return { ok: true, removed: true, alreadyGone: false, worktree, branch, pending: [], problems: [] }
 }
+
+// AC-002: the one step between "the worktree exists" and "its worker can build".
+// Re-exported (not duplicated) so `prepareTaskWorktree` is reachable from the
+// module that owns the worktree lifecycle.
+export { prepareTaskWorktree } from './worktree-prepare.js'
+export type { PrepareWorktreeInput, PrepareWorktreeResult } from './worktree-prepare.js'

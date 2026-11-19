@@ -36,7 +36,7 @@ import {
 import { tempWorkspace } from 'dsh-eng-core/testing'
 import { splitReworkFile } from 'dsh-eng-core/split'
 import { runSplitPlan } from '../dist/split-runner.js'
-import { splitRunFile, type SplitRunnerDeps, type SplitRoleGuard } from '../dist/split-run-types.js'
+import { splitRunFile, splitReportFile, type SplitRunnerDeps, type SplitRoleGuard } from '../dist/split-run-types.js'
 
 /** One git invocation in the fixture (a broken fixture must not look green). */
 function git(cwd: string, argv: string[]): string {
@@ -496,4 +496,132 @@ test('a caller-passed plan that is not the one on disk is refused (digest mismat
     assert.equal(workers.started.length, 0)
     // The plan on disk is untouched by the refusal.
     assert.equal(readSplitPlan(resolveLayout(cwd), 'm1')?.plan.tasks[1]?.goal, '做 T-002')
+})
+
+// --- the deadline (AC-003) and the report (AC-005) -------------------------
+
+/** The whole `split/report.json` of a mission (fails when it was not written). */
+function reportRecord(cwd: string): {
+    planDigest: string
+    state: string
+    tasks: { id: string; modelClass: string | null; model: string | null; durationMs: number; attempts: number; reworkReasons: string[]; imported: number }[]
+    rework: { ratio: number; threshold: number; escalate: boolean }
+    parallelism: { maxParallel: number; groups: string[][] }
+} {
+    const file = splitReportFile(resolveLayout(cwd), 'm1')
+    assert.equal(fs.existsSync(file), true, `missing ${file}`)
+    return JSON.parse(fs.readFileSync(file, 'utf8')) as never
+}
+
+test('a worker past split.taskTimeoutMs is rework with a timeout signal, and its worktree + local ledger stay (TC-2103)', async () => {
+    const cwd = repo()
+    mission(cwd, twoTasks([['T-001', 'T-002']]))
+    const workers = fakeWorkers()
+    const running = runSplitPlan(deps(cwd, workers, { taskTimeoutMs: 1 }))
+
+    await workers.waitFor(2)
+    const layout = resolveLayout(cwd)
+    // Whatever the worker wrote before the deadline fired is the only copy of
+    // that work: the run must not delete it.
+    fs.writeFileSync(path.join(splitWorktreeDir(layout, 'm1', 'T-001'), 'worker-note.txt'), 'half done\n')
+    const result = await running
+
+    assert.equal(result.state, 'ran')
+    assert.deepEqual(result.tasks.map((entry) => entry.state), ['failed', 'failed'])
+    assert.deepEqual(result.tasks.map((entry) => entry.signals), [['timeout'], ['timeout']])
+    assert.match(result.problems.join('\n'), /超时/)
+    // AC-003: the worktree and its local files stay for a later import/cleanup.
+    assert.equal(fs.existsSync(splitWorktreeDir(layout, 'm1', 'T-001')), true)
+    assert.equal(fs.readFileSync(path.join(splitWorktreeDir(layout, 'm1', 'T-001'), 'worker-note.txt'), 'utf8'), 'half done\n')
+    assert.equal(result.tasks.every((entry) => entry.cleanedUp === false), true)
+    // The timeout is in the durable records, not only in the returned object.
+    const run = JSON.parse(fs.readFileSync(splitRunFile(layout, 'm1'), 'utf8')) as { tasks: { signals: string[]; cleanedUp: boolean }[] }
+    assert.deepEqual(run.tasks.map((entry) => entry.signals), [['timeout'], ['timeout']])
+    assert.deepEqual(run.tasks.map((entry) => entry.cleanedUp), [false, false])
+    assert.deepEqual(reportRecord(cwd).tasks.map((entry) => entry.reworkReasons), [['timeout'], ['timeout']])
+    assert.equal(result.ok, false)
+})
+
+test('a worker whose own failure merely mentions 超时 is NOT recorded as a timeout (signal honesty)', async () => {
+    const cwd = repo()
+    mission(cwd, twoTasks([['T-001', 'T-002']]))
+    const workers = fakeWorkers()
+    const running = runSplitPlan(deps(cwd, workers, { taskTimeoutMs: 60_000 }))
+
+    await workers.waitFor(2)
+    const worker = workers.started[0] as StartedWorker
+    worker.reject(new Error('上游返回 超时'))
+    finishWorker(workers, resolveLayout(cwd), 'T-002')
+    const result = await running
+
+    assert.deepEqual(result.tasks[0]?.signals, ['acceptance-failed'])
+    assert.match(result.tasks[0]?.problems.join('\n') ?? '', /超时/)
+})
+
+test('report.json holds every per-task field and the REAL parallelism (TC-2105/TC-2110)', async () => {
+    const cwd = repo()
+    mission(cwd, twoTasks([['T-001', 'T-002']]))
+    const workers = fakeWorkers()
+    let clock = 1_700_000_000_000
+    const running = runSplitPlan(deps(cwd, workers, { maxParallel: 2, now: () => clock }))
+
+    await workers.waitFor(2)
+    const layout = resolveLayout(cwd)
+    clock += 250
+    finishWorker(workers, layout, 'T-001')
+    // Let the runner's continuation record the first finish before moving the
+    // clock: the durations are the assertion, so the test must not race them.
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    clock += 250
+    finishWorker(workers, layout, 'T-002')
+    const result = await running
+
+    assert.equal(result.ok, true, result.problems.join(' | '))
+    const reportFile = splitReportFile(layout, 'm1')
+    assert.equal(result.reportFile, reportFile)
+    const report = reportRecord(cwd)
+    assert.equal(report.state, 'ran')
+    assert.equal(report.planDigest, result.planDigest)
+    assert.deepEqual(report.parallelism, { maxParallel: 2, groups: [['T-001', 'T-002']] })
+    assert.deepEqual(report.rework, { ratio: 0, threshold: 0.3, escalate: false })
+    assert.deepEqual(report.tasks, [
+        { id: 'T-001', modelClass: 'worker', model: 'deepseek-chat', durationMs: 250, attempts: 1, reworkReasons: [], imported: 1 },
+        // Both tasks were dispatched together; the second one finished 250ms later.
+        { id: 'T-002', modelClass: 'worker', model: 'deepseek-chat', durationMs: 500, attempts: 1, reworkReasons: [], imported: 1 },
+    ])
+})
+
+test('report.json names the escalated model class when the rework ratio switches routes (TC-2110 / AC-011)', async () => {
+    const cwd = repo()
+    mission(cwd, twoTasks([['T-001'], ['T-002']]))
+    const workers = fakeWorkers()
+    const running = runSplitPlan(deps(cwd, workers))
+
+    await workers.waitFor(1)
+    ;(workers.started[0] as StartedWorker).reject(new Error('验收不过'))
+    await workers.waitFor(2)
+    finishWorker(workers, resolveLayout(cwd), 'T-002')
+    const result = await running
+
+    assert.equal(result.rework.escalate, true)
+    const report = reportRecord(cwd)
+    assert.equal(report.rework.ratio, 0.5)
+    assert.equal(report.rework.escalate, true)
+    assert.equal(report.tasks[0]?.modelClass, 'worker')
+    assert.equal(report.tasks[1]?.modelClass, 'planner')
+    assert.equal(report.tasks[1]?.model, 'deepseek-reasoner')
+    assert.deepEqual(report.tasks[0]?.reworkReasons, ['acceptance-failed'])
+})
+
+test('a refused run still writes report.json, so "why nothing ran" is answerable from the artifacts', async () => {
+    const cwd = repo()
+    mission(cwd, twoTasks([['T-001', 'T-002']]), { review: 'none' })
+    const workers = fakeWorkers()
+    const result = await runSplitPlan(deps(cwd, workers))
+
+    assert.equal(result.state, 'refused')
+    const report = reportRecord(cwd)
+    assert.equal(report.state, 'refused')
+    assert.equal(report.parallelism.groups.length, 1)
+    assert.deepEqual(report.tasks.map((entry) => entry.attempts), [0, 0])
 })

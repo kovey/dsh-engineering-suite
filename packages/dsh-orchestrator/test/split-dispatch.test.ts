@@ -18,6 +18,7 @@ import { recordSplitReview, saveSplitPlan, splitPlanDigest, splitWorktreeDir, wo
 import { createFakeHost, runText, tempWorkspace, type FakeHost } from 'dsh-eng-core/testing'
 import { splitRunFile } from '../dist/split-run-types.js'
 import { apply } from '../dist/index.js'
+import { splitTaskTimeoutMs } from '../dist/split-dispatch.js'
 
 /** Sibling plugin tools the default pipeline probes (stubbed as mounted). */
 const PLUGIN_TOOLS = ['spec_create', 'test_design_review', 'team_delegate', 'quality_gate_run', 'mission_complete', 'audit_report']
@@ -193,4 +194,35 @@ test('a plan that is not worth splitting leaves implement on the plain path (no 
     assert.equal(fake.activationSpecs.length, 0, 'a plan that is not worth splitting dispatches nobody')
     assert.equal(fs.existsSync(splitRunFile(layout, 'm1')), false, 'and it writes no dispatch record')
     assert.equal(fs.existsSync(worktreeRoot(layout)), false, 'and it creates no worktree')
+})
+
+test('the per-worker deadline comes from models.json split.taskTimeoutMs, not the host default (AC-003)', async () => {
+    const cwd = repo()
+    const fake = host(cwd)
+    const { layout } = missionAt(fake, 'split-review')
+    // The project overrides the host's autoDispatch.timeoutMs (which stays at
+    // its 10-minute default here): the dispatch report must quote the project's.
+    const modelsFile = path.join(layout.rootDir, 'models.json')
+    const models = JSON.parse(fs.readFileSync(modelsFile, 'utf8')) as { split: Record<string, unknown> }
+    models.split['taskTimeoutMs'] = 4321
+    fs.writeFileSync(modelsFile, JSON.stringify(models))
+    saveSplitPlan(layout, 'm1', goodPlan())
+    approve(layout)
+
+    const text = await orchestrate(fake, { action: 'advance', verdict: 'PASS' })
+
+    assert.match(text, /单任务超时 4321ms/)
+    assert.equal(fake.activationSpecs.length, 2, text)
+})
+
+test('splitTaskTimeoutMs: project value → autoDispatch.timeoutMs → 600000, and an unusable value falls back', () => {
+    const config = { autoDispatch: { timeoutMs: 90_000 } } as never
+    assert.equal(splitTaskTimeoutMs(config, { split: { taskTimeoutMs: 4321 } }), 4321)
+    assert.equal(splitTaskTimeoutMs(config, { split: {} }), 90_000)
+    assert.equal(splitTaskTimeoutMs({ autoDispatch: undefined } as never, { split: {} }), 600_000)
+    // 0 / negative / NaN are not deadlines: the documented default applies, never
+    // "no deadline at all" (which is how a stuck worker wedges a tool call).
+    for (const unusable of [0, -5, Number.NaN]) {
+        assert.equal(splitTaskTimeoutMs(config, { split: { taskTimeoutMs: unusable } }), 90_000)
+    }
 })

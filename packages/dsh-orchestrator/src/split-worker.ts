@@ -31,6 +31,13 @@ import type { SplitRolePlan, SplitRunBook, SplitRunnerDeps } from './split-run-t
 /** Who is delegating, for the delegation seam's refusal texts. */
 const WORKER_OWNER = { plugin: 'dsh-orchestrator', subject: '子任务 worker' }
 
+/** Why one worker did not finish (AC-003 needs the timeout to be nameable). */
+export interface WorkerFailure {
+    detail: string
+    /** `true` only when the configured `taskTimeoutMs` stopped the worker. */
+    timeout?: true
+}
+
 /** The resolved delegation of one run (registered preset included). */
 export interface WorkerDispatch {
     plan: Exclude<DelegationPlan, { kind: 'refused' }>
@@ -46,14 +53,35 @@ export interface WorkerStart {
     route: NextTaskRoute
 }
 
-/** A deadline for one worker (a stuck child must not wedge the tool call). */
+/**
+ * The deadline error, distinguishable from the worker's OWN rejection.
+ *
+ * A plain message would have to be pattern-matched later, and a worker that
+ * failed with the word "超时" in its diagnostic would then be recorded as a
+ * `timeout` rework signal (a wrong signal understates a real failure).
+ */
+class DeadlineError extends Error {
+    constructor(message: string) {
+        super(message)
+        this.name = 'DeadlineError'
+    }
+}
+
+/**
+ * A deadline for one worker (a stuck child must not wedge the tool call).
+ *
+ * The configured value is honoured AS GIVEN (minimum 1ms): the deadline is a
+ * deployment decision, and silently raising a 1ms test configuration to 1s
+ * would make "the timeout works" unprovable. `0`/absent means "no deadline" and
+ * never reaches this function.
+ */
 async function withDeadline<T>(work: Promise<T>, timeoutMs: number, label: string): Promise<T> {
     let timer: ReturnType<typeof setTimeout> | undefined
     try {
         return await Promise.race([
             work,
             new Promise<never>((_resolve, reject) => {
-                timer = setTimeout(() => reject(new Error(`${label} 超时（${timeoutMs}ms）`)), Math.max(1_000, timeoutMs))
+                timer = setTimeout(() => reject(new DeadlineError(`${label} 超时（${timeoutMs}ms）`)), Math.max(1, timeoutMs))
                 timer.unref?.()
             }),
         ])
@@ -185,18 +213,21 @@ async function startChild(book: SplitRunBook, deps: SplitRunnerDeps, start: Work
 }
 
 /** Wait for the child (bounded when a deadline is configured) and read its stop reason. */
-async function settleChild(book: SplitRunBook, deps: SplitRunnerDeps, task: SplitTask, child: NonNullable<StartedChild['child']>): Promise<string | undefined> {
+async function settleChild(book: SplitRunBook, deps: SplitRunnerDeps, task: SplitTask, child: NonNullable<StartedChild['child']>): Promise<WorkerFailure | undefined> {
     try {
         const bounded = deps.taskTimeoutMs !== undefined && deps.taskTimeoutMs > 0
         const settled = bounded ? await withDeadline(child.result, deps.taskTimeoutMs ?? 0, `子任务 ${task.id} 的 worker`) : await child.result
         const stopReason = typeof settled.stopReason === 'string' ? settled.stopReason : 'unknown'
         if (stopReason === 'error' || stopReason === 'cancelled' || stopReason === 'aborted') {
-            return `worker 结束于 ${stopReason}${typeof settled.diagnostic === 'string' ? `（${settled.diagnostic}）` : ''}`
+            return { detail: `worker 结束于 ${stopReason}${typeof settled.diagnostic === 'string' ? `（${settled.diagnostic}）` : ''}` }
         }
         book.log(`子任务 ${task.id} 的 worker 返回（stopReason=${stopReason}，run ${child.id}）`)
         return undefined
     } catch (error) {
-        return `worker 未完成：${(error as Error).message}`
+        const message = error instanceof Error ? error.message : String(error)
+        // AC-003: only the DEADLINE is a timeout. The worker's own failure is a
+        // different rework signal even when its text happens to contain "超时".
+        return error instanceof DeadlineError ? { detail: `worker 未完成：${message}`, timeout: true } : { detail: `worker 未完成：${message}` }
     }
 }
 
@@ -214,11 +245,11 @@ async function disposeChild(child: NonNullable<StartedChild['child']>): Promise<
  * @param book - the run state (warnings are appended here).
  * @param deps - the seams and the caller's agent/signal.
  * @param start - the task, its delegation, its worktree and the model route.
- * @returns `undefined` on success, else the failure text (never throws).
+ * @returns `undefined` on success, else the failure (never throws).
  */
-export async function startWorker(book: SplitRunBook, deps: SplitRunnerDeps, start: WorkerStart): Promise<string | undefined> {
+export async function startWorker(book: SplitRunBook, deps: SplitRunnerDeps, start: WorkerStart): Promise<WorkerFailure | undefined> {
     const started = await startChild(book, deps, start, start.worktree)
-    if (started.child === undefined) return started.error ?? '派发失败'
+    if (started.child === undefined) return { detail: started.error ?? '派发失败' }
     bindWorker(deps, book, started.child.id)
     const failure = await settleChild(book, deps, start.task, started.child)
     await disposeChild(started.child)

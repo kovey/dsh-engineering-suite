@@ -197,7 +197,7 @@ ctx.tools.register(defineTool({
 | dsh-quality-gate | `quality_gate_run` / `quality_gate_status` | 执行宿主配置命令并三态裁决 / 查询最近门禁 |
 | dsh-evidence-gate | `evidence_record` / `evidence_status` / `mission_complete` | 记录证据 / 证据与门禁总览 / 交付验收并签发回执 |
 | dsh-audit-trail | `audit_report` / `audit_rewind` | 审计汇总 / 按轮次回滚工作区 |
-| dsh-orchestrator | `orchestrate` | 推进/查询/重跑阶段流水线 |
+| dsh-orchestrator | `orchestrate` / `split_plan` | 推进/查询/重跑阶段流水线 / 校验三道并写拆分计划（摘要变化需 `force`） |
 
 门禁三态统一为 `PASS` / `WARN` / `BLOCK`（`GateState`），写入
 `store.recordGate(missionId, { source, state, reason, results, fingerprint })`。

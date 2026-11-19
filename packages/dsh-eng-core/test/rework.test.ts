@@ -165,3 +165,15 @@ test('the summary names the ratio, the threshold and the decision', () => {
     assert.match(text, /超过阈值 0\.3/)
     assert.match(text, /planner 模型（不中止）/)
 })
+
+test('a dispatch timeout is a known rework signal, not an unknown marker (AC-003)', () => {
+    // AC-003: a worker stopped at split.taskTimeoutMs is rework. It must be a
+    // FIRST-CLASS signal — an unknown name would be reported as a problem and
+    // silently dropped from the ratio.
+    const report = computeRework({ tasks: [{ id: 't1', started: true, signals: ['timeout'] }, { id: 't2', started: true }], threshold: 0.3 })
+    assert.deepEqual(report.problems, [])
+    assert.deepEqual(report.tasks[0]?.signals, ['timeout'])
+    assert.equal(report.reworked, 1)
+    assert.equal(report.ratio, 0.5)
+    assert.match(renderReworkReport(report), /返工率 1\/2/)
+})

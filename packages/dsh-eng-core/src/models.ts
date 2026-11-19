@@ -11,7 +11,7 @@
  * <root>/models.json
  *   planner { model, reasoningEffort, provider }
  *   worker  { model, reasoningEffort, provider }
- *   split   { reviewRequired, maxTasks, maxParallel, maxReworkRounds }
+ *   split   { reviewRequired, maxTasks, maxParallel, maxReworkRounds, taskTimeoutMs }
  *   quality { maxReworkRatio }
  * ```
  *
@@ -26,6 +26,14 @@
 
 import type { Layout } from './paths.js'
 import { loadProjectConfig } from './project-config.js'
+import { isRecord, parseQualitySection, parseSplitSection, type QualitySettings, type SplitSettings } from './models-sections.js'
+
+// The two section SHAPES live with their parsers (`models-sections.ts`): the
+// resolver imports the parsers at runtime, so a type import in the other
+// direction would still be a module edge (the standards lexer sees `import type`
+// as an import) and therefore a cycle. Re-exported here so the public surface
+// (`dsh-eng-core/split`) does not change.
+export type { QualitySettings, SplitSettings } from './models-sections.js'
 
 /** One model class (`planner` / `worker`). */
 export interface ModelClassConfig {
@@ -33,24 +41,6 @@ export interface ModelClassConfig {
     model?: string
     provider?: string
     reasoningEffort?: string
-}
-
-/** Splitting granularity and the review requirement. */
-export interface SplitSettings {
-    /** A human must review the plan before any worker is dispatched. */
-    reviewRequired: boolean
-    /** Upper bound on tasks in one plan; more than this is "split into missions". */
-    maxTasks: number
-    /** Upper bound on one parallel group; more than this is "split into missions". */
-    maxParallel: number
-    /** How many re-split rounds a rejected plan gets before the work goes plain. */
-    maxReworkRounds: number
-}
-
-/** Quality thresholds of the split workflow. */
-export interface QualitySettings {
-    /** Reworked tasks ÷ started tasks above this escalates later tasks to planner. */
-    maxReworkRatio: number
 }
 
 /** The four sections of `models.json`. */
@@ -101,12 +91,8 @@ export interface ModelsLayer {
 const SECTION_DEFAULTS: Record<ModelsClass, string> = {
     planner: 'planner{model,reasoningEffort}',
     worker: 'worker{model,reasoningEffort}',
-    split: 'split{reviewRequired,maxTasks,maxParallel,maxReworkRounds}',
+    split: 'split{reviewRequired,maxTasks,maxParallel,maxReworkRounds,taskTimeoutMs}',
     quality: 'quality{maxReworkRatio}',
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-    return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
 /** Read an optional non-empty string, reporting a wrong type. */
@@ -133,47 +119,6 @@ function parseModelClass(value: unknown, where: string, problems: string[]): Mod
     }
 }
 
-/** Read a positive integer field (a rejected value is reported, never guessed). */
-function positiveInt(value: unknown, where: string, minimum: number, problems: string[]): number | undefined {
-    if (value === undefined) return undefined
-    if (typeof value !== 'number' || !Number.isInteger(value) || value < minimum) {
-        problems.push(`${where} 必须是不小于 ${minimum} 的整数（收到 ${JSON.stringify(value)}），已忽略`)
-        return undefined
-    }
-    return value
-}
-
-/** Read the `split` section. */
-function parseSplit(value: unknown, where: string, problems: string[]): Partial<SplitSettings> {
-    const raw = isRecord(value) ? value : {}
-    if (!isRecord(value)) problems.push(`${where} 必须是对象（收到 ${JSON.stringify(value)}），已忽略`)
-    const reviewRequired = raw['reviewRequired']
-    if (reviewRequired !== undefined && typeof reviewRequired !== 'boolean') {
-        problems.push(`${where}.reviewRequired 必须是布尔值（收到 ${JSON.stringify(reviewRequired)}），已忽略`)
-    }
-    const maxTasks = positiveInt(raw['maxTasks'], `${where}.maxTasks`, 2, problems)
-    const maxParallel = positiveInt(raw['maxParallel'], `${where}.maxParallel`, 1, problems)
-    const maxReworkRounds = positiveInt(raw['maxReworkRounds'], `${where}.maxReworkRounds`, 0, problems)
-    return {
-        ...(typeof reviewRequired === 'boolean' ? { reviewRequired } : {}),
-        ...(maxTasks === undefined ? {} : { maxTasks }),
-        ...(maxParallel === undefined ? {} : { maxParallel }),
-        ...(maxReworkRounds === undefined ? {} : { maxReworkRounds }),
-    }
-}
-
-/** Read the `quality` section. */
-function parseQuality(value: unknown, where: string, problems: string[]): Partial<QualitySettings> {
-    const raw = isRecord(value) ? value : {}
-    if (!isRecord(value)) problems.push(`${where} 必须是对象（收到 ${JSON.stringify(value)}），已忽略`)
-    const ratio = raw['maxReworkRatio']
-    if (ratio !== undefined && (typeof ratio !== 'number' || !Number.isFinite(ratio) || ratio < 0 || ratio > 1)) {
-        problems.push(`${where}.maxReworkRatio 必须是 0..1 之间的数字（收到 ${JSON.stringify(ratio)}），已忽略`)
-        return {}
-    }
-    return typeof ratio === 'number' ? { maxReworkRatio: ratio } : {}
-}
-
 /**
  * Parse one configuration layer (`models.json` or the profile's defaults).
  *
@@ -196,8 +141,8 @@ export function parseModelsSection(input: unknown, origin: string): ModelsLayer 
     }
     if (input['planner'] !== undefined) layer.planner = parseModelClass(input['planner'], `${origin} 的 planner 段`, problems)
     if (input['worker'] !== undefined) layer.worker = parseModelClass(input['worker'], `${origin} 的 worker 段`, problems)
-    if (input['split'] !== undefined) layer.split = parseSplit(input['split'], `${origin} 的 split 段`, problems)
-    if (input['quality'] !== undefined) layer.quality = parseQuality(input['quality'], `${origin} 的 quality 段`, problems)
+    if (input['split'] !== undefined) layer.split = parseSplitSection(input['split'], `${origin} 的 split 段`, problems)
+    if (input['quality'] !== undefined) layer.quality = parseQualitySection(input['quality'], `${origin} 的 quality 段`, problems)
     return layer
 }
 

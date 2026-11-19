@@ -55,6 +55,7 @@ import { describeMount, refusalForMissingPlugins, requiredPluginStates, type Plu
 import { laneAfterPass } from './split-advance.js'
 import { splitReviewGateRefusal } from './split-approval.js'
 import { splitTransitionRefusal } from './split-gates.js'
+import { renderSplitStatus } from './split-status.js'
 import { stageRoleDelegationCheck } from './stage-role.js'
 
 const TEXT_OUTPUT = { type: 'string' } as const
@@ -595,6 +596,7 @@ function statusReport(deps: SequenceDeps, probes: Record<string, PluginProbe>, c
             if (!state.mounted) missing.add(state.plugin)
         }
     }
+    lines.push(...renderSplitStatus(ctx.store.layout, mission.id))
     lines.push('')
     lines.push(missing.size === 0 ? '未挂载插件：无（所有阶段的插件探测均已通过）' : `未挂载插件：${[...missing].join('、')}（这些阶段无法进入）`)
     lines.push(`阶段工件目录：.dsh/missions/${mission.id}/stages/`)
@@ -1460,14 +1462,6 @@ export async function runOrchestrate(deps: SequenceDeps, args: OrchestrateArgs, 
     }
 }
 
-/**
- * `metrics` — 交付度量（只读）。
- *
- * 度量是**仓库级**的问题（"这段时间交付怎么样"），不是某个 mission 的问题：所以
- * 这里不看 `ctx.mission`，也就没有"没有 mission"这种拒绝——空仓库是要报告的事实
- * （每条指标说"没有数据"），不是错误。它同时**不写任何文件**：`metrics.ts` 没有写
- * 路径，测试用 `.dsh` 前后快照断言。
- */
 /** The injected clock, or the real one. Never throws: a broken clock falls back. */
 function clock(deps: SequenceDeps): number {
     if (deps.now === undefined) return Date.now()
@@ -1479,6 +1473,7 @@ function clock(deps: SequenceDeps): number {
     }
 }
 
+/** `metrics` — 交付度量（只读）：仓库级、不读 mission、不写任何文件（`metrics.ts` 没有写路径）。 */
 function metricsAction(deps: SequenceDeps, ctx: CallContext, args: OrchestrateArgs): string {
     const window = resolveWindowDays(args.windowDays, deps.config.metrics.windowDays)
     const maxInFlight = resolveMaxInFlight(args.maxInFlight, deps.config.metrics.maxInFlight)

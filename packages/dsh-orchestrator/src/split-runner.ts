@@ -92,6 +92,7 @@ function resolvePlan(deps: SplitRunnerDeps): PlanTarget {
 
 /** The run's mutable state (one record per plan task, even ones that never start). */
 function newBook(deps: SplitRunnerDeps, target: PlanTarget): SplitRunBook {
+    const now = deps.now ?? Date.now
     return {
         layout: deps.layout,
         missionId: deps.missionId,
@@ -100,7 +101,12 @@ function newBook(deps: SplitRunnerDeps, target: PlanTarget): SplitRunBook {
         models: deps.models,
         maxParallel: maxParallelOf(deps),
         seam: deps.worktrees ?? defaultSplitWorktrees(),
-        at: (deps.now ?? Date.now)(),
+        at: now(),
+        now,
+        // The plan's groups are the PLANNED parallelism; `runSplitPlan` replaces
+        // them with the scheduler's order as soon as it has one (AC-005's report
+        // must describe the real run, not the plan's text).
+        groups: (target.plan?.parallelGroups ?? []).map((group) => [...group]),
         tasks: (target.plan?.tasks ?? []).map(
             (task): SplitTaskRun => ({ id: task.id, state: 'pending', attempts: 0, imported: 0, cleanedUp: false, signals: [], problems: [] }),
         ),
@@ -136,6 +142,18 @@ async function runTask(book: SplitRunBook, deps: SplitRunnerDeps, task: SplitTas
         blockTask(book, task, `依赖 ${unmet.join('、')} 尚未完成`)
         return
     }
+    // The pair (startedAt, finishedAt) is what `report.json` turns into a
+    // duration — recorded around ALL exit paths, so a timeout is timed too.
+    record.startedAt = book.now()
+    try {
+        await dispatchTask(book, task, record, dispatch, deps)
+    } finally {
+        record.finishedAt = book.now()
+    }
+}
+
+/** The dispatch itself, split out so the timing wrapper above stays readable. */
+async function dispatchTask(book: SplitRunBook, task: SplitTask, record: SplitTaskRun, dispatch: WorkerDispatch, deps: SplitRunnerDeps): Promise<void> {
     const route = routeFor(book)
     record.modelClass = route.modelClass
     record.model = route.model
@@ -154,7 +172,10 @@ async function runTask(book: SplitRunBook, deps: SplitRunnerDeps, task: SplitTas
     record.attempts = 1
     const failure = await startWorker(book, deps, { task, dispatch, worktree: created.worktree, route })
     if (failure !== undefined) {
-        failTask(book, record, [failure], 'acceptance-failed')
+        // AC-003: a deadline stop is a `timeout` rework signal — the worktree and
+        // its local ledger are KEPT (nothing here removes them), so the import
+        // and cleanup steps can still consume what the worker wrote.
+        failTask(book, record, [failure.detail], failure.timeout === true ? 'timeout' : 'acceptance-failed')
         return
     }
     const head = book.seam.head(created.worktree)
@@ -217,6 +238,8 @@ export async function runSplitPlan(deps: SplitRunnerDeps): Promise<SplitRunResul
     }
     const order = planOrder(target.plan)
     if (order.problems.length > 0) return finishSkippedRun(book, 'refused', emptyRework(deps.models), order.problems)
+    // The report's parallelism is the scheduler's REAL order, not the plan text.
+    book.groups = order.groups.map((group) => group.map((task) => task.id))
     const ready = await prepareDispatch(book, deps)
     if (ready.dispatch === undefined) return finishSkippedRun(book, 'refused', emptyRework(deps.models), [ready.refusal ?? '派发前提不成立'])
     for (const group of order.groups) await runGroup(book, deps, group, ready.dispatch)
