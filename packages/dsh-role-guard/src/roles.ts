@@ -37,12 +37,21 @@ export interface Role {
     /**
      * Problems resolving a `model: @class` reference (`model-class.ts`).
      *
-     * Non-empty means "this role named a model class that has no model": every
-     * dispatch path refuses it by name. Falling back to the host default here
-     * would silently run a planner on the cheapest available model — the exact
-     * downgrade the class reference exists to make visible.
+     * Non-empty means "the reference ITSELF is wrong" — an unknown class name or
+     * an empty `@`. That is a typo, and swallowing it as "unconfigured" would
+     * silently run the role on a different model than its author named, so every
+     * dispatch path refuses it by name.
      */
     modelProblems?: readonly string[]
+    /**
+     * The reported fallback of a `model: @class` reference (`model-class.ts`).
+     *
+     * Set when the class EXISTS (`planner` / `worker`) but has no `model`: the
+     * role is dispatchable and runs on the host default (no `model`/`provider`
+     * in the request), and this sentence is shown in the `team_delegate` result,
+     * `role_list` and the log — a fallback must be visible, not silent.
+     */
+    modelNote?: string
     /** The role's persona, registered as the child's shadowing persona section. */
     persona: string
     /** Where the role came from (`builtin`, a file path, or `config`). */

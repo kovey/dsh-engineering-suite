@@ -395,6 +395,12 @@ team_delegate(role, model)  role-guard 按调用覆盖（逐字段：只换 effo
 2. **类型错误与语义错误分开处理**：参数类型错误由工具 schema 在 `execute` 之前直接拒绝（模型立刻知道要传字符串），
    类型正确但无法成路由的值（空串、裸模型 id 但全局无 provider、非正数上限）才回落到角色路由并在结果里报告；
 3. **成本可控**：宿主可 `allowModelOverride: false` 禁掉按调用覆盖，此时阶段难度只作为提示，派发沿用角色路由。
+4. **模型类引用是可选覆盖，拼错才算错**：角色文件的 `model: @planner` / `@worker` 与 `models.json` 的
+   `planner`/`worker` 段遵守同一条规则——**段存在但没写 `model` → 回退宿主默认**（派发请求不带
+   `model`/`provider`，`team_delegate` 返回、`role_list` 与日志给出「模型类 <class> 未配置，使用宿主
+   默认」的 note）；**类名本身写错**（`@bogus` / `@planer` / 空 `@`）仍然**明确报错并列出可用类
+   `planner / worker`** 后拒绝派发。只豁免"类没配 model"这一种情况：把拼写错误当成"未配置"放过，
+   等于让静默降级从另一扇门回来。
 
 ## 5.6 自主派发：进入阶段就把活交出去
 

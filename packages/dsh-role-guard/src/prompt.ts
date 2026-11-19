@@ -4,10 +4,24 @@
  */
 
 import type { RoleGuardConfig } from './config.js'
-import type { RoleRegistry } from './roles.js'
+import type { Role, RoleRegistry } from './roles.js'
 
 /** Prompt section name. */
 export const PROMPT_SECTION = 'eng:role-guard'
+
+/**
+ * How one role's model column reads in the prompt.
+ *
+ * A WRONG `@class` name is marked as a refusal (the role is listed but not
+ * dispatchable); an unconfigured class is the documented fallback, so it states
+ * the note without a warning sign. Kept out of {@link sectionText} so the loop
+ * body stays one statement per fact.
+ * @param role - one resolved role.
+ */
+function modelTag(role: Role): string {
+    if ((role.modelProblems ?? []).length > 0) return '；⚠️ 模型类引用无法解析（类名写错），派发会被拒绝（见 role_list）'
+    return role.modelNote === undefined ? '' : `；${role.modelNote}`
+}
 
 /**
  * Build the section text.
@@ -33,11 +47,8 @@ export function sectionText(config: RoleGuardConfig, registry: RoleRegistry | un
         for (const role of roles) {
             const tools = role.tools.length > 0 ? role.tools.join('/') : `全部（deny: ${role.deny.join('/') || '无'}）`
             const skills = role.skills.length > 0 ? role.skills.join('/') : '不限'
-            // A role whose `model: @class` did not resolve is listed but marked:
-            // "available" and "dispatchable" must not read the same in the prompt.
-            const blocked = (role.modelProblems ?? []).length > 0 ? '；⚠️ 模型类未配置，派发会被拒绝（见 role_list）' : ''
             lines.push(
-                `- \`${role.id}\`（${role.name}，${role.mode === 'read' ? '只读' : '可写'}）：${role.description || '（未填写说明）'}；工具：${tools}；技能：${skills}${blocked}`,
+                `- \`${role.id}\`（${role.name}，${role.mode === 'read' ? '只读' : '可写'}）：${role.description || '（未填写说明）'}；工具：${tools}；技能：${skills}${modelTag(role)}`,
             )
         }
         lines.push('')

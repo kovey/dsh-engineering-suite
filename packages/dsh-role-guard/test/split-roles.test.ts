@@ -1,15 +1,18 @@
 /**
  * The split workflow's two roles and the `model: @class` indirection
- * (AC-002 / AC-007 of the split mission).
+ * (AC-002 / AC-007 of the split mission; AC-001..AC-004 of the model-class
+ * follow-up mission).
  *
  * What is pinned here:
  *  - `planner` is READ-ONLY and `worker` carries only the seven execution tools
  *    (no gate/delivery tool, no `team_delegate`), so "worker cannot write the
  *    main mission's gates or receipt" is a tool-surface fact, not a promise;
  *  - `model: @planner` / `@worker` resolve through the project's `models.json`;
- *  - an unresolvable reference is NAMED and refuses dispatch — it never falls
- *    back to the host default model (that silent downgrade is the defect the
- *    class reference exists to prevent).
+ *  - a class that EXISTS but has no `model` is a reported FALLBACK: dispatch
+ *    succeeds, the request carries no `model`/`provider` (host default), and the
+ *    result text/log carry「模型类 <class> 未配置，使用宿主默认」;
+ *  - a WRONG reference (`@bogus`, `@planer`, a bare `@`) is still a hard error
+ *    listing the usable classes — a typo must never be read as "unconfigured".
  */
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
@@ -19,7 +22,7 @@ import { resolveLayout, type Layout } from 'dsh-eng-core'
 import { createFakeHost, runText, tempWorkspace, type FakeHost } from 'dsh-eng-core/testing'
 import { apply } from '../dist/index.js'
 import { builtinRolesDir } from '../dist/loader.js'
-import { modelClassRefusal, resolveModelClassRoles, resolveRoleModelClass } from '../dist/model-class.js'
+import { resolveModelClassRoles, resolveRoleModelClass } from '../dist/model-class.js'
 import { isRoleError, parseRole, RoleRegistry, type Role } from '../dist/roles.js'
 
 const HOST_TOOLS = ['read', 'write', 'edit', 'bash', 'glob', 'grep', 'todo_write', 'read_image', 'subagent', 'skill', 'quality_gate_run', 'mission_complete', 'evidence_record', 'orchestrate']
@@ -115,30 +118,60 @@ test('@planner / @worker resolve through the project models.json (AC-001/AC-002)
     assert.equal(worker.reasoningEffort, 'low')
 })
 
-test('a missing class is NAMED and refuses dispatch — never the host default', async () => {
+test('a class that has no model FALLS BACK to the host default and says so (TC-2401 / TC-2402 / AC-001)', async () => {
     const { cwd, layout } = workspace()
     const planner = resolveIn(layout, 'planner')
-    assert.deepEqual(planner.modelProblems?.length, 1)
-    assert.match(planner.modelProblems?.[0] ?? '', /@planner/)
-    assert.match(planner.modelProblems?.[0] ?? '', /planner 段没有配置 model/)
-    const refusal = modelClassRefusal(planner)
-    assert.ok(refusal !== undefined)
-    assert.match(refusal, /fail closed/)
-    assert.match(refusal, /不会回退宿主默认/)
+    assert.deepEqual(planner.modelProblems, undefined, 'an unconfigured class is not a problem')
+    assert.equal(planner.modelNote, '模型类 planner 未配置，使用宿主默认')
+    // The request must carry NO route at all: that IS the host default.
+    assert.equal(planner.model, undefined)
+    assert.equal(planner.provider, undefined)
 
     const fake = host(cwd)
     const run = await fake.runTool('team_delegate', { role: 'planner', task: '拆任务' })
-    assert.equal(run.isError, true, 'dispatch must be refused, not silently downgraded')
-    assert.match(String(run.content), /planner/)
-    assert.match(String(run.content), /没有配置 model/)
+    assert.equal(run.isError, false, 'an unconfigured class must dispatch, not refuse')
+    assert.match(runText(run), /note: 模型类 planner 未配置，使用宿主默认/)
+    const start = fake.subagentStarts[0] as { request: Record<string, unknown> }
+    assert.equal(start.request['agentOptions'], undefined, 'no model/provider = the host default')
+    // Same sentence, logged at info level (never a warning).
+    const log = fs.readFileSync(path.join(cwd, 'role-guard.log'), 'utf8')
+    assert.match(log, /\[info\].*模型类 planner 未配置，使用宿主默认/)
     fake.dispose()
 })
 
-test('a workspace that configures only one class resolves that one and names the other', () => {
+test('a WRONG class name still refuses dispatch and lists the usable classes (TC-2404 / TC-2405 / AC-002)', async () => {
+    const cases = [
+        { id: 'bogus-role', model: '@bogus', detail: /models\.json 没有这个类/ },
+        { id: 'typo-role', model: '@planer', detail: /models\.json 没有这个类/ },
+        { id: 'empty-role', model: '@', detail: /@ 后面没有类名/ },
+    ] as const
+    for (const entry of cases) {
+        const cwd = tempWorkspace('role-guard-wrong-class-')
+        const rolesDir = path.join(cwd, '.dsh', 'roles')
+        fs.mkdirSync(rolesDir, { recursive: true })
+        fs.writeFileSync(
+            path.join(rolesDir, `${entry.id}.md`),
+            ['---', `id: ${entry.id}`, `name: ${entry.model}`, 'mode: read', `model: '${entry.model}'`, 'tools:', '  - read', '---', '只读。', ''].join('\n'),
+        )
+        const fake = host(cwd)
+        const run = await fake.runTool('team_delegate', { role: entry.id, task: 't' })
+        assert.equal(run.isError, true, `${entry.model} must be refused, not treated as unconfigured`)
+        const text = String(run.content)
+        assert.match(text, /模型类引用无法解析/)
+        assert.match(text, /可用模型类：planner \/ worker/)
+        assert.match(text, entry.detail)
+        assert.match(text, /类名写错不会被当成"未配置"放过/)
+        assert.equal(fake.subagentStarts.length, 0, 'a typo never starts a child')
+        fake.dispose()
+    }
+})
+
+test('a workspace that configures only one class resolves that one and falls back for the other', () => {
     const { layout } = workspace({ worker: { model: 'deepseek/deepseek-chat' } })
     assert.equal(resolveIn(layout, 'worker').model, 'deepseek-chat')
     const planner = resolveIn(layout, 'planner')
-    assert.match(planner.modelProblems?.[0] ?? '', /缺失的类：planner/)
+    assert.deepEqual(planner.modelProblems, undefined)
+    assert.equal(planner.modelNote, '模型类 planner 未配置，使用宿主默认')
 })
 
 test('a literal provider/model route is untouched by the class resolver', () => {

@@ -47,13 +47,29 @@ function reworkLimit(facts: GateFacts): ReworkLimit {
     return { rejected, rounds, active: rejected > 0 && rejected >= rounds }
 }
 
+/**
+ * The one sentence that keeps "the review ran out of rounds" apart from "the
+ * threshold said this work is not worth splitting".
+ *
+ * They are different facts — one is a process limit, the other a property of
+ * the plan — and a summary that says only "降级为 plain implement" invites the
+ * second reading. Hence the explicit contrast and the threshold's own criteria.
+ * @param limit - the recorded rejections and the configured allowance.
+ */
+function degradeSummary(limit: ReworkLimit): string {
+    return (
+        `拆分审核 ${limit.rejected} 轮未通过（maxReworkRounds=${limit.rounds}）：按规则降级为 plain implement —— ` +
+        '这不等于"不值得拆分"（判定标准见 split-threshold：任务数 <2 / 路径完全相同才叫不值得拆）'
+    )
+}
+
 /** The PASS that degrades a repeatedly rejected plan to plain implement. */
 function degradePass(facts: GateFacts, limit: ReworkLimit, extra: readonly string[]): GateOutcome {
     return {
         ok: true,
         state: 'PASS',
         detail: [
-            `拆分已被人工审核拒绝 ${limit.rejected} 轮（上限 maxReworkRounds=${limit.rounds}）：降级为 plain implement——不建 worktree、不派 worker。`,
+            `${degradeSummary(limit)}——不建 worktree、不派 worker。`,
             ...extra,
             ...fallbackLines(facts),
         ].join('\n'),
@@ -170,7 +186,7 @@ export function splitReviewedOutcome(facts: GateFacts): GateOutcome {
         return {
             ok: true,
             state: 'PASS',
-            detail: `拆分已被拒绝 ${limit.rejected} 轮（上限 maxReworkRounds=${limit.rounds}）：已降级为 plain implement——不建 worktree、不派 worker。`,
+            detail: `${degradeSummary(limit)}——不建 worktree、不派 worker。`,
         }
     }
     const status = splitReviewStatus(facts.store.layout, facts.mission.id)

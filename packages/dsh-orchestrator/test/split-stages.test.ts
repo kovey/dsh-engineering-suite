@@ -191,6 +191,10 @@ test('a one-task plan is not worth splitting: review is skipped and implement is
     const text = await orchestrate(fake, { action: 'advance', verdict: 'PASS' })
     assert.match(text, /→ 下一阶段 implement/)
     assert.match(text, /跳过 split-review/)
+    // AC-003 of the model-class follow-up: the threshold's own verdict/wording
+    // is untouched — "not worth splitting" is decided here, not by the rework
+    // limit (which never even ran: this plan was never sent for review).
+    assert.match(text, /只有 1 条子任务（少于 2 条）：不值得拆分成并行任务/)
     assert.equal(stageFile(cwd, 'm-split', 'split').state, 'passed')
     assert.equal(stageFile(cwd, 'm-split', 'split-review').state, 'skipped')
     assert.equal(storeFor(cwd).read('m-split')?.stage, 'implement')

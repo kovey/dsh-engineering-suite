@@ -1,5 +1,35 @@
 ## [未发布]
 
+### 修复 · 角色文件的模型类引用统一为"未配置 → 宿主默认，拼错仍报错"；降级措辞不再与"不值得拆"混淆
+
+P4 把 `models.json` 的 `worker`/`planner` 改成"可选覆盖"（配了用配的，没配走宿主默认），但角色文件的
+`model: @planner` / `@worker` 还是 fail closed：同一件事在拆分 runner 里是回退，在角色文件里却是拒绝。
+这一轮统一为一条规则，并把"审核打回用满轮数后的降级"与"阈值判定不值得拆"在文案上彻底分开。
+
+- **统一回退（AC-001）**：`packages/dsh-role-guard/src/model-class.ts` 解析 `@<class>` 时，类名属于
+  `planner` / `worker` 但该段**没有配置 `model`** → 不再报错：角色照常派发，**请求不带 `model`/`provider`**
+  （宿主默认），并在 `team_delegate` 返回（`note:` 行）、`role_list`、prompt 的角色行与日志（**info** 级别，
+  不是 warning）里给出 note「模型类 <class> 未配置，使用宿主默认」。`role-guard` 服务的 `plan()` 走同一条
+  回退（`route` 为空 + 一条 info 日志），模型面与自主派发两条路径不会给出不同答案；角色自身声明的
+  `reasoningEffort` / `maxTokens` 不受影响。
+- **拼错仍报错（AC-002）**：`@bogus` / `@planer` / 空 `@` 依旧是硬错误——拒绝派发，报错点名该引用、
+  **列出可用模型类 `planner / worker`**，并写明"类名写错不会被当成'未配置'放过"。只豁免"类没配 model"
+  这一种情况，不吞掉拼写错误。
+- **降级措辞（AC-003）**：`packages/dsh-orchestrator/src/split-gates.ts` 里"审核打回达 `maxReworkRounds`
+  → 降级 plain implement"的 summary（`split` 阶段与 `implement` 入口两处）改为
+  「拆分审核 N 轮未通过（maxReworkRounds=N）：按规则降级为 plain implement —— 这不等于"不值得拆分"
+  （判定标准见 split-threshold：任务数 <2 / 路径完全相同才叫不值得拆）」，并保留"不建 worktree、不派
+  worker"与跳过 split-review 的既有指令。`not-worth-splitting` 的判定与文案**一字未改**。
+- **文档**：`packages/dsh-role-guard/README.md` 的"绝不回退宿主默认"改为"回退宿主默认 + note；类名写错
+  仍报错"，服务 seam 一节同步；`docs/ARCHITECTURE.md` §5.5 增加第 4 条边界（模型类=可选覆盖，拼错才算错）。
+- **测试**：`dsh-role-guard/test/split-roles.test.ts` 从 7 例变 8 例——新增「类未配 → 派发成功、请求无
+  `agentOptions`、note 进返回文本与日志」与「`@bogus`/`@planer`/空 `@` 三种误写全部拒绝并列出可用类」；
+  **2 处既有断言按新语义重写**（"缺类 → 拒绝派发"与"只配一个类 → 另一个报缺失"改为"回退 + note"，
+  新断言仍是精确相等/精确匹配，不是放宽）。`dsh-orchestrator/test/split-review-approval.test.ts` 的降级
+  summary 断言换成新文案（含"不等于'不值得拆分'"、判定标准与实际轮数），`split-stages.test.ts` 的
+  "只有 1 条子任务"用例加一条断言钉住阈值原话不变。`bash scripts/verify.sh --quiet` → exit 0；
+  `bash scripts/standards-check.sh --quiet` → exit 0。
+
 ### 修复 · 模型类是**可选覆盖**、审批是**同一条宿主接缝**：缺模型不再判任务失败（P4）
 
 真实使用里最容易被读成前提的两件事——"要跑拆分得先配好模型类"和"得先接一条审批通道"——都不是前提。

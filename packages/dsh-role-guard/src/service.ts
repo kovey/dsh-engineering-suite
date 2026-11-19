@@ -24,7 +24,7 @@
 import fs from 'node:fs'
 import type { AgentLike, Layout, LayoutOptions, MissionStoreRegistry } from 'dsh-eng-core'
 import type { RoleBinding, RoleBindingStore } from './bindings.js'
-import { modelClassRefusal } from './model-class.js'
+import { logModelClassFallback, modelClassRefusal } from './model-class.js'
 import { roleRoute, resolveRoute, type EffectiveRoute } from './route.js'
 import type { Role } from './roles.js'
 import { recordStageDelegation } from './stage-delegations.js'
@@ -106,8 +106,8 @@ export interface RolePlannerDeps {
     stores: MissionStoreRegistry
     /** The plugin's layout overrides, so the ledger lives where missions do. */
     layout: LayoutOptions
-    /** A logger, for refusals and un-writable bindings. */
-    logger?: { warn: (message: string, error?: unknown) => void }
+    /** A logger, for refusals, model-class fallbacks and un-writable bindings. */
+    logger?: { warn: (message: string, error?: unknown) => void; info?: (message: string) => void }
 }
 
 /**
@@ -145,15 +145,18 @@ export function createRolePlanner(deps: RolePlannerDeps): RoleGuardService {
                 deps.logger?.warn(`service.plan 拒绝角色 ${role.id}：${refusal.split('\n')[0] ?? refusal}`)
                 throw new Error(refusal)
             }
-            // SAME rule as `team_delegate`: a `model: @class` reference that did
-            // not resolve is a refusal here too — an autonomous dispatcher must
-            // not fall back to the host default where the model-facing path does
-            // not.
+            // SAME rule as `team_delegate`: a WRONG `model: @class` reference
+            // (unknown name / empty `@`) is a refusal here too, so a typo cannot
+            // be swallowed on one path while the model-facing path reports it.
+            // An existing class without a `model` is the shared fallback instead.
             const modelRefusal = modelClassRefusal(role)
             if (modelRefusal !== undefined) {
                 deps.logger?.warn(`service.plan 拒绝角色 ${role.id}：${modelRefusal.split('\n')[0] ?? modelRefusal}`)
                 throw new Error(modelRefusal)
             }
+            // An unconfigured class is a logged fallback here too (not a warning):
+            // the route below is empty, so the child runs on the host default.
+            logModelClassFallback(role, deps.logger, 'service.plan')
             return {
                 role: role.id,
                 persona: role.persona,

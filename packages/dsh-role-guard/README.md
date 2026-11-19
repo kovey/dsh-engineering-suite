@@ -68,8 +68,12 @@ model: '@planner'        # 用项目级 models.json 的 planner 段填充 provid
 
 - 字面量 `provider/model` **原样保留**；
 - `@` 引用在角色加载时解析，`models.json` 改动会触发角色重载；
-- 该类**没有配置 model** 时：角色仍出现在 `role_list` 里（并列出问题），但 `team_delegate` 与
-  `role-guard` 服务都会**明确拒绝**派发，**绝不回退宿主默认模型**——那会把"拆分/实现"悄悄跑在别的模型上。
+- 该类**没有配置 model** 时：按与 `models.json` 其它模型段相同的规则**回退宿主默认**——派发请求
+  **不带 `model`/`provider`**，派发照常进行；`team_delegate` 的返回、`role_list` 与日志里给出一条 note
+  「模型类 planner 未配置，使用宿主默认」（info 级别，不是 warning）；
+- 只有 `@` 引用**本身写错**（类名不是 `planner`/`worker`，或 `@` 后面为空）才**明确报错并拒绝派发**，
+  报错列出可用类 `planner / worker`——**拼写错误不会被当成"未配置"静默放过**。
+
 
 ## 工具
 
@@ -94,6 +98,8 @@ const plan = ctx.get('role-guard').plan({ role: 'developer', cwd: mission.cwd, a
 - 用的是**与 `team_delegate` 完全相同的解析器**（工具白名单过滤、只读模式降权、角色路由），
   所以"自动派发的子代理"不会拿到比"模型派发的子代理"更多的权限；
 - **未知角色抛错**（fail closed），调用方应拒绝派发而不是放宽权限；
+- **模型类未配置时与 `team_delegate` 同一条回退**：`route` 为空（宿主默认）并记一条 info 日志；
+  类名写错仍然抛错——两条派发路径不会给出不同答案；
 - `plan({ role, cwd })` 按 **cwd** 解析角色层（`<repo>/.dsh/roles/`），不传 cwd 时按调用方 agent 的会话目录；
 - 该服务**不提供按调用覆盖模型**：自主派发器不能替角色升级模型。
 

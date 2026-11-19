@@ -255,8 +255,14 @@ test('at maxReworkRounds the split degrades to plain implement and records a ski
     assert.equal(readSplitReviews(layout, 'm-split').length, 2)
 
     const text = await orchestrate(fake, { action: 'advance' })
+    // AC-003 of the model-class follow-up: the summary says WHICH rule fired
+    // (the review ran out of rounds) and explicitly separates it from the
+    // threshold's "not worth splitting" verdict — those are different facts.
+    assert.match(text, /拆分审核 2 轮未通过（maxReworkRounds=2）：按规则降级为 plain implement/)
+    assert.match(text, /这不等于"不值得拆分"/)
+    assert.match(text, /判定标准见 split-threshold：任务数 <2 \/ 路径完全相同才叫不值得拆/)
     assert.match(text, /降级为 plain implement/)
-    assert.match(text, /拒绝 2 轮（上限 maxReworkRounds=2）/)
+    assert.match(text, /不建 worktree、不派 worker/)
     assert.match(text, /跳过 split-review：拆分多轮未通过审核，降级为 plain implement/)
     assert.equal(stageState(cwd, 'split'), 'passed')
     assert.equal(stageState(cwd, 'split-review'), 'skipped')
