@@ -27,7 +27,7 @@
  */
 
 import { resolveLayout, type AgentLike, type MissionRecord } from 'dsh-eng-core'
-import { decideSplit, loadModelsConfig, readSplitPlan, splitReviewStatus } from 'dsh-eng-core/split'
+import { decideSplit, loadModelsConfig, readSplitPlan, splitMaxAttempts, splitReviewStatus } from 'dsh-eng-core/split'
 import type { DispatchDeps, DispatchOutcome } from './dispatch.js'
 import type { StageConfig } from './pipeline.js'
 import { runSplitPlan } from './split-runner.js'
@@ -78,7 +78,7 @@ export function splitTaskTimeoutMs(config: DispatchDeps['config'], models: { spl
  * (`outputFile`); the report carries one compact line so a stage entry does not
  * turn into a wall of text.
  */
-function outcomeOf(result: SplitRunResult, modelProblems: readonly string[], timeoutMs: number): DispatchOutcome {
+function outcomeOf(result: SplitRunResult, modelProblems: readonly string[], deadline: { timeoutMs: number; maxAttempts: number }): DispatchOutcome {
     const modelNotes = modelProblems.length === 0 ? '' : `；models.json 有 ${modelProblems.length} 条回退/忽略（首条：${modelProblems[0] ?? ''}）`
     if (result.state === 'refused') {
         return {
@@ -92,7 +92,7 @@ function outcomeOf(result: SplitRunResult, modelProblems: readonly string[], tim
         runId: `split-${(result.planDigest ?? '').slice(0, 12) || 'plan'}`,
         ...(result.file === undefined ? {} : { outputFile: result.file }),
         stopReason: result.ok ? 'completed' : 'error',
-        roleNote: `${headline}；每个子任务一个 worktree + worker 角色（模型 ${describeRoutes(result)}；单任务超时 ${timeoutMs}ms；orchestrate 已从 worker 作用域剔除）${modelNotes}`,
+        roleNote: `${headline}；每个子任务一个 worktree + worker 角色（模型 ${describeRoutes(result)}；单任务超时 ${deadline.timeoutMs}ms、重试上限 ${deadline.maxAttempts} 次；orchestrate 已从 worker 作用域剔除）${modelNotes}`,
         ...(result.ok ? {} : { error: result.problems.length === 0 ? '部分子任务未完成（见 run.json）' : result.problems.join('；') }),
     }
 }
@@ -137,7 +137,7 @@ export async function splitDispatch(deps: DispatchDeps, input: SplitDispatchInpu
         maxDepth: deps.config.autoDispatch.maxDepth,
         taskTimeoutMs,
     })
-    const outcome = outcomeOf(result, models.problems, taskTimeoutMs)
+    const outcome = outcomeOf(result, models.problems, { timeoutMs: taskTimeoutMs, maxAttempts: splitMaxAttempts(models.config.split) })
     // The attempt rides along like it does for the ordinary stage dispatch, so the
     // stage artifact names which entry produced this run.
     return input.attempt === undefined ? outcome : { ...outcome, attempt: input.attempt }

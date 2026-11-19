@@ -32,11 +32,12 @@
 
 import path from 'node:path'
 import { computeRework, decideSplit, readSplitPlan, readSplitReview, splitPlanDigest, type ModelsConfig, type ReworkReport, type SplitPlan, type SplitTask } from 'dsh-eng-core/split'
-import { failTask, finishDispatchedRun, finishSkippedRun, taskRecordOf } from './split-run-finish.js'
+import { dispatchTask, unmetReason } from './split-run-attempt.js'
+import { finishDispatchedRun, finishSkippedRun, taskRecordOf } from './split-run-finish.js'
 import { defaultSplitWorktrees } from './split-run-git.js'
 import { planOrder, unmetDeps } from './split-run-order.js'
 import type { SplitRunBook, SplitRunnerDeps, SplitRunResult, SplitTaskRun } from './split-run-types.js'
-import { prepareDispatch, routeFor, startWorker, type WorkerDispatch } from './split-worker.js'
+import { prepareDispatch, type WorkerDispatch } from './split-worker.js'
 
 /** The plan to run, plus every reason it must not be dispatched. */
 interface PlanTarget {
@@ -110,6 +111,7 @@ function newBook(deps: SplitRunnerDeps, target: PlanTarget): SplitRunBook {
         tasks: (target.plan?.tasks ?? []).map(
             (task): SplitTaskRun => ({ id: task.id, state: 'pending', attempts: 0, imported: 0, cleanedUp: false, signals: [], problems: [] }),
         ),
+        taskDeps: Object.fromEntries((target.plan?.tasks ?? []).map((task) => [task.id, [...(task.dependsOn ?? [])]])),
         problems: [],
         warnings: [],
         log: deps.log ?? (() => undefined),
@@ -131,7 +133,7 @@ function blockTask(book: SplitRunBook, task: SplitTask, reason: string): void {
     book.problems.push(`子任务 ${task.id} 未启动：${reason}`)
 }
 
-/** Run ONE task: worktree → worker → commit prefix → done/failed (AC-006). */
+/** Run ONE task: preparation (worktree) → bounded attempts → done/needs-resplit (AC-006). */
 async function runTask(book: SplitRunBook, deps: SplitRunnerDeps, task: SplitTask, dispatch: WorkerDispatch): Promise<void> {
     const record = taskRecordOf(book, task.id)
     if (record === undefined) return
@@ -139,63 +141,17 @@ async function runTask(book: SplitRunBook, deps: SplitRunnerDeps, task: SplitTas
     if (unmet.length > 0) {
         // The scheduler already ordered the groups; this is the per-dispatch
         // assertion AC-006 asks for ("dependsOn 未完成的子任务不得启动").
-        blockTask(book, task, `依赖 ${unmet.join('、')} 尚未完成`)
+        blockTask(book, task, unmetReason(book, unmet))
         return
     }
     // The pair (startedAt, finishedAt) is what `report.json` turns into a
-    // duration — recorded around ALL exit paths, so a timeout is timed too.
+    // duration — recorded around ALL exit paths (timeouts and retries included).
     record.startedAt = book.now()
     try {
-        await dispatchTask(book, task, record, dispatch, deps)
+        await dispatchTask(book, deps, task, dispatch)
     } finally {
         record.finishedAt = book.now()
     }
-}
-
-/** The dispatch itself, split out so the timing wrapper above stays readable. */
-async function dispatchTask(book: SplitRunBook, task: SplitTask, record: SplitTaskRun, dispatch: WorkerDispatch, deps: SplitRunnerDeps): Promise<void> {
-    const route = routeFor(book)
-    record.modelClass = route.modelClass
-    record.model = route.model
-    record.provider = route.provider
-    if (route.model === undefined) {
-        failTask(book, record, route.problems.length > 0 ? route.problems : [`模型类 ${route.modelClass} 没有配置 model`], 'acceptance-failed')
-        return
-    }
-    const created = book.seam.create({ mainTree: book.mainTree, missionId: book.missionId, taskId: task.id })
-    record.worktree = created.worktree
-    record.branch = created.branch
-    if (!created.ok) {
-        failTask(book, record, created.problems, 'acceptance-failed')
-        return
-    }
-    record.attempts = 1
-    const failure = await startWorker(book, deps, { task, dispatch, worktree: created.worktree, route })
-    if (failure !== undefined) {
-        // AC-003: a deadline stop is a `timeout` rework signal — the worktree and
-        // its local ledger are KEPT (nothing here removes them), so the import
-        // and cleanup steps can still consume what the worker wrote.
-        failTask(book, record, [failure.detail], failure.timeout === true ? 'timeout' : 'acceptance-failed')
-        return
-    }
-    const head = book.seam.head(created.worktree)
-    record.commit = head.commit
-    if (!head.ok || head.commit === undefined) {
-        failTask(book, record, head.problems.length > 0 ? head.problems : ['读不到 worktree 的 HEAD commit'], 'acceptance-failed')
-        return
-    }
-    const prefix = `${task.id}:`
-    if (!(head.subject ?? '').startsWith(prefix)) {
-        failTask(
-            book,
-            record,
-            [`commit ${head.commit.slice(0, 12)} 的标题 ${JSON.stringify(head.subject ?? '')} 不带前缀 "${prefix}"：无法证明它属于子任务 ${task.id}`],
-            'acceptance-failed',
-        )
-        return
-    }
-    record.state = 'done'
-    book.log(`子任务 ${task.id} 完成：commit ${head.commit.slice(0, 8)}（${route.modelClass} ${route.model}）`)
 }
 
 /** One group: chunks of at most `maxParallel` eligible tasks, chunks serial. */
@@ -209,7 +165,7 @@ async function runGroup(book: SplitRunBook, deps: SplitRunnerDeps, group: readon
         const done = doneIds(book)
         const eligible = remaining.filter((task) => unmetDeps(task, done).length === 0)
         if (eligible.length === 0) {
-            for (const task of remaining) blockTask(book, task, `依赖 ${unmetDeps(task, done).join('、')} 未完成（失败或阻塞）`)
+            for (const task of remaining) blockTask(book, task, unmetReason(book, unmetDeps(task, done)))
             return
         }
         const chunk = eligible.slice(0, book.maxParallel)

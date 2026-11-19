@@ -20,7 +20,7 @@
  */
 
 import { writeJsonAtomic } from 'dsh-eng-core'
-import { importTaskEvidence, pendingImports, splitTaskBranch, type ReworkReport, type ReworkSignal } from 'dsh-eng-core/split'
+import { importTaskEvidence, pendingImports, splitMaxAttempts, splitTaskBranch, type ReworkReport, type ReworkSignal } from 'dsh-eng-core/split'
 import { writeSplitRunReport } from './split-run-report.js'
 import { planNextSplitTask } from './split-rework.js'
 import { splitRunFile, type SplitRunBook, type SplitRunResult, type SplitRunState, type SplitTaskRun } from './split-run-types.js'
@@ -31,7 +31,7 @@ export function taskRecordOf(book: SplitRunBook, taskId: string): SplitTaskRun |
 }
 
 /** Add one problem line and pass it to the progress log. */
-function note(book: SplitRunBook, line: string): void {
+export function note(book: SplitRunBook, line: string): void {
     book.problems.push(line)
     book.log(line)
 }
@@ -146,14 +146,20 @@ function resultOf(book: SplitRunBook, state: SplitRunState, rework: ReworkReport
 
 /** Write `split/run.json` and `split/report.json` (one shape for every outcome) and return it with `file`. */
 function writeRunRecord(book: SplitRunBook, result: SplitRunResult): SplitRunResult {
+    // P3 AC-001: `finishedAt` is the end of the whole run (dispatch + finish
+    // steps), so `report.json`'s wall clock includes merge/import/cleanup — the
+    // overhead that decides whether parallel actually paid off.
+    book.finishedAt = book.now()
     const file = splitRunFile(book.layout, book.missionId)
     writeJsonAtomic(file, {
         missionId: book.missionId,
         at: book.at,
+        finishedAt: book.finishedAt,
         state: result.state,
         ok: result.ok,
         planDigest: result.planDigest,
         maxParallel: book.maxParallel,
+        maxAttempts: splitMaxAttempts(book.models.split),
         modelClasses: { worker: book.models.worker, planner: book.models.planner },
         tasks: result.tasks,
         imported: result.imported,

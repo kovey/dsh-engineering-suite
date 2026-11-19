@@ -36,6 +36,7 @@ import {
 import { tempWorkspace } from 'dsh-eng-core/testing'
 import { splitReworkFile } from 'dsh-eng-core/split'
 import { runSplitPlan } from '../dist/split-runner.js'
+import { defaultSplitWorktrees } from '../dist/split-run-git.js'
 import { splitRunFile, splitReportFile, type SplitRunnerDeps, type SplitRoleGuard } from '../dist/split-run-types.js'
 
 /** One git invocation in the fixture (a broken fixture must not look green). */
@@ -337,9 +338,13 @@ test('a task whose dependency failed is NEVER started (AC-006 assertion inside t
     const result = await running
 
     assert.equal(workers.started.length, 1, 'the dependent task must not start')
-    assert.equal(result.tasks[0]?.state, 'failed')
+    // P3 AC-002: the single allowed attempt failed, so the task is
+    // `needs-resplit` (not `failed`), and the successor is blocked NAMING it.
+    assert.equal(result.tasks[0]?.state, 'needs-resplit')
     assert.equal(result.tasks[1]?.state, 'blocked')
-    assert.match(result.tasks[1]?.problems.join(' ') ?? '', /依赖 T-001 尚未完成|依赖 T-001 未完成/)
+    assert.match(result.tasks[1]?.problems.join(' ') ?? '', /依赖 T-001/)
+    assert.match(result.problems.join(' '), /needs-resplit/)
+    assert.match(result.problems.join(' '), /后继 T-002 一律 blocked/)
     assert.equal(result.ok, false)
 })
 
@@ -404,7 +409,9 @@ test('a commit without the `<taskId>:` prefix is rework, named with the commit a
     finishWorker(workers, resolveLayout(cwd), 'T-002')
     const result = await running
 
-    assert.equal(result.tasks[0]?.state, 'failed')
+    // The attempt failed and exhausted the default `maxAttempts: 1` (AC-002):
+    // `needs-resplit`, not `failed`, and the commit/subject are still named.
+    assert.equal(result.tasks[0]?.state, 'needs-resplit')
     assert.equal(result.tasks[0]?.commit, commit)
     assert.match(result.tasks[0]?.problems.join('\n') ?? '', /不带前缀 "T-001:"/)
     assert.match(result.tasks[0]?.problems.join('\n') ?? '', new RegExp(commit.slice(0, 12)))
@@ -507,6 +514,15 @@ function reportRecord(cwd: string): {
     tasks: { id: string; modelClass: string | null; model: string | null; durationMs: number; attempts: number; reworkReasons: string[]; imported: number }[]
     rework: { ratio: number; threshold: number; escalate: boolean }
     parallelism: { maxParallel: number; groups: string[][] }
+    economics: {
+        tasks: { id: string; durationMs: number; prepareMs: number; attempts: number }[]
+        serialEstimateMs: number
+        wallClockMs: number
+        speedup: number | null
+        verdict: string
+        reasons: string[]
+        tokens: { state: string; reason: string }
+    }
 } {
     const file = splitReportFile(resolveLayout(cwd), 'm1')
     assert.equal(fs.existsSync(file), true, `missing ${file}`)
@@ -527,7 +543,10 @@ test('a worker past split.taskTimeoutMs is rework with a timeout signal, and its
     const result = await running
 
     assert.equal(result.state, 'ran')
-    assert.deepEqual(result.tasks.map((entry) => entry.state), ['failed', 'failed'])
+    // A deadline stop is retryable, but the default `maxAttempts: 1` was used up
+    // (AC-002) — and the timeout rule of AC-003 (keep the worktree + ledger) still
+    // wins over the cleanup step below.
+    assert.deepEqual(result.tasks.map((entry) => entry.state), ['needs-resplit', 'needs-resplit'])
     assert.deepEqual(result.tasks.map((entry) => entry.signals), [['timeout'], ['timeout']])
     assert.match(result.problems.join('\n'), /超时/)
     // AC-003: the worktree and its local files stay for a later import/cleanup.
@@ -624,4 +643,246 @@ test('a refused run still writes report.json, so "why nothing ran" is answerable
     assert.equal(report.state, 'refused')
     assert.equal(report.parallelism.groups.length, 1)
     assert.deepEqual(report.tasks.map((entry) => entry.attempts), [0, 0])
+})
+
+// --- P3 AC-001: does the parallelism actually pay off? -----------------------
+
+test('two tasks in one parallel group: economics says worth-parallel with speedup 2.00 (TC-2201)', async () => {
+    const cwd = repo()
+    mission(cwd, twoTasks([['T-001', 'T-002']]))
+    const workers = fakeWorkers()
+    let clock = 1_700_000_000_000
+    const running = runSplitPlan(deps(cwd, workers, { maxParallel: 2, now: () => clock }))
+
+    await workers.waitFor(2)
+    // Both workers finish at the same (fake) moment: 2 × 100ms of work in a
+    // 100ms wall clock — the verdict must come out of the numbers, not the plan.
+    clock += 100
+    finishWorker(workers, resolveLayout(cwd), 'T-001')
+    finishWorker(workers, resolveLayout(cwd), 'T-002')
+    const result = await running
+
+    assert.equal(result.ok, true, result.problems.join(' | '))
+    const economics = reportRecord(cwd).economics
+    assert.equal(economics.wallClockMs, 100)
+    assert.equal(economics.serialEstimateMs, 200)
+    assert.equal(economics.speedup, 2)
+    assert.equal(economics.verdict, 'worth-parallel')
+    assert.match(economics.reasons.join(' '), /并行值得/)
+    assert.deepEqual(economics.tasks, [
+        { id: 'T-001', durationMs: 100, prepareMs: 0, attempts: 1 },
+        { id: 'T-002', durationMs: 100, prepareMs: 0, attempts: 1 },
+    ])
+})
+
+test('the one-time worktree preparation is timed per task (prepareMs) and is part of the duration (AC-001)', async () => {
+    const cwd = repo()
+    mission(cwd, twoTasks([['T-001', 'T-002']]))
+    const workers = fakeWorkers()
+    let clock = 1_700_000_000_000
+    // The real seam, with the clock moved by 40ms on each worktree creation: the
+    // ONLY way "preparation cost" can be observed is by timing it around create.
+    const real = defaultSplitWorktrees()
+    const seam = {
+        ...real,
+        create: (input: Parameters<typeof real.create>[0]) => {
+            clock += 40
+            return real.create(input)
+        },
+    }
+    const running = runSplitPlan(deps(cwd, workers, { maxParallel: 2, now: () => clock, worktrees: seam }))
+
+    await workers.waitFor(2)
+    clock += 100
+    finishWorker(workers, resolveLayout(cwd), 'T-001')
+    finishWorker(workers, resolveLayout(cwd), 'T-002')
+    const result = await running
+
+    assert.equal(result.ok, true, result.problems.join(' | '))
+    const economics = reportRecord(cwd).economics
+    assert.deepEqual(economics.tasks.map((entry) => entry.prepareMs), [40, 40])
+    // T-001 started before its own create, T-002 only after T-001's: the durations
+    // differ by exactly one preparation, and both include theirs.
+    assert.deepEqual(economics.tasks.map((entry) => entry.durationMs), [180, 140])
+    assert.equal(economics.serialEstimateMs, 320)
+    assert.equal(economics.wallClockMs, 180)
+    assert.equal(economics.speedup, 1.78)
+    assert.equal(economics.verdict, 'worth-parallel')
+    assert.match(economics.reasons.join(' '), /prepare 合计 80ms/)
+})
+
+test('a serial plan whose finishing overhead eats the gain is slower-than-serial, with the numbers (TC-2202)', async () => {
+    const cwd = repo()
+    // One task per group: the scheduler runs them one after the other.
+    mission(cwd, twoTasks([['T-001'], ['T-002']]))
+    const workers = fakeWorkers()
+    let clock = 1_700_000_000_000
+    const real = defaultSplitWorktrees()
+    const seam = {
+        ...real,
+        // Merge/import/cleanup are real cost that a serial run would NOT avoid:
+        // charging 60ms per merge is how "parallel lost to overhead" is observed.
+        merge: (input: Parameters<typeof real.merge>[0]) => {
+            clock += 60
+            return real.merge(input)
+        },
+    }
+    const running = runSplitPlan(deps(cwd, workers, { now: () => clock, worktrees: seam }))
+
+    await workers.waitFor(1)
+    clock += 100
+    finishWorker(workers, resolveLayout(cwd), 'T-001')
+    await workers.waitFor(2)
+    clock += 100
+    finishWorker(workers, resolveLayout(cwd), 'T-002')
+    const result = await running
+
+    assert.equal(result.ok, true, result.problems.join(' | '))
+    const economics = reportRecord(cwd).economics
+    assert.equal(economics.serialEstimateMs, 200)
+    // 200ms of work + 2 merges × 60ms: the wall clock is worse than running the
+    // same tasks one at a time with no finishing steps.
+    assert.equal(economics.wallClockMs, 320)
+    assert.equal(economics.speedup, 0.63)
+    assert.equal(economics.verdict, 'slower-than-serial')
+    assert.match(economics.reasons.join(' '), /并行反而更慢/)
+    assert.match(economics.reasons.join(' '), /墙钟 320ms/)
+})
+
+test('a single-task plan is not worth splitting and its economics says unknown, naming why (TC-2210)', async () => {
+    const cwd = repo()
+    const single: SplitPlan = {
+        tasks: [{ id: 'T-001', goal: '全部', paths: ['src/**'], acceptance: ['AC-001'], dependsOn: [], parallel: false }],
+        coverage: { 'AC-001': ['T-001'] },
+        parallelGroups: [['T-001']],
+    }
+    mission(cwd, single)
+    const workers = fakeWorkers()
+    const result = await runSplitPlan(deps(cwd, workers))
+
+    assert.equal(result.state, 'not-worth-splitting')
+    const economics = reportRecord(cwd).economics
+    assert.equal(economics.verdict, 'unknown')
+    assert.equal(economics.wallClockMs, 0)
+    assert.equal(economics.speedup, null, 'no wall clock means no speedup — never a made-up 0')
+    assert.match(economics.reasons.join(' '), /没有并行收益/)
+    assert.deepEqual(economics.tasks, [{ id: 'T-001', durationMs: 0, prepareMs: 0, attempts: 0 }])
+})
+
+test('tokens are explicitly unavailable with a fixed reason and never a number (TC-2206)', async () => {
+    const cwd = repo()
+    // A refused run also writes the report, so the token contract holds for every
+    // outcome — not only for a run that dispatched.
+    mission(cwd, twoTasks([['T-001', 'T-002']]), { review: 'none' })
+    const workers = fakeWorkers()
+    const result = await runSplitPlan(deps(cwd, workers))
+
+    assert.equal(result.state, 'refused')
+    const economics = reportRecord(cwd).economics
+    assert.deepEqual(economics.tokens, { state: 'unavailable', reason: '宿主 subagent 接缝不暴露 usage' })
+    // The negative constraint, as an assertion: no digits anywhere in the field.
+    assert.equal(/\d/.test(JSON.stringify(economics.tokens)), false, 'the host has no usage seam: a number here would be invented')
+    // ...and measuring wrote no gate record (AC-005: a measurement decides nothing).
+    assert.equal(fs.existsSync(path.join(resolveLayout(cwd).missionsDir, 'm1', 'gates')), false, 'economics must not write a gate')
+})
+
+// --- P3 AC-002: bounded retries and needs-resplit ---------------------------
+
+/** The effective models of a retry test (maxAttempts + no escalation noise). */
+function retryModels(maxAttempts: number): ModelsConfig {
+    return models({
+        split: { reviewRequired: true, maxTasks: 8, maxParallel: 3, maxReworkRounds: 2, maxAttempts },
+        quality: { maxReworkRatio: 1 },
+    })
+}
+
+test('maxAttempts=2: the first failure is retried in the SAME worktree and the second attempt succeeds (TC-2203)', async () => {
+    const cwd = repo()
+    mission(cwd, twoTasks([['T-001'], ['T-002']]))
+    const workers = fakeWorkers()
+    const running = runSplitPlan(deps(cwd, workers, { models: retryModels(2) }))
+
+    await workers.waitFor(1)
+    const first = workers.started[0] as StartedWorker
+    assert.equal(first.taskId, 'T-001')
+    const worktree = worktreeOf(first)
+    first.reject(new Error('第一次没做完'))
+    // The retry is a NEW activation of the SAME task, inside the SAME directory.
+    await workers.waitFor(2)
+    const retry = workers.started[1] as StartedWorker
+    assert.equal(retry.taskId, 'T-001')
+    assert.equal(worktreeOf(retry), worktree, 'a retry must reuse the task worktree')
+    const commit = finishWorker(workers, resolveLayout(cwd), 'T-001')
+    await workers.waitFor(3)
+    finishWorker(workers, resolveLayout(cwd), 'T-002')
+    const result = await running
+
+    assert.equal(result.ok, true, result.problems.join(' | '))
+    assert.equal(result.tasks[0]?.state, 'done')
+    assert.equal(result.tasks[0]?.attempts, 2)
+    assert.equal(result.tasks[0]?.commit, commit)
+    // Every failed attempt counts as rework, even though the task finished (AC-002).
+    assert.deepEqual(result.tasks[0]?.signals, ['acceptance-failed'])
+    assert.equal(result.rework.reworked, 1)
+    assert.equal(result.rework.started, 2)
+    // The durable records carry the attempt count too.
+    const report = reportRecord(cwd)
+    assert.equal(report.tasks[0]?.attempts, 2)
+    assert.equal(report.economics.tasks[0]?.attempts, 2)
+    const run = JSON.parse(fs.readFileSync(splitRunFile(resolveLayout(cwd), 'm1'), 'utf8')) as { maxAttempts: number }
+    assert.equal(run.maxAttempts, 2)
+})
+
+test('maxAttempts=2 and both attempts fail: exactly two dispatches, then needs-resplit (bounded, AC-002)', async () => {
+    const cwd = repo()
+    mission(cwd, twoTasks([['T-001'], ['T-002']]))
+    const workers = fakeWorkers()
+    const running = runSplitPlan(deps(cwd, workers, { models: retryModels(2) }))
+
+    await workers.waitFor(1)
+    ;(workers.started[0] as StartedWorker).reject(new Error('第一次失败'))
+    await workers.waitFor(2)
+    ;(workers.started[1] as StartedWorker).reject(new Error('第二次失败'))
+    await workers.waitFor(3)
+    finishWorker(workers, resolveLayout(cwd), 'T-002')
+    const result = await running
+
+    assert.equal(result.tasks[0]?.state, 'needs-resplit')
+    assert.equal(result.tasks[0]?.attempts, 2)
+    // Bounded means bounded: no third activation of T-001, ever.
+    assert.equal(workers.started.filter((entry) => entry.taskId === 'T-001').length, 2)
+    assert.match(result.problems.join(' '), /用尽 2 次尝试仍失败/)
+    assert.match(result.problems.join(' '), /第二次失败/)
+    // The independent task still finished; only the exhausted one needs a re-split.
+    assert.equal(result.tasks[1]?.state, 'done')
+    assert.equal(result.ok, false)
+})
+
+test('retrying does NOT bypass "import before cleanup": an unimported row keeps the worktree (AC-002/AC-009)', async () => {
+    const cwd = repo()
+    mission(cwd, twoTasks([['T-001'], ['T-002']]))
+    const workers = fakeWorkers()
+    const layout = resolveLayout(cwd)
+    const running = runSplitPlan(deps(cwd, workers, { models: retryModels(2) }))
+
+    await workers.waitFor(1)
+    const first = workers.started[0] as StartedWorker
+    // The first attempt leaves a local evidence row (pointing at a commit that
+    // will never be merged) and then fails.
+    const unmerged = commitIn(worktreeOf(first), 'T-001: 第一次尝试')
+    writeLocalEvidence(worktreeOf(first), layout, 'T-001', unmerged)
+    first.reject(new Error('验收不过'))
+    await workers.waitFor(2)
+    ;(workers.started[1] as StartedWorker).reject(new Error('第二次还是失败'))
+    await workers.waitFor(3)
+    finishWorker(workers, layout, 'T-002')
+    const result = await running
+
+    assert.equal(result.tasks[0]?.state, 'needs-resplit')
+    // The retry never removes anything, and the cleanup step still refuses while
+    // that row is unimported — the discipline is structural, not a code path.
+    assert.equal(result.tasks[0]?.cleanedUp, false)
+    assert.equal(fs.existsSync(splitWorktreeDir(layout, 'm1', 'T-001')), true)
+    assert.match(result.problems.join(' '), /待导入/)
+    assert.equal(result.imported, 1, 'only T-002 rows landed')
 })

@@ -16,11 +16,13 @@ import { resolveLayout, type Layout } from '../dist/index.js'
 import { tempWorkspace } from 'dsh-eng-core/testing'
 import {
     DEFAULT_MODELS_CONFIG,
+    MAX_SPLIT_ATTEMPTS,
     canonicalJson,
     decideSplit,
     loadModelsConfig,
     recordSplitReview,
     saveSplitPlan,
+    splitMaxAttempts,
     splitPlanDigest,
     splitReviewStatus,
     splitTaskBranch,
@@ -369,4 +371,39 @@ test('worktree and branch names are derived from the mission and task ids', () =
     assert.equal(splitTaskBranch('m-1', 't1'), 'split/m-1/t1')
     assert.ok(splitWorktreeDir(layout, 'm-1', 't1').endsWith(path.join('worktrees', 'm-1', 't1')))
     assert.throws(() => splitWorktreeDir(layout, 'm-1', '../escape'), /unsafe/)
+})
+
+// --- P3: bounded retries (AC-002) -----------------------------------------
+
+test('split.maxAttempts is parsed in 1..3, an unusable value is named, and absence means 1 attempt (AC-002)', () => {
+    const declared = loadModelsConfig(workspace({ split: { maxAttempts: 2 } }).layout)
+    assert.equal(declared.config.split.maxAttempts, 2)
+    assert.equal(splitMaxAttempts(declared.config.split), 2)
+    // The whole split section is not declared, so the other fields are reported;
+    // maxAttempts itself must NOT be reported as a fallback (it has no default).
+    assert.equal(
+        declared.problems.some((problem) => /maxAttempts (必须|未配置)/.test(problem)),
+        false,
+        declared.problems.join(' | '),
+    )
+
+    for (const bad of [0, 4, -1, 1.5, '2']) {
+        const resolved = loadModelsConfig(workspace({ split: { maxAttempts: bad } }).layout)
+        assert.equal(resolved.config.split.maxAttempts, undefined, `maxAttempts=${JSON.stringify(bad)} must be ignored`)
+        assert.ok(
+            resolved.problems.some((problem) => problem.includes('maxAttempts') && problem.includes('1..3')),
+            `missing problem for maxAttempts=${JSON.stringify(bad)}: ${resolved.problems.join(' | ')}`,
+        )
+        // The effective value falls back to the documented 1 attempt.
+        assert.equal(splitMaxAttempts(resolved.config.split), 1)
+    }
+
+    // Absent everywhere: 1 attempt (the P1/P2 behaviour, unchanged by default).
+    const absent = loadModelsConfig(workspace().layout)
+    assert.equal(absent.config.split.maxAttempts, undefined)
+    assert.equal(splitMaxAttempts(absent.config.split), 1)
+    assert.equal(MAX_SPLIT_ATTEMPTS, 3)
+    // A hand-built config cannot exceed the ceiling either (fail closed).
+    assert.equal(splitMaxAttempts({ maxAttempts: 9 }), 3)
+    assert.equal(splitMaxAttempts(undefined), 1)
 })

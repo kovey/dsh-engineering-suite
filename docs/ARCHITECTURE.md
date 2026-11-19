@@ -1920,7 +1920,8 @@ worker 在自己的 worktree 里跑的门禁是**部分 scope**：它只看到�
   调度、模型路由、commit 契约与写入模型，不证明"真 worker 会写出合格的 commit"。
 - 合并是 runner 做的（AC-008 要求"合并后导入"），但**主树完整门禁与回执仍是 lead 的**；本节的接线
   只覆盖到"派发 + 收尾记录"。
-- 子任务失败**不会自动重试**：`attempts` 记 1，下一轮从 `split` 重新拆分/审核（返工率会把它记进去）。
+- 子任务失败在**这一节交付时**不会自动重试：`attempts` 记 1，下一轮从 `split` 重新拆分/审核（返工率会把它
+  记进去）。§5.38.2 的 P3 把它改成**有界重试**（`split.maxAttempts`，用尽记 `needs-resplit`）。
 - plan.json 的生产写入路径在本轮之前只有"调用方把 planner 的 JSON 落盘"（`saveSplitPlan` 只有测试在用）；
   §5.38.1 的 `split_plan` 补上了这个缺口，runner/门禁/导入器仍只按**磁盘上的 plan 与摘要**工作。
 
@@ -2014,6 +2015,128 @@ reworkReasons[], imported}`，整体 `{rework:{ratio,threshold,escalate}, parall
 - `report.json` 是投影：删掉它不影响任何判定；反过来，它也不能用来证明"子任务做对了"。
 - 冒烟的 `simulated worker` 证明了导入器/清理器的真实行为，但**不证明真 worker 会写出合格 commit**；
   真派发分支需要本机 `dsh` + 打开 `split.enabled` 的 profile，本仓库的验收跑只覆盖 SKIP 与反证。
+
+### 5.38.2 P3：让拆分**可运营**：值不值得、重试有界、崩溃可恢复
+
+P2 之后派发链是完整的，但运营者仍回答不了三个问题：**并行到底划不划算**（`report.json` 有耗时，
+没有判定）、**失败能不能有限重试**（P1 的答案是"不重试，下一轮重新拆分"，而"下一轮"没有任何触发点）、
+**崩溃后留下的 worktree 谁来收**（`cleanupTaskWorktree` 只在 runner 收尾时被调用，进程死掉就没有调用点）。
+这一节补四件：`economics`（含 `tokens=unavailable`）、`split.maxAttempts` + `needs-resplit`、
+只读 doctor + 显式的 `split clean --orphans`、以及真机接入文档（`docs/SPLIT-RUNBOOK.md`）。
+四件都**不改变交付判定**：不写门禁、不被 `mission_complete` 读取、不放宽任何既有断言。
+
+**A. `economics`：把"划不划算"写成可复核的判定（AC-001）**
+
+`split/report.json` 新增一段（**只在这一段**，P2 的 `tasks[]` 形状逐字段不变——它的 `deepEqual` 断言仍
+是钉住 P2 投影的证据）：
+
+```json
+"economics": {
+  "tasks": [{ "id": "T-001", "durationMs": 100, "prepareMs": 40, "attempts": 1 }],
+  "serialEstimateMs": 200, "wallClockMs": 100, "speedup": 2,
+  "verdict": "worth-parallel", "reasons": ["墙钟 100ms < 串行估算 200ms 的 90%（180ms）：并行值得", "…"],
+  "tokens": { "state": "unavailable", "reason": "宿主 subagent 接缝不暴露 usage" }
+}
+```
+
+- **`serialEstimateMs` = Σ 各任务 `durationMs`**（含每个任务一次性的 worktree `prepareMs`：串行执行也要付
+  这份准备）；**`wallClockMs` = run 开始 → 收尾（合并/导入/清理）结束**。收尾开销只进墙钟、不进估算，
+  这正是"并行被开销吃掉"能被看见的原因。
+- **判定规则写在一处代码注释里**（`split-run-report.ts` 的 `verdictOf`）：`wall < 0.9×serial` →
+  `worth-parallel`；`wall > 1.1×serial` → `slower-than-serial`；其余 → `unknown`。实际执行 < 2 个任务、
+  0 个任务、`serial` 为 0、`wall` 为 0 都判 `unknown` 并**在 `reasons` 里写依据**；`speedup` 在没有墙钟时
+  是 `null`，不是 0。
+- **`tokens` 是固定句，不是数字**：宿主 `dsh-subagent` 的派发结果没有 `usage`/token 字段，所以
+  `{ state: 'unavailable', reason: '宿主 subagent 接缝不暴露 usage' }`。从 session 日志猜、按耗时插值、
+  写 0，三者都是"没人能核对的数字"，测试直接断言该字段**不含任何数字**。
+- `prepareMs` 在 runner 里围绕 `create` 计时（首次也是唯一一次：**重试复用同一个 worktree**，不再计
+  prepare）。`finishedAt` 由收尾步骤写入 book，`report.json` 的墙钟因此包含收尾开销。
+
+**B. 有界重试与 `needs-resplit`（AC-002）**
+
+`models.json` 的 `split` 段新增 `maxAttempts`（缺省 1、允许 1..3、非法值**点名**后回退 1）。
+没有内建默认值（与 `taskTimeoutMs` 同一理由）：`DEFAULT_MODELS_CONFIG` 里放一个 1，会让每个只声明了
+`split` 的项目都多一条"字段回退默认"的噪音行，而行为没变；生效值由 `splitMaxAttempts()` 在使用点解析，
+并把手工构造的配置也**夹到上限**（"有界"是安全属性，fail closed 的方向是天花板）。
+
+attempt 循环（`split-run-attempt.ts`）：
+
+| 事实 | 行为 |
+|------|------|
+| 失败且 `attempts < maxAttempts` | 同一个 worktree 重新派发；`attempts++`；失败的尝试记 `signals`（`acceptance-failed` / `timeout`）→ 计入返工率，即使后来成功 |
+| 用尽仍失败 | `state: needs-resplit`；`run.json` 的 run-level `problems` 写出**最后一次尝试**的原因，以及"后继 T-002 一律 blocked" |
+| `dependsOn` 后继 | 由调度器的既有断言记 `blocked`，原因里点名"依赖 T-001（需要重新拆分）未完成"——不是"仍在跑" |
+| 不可重试的失败 | 模型类没配 `model`、worktree 建不出来 → 仍是 `failed`：重新拆一次不会修好配置错误 |
+
+两条不变式：① **重试从不删除任何东西**——清理仍只在收尾的"导入之后"发生，未导入的行会让清理拒绝
+（AC-009 的纪律对重试后的 worktree 一字不改）；② **重试不是"无限跑"**——尝试次数由配置的 1..3 夹住，
+测试钉住 `maxAttempts=2` 时同一任务**只有两次** `startActivation`。
+
+**C. 只读 doctor + 显式 clean（AC-003）**
+
+`packages/dsh-eng-core/src/worktree-doctor.ts` 的 `findOrphanWorktrees({ mainTree, missionId })` 把
+`worktrees/<missionId>/` 下的**每个目录**对三份事实分类：
+
+| 分类 | 判定 | 含义 |
+|------|------|------|
+| `needs-import` | 该任务还有未导入主 mission 的本地 evidence | **唯一不能删的一类**：目录是那些行的唯一副本 |
+| `safe-to-clean` | `run.json` 记 `done` 且没有待导入 | 证据已落地，只剩目录 |
+| `orphan` | `run.json` 无此行，或状态不是 `done`，且没有待导入 | 没有产物解释这个目录（崩溃/未写记录） |
+
+三条性质：**纯读**（没有写路径，测试用 `.dsh` 前后逐字节快照）；**不猜**（`run.json` 缺失或解析失败
+→ 全部按 `orphan` 列出 + `problems` 点名文件，绝不把"读不出来"当成"任务完成"）；**不自动删**（doctor 只
+给分类与命令）。`orchestrate status` 的 `## 拆分` 段末尾追加一行计数 + 前 5 个目录 + 清理命令，仍是纯读。
+
+`scripts/split-clean.sh --orphans --mission <id>` 是唯一的删除入口，两条硬规则：
+
+1. **默认 dry-run**：打印候选与将要执行的删除，一个目录都不动；`--apply` 才是显式确认（未知参数 exit 2，
+   `--mission` 必填——不猜"最近一个 mission"，删错不可撤销）；
+2. **"先导入再删"由删除代码本身执行**：只要本 mission 还有任何未导入的本地 evidence，**整批中止**并列出
+   待导入清单；逐个删除都走 `cleanupTaskWorktree`（`git worktree remove`，**不带 `--force`**），任一拒绝
+   立即中止整批。删目录**不删分支**：commit 仍在 `split/<missionId>/<taskId>` 上。
+
+**D. 度量与恢复为什么结构性不参与交付（AC-005）**
+
+- `report.json`/economics 不被任何门禁、导入器或回执读取（P2 就如此，P3 只加字段）；doctor 与 status 的
+  拆分段没有写路径。测试断言：调用 doctor/status 前后 `.dsh` 逐字节不变、`gates/` 目录不出现、
+  `report.json` 被手写篡改也不改变 status 的渲染。
+- 反过来也成立：**它们也不能用来证明"子任务做对了"**。交付仍是"合并后的主树完整门禁 + lead 的回执"。
+
+**E. 真机接入文档（AC-004）**
+
+`docs/SPLIT-RUNBOOK.md`：profile 打开 `split.enabled` 的配置样例、项目 `models.json` 样例（含
+`maxAttempts`）、`DSH_SMOKE_REAL=1` 的步骤与判据（**`split/run.json` 的 `state=ran`**，不看 `dsh` 退出码）、
+无 `dsh` 时 SKIP 的边界与四条反证、以及三条运维命令（status / `split-clean --orphans` / 看 `report.json`）。
+本仓库**不代改任何 profile**。
+
+**F. 测试**
+
+- `split-runner.test.ts` 追加 8 例：并行两任务 → `worth-parallel` + `speedup 2.00`；`prepareMs` 按任务计时
+  （`[40,40]`，durations `[180,140]`、`speedup 1.78`）；串行 + 合并开销 → `slower-than-serial`（
+  `serial 200 / wall 320 / speedup 0.63`）；单任务 → `unknown` 且无并行收益；`tokens` 固定句且**无数字**、
+  且不写 gate；`maxAttempts=2` 首次失败第二次成功（同一 worktree、`attempts=2`、计入返工）；两次都失败 →
+  恰好两次派发 + `needs-resplit`；重试后的未导入行仍让清理拒绝（worktree 保留）。
+- 因 AC-002 重新定义"用尽尝试"，**4 处既有断言**从 `failed` 改为 `needs-resplit`（依赖失败、commit 前缀、
+  超时、dispatch 的假子代理不产 commit）：这是行为定义变更，不是放宽——新断言仍然精确相等，并额外断言
+  后继 `blocked` 与点名。
+- `worktree-doctor.test.ts`（7 例，真 git + 真 worktree）：无 `run.json` 行 → `orphan`（列目录/分支/命令，
+  不删除）；有未导入行 → `needs-import`（clean 拒绝并保留目录）；`done` 且无待导入 → `safe-to-clean`
+  （真删除成功）；非 worktree 目录 → 删除失败且**目录与文件都在**；纯读快照；`run.json` 损坏 → 点名 + 全
+  孤儿；渲染有上限。
+- `split-status.test.ts` 追加 1 例（`needs-import` + `orphan` 一起渲染，含清理命令，两个目录都原样保留），
+  并把只读快照用例的夹具加上孤儿目录（医生输出也被覆盖）。
+- `split-workflow.test.ts` 追加 1 例：`maxAttempts` 的 1..3 / 非法值点名 / 缺省 1 / 上限夹取。
+- `scripts/selftest-ops.sh` **C23** 驱动 `split-clean.sh`：dry-run 列候选且一个不删、缺 `--mission` 与
+  `--aply` 拼错都 exit 2、`--apply` 真删两个目录、有未导入证据时 dry-run 与 `--apply` 都 exit 1 且目录保留。
+
+**诚实边界（P3）**
+
+- `worth-parallel` 是"这一次运行的墙钟 vs 耗时之和"，不是"下次也划算"的预测；时钟冻结或运行过快时它给
+  `unknown`，不是给一个好看的数字。
+- `needs-resplit` 只说明"这个 plan 的子任务失败了"；重新拆得好不好仍由审核者判断。
+- doctor 只能按产物分类，看不到"没写任何 evidence 的半成品文件"；这一层安全性由 `git worktree remove`
+  （无 `--force`）自己提供，而它拒绝时**不会**退化成删目录。
+- `split-clean` 不会代替你导入证据；本套件没有独立导入 CLI，待导入目录需要走 runner 收尾或既有导入路径。
 
 ## 6. 为什么这样切分
 

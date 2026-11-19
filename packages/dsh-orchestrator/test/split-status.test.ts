@@ -12,7 +12,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import test, { after } from 'node:test'
 import { MissionStoreRegistry, resolveLayout, type Layout, type MissionStore } from 'dsh-eng-core'
-import { recordSplitReview, saveSplitPlan, splitPlanDigest, splitTaskBranch, worktreeRoot, type SplitPlan } from 'dsh-eng-core/split'
+import { recordSplitReview, saveSplitPlan, splitPlanDigest, splitTaskBranch, splitWorktreeDir, worktreeRoot, type SplitPlan } from 'dsh-eng-core/split'
 import { createFakeHost, runText, tempWorkspace, type FakeHost } from 'dsh-eng-core/testing'
 import { apply } from '../dist/index.js'
 import { splitReportFile, splitRunFile } from '../dist/split-run-types.js'
@@ -223,13 +223,44 @@ test('status is READ-ONLY: it neither writes nor records a gate while rendering 
     const { layout } = mission(fake)
     const digest = withPlan(layout, { review: 'approved' })
     withRun(layout, digest)
+    // Since P3 the section also contains the doctor (orphans + pending imports):
+    // both are computed BEFORE the snapshot is taken, so "still byte-identical"
+    // covers them as well.
+    fs.mkdirSync(path.join(worktreeRoot(layout), 'm1', 'T-009'), { recursive: true })
+    withPendingEvidence(layout, cwd, 'T-003')
     const before = snapshot(layout.rootDir)
 
     const text = await status(fake)
 
     assert.match(text, /## 拆分/)
+    assert.match(text, /孤儿：/)
     assert.equal(snapshot(layout.rootDir), before, 'orchestrate status must not write anything')
     assert.equal(fs.existsSync(path.join(layout.rootDir, 'missions', 'm1', 'gates')), false, 'no gate record may be created by a status view')
+})
+
+test('leftover task worktrees are classified and listed with the clean command, and nothing is deleted (AC-003)', async () => {
+    const cwd = tempWorkspace('split-status-orphan-')
+    const fake = host(cwd)
+    const { layout } = mission(fake)
+    const digest = withPlan(layout, { review: 'approved' })
+    withRun(layout, digest)
+    // ① a directory the run record never mentions (the crashed run's leftover).
+    const orphan = path.join(worktreeRoot(layout), 'm1', 'T-009')
+    fs.mkdirSync(orphan, { recursive: true })
+    fs.writeFileSync(path.join(orphan, 'worker-note.txt'), 'half done\n')
+    // ② a directory whose local evidence never landed in the main ledger.
+    withPendingEvidence(layout, cwd, 'T-003')
+
+    const text = await status(fake)
+
+    assert.match(text, /孤儿：1 个 \/ 待导入残留：1 个 \/ 可安全清理：0 个/)
+    assert.match(text, /- T-003：needs-import（run=无记录，1 条待导入/)
+    assert.match(text, /- T-009：orphan（run=无记录/)
+    assert.match(text, /待导入的目录\*\*不能删\*\*/)
+    assert.match(text, /bash scripts\/split-clean\.sh --orphans --mission m1/)
+    // Listing is not deleting: both directories are exactly as they were.
+    assert.equal(fs.readFileSync(path.join(orphan, 'worker-note.txt'), 'utf8'), 'half done\n')
+    assert.equal(fs.existsSync(splitWorktreeDir(layout, 'm1', 'T-003')), true)
 })
 
 test('the report.json next to run.json is not consulted by the status view', async () => {

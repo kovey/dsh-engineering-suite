@@ -162,17 +162,20 @@ test('entering implement with an approved plan dispatches one worker per task, i
     assert.equal(fake.activationDisposals(), 2)
     // The workers produced nothing usable (the fake host's child makes no commit),
     // so the run is recorded as failed tasks rather than claimed as success.
+    // Since P3 the state is `needs-resplit` (AC-002): the ONE allowed attempt
+    // (default `maxAttempts: 1`) failed, so the task needs a new split/review
+    // round — `failed` would read like "an attempt is still coming".
     const record = JSON.parse(fs.readFileSync(splitRunFile(layout, 'm1'), 'utf8')) as { state: string; tasks: { id: string; state: string; attempts: number }[]; rework: { ratio: number } }
     assert.equal(record.state, 'ran')
     assert.deepEqual(record.tasks.map((entry) => [entry.id, entry.state, entry.attempts]), [
-        ['T-001', 'failed', 1],
-        ['T-002', 'failed', 1],
+        ['T-001', 'needs-resplit', 1],
+        ['T-002', 'needs-resplit', 1],
     ])
     assert.equal(record.rework.ratio, 1)
     // The report shows one line per task and says the stage is NOT settled.
     assert.match(text, /拆分派发：2 个子任务/)
-    assert.match(text, /T-001 failed/)
-    assert.match(text, /T-002 failed/)
+    assert.match(text, /T-001 needs-resplit/)
+    assert.match(text, /T-002 needs-resplit/)
     assert.match(text, /派发\*\*不结算\*\*本阶段/)
 })
 

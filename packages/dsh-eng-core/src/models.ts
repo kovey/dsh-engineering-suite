@@ -11,7 +11,7 @@
  * <root>/models.json
  *   planner { model, reasoningEffort, provider }
  *   worker  { model, reasoningEffort, provider }
- *   split   { reviewRequired, maxTasks, maxParallel, maxReworkRounds, taskTimeoutMs }
+ *   split   { reviewRequired, maxTasks, maxParallel, maxReworkRounds, taskTimeoutMs, maxAttempts }
  *   quality { maxReworkRatio }
  * ```
  *
@@ -34,6 +34,9 @@ import { isRecord, parseQualitySection, parseSplitSection, type QualitySettings,
 // as an import) and therefore a cycle. Re-exported here so the public surface
 // (`dsh-eng-core/split`) does not change.
 export type { QualitySettings, SplitSettings } from './models-sections.js'
+// AC-002 of P3: the retry ceiling lives with the section that declares it, and is
+// resolved at the point of use (an absent `maxAttempts` means the documented 1).
+export { DEFAULT_SPLIT_MAX_ATTEMPTS, MAX_SPLIT_ATTEMPTS, splitMaxAttempts } from './models-sections.js'
 
 /** One model class (`planner` / `worker`). */
 export interface ModelClassConfig {
@@ -91,7 +94,7 @@ export interface ModelsLayer {
 const SECTION_DEFAULTS: Record<ModelsClass, string> = {
     planner: 'planner{model,reasoningEffort}',
     worker: 'worker{model,reasoningEffort}',
-    split: 'split{reviewRequired,maxTasks,maxParallel,maxReworkRounds,taskTimeoutMs}',
+    split: 'split{reviewRequired,maxTasks,maxParallel,maxReworkRounds,taskTimeoutMs,maxAttempts}',
     quality: 'quality{maxReworkRatio}',
 }
 

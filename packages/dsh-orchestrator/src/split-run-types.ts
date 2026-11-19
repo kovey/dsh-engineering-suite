@@ -20,8 +20,16 @@ import path from 'node:path'
 import type { AgentLike, DelegationPresets, DelegationServices, Layout } from 'dsh-eng-core'
 import type { CleanupWorktreeResult, CreateWorktreeResult, ModelsConfig, ReworkReport, ReworkSignal, SplitPlan } from 'dsh-eng-core/split'
 
-/** How one task ended (a task that never started says so). */
-export type SplitTaskState = 'pending' | 'done' | 'failed' | 'blocked'
+/**
+ * How one task ended (a task that never started says so).
+ *
+ * `needs-resplit` (P3, AC-002) is the exhausted-retry outcome: every allowed
+ * attempt failed, so the task must go back through a split/review round — it is
+ * NOT `failed`, because the same plan re-dispatched unchanged would fail again,
+ * and it is not `blocked`, because it did run. Its `dependsOn` successors are
+ * `blocked` and name it.
+ */
+export type SplitTaskState = 'pending' | 'done' | 'failed' | 'blocked' | 'needs-resplit'
 
 /** One task's outcome inside one run. */
 export interface SplitTaskRun {
@@ -29,8 +37,15 @@ export interface SplitTaskRun {
     state: SplitTaskState
     /** The commit the task branch produced (absent when nothing was committed). */
     commit?: string
-    /** Dispatch attempts (0 = never started). */
+    /** Dispatch attempts (0 = never started; with retries this is 1..maxAttempts). */
     attempts: number
+    /**
+     * Wall time of this task's first (and only) worktree preparation, in ms
+     * (P3 AC-001). Retries reuse the same worktree, so this is never re-counted
+     * — and it is a PART of `startedAt..finishedAt`, not an extra cost: serial
+     * execution would pay the same preparation.
+     */
+    prepareMs?: number
     /** When the dispatch of this task started (epoch ms, absent = never dispatched). */
     startedAt?: number
     /** When it stopped being in flight (epoch ms; filled even for a timeout). */
@@ -169,6 +184,12 @@ export interface SplitRunBook {
     /** Run start (epoch ms). */
     at: number
     /**
+     * When the run finished its dispatch+finish steps (epoch ms; filled by the
+     * finishing step). `finishedAt - at` is the wall clock `report.json`'s
+     * economics is built from (P3 AC-001).
+     */
+    finishedAt?: number
+    /**
      * The clock used for `at` and for per-task durations (tests freeze it).
      *
      * Kept on the book because the report's `durationMs` must come from the same
@@ -177,6 +198,14 @@ export interface SplitRunBook {
      * @returns milliseconds since the epoch.
      */
     now: () => number
+    /**
+     * `dependsOn` per plan task id (the plan's graph).
+     *
+     * Kept on the book so a task that exhausts its retries can NAME the successors
+     * it will block (AC-002) without the runner threading the plan through every
+     * dispatch call.
+     */
+    taskDeps: Record<string, string[]>
     /**
      * The groups actually handed to the scheduler, in execution order (AC-005
      * asks the report's parallelism to be the REAL one, not the plan's text).

@@ -4,7 +4,9 @@
  * It answers, from artifacts alone: which plan is on disk (digest), whether a
  * person approved THAT version, what each task's run did (state, commit, imported
  * rows, whether its worktree is gone), the rework ratio and whether the model was
- * escalated, and how many evidence rows are still unimported.
+ * escalated, and how many evidence rows are still unimported. Since P3 it also
+ * lists the leftover/orphan worktrees with their cleanup command (AC-003), still
+ * read-only.
  *
  * Two rules shape it:
  *
@@ -23,7 +25,15 @@
  */
 
 import { readJson, type Layout } from 'dsh-eng-core'
-import { pendingImports, readSplitPlan, splitReviewStatus, type SplitReviewStatus } from 'dsh-eng-core/split'
+import {
+    describeOrphanWorktrees,
+    findOrphanWorktrees,
+    orphanCount,
+    pendingImports,
+    readSplitPlan,
+    splitReviewStatus,
+    type SplitReviewStatus,
+} from 'dsh-eng-core/split'
 import { splitRunFile } from './split-run-types.js'
 
 /** One task as `split/run.json` recorded it (absent for a never-dispatched task). */
@@ -102,6 +112,30 @@ function reworkLine(run: SplitRunRecord | undefined): string {
 }
 
 /**
+ * The crash-recovery lines of the split section (P3 AC-003).
+ *
+ * `findOrphanWorktrees` only READS: this view lists the leftovers, the one
+ * category that must be imported before anything is deleted, and the exact
+ * command an operator can run. It never removes a directory and never writes a
+ * gate record — AC-005 says a measurement may not change a delivery verdict.
+ */
+function orphanLines(layout: Layout, missionId: string): string[] {
+    const report = findOrphanWorktrees({ mainTree: layout.cwd, missionId, layout })
+    const orphans = orphanCount(report, 'orphan')
+    const needsImport = orphanCount(report, 'needs-import')
+    const cleanable = orphanCount(report, 'safe-to-clean')
+    const runText = report.runRecordRead ? '已读' : '缺失/无法解析（全部按孤儿列出）'
+    return [
+        `- 孤儿：${orphans} 个 / 待导入残留：${needsImport} 个 / 可安全清理：${cleanable} 个（磁盘共 ${report.entries.length} 个目录；run.json ${runText}）`,
+        ...describeOrphanWorktrees(report, 5),
+        ...(report.entries.length > 5 ? [`- （另有 ${report.entries.length - 5} 个目录未逐条列出）`] : []),
+        ...(needsImport > 0 ? ['- 待导入的目录**不能删**：先导入这些证据，clean 会拒绝（未导入的本地证据随目录删除就再也找不回来了）'] : []),
+        ...report.problems.map((problem) => `- doctor：${problem}`),
+        `- 清理命令：bash scripts/split-clean.sh --orphans --mission ${missionId}（默认 dry-run 只打印；--apply 才逐个走"先导入再删"）`,
+    ]
+}
+
+/**
  * Render the split section of the status report.
  * @param layout - the workspace layout.
  * @param missionId - the mission whose split artifacts to read.
@@ -129,6 +163,7 @@ export function renderSplitStatus(layout: Layout, missionId: string): string[] {
         '',
         `- ${reworkLine(run)}`,
         `- 待导入：${pendingRows} 条（${pending.length} 个子任务）${cleanableText(run, tasks.length, pendingRows)}`,
+        ...orphanLines(layout, missionId),
     ]
     return lines
 }

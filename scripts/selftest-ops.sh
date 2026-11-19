@@ -1253,6 +1253,142 @@ else
   fail "split-smoke: an unknown DSH_SMOKE_REAL must exit 2, got $LAST_RC — $LAST_OUT"
 fi
 
+# ---------------------------------------------------------------------------
+section "C23 — split-clean: dry-run deletes nothing, --apply deletes, a pending import refuses the batch"
+# ---------------------------------------------------------------------------
+# `split-clean --orphans` is the ONLY command that removes leftover task
+# worktrees, and the two ways it could destroy work are both driven here:
+#   ① it deletes something in dry-run (the default must be harmless);
+#   ② it deletes a worktree whose local evidence never reached the main ledger
+#      (the only copy of those rows), or deletes PAST such a refusal.
+# A successful --apply is also driven: a command that never deletes anything
+# would pass every "refused" test while being useless.
+SPLIT_CLEAN="$ROOT/scripts/split-clean.sh"
+
+make_clean_ws() { # make_clean_ws <dir>
+  local ws="$1"
+  rm -rf "$ws"
+  mkdir -p "$ws/.dsh/missions/m1/split"
+  git -C "$ws" init -q
+  git -C "$ws" config user.email selftest@example.com
+  git -C "$ws" config user.name selftest
+  printf '.dsh/\n' > "$ws/.gitignore"
+  printf '# c23\n' > "$ws/README.md"
+  git -C "$ws" add -A >/dev/null 2>&1
+  git -C "$ws" commit -qm base >/dev/null 2>&1
+  # T-001 finished and nothing pending → `safe-to-clean`; T-002 is on disk but
+  # the run record never mentions it → `orphan`.
+  printf '{"missionId":"m1","at":1700000000000,"state":"ran","tasks":[{"id":"T-001","state":"done"}]}\n' \
+    > "$ws/.dsh/missions/m1/split/run.json"
+  git -C "$ws" worktree add -q -b split/m1/T-001 "$ws/.dsh/worktrees/m1/T-001" HEAD
+  git -C "$ws" worktree add -q -b split/m1/T-002 "$ws/.dsh/worktrees/m1/T-002" HEAD
+}
+
+C23A="$TMP/c23-a"
+make_clean_ws "$C23A"
+
+# ① dry-run (the default): lists both candidates, deletes nothing, exit 0.
+run_rc bash "$SPLIT_CLEAN" --orphans --mission m1 --workspace "$C23A"
+if [ "$LAST_RC" = "0" ]; then
+  pass "split-clean: dry-run exits 0 (nothing to remove is not a failure when listed)"
+else
+  fail "split-clean: dry-run must exit 0, got $LAST_RC — $LAST_OUT"
+fi
+case "$LAST_OUT" in
+  *"DRY-RUN"*) pass "split-clean: the default really says DRY-RUN" ;;
+  *) fail "split-clean: the default branch does not say DRY-RUN — $LAST_OUT" ;;
+esac
+case "$LAST_OUT" in
+  *"将删除 T-001（safe-to-clean）"*) pass "split-clean: the done task is listed as safe-to-clean" ;;
+  *) fail "split-clean: the safe-to-clean candidate is not listed — $LAST_OUT" ;;
+esac
+case "$LAST_OUT" in
+  *"将删除 T-002（orphan）"*) pass "split-clean: the unrecorded directory is listed as orphan" ;;
+  *) fail "split-clean: the orphan candidate is not listed — $LAST_OUT" ;;
+esac
+if [ -d "$C23A/.dsh/worktrees/m1/T-001" ] && [ -d "$C23A/.dsh/worktrees/m1/T-002" ]; then
+  pass "split-clean: the dry-run deleted nothing"
+else
+  fail "split-clean: the dry-run removed a directory"
+fi
+
+# ② an explicit confirmation is required: no --mission, or a typo'd flag, must
+#    not degrade into "did nothing" (or worse, into --apply).
+run_rc bash "$SPLIT_CLEAN" --orphans --workspace "$C23A"
+if [ "$LAST_RC" = "2" ]; then
+  pass "split-clean: a missing --mission is refused (no 'latest mission' guessing)"
+else
+  fail "split-clean: a missing --mission must exit 2, got $LAST_RC — $LAST_OUT"
+fi
+run_rc bash "$SPLIT_CLEAN" --orphans --mission m1 --aply --workspace "$C23A"
+if [ "$LAST_RC" = "2" ]; then
+  pass "split-clean: a typo'd --aply is refused (a typo cannot become a no-op)"
+else
+  fail "split-clean: an unknown flag must exit 2, got $LAST_RC — $LAST_OUT"
+fi
+
+# ③ --apply really removes the candidates.
+run_rc bash "$SPLIT_CLEAN" --orphans --mission m1 --apply --workspace "$C23A"
+if [ "$LAST_RC" = "0" ]; then
+  pass "split-clean: --apply exits 0 after removals"
+else
+  fail "split-clean: --apply must exit 0, got $LAST_RC — $LAST_OUT"
+fi
+case "$LAST_OUT" in
+  *"已清理 T-001"*) pass "split-clean: T-001 was removed" ;;
+  *) fail "split-clean: T-001 was not removed — $LAST_OUT" ;;
+esac
+if [ ! -d "$C23A/.dsh/worktrees/m1/T-001" ] && [ ! -d "$C23A/.dsh/worktrees/m1/T-002" ]; then
+  pass "split-clean: both candidate directories are gone"
+else
+  fail "split-clean: --apply left a directory behind"
+fi
+
+# ④ a directory whose local evidence never landed refuses the WHOLE batch, in
+#    dry-run and in --apply, and the directory stays exactly where it was.
+C23B="$TMP/c23-b"
+make_clean_ws "$C23B"
+mkdir -p "$C23B/.dsh/worktrees/m1/T-001/.dsh/missions/m1"
+printf '{"id":"ev-1","kind":"test","at":1700000000000,"summary":"未导入的本地验证","taskId":"T-001","commit":"abcdef0123456789"}\n' \
+  > "$C23B/.dsh/worktrees/m1/T-001/.dsh/missions/m1/evidence.jsonl"
+run_rc bash "$SPLIT_CLEAN" --orphans --mission m1 --apply --workspace "$C23B"
+if [ "$LAST_RC" = "1" ]; then
+  pass "split-clean: a pending import refuses --apply (exit 1)"
+else
+  fail "split-clean: a pending import must exit 1, got $LAST_RC — $LAST_OUT"
+fi
+case "$LAST_OUT" in
+  *"存在 1 个子任务的未导入本地 evidence"*) pass "split-clean: the refusal names the pending sub-task" ;;
+  *) fail "split-clean: the refusal does not name the pending evidence — $LAST_OUT" ;;
+esac
+case "$LAST_OUT" in
+  *"整批中止"*) pass "split-clean: the refusal aborts the whole batch" ;;
+  *) fail "split-clean: the refusal does not say 整批中止 — $LAST_OUT" ;;
+esac
+if [ -d "$C23B/.dsh/worktrees/m1/T-001" ]; then
+  pass "split-clean: the refused directory is still there (its evidence is the only copy)"
+else
+  fail "split-clean: a refused cleanup removed the directory"
+fi
+run_rc bash "$SPLIT_CLEAN" --orphans --mission m1 --workspace "$C23B"
+if [ "$LAST_RC" = "1" ]; then
+  pass "split-clean: even the dry-run refuses while an import is pending"
+else
+  fail "split-clean: the dry-run must report the pending refusal, got $LAST_RC — $LAST_OUT"
+fi
+
+# ⑤ an unsafe mission id must be a refusal sentence, not a path or a stack trace.
+run_rc bash "$SPLIT_CLEAN" --orphans --mission ../escape --workspace "$C23B"
+if [ "$LAST_RC" = "1" ]; then
+  pass "split-clean: an unsafe mission id is refused (ids are single path segments)"
+else
+  fail "split-clean: an unsafe mission id must exit 1, got $LAST_RC — $LAST_OUT"
+fi
+case "$LAST_OUT" in
+  *"unsafe mission id"*) pass "split-clean: the refusal names the unsafe id" ;;
+  *) fail "split-clean: the refusal does not name the unsafe id — $LAST_OUT" ;;
+esac
+
 section "summary"
 if [ "$FAILURES" = "0" ]; then
   printf '  \033[32mOPS SELFTEST GREEN\033[0m — every finding above is still refused.\n'
