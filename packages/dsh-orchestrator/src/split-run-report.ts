@@ -90,6 +90,11 @@ export interface SplitRunReport {
     ok: boolean
     planDigest: string
     tasks: SplitTaskReport[]
+    /**
+     * The distinct model-fallback notes (P4 AC-001/AC-002) — 「worker 模型未配置，
+     * 使用宿主默认」. Empty = every class the run needed was configured.
+     */
+    modelNotes: string[]
     /** The same numbers `rework.json` carries, repeated so one file answers "how did it go". */
     rework: { ratio: number; threshold: number; escalate: boolean }
     /** The concurrency the scheduler really used. */
@@ -203,6 +208,9 @@ export function buildSplitRunReport(book: SplitRunBook, result: SplitRunResult):
             reworkReasons: [...task.signals],
             imported: task.imported,
         })),
+        // P4: "no model configured" is an override nobody set, not a failure — the
+        // report names it instead of leaving a `model: null` to be misread.
+        modelNotes: [...result.modelNotes],
         rework: { ratio: result.rework.ratio, threshold: result.rework.threshold, escalate: result.rework.escalate },
         parallelism: { maxParallel: book.maxParallel, groups: book.groups.map((group) => [...group]) },
         economics: buildEconomics(book, result),

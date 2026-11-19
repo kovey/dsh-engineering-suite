@@ -130,6 +130,12 @@ function recordRework(book: SplitRunBook): ReworkReport {
     return plan.report
 }
 
+/** The distinct model-fallback notes of the run (P4 AC-001: one sentence per fallback). */
+function modelNotesOf(book: SplitRunBook): string[] {
+    const notes = book.tasks.flatMap((record) => (record.modelNote === undefined ? [] : [record.modelNote]))
+    return [...new Set(notes)]
+}
+
 /** The result object for one state (no artifacts written). */
 function resultOf(book: SplitRunBook, state: SplitRunState, rework: ReworkReport): SplitRunResult {
     return {
@@ -139,6 +145,7 @@ function resultOf(book: SplitRunBook, state: SplitRunState, rework: ReworkReport
         tasks: book.tasks,
         imported: book.tasks.reduce((sum, record) => sum + record.imported, 0),
         rework,
+        modelNotes: modelNotesOf(book),
         problems: book.problems,
         warnings: book.warnings,
     }
@@ -164,6 +171,7 @@ function writeRunRecord(book: SplitRunBook, result: SplitRunResult): SplitRunRes
         tasks: result.tasks,
         imported: result.imported,
         rework: result.rework,
+        modelNotes: result.modelNotes,
         problems: result.problems,
         warnings: result.warnings,
     })

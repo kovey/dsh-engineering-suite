@@ -45,8 +45,10 @@ export interface SplitDispatchInput {
 
 /** The model classes the run actually used, as one report phrase. */
 function describeRoutes(result: SplitRunResult): string {
-    const used = [...new Set(result.tasks.filter((task) => task.model !== undefined).map((task) => `${task.modelClass}=${task.provider === undefined ? '' : `${task.provider}/`}${task.model}`))]
-    return used.length === 0 ? '(没有启动 worker)' : used.join('、')
+    const used = result.tasks
+        .filter((task) => task.attempts > 0)
+        .map((task) => (task.model === undefined ? `${task.modelClass ?? 'worker'}=宿主默认` : `${task.modelClass}=${task.provider === undefined ? '' : `${task.provider}/`}${task.model}`))
+    return used.length === 0 ? '(没有启动 worker)' : [...new Set(used)].join('、')
 }
 
 /** One line per task (`T-001 done`), so the report says who did what. */
@@ -86,13 +88,16 @@ function outcomeOf(result: SplitRunResult, modelProblems: readonly string[], dea
             note: [`拆分派发未执行：${result.problems[0] ?? '派发前提不成立'}`, ...(result.file === undefined ? [] : [`记录：${result.file}`])].join('\n'),
         }
     }
-    const headline = `拆分派发：${result.tasks.length} 个子任务（${describeTasks(result)}），导入 ${result.imported} 条证据，返工率 ${result.rework.reworked}/${result.rework.started} = ${result.rework.ratio.toFixed(3)}（阈值 ${result.rework.threshold}${result.rework.escalate ? '，已升级 planner 模型' : ''}）`
+    const headline = `拆分派发：${result.tasks.length} 个子任务（${describeTasks(result)}），导入 ${result.imported} 条证据，返工率 ${result.rework.reworked}/${result.rework.started} = ${result.rework.ratio.toFixed(3)}（阈值 ${result.rework.threshold}${result.rework.escalate ? '，已超阈值：后续子任务按 planner 模型路由' : ''}）`
+    // P4 AC-001: a missing model class rides along as a note, not as an error —
+    // the summary a person reads must say "host default" instead of nothing.
+    const fallbackNotes = result.modelNotes.length === 0 ? '' : `；模型回退：${result.modelNotes.join('；')}`
     return {
         dispatched: true,
         runId: `split-${(result.planDigest ?? '').slice(0, 12) || 'plan'}`,
         ...(result.file === undefined ? {} : { outputFile: result.file }),
         stopReason: result.ok ? 'completed' : 'error',
-        roleNote: `${headline}；每个子任务一个 worktree + worker 角色（模型 ${describeRoutes(result)}；单任务超时 ${deadline.timeoutMs}ms、重试上限 ${deadline.maxAttempts} 次；orchestrate 已从 worker 作用域剔除）${modelNotes}`,
+        roleNote: `${headline}；每个子任务一个 worktree + worker 角色（模型 ${describeRoutes(result)}；单任务超时 ${deadline.timeoutMs}ms、重试上限 ${deadline.maxAttempts} 次；orchestrate 已从 worker 作用域剔除）${modelNotes}${fallbackNotes}`,
         ...(result.ok ? {} : { error: result.problems.length === 0 ? '部分子任务未完成（见 run.json）' : result.problems.join('；') }),
     }
 }

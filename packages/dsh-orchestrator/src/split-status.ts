@@ -50,6 +50,8 @@ interface SplitRunRecord {
     state?: unknown
     tasks?: unknown
     rework?: { ratio?: unknown; threshold?: unknown; escalate?: unknown; started?: unknown; reworked?: unknown }
+    /** P4: 「worker 模型未配置，使用宿主默认」/「无法升级到 planner：未配置，…」. */
+    modelNotes?: unknown
 }
 
 /** The review state as one word plus its detail (a person reads both). */
@@ -135,6 +137,12 @@ function orphanLines(layout: Layout, missionId: string): string[] {
     ]
 }
 
+/** The model-fallback notes of the run (P4 AC-001/AC-002), one line each. */
+function modelNoteLines(run: SplitRunRecord | undefined): string[] {
+    if (!Array.isArray(run?.modelNotes)) return []
+    return run.modelNotes.filter((note): note is string => typeof note === 'string' && note !== '').map((note) => `- 模型：${note}`)
+}
+
 /**
  * Render the split section of the status report.
  * @param layout - the workspace layout.
@@ -162,6 +170,7 @@ export function renderSplitStatus(layout: Layout, missionId: string): string[] {
         ...tasks.map((task) => taskLine(task.id, rows.get(task.id))),
         '',
         `- ${reworkLine(run)}`,
+        ...modelNoteLines(run),
         `- 待导入：${pendingRows} 条（${pending.length} 个子任务）${cleanableText(run, tasks.length, pendingRows)}`,
         ...orphanLines(layout, missionId),
     ]

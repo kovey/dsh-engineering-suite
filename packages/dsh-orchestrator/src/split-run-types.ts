@@ -54,6 +54,12 @@ export interface SplitTaskRun {
     modelClass?: 'worker' | 'planner'
     model?: string
     provider?: string
+    /**
+     * How this task's model was resolved when its class had no `model` (P4
+     * AC-001): 「worker 模型未配置，使用宿主默认」, or the escalation's
+     * 「无法升级到 planner：未配置，继续使用 …」. Absent = the class was configured.
+     */
+    modelNote?: string
     worktree?: string
     branch?: string
     /** Evidence rows imported into the main mission from this task. */
@@ -87,6 +93,13 @@ export interface SplitRunResult {
     imported: number
     /** The rework ratio and the escalation decision (AC-011). */
     rework: ReworkReport
+    /**
+     * The DISTINCT model-fallback notes of this run (P4 AC-001/AC-002): a class
+     * with no `model` means "host default", and this is the sentence that says so
+     * in `run.json`/`report.json`/the dispatch summary. Empty = every class the
+     * run needed was configured.
+     */
+    modelNotes: string[]
     problems: string[]
     warnings: string[]
     /** Absolute path of `split/run.json` (absent when nothing was written). */

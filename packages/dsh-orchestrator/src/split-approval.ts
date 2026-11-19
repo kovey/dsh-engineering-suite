@@ -3,8 +3,9 @@
  *
  * The split workflow's second stage exists so that a PERSON — not the model that
  * wrote the plan — decides whether the decomposition may dispatch workers. The
- * seam is the host's own (`ctx.get('approval')`), so an IM card, a TUI popup or
- * a terminal prompt all work without this plugin knowing which one answered.
+ * seam is the host's own (`ctx.get('approval')`) — the SAME one `spec_approve`
+ * asks through, so an IM card, a TUI popup or a terminal prompt all work without
+ * this plugin knowing which one answered, and nothing extra has to be configured.
  *
  * Four answers, one mapping, fail closed:
  *
@@ -14,7 +15,7 @@
  *    rounds), and the stage rolls back to `split` for a re-plan;
  *  - `cancelled` / `unavailable` → NO record at all: nobody decided, so the
  *    stage stays entered and can be retried;
- *  - no seam mounted → refused by name ("无审批通道"), never assumed.
+ *  - no seam mounted → refused by name (「宿主没有 approval 接缝」), never assumed.
  *
  * A stale review (`plan 已改动`) re-asks and, when rejected, records why the old
  * decision no longer applied. Nothing here trusts the answerer's prose: the
@@ -93,8 +94,10 @@ function planRelative(facts: GateFacts): string[] {
 function noSeam(): SplitReviewAskResult {
     return {
         kind: 'blocked',
-        detail: '无审批通道：宿主没有装配审批接缝（ctx.get("approval") 为空，也没有可用的 IM 卡），无法人工审核这份拆分；本轮未写任何审核记录。',
-        fix: '让宿主装配审批插件或可回答的 interaction/IM 通道后重试；拆分审核是硬门禁，没有"自动通过"这条路径（除非由人把 split.reviewRequired 关掉，那仍是宿主的决定）。',
+        detail:
+            '宿主没有 approval 接缝：ctx.get("approval") 为空，无法人工审核这份拆分；本轮未写任何审核记录。' +
+            'split-review 与 spec_approve 使用同一条宿主接缝（跟随当前运行界面 tui/web/desktop；配置了 IM 即走 IM），不需要任何额外配置。',
+        fix: '让宿主装配它本来就有的人工审批面（终端 / desktop / web TUI 的审批插件，或 IM 通道）后重试；拆分审核是硬门禁，没有"自动通过"这条路径（除非由人把 split.reviewRequired 关掉，那仍是宿主的决定）。',
     }
 }
 

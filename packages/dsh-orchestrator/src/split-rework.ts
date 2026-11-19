@@ -10,7 +10,10 @@
  *
  * It never stops the mission. A high rework ratio means the decomposition was
  * probably wrong, not that the work should be abandoned; the warning goes into
- * the mission's evidence ledger and the caller keeps dispatching.
+ * the mission's evidence ledger and the caller keeps dispatching. The same is
+ * true of a MISSING planner model (P4 AC-002): the escalation degrades to the
+ * worker class or the host default, and `split/rework.json` records the route
+ * with the note 「无法升级到 planner：未配置，继续使用 …」.
  *
  * Per-task dispatch has no dedicated runner yet: this module IS the seam such a
  * runner (or the next round's task loop) calls, and its test pins the three
@@ -59,10 +62,20 @@ export interface NextSplitTaskPlan {
     problems: string[]
 }
 
+/** The model a route actually runs on, as one phrase (`provider/model` or the host default). */
+function modelText(route: NextTaskRoute): string {
+    if (route.model === undefined) return '宿主默认（请求省略 model/provider）'
+    const model = `${route.provider === undefined ? '' : `${route.provider}/`}${route.model}`
+    return route.fallback === 'worker' ? `${model}（worker 段，无法升级）` : model
+}
+
 /** The warning paragraph (also written to the mission's evidence ledger). */
 function warningText(report: ReworkReport, route: NextTaskRoute): string {
-    const target = route.model === undefined ? 'planner 模型（未配置，见下方问题）' : `${route.provider === undefined ? '' : `${route.provider}/`}${route.model}`
-    return `⚠️ 返工率 ${ratioText(report)} 超过阈值 ${report.threshold}：后续子任务升级到 planner 模型 ${target}（不中止，继续派发）`
+    const head = `⚠️ 返工率 ${ratioText(report)} 超过阈值 ${report.threshold}`
+    // P4 AC-002: "escalate, but there is no planner model" is a DEGRADATION, not a
+    // stop — the note (from `routeForNextTask`) is the sentence an operator needs.
+    if (route.note !== undefined) return `${head}：${route.note}（不中止，继续派发）`
+    return `${head}：后续子任务升级到 planner 模型 ${modelText(route)}（不中止，继续派发）`
 }
 
 /** The numbers a later reader compares against the threshold. */
@@ -94,12 +107,14 @@ function recordWarning(store: MissionStore, missionId: string, warning: string, 
  */
 export function planNextSplitTask(input: NextSplitTaskInput): NextSplitTaskPlan {
     const report = computeRework({ tasks: input.tasks as readonly ReworkTaskInput[], threshold: input.models.quality.maxReworkRatio })
-    const { file } = writeSplitReworkReport(input.layout, input.missionId, report, input.at)
+    // The route is decided BEFORE the file is written: "escalation without a
+    // planner model" belongs in `split/rework.json`, not only in the report lines.
     const route = routeForNextTask(report, input.models)
+    const { file } = writeSplitReworkReport(input.layout, input.missionId, report, input.at, route)
     const problems: string[] = []
     const lines = [
         renderReworkReport(report),
-        `下一个子任务模型：${route.modelClass}${route.model === undefined ? '(未配置)' : ` → ${route.provider === undefined ? '' : `${route.provider}/`}${route.model}`}`,
+        `下一个子任务模型：${route.modelClass} → ${modelText(route)}`,
         ...route.problems.map((problem) => `- ${problem}`),
     ]
     if (!report.escalate) return { report, route, file, lines, problems }

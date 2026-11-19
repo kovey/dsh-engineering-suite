@@ -12,13 +12,15 @@
  *     see `splitMaxAttempts`). Every attempt increments `attempts`.
  *  3. **Each failed attempt counts as rework.** The signal (`acceptance-failed`,
  *     `timeout`) stays on the task even when a later attempt succeeds: the task
- *     really was worked on twice, and the rework ratio exists to show that.
+ *     really was worked on twice, and the rework ratio exists to show that. A
+ *     model class nobody configured is NOT a failure and never enters this
+ *     signal (P4 AC-001) — the task runs on the host default instead.
  *  4. **Exhausted is not `failed`.** A task that used every allowed attempt is
  *     `needs-resplit`: re-dispatching the same plan unchanged would fail again,
  *     so it must go back through split/review. Its `dependsOn` successors are
- *     `blocked` and name it. A NON-retryable cause (no model configured, the
- *     worktree could not be created) stays `failed`, because a new plan would not
- *     fix a configuration mistake.
+ *     `blocked` and name it. A NON-retryable cause (the worktree could not be
+ *     created) stays `failed`, because a new plan would not fix a configuration
+ *     mistake.
  *
  * @module dsh-orchestrator/split-run-attempt
  */
@@ -140,7 +142,7 @@ async function runAttempts(book: SplitRunBook, deps: SplitRunnerDeps, target: At
         const failure = await attemptOnce(book, deps, target)
         if (failure === undefined) {
             record.state = 'done'
-            book.log(`子任务 ${task.id} 完成：commit ${(record.commit ?? '').slice(0, 8)}（${record.modelClass} ${record.model}；第 ${record.attempts} 次尝试）`)
+            book.log(`子任务 ${task.id} 完成：commit ${(record.commit ?? '').slice(0, 8)}（${record.modelClass} ${record.model ?? '宿主默认'}；第 ${record.attempts} 次尝试）`)
             return
         }
         if (!failure.retryable) {
@@ -154,6 +156,20 @@ async function runAttempts(book: SplitRunBook, deps: SplitRunnerDeps, target: At
         }
         book.log(`子任务 ${task.id}：第 ${record.attempts}/${maxAttempts} 次尝试失败，复用同一 worktree 重新派发：${target.worktree}`)
     }
+}
+
+/**
+ * Record how an unconfigured model class continued (P4 AC-001/AC-002).
+ *
+ * `models.json` is an OVERRIDE layer: "nobody pinned a model" means "use the host
+ * default" (`agentOptionsOf` already omits `model`/`provider`), never "this task
+ * failed". The note goes on the task record so `run.json`, `report.json` and the
+ * dispatch summary all carry the same sentence.
+ */
+function recordModelNote(book: SplitRunBook, record: SplitTaskRun, route: NextTaskRoute): void {
+    if (route.note === undefined) return
+    record.modelNote = route.note
+    book.log(`子任务 ${record.id}：${route.note}`)
 }
 
 /**
@@ -171,12 +187,7 @@ export async function dispatchTask(book: SplitRunBook, deps: SplitRunnerDeps, ta
     record.modelClass = route.modelClass
     record.model = route.model
     record.provider = route.provider
-    if (route.model === undefined) {
-        // Not retryable and not a re-split problem: a missing model class is a
-        // deployment mistake, so it stays `failed` (the P1 meaning).
-        failTask(book, record, route.problems.length > 0 ? route.problems : [`模型类 ${route.modelClass} 没有配置 model`], 'acceptance-failed')
-        return
-    }
+    recordModelNote(book, record, route)
     // AC-001: the FIRST preparation is timed (retries reuse the worktree and are
     // not preparation). It is a part of the task's duration, not an extra cost.
     const prepareStart = book.now()

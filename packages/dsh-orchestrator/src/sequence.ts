@@ -146,8 +146,9 @@ export interface SequenceDeps {
      * The host approval seam, read at call time (`ctx.get('approval')`).
      *
      * Used by the `split-review` stage: a human must approve the plan before any
-     * worker is dispatched. Absent = the stage refuses by name ("无审批通道");
-     * it is never treated as "approved".
+     * worker is dispatched. Absent = the stage refuses by name
+     * (「宿主没有 approval 接缝」); it is never treated as "approved". This is the
+     * same host seam `spec_approve` asks through, so nothing extra is configured.
      */
     approval?: () => ApprovalLike | undefined
     /**

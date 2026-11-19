@@ -179,6 +179,27 @@ test('entering implement with an approved plan dispatches one worker per task, i
     assert.match(text, /派发\*\*不结算\*\*本阶段/)
 })
 
+test('a project without model classes dispatches on the host default and the summary says so (P4 AC-001)', async () => {
+    const cwd = repo()
+    const fake = host(cwd)
+    const { layout } = missionAt(fake, 'split-review')
+    // No model classes at all: the override nobody wrote means "host default".
+    fs.writeFileSync(path.join(layout.rootDir, 'models.json'), JSON.stringify({ worker: {}, planner: {} }))
+    saveSplitPlan(layout, 'm1', goodPlan())
+    approve(layout)
+
+    const text = await orchestrate(fake, { action: 'advance', verdict: 'PASS' })
+
+    // Dispatched anyway, with model/provider OMITTED from the request (the host decides).
+    assert.equal(fake.activationSpecs.length, 2, text)
+    const specs = fake.activationSpecs as { request?: { agentOptions?: { model?: string; provider?: string } } }[]
+    assert.deepEqual(specs.map((spec) => spec.request?.agentOptions?.model), [undefined, undefined])
+    assert.deepEqual(specs.map((spec) => spec.request?.agentOptions?.provider), [undefined, undefined])
+    // The cross-task summary carries the same note `run.json` records.
+    assert.match(text, /模型回退：worker 模型未配置，使用宿主默认/)
+    assert.match(text, /worker=宿主默认/)
+})
+
 test('a plan that is not worth splitting leaves implement on the plain path (no worker, no run record) (AC-005)', async () => {
     const cwd = repo()
     const fake = host(cwd)

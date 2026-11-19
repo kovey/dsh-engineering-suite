@@ -1864,9 +1864,13 @@ spec-clarify → test-design-review → spec-approve → split → split-review 
 3. **`cwd` 落在 worktree 上**：派发接缝新增 `SubagentStartRequest.cwd`（rc.1 读 `spec.request`、rc.2 读顶层）。
    不传 `cwd` 时 worker 继承父会话目录，它的本地 `.dsh/…/evidence.jsonl` 会直接写进**主 mission 的台账**——
    这正是 AC-007 说的"污染主树"，而且是很自然的一步错。测试同时断言两种形状都有 `cwd`。
-4. **模型来自 `models.json`**（不是宿主默认，也不靠角色文件里的字面量）：正常用 `worker` 段；返工率
-   （需要重做的子任务 ÷ 已开始子任务）超过 `quality.maxReworkRatio` 后，**后续**子任务改用 `planner` 段并告警
-   （AC-011，不中止）。任一段没配 `model` → 该任务不派发、记失败并点名"不会回退宿主默认"。
+4. **模型类是可选覆盖**（`models.json` 的 `worker`/`planner` 段，不靠角色文件里的字面量）：配了就用，
+   **没配就省略 `model`/`provider` 走宿主默认**——任务照常派发，`run.json` 的 `tasks[].modelNote` 与
+   run 级 `modelNotes` 记一句「worker 模型未配置，使用宿主默认」，缺模型**不计入返工率**（返工率只由真
+   失败/冲突/超时产生）。正常用 `worker` 段；返工率（需要重做的子任务 ÷ 已开始子任务）超过
+   `quality.maxReworkRatio` 后，**后续**子任务改走 `planner` 段并告警（AC-011，不中止）；`planner` 未配时
+   降级到已配置的 `worker`（否则宿主默认），`split/rework.json` 的 `route.note` 与告警行写明
+   「无法升级到 planner：未配置，继续使用 …」。
 5. commit 标题必须以 `<taskId>:` 开头；runner 在合并/记录前校验，不符则记 `acceptance-failed`，并把
    commit 与标题原样写进 `problems`（"fail closed，不尽力而为"）。
 
@@ -2066,11 +2070,28 @@ attempt 循环（`split-run-attempt.ts`）：
 | 失败且 `attempts < maxAttempts` | 同一个 worktree 重新派发；`attempts++`；失败的尝试记 `signals`（`acceptance-failed` / `timeout`）→ 计入返工率，即使后来成功 |
 | 用尽仍失败 | `state: needs-resplit`；`run.json` 的 run-level `problems` 写出**最后一次尝试**的原因，以及"后继 T-002 一律 blocked" |
 | `dependsOn` 后继 | 由调度器的既有断言记 `blocked`，原因里点名"依赖 T-001（需要重新拆分）未完成"——不是"仍在跑" |
-| 不可重试的失败 | 模型类没配 `model`、worktree 建不出来 → 仍是 `failed`：重新拆一次不会修好配置错误 |
+| 不可重试的失败 | `worktree` 建不出来 → 仍是 `failed`：重新拆一次不会修好环境错误（模型类没配 `model` **不在此列**，见 B′） |
 
 两条不变式：① **重试从不删除任何东西**——清理仍只在收尾的"导入之后"发生，未导入的行会让清理拒绝
 （AC-009 的纪律对重试后的 worktree 一字不改）；② **重试不是"无限跑"**——尝试次数由配置的 1..3 夹住，
 测试钉住 `maxAttempts=2` 时同一任务**只有两次** `startActivation`。
+
+**B′. 模型类与审批都不是硬依赖（P4 更正）**
+
+P3 之前的写法把两件"可选覆盖"说成了前提（"任一段没配 `model` 就不派发"、"没有审批通道就 BLOCK"），
+读起来像"要跑拆分必须先配模型 + 先接审批"。三条事实：
+
+- **模型 = 可选覆盖，默认宿主默认**：`worker`/`planner` 段没写 `model` 时，派发请求**省略**
+  `model`/`provider`（`agentOptionsOf` 本来就是这样），由宿主默认模型执行；`split/run.json` 的
+  `tasks[].modelNote`、run 级 `modelNotes`、`split/report.json` 的 `modelNotes` 与派发摘要记同一句
+  「worker 模型未配置，使用宿主默认」。缺模型**不再**让任务失败、**不**记 `failed`/`needs-resplit`、
+  **不**计入返工率。需要升级而 `planner` 未配时：降级到已配置的 `worker`（否则宿主默认），继续派发，
+  `split/rework.json` 的 `route.note` 与告警行写「无法升级到 planner：未配置，继续使用 …」。
+- **审批 = 宿主同一条接缝，无额外配置**：`split-review` 通过 `ctx.get('approval')` 问人，与
+  `spec_approve` 是**同一条**宿主接缝——跟随当前运行界面（tui / web / desktop），配置了 IM 即走 IM。
+  宿主根本没有这个接缝时按名字拒绝（「宿主没有 approval 接缝」），不会自动通过（fail closed）。
+- **只有 `split.enabled` 是真开关**：它决定"这个仓库要不要派 worker"；模型、审批通道、`autoDispatch`
+  都不是拆分能否运行的前提。
 
 **C. 只读 doctor + 显式 clean（AC-003）**
 

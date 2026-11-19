@@ -133,13 +133,37 @@ test('the next task uses the worker model normally, the planner model when escal
     assert.equal(escalated.escalated, true)
 })
 
-test('escalation with no planner model is named, never silently downgraded', () => {
+test('escalation with no planner model continues on the worker model, named as a degradation (P4 AC-002)', () => {
     const route = routeForNextTask({ escalate: true }, { worker: { model: 'deepseek/deepseek-chat' } })
     assert.equal(route.escalated, true)
     assert.equal(route.modelClass, 'planner')
+    // P4: a model class is an OVERRIDE. "No planner model" is not a refusal — the
+    // task continues on the worker class, and the note says exactly that.
+    assert.equal(route.model, 'deepseek-chat')
+    assert.equal(route.provider, 'deepseek')
+    assert.equal(route.fallback, 'worker')
+    assert.equal(route.note, '无法升级到 planner：未配置，继续使用 worker 模型')
+    assert.deepEqual(route.problems, [route.note])
+})
+
+test('an unconfigured worker model means "host default": no model, no failure, one note (P4 AC-001)', () => {
+    const route = routeForNextTask({ escalate: false }, { planner: { model: 'deepseek/deepseek-reasoner' } })
+    assert.equal(route.modelClass, 'worker')
+    assert.equal(route.escalated, false)
+    assert.equal(route.model, undefined, 'the dispatch request omits model/provider; the host decides')
+    assert.equal(route.provider, undefined)
+    assert.equal(route.fallback, 'host-default')
+    assert.equal(route.note, 'worker 模型未配置，使用宿主默认')
+    assert.deepEqual(route.problems, [route.note])
+})
+
+test('with neither class configured the escalation still degrades to the host default, named (P4 AC-002)', () => {
+    const route = routeForNextTask({ escalate: true }, {})
+    assert.equal(route.modelClass, 'planner')
     assert.equal(route.model, undefined)
-    assert.ok(route.problems.some((problem) => problem.includes('planner 段没有配置 model')))
-    assert.match(route.problems[0] ?? '', /不会回退宿主默认/)
+    assert.equal(route.fallback, 'host-default')
+    assert.equal(route.note, '无法升级到 planner：未配置，继续使用宿主默认')
+    assert.deepEqual(route.problems, [route.note])
 })
 
 test('the ratio and threshold are written into the mission split report (AC-011)', () => {
@@ -155,6 +179,19 @@ test('the ratio and threshold are written into the mission split report (AC-011)
     assert.equal(stored.threshold, 0.3)
     assert.equal(stored.escalate, true)
     assert.ok(fs.existsSync(path.dirname(written.file)))
+})
+
+test('the next route is recorded in split/rework.json, so "escalated without a planner" is durable (P4 AC-002)', () => {
+    const cwd = tempWorkspace('rework-route-')
+    const layout = resolveLayout(cwd)
+    const report = computeRework({ tasks: [{ id: 't1', reworked: true }, { id: 't2' }], threshold: 0.3 })
+    const route = routeForNextTask(report, { worker: { model: 'deepseek/deepseek-chat' } })
+    const written = writeSplitReworkReport(layout, 'm1', report, 1_700_000_000_000, route)
+    const stored = JSON.parse(fs.readFileSync(written.file, 'utf8')) as { route?: { modelClass?: string; fallback?: string; note?: string; model?: string } }
+    assert.equal(stored.route?.modelClass, 'planner')
+    assert.equal(stored.route?.fallback, 'worker')
+    assert.equal(stored.route?.model, 'deepseek-chat')
+    assert.equal(stored.route?.note, '无法升级到 planner：未配置，继续使用 worker 模型')
 })
 
 test('the summary names the ratio, the threshold and the decision', () => {

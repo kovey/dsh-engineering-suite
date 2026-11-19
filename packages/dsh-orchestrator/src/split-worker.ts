@@ -15,10 +15,11 @@
  *    todo_write, no gate tools) and `orchestrate` is stripped structurally — the
  *    same anti-recursion guard the stage dispatcher uses, because a worker that
  *    can call `orchestrate` re-enters the pipeline and spawns grandchildren;
- *  - **The model comes from `models.json`**, not from the host default: the
+ *  - **The model is an override from `models.json`, not a requirement** (P4): the
  *    `worker` class normally, the `planner` class once the rework ratio is above
- *    `quality.maxReworkRatio` (AC-011). A class with no `model` refuses the task
- *    instead of running on something nobody configured.
+ *    `quality.maxReworkRatio` (AC-011). A class with no `model` means "host
+ *    default" — `agentOptionsOf` omits `model`/`provider` and the task still runs;
+ *    the route's `note` says so and is not a failure.
  *
  * @module dsh-orchestrator/split-worker
  */
@@ -146,7 +147,7 @@ export async function prepareDispatch(book: SplitRunBook, deps: SplitRunnerDeps)
     return { dispatch: { plan: decision, persona: rolePlan.persona === '' ? undefined : rolePlan.persona, filter } }
 }
 
-/** The model the NEXT worker runs on (planner once the rework ratio is exceeded). */
+/** The model the NEXT worker runs on (planner once the rework ratio is exceeded, else the fallback). */
 export function routeFor(book: SplitRunBook): NextTaskRoute {
     const started = book.tasks.filter((record) => record.attempts > 0).map((record) => ({ id: record.id, started: true, signals: [...record.signals] }))
     const report = computeRework({ tasks: started, threshold: book.models.quality.maxReworkRatio })

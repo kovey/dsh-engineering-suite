@@ -135,7 +135,7 @@ export function splitReviewOutcome(facts: GateFacts): GateOutcome {
     const rounds = models.config.split.maxReworkRounds
     const fix =
         status.state === 'missing-review'
-            ? '重新调用 orchestrate({ action: "advance" }) 触发人工审核：审批通过后插件会写入审核记录；没有审批通道时会明确报"无审批通道"并 BLOCK，不会自动通过。'
+            ? '重新调用 orchestrate({ action: "advance" }) 触发人工审核：审批通过后插件会写入审核记录；宿主没有 approval 接缝时会点名并 BLOCK，不会自动通过（split-review 与 spec_approve 走同一条宿主接缝，不需要额外配置）。'
             : status.state === 'rejected'
               ? `按审核意见重新拆分并再次送审（最多 ${rounds} 轮返工；用满 ${rounds} 轮后降级为 plain implement 并告警）。`
               : status.state === 'stale'

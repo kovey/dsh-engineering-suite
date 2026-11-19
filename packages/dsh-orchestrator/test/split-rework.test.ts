@@ -86,7 +86,7 @@ test('a rework ratio at or under the threshold keeps the worker model and writes
     assert.match(plan.lines.join('\n'), /未超过阈值 0\.3/)
 })
 
-test('an escalation without a planner model is reported on the dispatch line (never silently un-escalated)', () => {
+test('an escalation without a planner model degrades to the worker model and is named everywhere (P4 AC-002)', () => {
     const config = { ...models(0.3), planner: {} }
     const { layout } = mission(config)
     const plan = planNextSplitTask({
@@ -99,11 +99,43 @@ test('an escalation without a planner model is reported on the dispatch line (ne
         ],
     })
     assert.equal(plan.route.escalated, true)
-    assert.equal(plan.route.model, undefined)
+    // P4: the model class is an override, so a missing planner is a DEGRADATION,
+    // not a refusal — the next task continues on the configured worker model.
+    assert.equal(plan.route.model, 'deepseek-chat')
+    assert.equal(plan.route.fallback, 'worker')
     assert.equal(plan.route.modelClass, 'planner')
-    assert.match(plan.lines.join('\n'), /planner 段没有配置 model/)
-    assert.match(plan.lines.join('\n'), /未配置/)
-    // Still not a stop: the mission keeps going, with the problem on the record.
+    assert.equal(plan.route.note, '无法升级到 planner：未配置，继续使用 worker 模型')
+    assert.match(plan.lines.join('\n'), /无法升级到 planner：未配置/)
+    assert.match(plan.lines.join('\n'), /继续使用 worker 模型/)
+    // Still not a stop: the mission keeps going, with the degradation on the record.
     assert.ok(fs.existsSync(splitReworkFile(layout, 'm-1')))
     assert.equal(path.dirname(splitReworkFile(layout, 'm-1')).endsWith(path.join('split')), true)
+    // ...and `split/rework.json` itself says it, not only the rendered lines.
+    const stored = JSON.parse(fs.readFileSync(splitReworkFile(layout, 'm-1'), 'utf8')) as { route?: { note?: string; fallback?: string } }
+    assert.equal(stored.route?.note, '无法升级到 planner：未配置，继续使用 worker 模型')
+    assert.equal(stored.route?.fallback, 'worker')
+    // The escalation warning carries the same sentence (it is the evidence row).
+    assert.match(plan.warning ?? '', /无法升级到 planner：未配置/)
+    assert.match(plan.warning ?? '', /不中止/)
+})
+
+test('a worker class without a model dispatches on the host default, named in the dispatch lines (P4 AC-001)', () => {
+    const config = { ...models(0.3), worker: {} }
+    const { layout } = mission(config)
+    const plan = planNextSplitTask({
+        layout,
+        missionId: 'm-1',
+        models: config,
+        tasks: [
+            { id: 't1', started: true },
+            { id: 't2', started: true },
+        ],
+    })
+    assert.equal(plan.report.escalate, false)
+    assert.equal(plan.route.model, undefined)
+    assert.equal(plan.route.fallback, 'host-default')
+    assert.match(plan.lines.join('\n'), /下一个子任务模型：worker → 宿主默认（请求省略 model\/provider）/)
+    assert.match(plan.lines.join('\n'), /worker 模型未配置，使用宿主默认/)
+    const stored = JSON.parse(fs.readFileSync(splitReworkFile(layout, 'm-1'), 'utf8')) as { route?: { note?: string } }
+    assert.equal(stored.route?.note, 'worker 模型未配置，使用宿主默认')
 })

@@ -215,7 +215,9 @@ export function apply(ctx: Context, config: unknown = {}): void {
  *
  * The split review asks a HUMAN through it. It is an accessor, not a captured
  * value: a host that withdraws the service mid-session must make the next review
- * refuse ("无审批通道"), not keep using a stale reference.
+ * refuse (「宿主没有 approval 接缝」), not keep using a stale reference. That is
+ * the same seam `spec_approve` asks through: TUI / desktop / web TUI natively,
+ * IM when it is configured — never an extra switch of this plugin.
  * @param context - host context.
  */
 function approvalSeamOf(context: ContextLike): () => ApprovalLike | undefined {

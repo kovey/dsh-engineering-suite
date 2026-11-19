@@ -1,5 +1,40 @@
 ## [未发布]
 
+### 修复 · 模型类是**可选覆盖**、审批是**同一条宿主接缝**：缺模型不再判任务失败（P4）
+
+真实使用里最容易被读成前提的两件事——"要跑拆分得先配好模型类"和"得先接一条审批通道"——都不是前提。
+`models.json` 的 `worker`/`planner` 是**可选覆盖**（配了用配的，没配走宿主默认），审批走宿主**本来就有的**
+那条接缝（与 `spec_approve` 同一条，不需要为本插件额外接线）。这一轮把行为、文案、文档与测试一起改过来。
+
+- **缺模型不再失败（AC-001）**：`split-run-attempt.ts` 的 `dispatchTask` 在 `route.model === undefined` 时
+  不再 `failTask(...)`，而是照常派发——`agentOptionsOf` 本来就省略 `model`/`provider`（宿主默认）。任务
+  记录写 `modelNote: 'worker 模型未配置，使用宿主默认'`，run 级 `modelNotes`、`split/report.json` 的
+  `modelNotes`、派发摘要与 `orchestrate status` 的「模型：」行都带同一句。缺模型**不**产生 rework 信号：
+  返工率只由真失败 / 合并冲突 / 超时产生。
+- **升级降级不中止（AC-002）**：返工率超阈值但 `planner` 未配时，`routeForNextTask` 降级到已配置的
+  `worker`（否则宿主默认），并给出 `route.fallback` / `route.note`；`split/rework.json` 现在记录 `route`
+  （含 `note`），告警行写「无法升级到 planner：未配置，继续使用 worker 模型 / 宿主默认」。任务照常执行，
+  后继任务不受影响。
+- **文案纠正（AC-003）**：`routeForNextTask` 的 problem 去掉"不会回退宿主默认"，改为"未配置 → 使用宿主
+  默认"；宿主没有审批接缝时 `split-approval.ts` 的拒绝文案改为点名「宿主没有 approval 接缝」，并说明
+  split-review 与 `spec_approve` 使用同一条宿主接缝（跟随当前运行界面 tui/web/desktop；配置了 IM 即走
+  IM），不需要任何额外配置。
+- **文档**：`docs/ARCHITECTURE.md` §5.38 C.4 与 §5.38.2（新增 **B′**）删掉"模型/审批是前提"的表述，改成
+  模型=可选覆盖、审批=同一条宿主接缝、只有 `split.enabled` 是真开关；`docs/SPLIT-RUNBOOK.md` §1/§2/§5
+  同步（`models.json` 模型段可选、不可重试失败不再包含"没配模型"、status 的「模型：」行与
+  `report.json` 的 `modelNotes`）。
+- **测试**：新增 8 例——`dsh-eng-core`（3 例：worker 未配 → 宿主默认且 note 精确等于新句子；两个类都未配
+  → 升级仍降级到宿主默认并点名；`route` 落盘 `split/rework.json`）；`dsh-orchestrator`（5 例：两个类都未配
+  时都执行且 note 进 `run.json`/`report.json`（TC-2305）；缺模型不计入返工率（TC-2306）；`planner` 缺失时
+  升级降级且告警落在 `split/rework.json`/警告行（TC-2302）；派发摘要带同一句 note；`split/rework` 的
+  worker 未配 → 宿主默认）。TC-2303 由既有 allowed-once 例覆盖（标题标注），TC-2304 更新文案断言。
+  **4 处既有断言按新语义更新**：`split-runner.test.ts` 的"缺 worker 模型 → 任务 failed 且拒绝派发"改为
+  "照常派发 + `modelNote`"（TC-2301）；`dsh-eng-core/test/rework.test.ts` 与 `split-rework.test.ts` 的
+  "planner 缺失 → problems 含'不会回退宿主默认'"改为"降级到 worker 且 note 精确等于新句子"；
+  `split-review-approval.test.ts` 的无接缝文案断言。这些是**行为定义变更，不是放宽**——新断言仍是精确
+  相等 / 精确匹配，并额外断言 `fallback`、`note` 与落盘记录。`bash scripts/verify.sh --quiet` → exit 0；
+  `bash scripts/standards-check.sh --quiet` → exit 0。
+
 ### 新增 · P3：让拆分**可运营**——值不值得、重试有界、崩溃可恢复（economics / maxAttempts / doctor）
 
 P2 之后派发链完整了，但三个运营问题没有答案：并行到底划不划算（`report.json` 只有耗时没有判定）、

@@ -6,13 +6,17 @@
  * rolled the work back, or a worker stopped at `split.taskTimeoutMs` (AC-003)
  * are the facts that mean "this task was done twice / never finished". The
  * caller supplies them because only the runner sees them; this module does not
- * guess from commit messages.
+ * guess from commit messages. A model class nobody configured is NOT one of
+ * those facts (P4): it means "use the host default", not "this task failed".
  *
  * Above `quality.maxReworkRatio` the mission is NOT stopped: the remaining tasks
  * are dispatched on the PLANNER model instead, because the failures are usually a
  * sign that the decomposition was wrong rather than that the workers were lazy.
  * That decision is {@link routeForNextTask} — pure, so the orchestrator can show
- * the exact route before starting a child.
+ * the exact route before starting a child. Escalation is best-effort in the same
+ * sense as the model classes themselves: with no planner model the next task
+ * continues on `worker` (when configured) or on the host default, and the route's
+ * `note` says so.
  *
  * `split/rework.json` is the durable record of the ratio and the threshold
  * (AC-011 asks for them in the mission's split report), written by
@@ -85,7 +89,18 @@ export interface NextTaskRoute {
     reasoningEffort?: string
     /** `true` when the rework ratio switched this task to the planner model. */
     escalated: boolean
-    /** Missing class configuration — reported, never replaced by a host default. */
+    /**
+     * Set when the chosen class has no `model` (P4): `worker` = the escalation
+     * fell back to the worker class, `host-default` = no model class at all, so
+     * the dispatch request omits `model`/`provider` and the host decides.
+     */
+    fallback?: 'worker' | 'host-default'
+    /**
+     * The one-line note a caller records when {@link fallback} is set — e.g.
+     * 「worker 模型未配置，使用宿主默认」. Absent when the class was configured.
+     */
+    note?: string
+    /** Unusable class configuration, reported; an ABSENT model is a note, not one of these. */
     problems: string[]
 }
 
@@ -180,23 +195,38 @@ function classRoute(config: ModelClassConfig | undefined): { provider?: string; 
     }
 }
 
+/** The note for "this class has no model": an override that was not given. */
+function unconfiguredNote(modelClass: 'planner' | 'worker', fallback: 'worker' | 'host-default'): string {
+    if (modelClass === 'worker') return 'worker 模型未配置，使用宿主默认'
+    return fallback === 'worker' ? '无法升级到 planner：未配置，继续使用 worker 模型' : '无法升级到 planner：未配置，继续使用宿主默认'
+}
+
 /**
  * Which model the NEXT task runs on (AC-011's "switch to planner, do not stop").
  *
+ * `models.json` is an OVERRIDE layer, not a requirement (P4 AC-001/AC-002): a
+ * class with no `model` means "let the host decide" — the dispatch request omits
+ * `model`/`provider` — and it is never a reason to refuse or fail a task.
+ * Escalation gets the same treatment: a missing planner continues on the worker
+ * class when THAT one is configured, else on the host default, and the returned
+ * `note` names the degradation. The note is also the single entry in `problems`,
+ * so a renderer that only shows `problems` cannot lose the fact.
+ *
  * @param report - the computed rework report.
  * @param models - the effective `models.json` (planner/worker classes).
- * @returns the chosen class, its route, and the problems that made it
- *   unroutable (a missing panel is named, never replaced by a host default).
+ * @returns the chosen class, its route, and how an unconfigured class continues.
  */
 export function routeForNextTask(
     report: Pick<ReworkReport, 'escalate'>,
     models: { planner?: ModelClassConfig; worker?: ModelClassConfig },
 ): NextTaskRoute {
     const modelClass = report.escalate ? ('planner' as const) : ('worker' as const)
-    const route = classRoute(models[modelClass])
-    const problems: string[] = []
-    if (route.model === undefined) problems.push(`${modelClass} 段没有配置 model：${report.escalate ? '无法把后续子任务升级到 planner 模型' : '后续子任务没有可用的 worker 模型'}（不会回退宿主默认）`)
-    return { modelClass, escalated: report.escalate, ...route, problems }
+    const declared = classRoute(models[modelClass])
+    if (declared.model !== undefined) return { modelClass, escalated: report.escalate, ...declared, problems: [] }
+    const workerRoute = modelClass === 'planner' ? classRoute(models.worker) : {}
+    const fallback = workerRoute.model === undefined ? ('host-default' as const) : ('worker' as const)
+    const note = unconfiguredNote(modelClass, fallback)
+    return { modelClass, escalated: report.escalate, ...(fallback === 'worker' ? workerRoute : {}), fallback, note, problems: [note] }
 }
 
 /** `missions/<id>/split/rework.json` — the durable ratio record. */
@@ -206,15 +236,27 @@ export function splitReworkFile(layout: Layout, missionId: string): string {
 
 /**
  * Write the rework report into the mission's split artifacts.
+ *
+ * `route` is recorded next to the ratio (P4): "we escalated but had no planner"
+ * must be answerable from `split/rework.json` itself, not only from a log line.
+ * Its `problems` repeat the `note` on purpose — `note` is the one-line record and
+ * `problems` is the list renderers show, so the two cannot drift apart.
  * @param layout - workspace layout.
  * @param missionId - the mission the tasks belong to.
  * @param report - the computed report.
  * @param at - timestamp override (tests).
+ * @param route - the route decided for the next task (recorded when given).
  * @returns the file written.
  */
-export function writeSplitReworkReport(layout: Layout, missionId: string, report: ReworkReport, at: number = Date.now()): { file: string } {
+export function writeSplitReworkReport(
+    layout: Layout,
+    missionId: string,
+    report: ReworkReport,
+    at: number = Date.now(),
+    route?: NextTaskRoute,
+): { file: string } {
     const file = splitReworkFile(layout, missionId)
-    writeJsonAtomic(file, { missionId, at, ...report })
+    writeJsonAtomic(file, { missionId, at, ...report, ...(route === undefined ? {} : { route }) })
     return { file }
 }
 

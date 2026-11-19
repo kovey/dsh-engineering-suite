@@ -111,7 +111,7 @@ function stageState(cwd: string, stageId: string): string | undefined {
 
 // --- the four answers ------------------------------------------------------
 
-test('allowed-once writes the approval for the shown digest and lets the mission enter implement (AC-003)', async () => {
+test('allowed-once writes the approval for the shown digest and lets the mission enter implement (TC-2303 / AC-003)', async () => {
     const fake = host({ approvalOutcome: 'allowed-once' })
     const { cwd, layout } = missionAt(fake, 'split-review')
     const saved = saveSplitPlan(layout, 'm-split', goodPlan())
@@ -125,7 +125,9 @@ test('allowed-once writes the approval for the shown digest and lets the mission
     assert.equal(reviewRows(layout), 1)
     assert.equal(stageState(cwd, 'split-review'), 'passed')
     assert.equal(storeFor(cwd).read('m-split')?.stage, 'implement')
-    // The card really was asked, through the host seam.
+    // The card really was asked, through the host seam — the SAME
+    // `ctx.get('approval')` service `spec_approve` asks through. TC-2303 pins that
+    // there is exactly one request and it is this one (no second channel).
     assert.equal(fake.approvalRequests.length, 1)
     assert.match(JSON.stringify(fake.approvalRequests[0]), /拆分计划审核/)
     assert.match(JSON.stringify(fake.approvalRequests[0]), /approval-context/)
@@ -173,13 +175,19 @@ test('unavailable writes NOTHING and says there was no answerer', async () => {
     assert.equal(storeFor(cwd).read('m-split')?.stage, 'split-review')
 })
 
-test('no approval seam refuses by name: 无审批通道, never an assumed pass', async () => {
+test('no approval seam refuses by name: 宿主没有 approval 接缝, never an assumed pass (TC-2304)', async () => {
     const fake = host({ withApproval: false })
     const { cwd, layout } = missionAt(fake, 'split-review')
     saveSplitPlan(layout, 'm-split', goodPlan())
 
     const text = await orchestrate(fake, { action: 'advance' })
-    assert.match(text, /无审批通道/)
+    // P4 AC-003: the refusal names the missing piece exactly, and says why nothing
+    // extra is needed — split-review uses the SAME host seam `spec_approve` uses.
+    assert.match(text, /宿主没有 approval 接缝/)
+    assert.match(text, /split-review 与 spec_approve 使用同一条宿主接缝/)
+    assert.match(text, /跟随当前运行界面 tui\/web\/desktop/)
+    assert.match(text, /配置了 IM 即走 IM/)
+    assert.match(text, /不需要任何额外配置/)
     assert.match(text, /未写任何审核记录/)
     assert.equal(readSplitReview(layout, 'm-split'), undefined)
     assert.equal(reviewRows(layout), 0)

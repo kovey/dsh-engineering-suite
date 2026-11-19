@@ -42,8 +42,17 @@ profile**（`.dsh/**` 与 profile 都在信任根里，Agent 写不了）。
 
 - **不依赖 `autoDispatch.enabled`**：`split.enabled` 本身就是"这个仓库要派 worker"的决定；再叠一道默认
   关闭的开关会让整个功能默认永不派发（§5.38 的 A 段）。
-- **`split` 段里的 `models` 是"默认层"不是"覆盖层"**：项目的 `models.json` 优先级更高；两层都没写
-  `model` 时任务**拒绝派发**并点名"不会回退宿主默认"，而不是偷偷用会话模型。
+- **`split` 段里的 `models` 是 profile 侧的默认层**：项目 `models.json` 的同名段优先（两层都没有时按
+  下面"可选覆盖"的规则走宿主默认）。
+- **模型段是可选覆盖，不是前提**：两层都没写 `model` 时，派发请求**省略** `model`/`provider`，由**宿主默认
+  模型**执行——任务照常派发（不失败、不中止），`split/run.json` 的 `tasks[].modelNote` 与 run 级
+  `modelNotes` 记一句「worker 模型未配置，使用宿主默认」，缺模型**不**计入返工率（返工率只由真失败/
+  冲突/超时产生）。需要升级而 `planner` 未配时降级到已配置的 `worker`（否则宿主默认），并在
+  `split/rework.json` 与告警行写「无法升级到 planner：未配置，继续使用 …」。
+- **审批不是额外配置**：`split-review` 通过宿主同一条审批接缝（`ctx.get('approval')`，与 `spec_approve`
+  **同一条**）问人——跟随当前运行界面（tui / web / desktop），配置了 IM 即走 IM。宿主根本没有这个接缝时
+  按名字拒绝（「宿主没有 approval 接缝」），不会自动通过；不需要为本插件额外接线。
+- **只有 `split.enabled` 是真开关**：模型段、审批通道、`autoDispatch` 都不是"拆分能否运行"的前提。
 
 `enabled: true` 之后，流水线是：
 
@@ -89,7 +98,8 @@ worktree、不会派 worker。
 - 每次尝试都计入 `attempts`，失败的尝试计入返工（`signals` 里留 `acceptance-failed` / `timeout`），
   即使后来成功也算一次返工；
 - 用尽仍失败 → 该任务 `state: needs-resplit`，它的 `dependsOn` 后继**一律 blocked 并点名它**；
-- **不可重试的失败仍是 `failed`**：模型类没配 `model`、worktree 建不出来——重新拆一次也不会好，要改配置。
+- **不可重试的失败仍是 `failed`**：worktree 建不出来——重新拆一次也不会好，要修环境。**模型类没配
+  `model` 不在此列**：那是可选覆盖，任务照常派发（走宿主默认），见 §1。
 
 ## 3. 真机接入：`DSH_SMOKE_REAL=1` 的步骤与判据
 
@@ -147,6 +157,7 @@ bash scripts/split-smoke.sh
 - 审核：approved（…）
 - 运行：ran
 - 返工率：1/3 = 0.333（阈值 0.3，已升级 planner 模型）
+- 模型：worker 模型未配置，使用宿主默认
 - 待导入：1 条（1 个子任务）；可清理：否（先导入这些证据，cleanup 会拒绝）
 - 孤儿：1 个 / 待导入残留：1 个 / 可安全清理：0 个（磁盘共 2 个目录；run.json 已读）
 - T-003：needs-import（run=无记录，1 条待导入，目录 不是活 worktree）
@@ -194,6 +205,10 @@ console.log(e.reasons.join("\n")); console.log(e.tokens)' \
 ——宿主 `dsh-subagent` 的派发结果**没有** `usage`/token 字段，所以这一项**不估算、不写 0**。
 `economics` 的每任务 `durationMs`/`prepareMs`/`attempts` 与整体 `serialEstimateMs`/`wallClockMs`/
 `speedup`/`verdict`/`reasons[]` 见下一节。
+
+`report.json` 顶层的 `modelNotes[]` 是模型回退的一句话（`[]` = 用到的模型类都配了）：
+「worker 模型未配置，使用宿主默认」/「无法升级到 planner：未配置，继续使用 …」——与 `run.json` 的
+`modelNotes`、每个任务的 `tasks[].modelNote` 是同一句。它记录的是"这一轮用了什么模型"，不是失败。
 
 ## 6. 判定规则速查
 

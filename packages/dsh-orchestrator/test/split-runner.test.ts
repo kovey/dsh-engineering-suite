@@ -233,7 +233,12 @@ function deps(cwd: string, workers: FakeWorkers, overrides: Partial<SplitRunnerD
 }
 
 /** The stored `split/run.json` of a mission. */
-function runRecord(cwd: string): { state: string; tasks: { id: string; state: string; commit?: string; imported: number; cleanedUp: boolean }[]; imported: number } {
+function runRecord(cwd: string): {
+    state: string
+    tasks: { id: string; state: string; commit?: string; imported: number; cleanedUp: boolean; modelNote?: string }[]
+    imported: number
+    modelNotes?: string[]
+} {
     const file = splitRunFile(resolveLayout(cwd), 'm1')
     assert.equal(fs.existsSync(file), true, `missing ${file}`)
     return JSON.parse(fs.readFileSync(file, 'utf8')) as never
@@ -384,16 +389,109 @@ test('above quality.maxReworkRatio the NEXT task switches to the planner model a
     assert.equal(runRecord(cwd).tasks[1]?.state, 'done')
 })
 
-test('a worker model class with no configuration refuses the task instead of using a host default', async () => {
+// P4 AC-001/AC-002: models.json is an OVERRIDE layer. "No model configured" means
+// "use the host default" (the dispatch request omits model/provider), never a
+// failed task — and it is never a rework signal either.
+
+test('a worker model class with no configuration still dispatches on the host default, with a note (TC-2301)', async () => {
     const cwd = repo()
     mission(cwd, twoTasks([['T-001', 'T-002']]))
     const workers = fakeWorkers()
-    const result = await runSplitPlan(deps(cwd, workers, { models: models({ worker: {} }) }))
+    const running = runSplitPlan(deps(cwd, workers, { models: models({ worker: {} }) }))
 
-    assert.equal(workers.started.length, 0)
-    assert.equal(result.tasks[0]?.state, 'failed')
-    assert.match(result.problems.join('\n'), /不会回退宿主默认/)
-    assert.equal(result.ok, false)
+    await workers.waitFor(2)
+    assert.equal(workers.started.length, 2, 'a missing model must not stop the dispatch')
+    const first = workers.started[0] as StartedWorker
+    // Omitted, not emptied: the host decides, which is the whole point of an override layer.
+    assert.equal(first.spec.request?.agentOptions?.model, undefined)
+    assert.equal(first.spec.request?.agentOptions?.provider, undefined)
+    finishWorker(workers, resolveLayout(cwd), 'T-001')
+    finishWorker(workers, resolveLayout(cwd), 'T-002')
+    const result = await running
+
+    assert.equal(result.ok, true, result.problems.join(' | '))
+    assert.deepEqual(result.tasks.map((entry) => entry.state), ['done', 'done'])
+    // The note is on the task record, at run level, and in the report projection.
+    assert.equal(result.tasks[0]?.modelNote, 'worker 模型未配置，使用宿主默认')
+    assert.deepEqual(result.modelNotes, ['worker 模型未配置，使用宿主默认'])
+    const record = runRecord(cwd)
+    assert.equal(record.tasks[0]?.modelNote, 'worker 模型未配置，使用宿主默认')
+    assert.deepEqual(record.modelNotes, ['worker 模型未配置，使用宿主默认'])
+    assert.deepEqual(reportRecord(cwd).modelNotes, ['worker 模型未配置，使用宿主默认'])
+    // A missing model is not rework: it never becomes a failure signal.
+    assert.equal(result.rework.ratio, 0)
+})
+
+test('with neither class configured every task runs on the host default and the summary says so (TC-2305)', async () => {
+    const cwd = repo()
+    mission(cwd, twoTasks([['T-001', 'T-002']]))
+    const workers = fakeWorkers()
+    const running = runSplitPlan(deps(cwd, workers, { models: models({ worker: {}, planner: {} }) }))
+
+    await workers.waitFor(2)
+    assert.deepEqual(workers.started.map((entry) => entry.spec.request?.agentOptions?.model), [undefined, undefined])
+    finishWorker(workers, resolveLayout(cwd), 'T-001')
+    finishWorker(workers, resolveLayout(cwd), 'T-002')
+    const result = await running
+
+    assert.equal(result.ok, true, result.problems.join(' | '))
+    assert.deepEqual(result.tasks.map((entry) => entry.state), ['done', 'done'])
+    // One sentence, not one per task: the summary says "all of it used the host default".
+    assert.deepEqual(result.modelNotes, ['worker 模型未配置，使用宿主默认'])
+    assert.match(result.modelNotes.join(' '), /使用宿主默认/)
+})
+
+test('a failing task still counts as rework while the missing model does not (TC-2306)', async () => {
+    const cwd = repo()
+    // Two groups so the first failure does not block the second task.
+    mission(cwd, twoTasks([['T-001'], ['T-002']]))
+    const workers = fakeWorkers()
+    const running = runSplitPlan(deps(cwd, workers, { models: models({ worker: {}, planner: {}, quality: { maxReworkRatio: 1 } }) }))
+
+    await workers.waitFor(1)
+    ;(workers.started[0] as StartedWorker).reject(new Error('验收不过'))
+    await workers.waitFor(2)
+    finishWorker(workers, resolveLayout(cwd), 'T-002')
+    const result = await running
+
+    // Exactly ONE rework: the real failure. If "no model" were still counted, the
+    // started tasks would both be reworked and the ratio would be 1.
+    assert.equal(result.rework.started, 2)
+    assert.equal(result.rework.reworked, 1)
+    assert.equal(result.rework.ratio, 0.5)
+    assert.deepEqual(result.tasks[0]?.signals, ['acceptance-failed'])
+    assert.equal(result.tasks[0]?.modelNote, 'worker 模型未配置，使用宿主默认')
+    assert.equal(result.tasks[1]?.state, 'done')
+})
+
+test('escalating without a planner model degrades to the worker model and warns, it does not fail (TC-2302)', async () => {
+    const cwd = repo()
+    mission(cwd, twoTasks([['T-001'], ['T-002']]))
+    const workers = fakeWorkers()
+    const running = runSplitPlan(deps(cwd, workers, { models: models({ planner: {} }) }))
+
+    await workers.waitFor(1)
+    assert.equal((workers.started[0] as StartedWorker).spec.request?.agentOptions?.model, 'deepseek-chat')
+    ;(workers.started[0] as StartedWorker).reject(new Error('验收不过'))
+    await workers.waitFor(2)
+    const second = workers.started[1] as StartedWorker
+    assert.equal(second.taskId, 'T-002')
+    // Escalation was ASKED for and could not be granted: the task continues on the
+    // worker class (which IS configured) instead of failing or stopping.
+    assert.equal(second.spec.request?.agentOptions?.model, 'deepseek-chat')
+    finishWorker(workers, resolveLayout(cwd), 'T-002')
+    const result = await running
+
+    assert.equal(result.tasks[1]?.state, 'done')
+    assert.equal(result.tasks[1]?.modelClass, 'planner')
+    assert.equal(result.tasks[1]?.model, 'deepseek-chat')
+    assert.equal(result.tasks[1]?.modelNote, '无法升级到 planner：未配置，继续使用 worker 模型')
+    // The degradation is in the durable artifacts (TC-2302 asks for the report/warning).
+    const rework = JSON.parse(fs.readFileSync(splitReworkFile(resolveLayout(cwd), 'm1'), 'utf8')) as { route?: { note?: string } }
+    assert.equal(rework.route?.note, '无法升级到 planner：未配置，继续使用 worker 模型')
+    assert.match(result.warnings.join('\n'), /无法升级到 planner：未配置/)
+    assert.deepEqual(reportRecord(cwd).modelNotes, ['无法升级到 planner：未配置，继续使用 worker 模型'])
+    assert.equal(result.ok, false, 'the first task really failed')
 })
 
 // --- the commit contract ---------------------------------------------------
@@ -511,6 +609,7 @@ test('a caller-passed plan that is not the one on disk is refused (digest mismat
 function reportRecord(cwd: string): {
     planDigest: string
     state: string
+    modelNotes: string[]
     tasks: { id: string; modelClass: string | null; model: string | null; durationMs: number; attempts: number; reworkReasons: string[]; imported: number }[]
     rework: { ratio: number; threshold: number; escalate: boolean }
     parallelism: { maxParallel: number; groups: string[][] }
