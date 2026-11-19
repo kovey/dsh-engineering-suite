@@ -140,6 +140,9 @@ export function apply(ctx: Context, config: unknown = {}): void {
             probesFor: (agent) => createProbes(context, resolved.probes, agent),
             dispatch: dispatchDeps,
             approval: approvalSeam,
+            // `split-review` reads the session approval policy before asking; a
+            // read failure is a log line (AC-002), never a refusal.
+            log: (message) => logger.info(message),
             // A host MAY provide a `clock`; tests freeze it so two runs are byte-identical.
             ...(clockService === undefined ? {} : { now: clockService }),
         }
@@ -244,6 +247,7 @@ function registerOrchestratorService(
         stores,
         probesFor: () => createProbes(context, config.probes, undefined),
         approval,
+        log: (message) => logger.info(message),
     })
     return provideOptionalService(context, ORCHESTRATOR_SERVICE, service, logger)
 }

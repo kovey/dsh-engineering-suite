@@ -151,6 +151,8 @@ export interface SequenceDeps {
      * same host seam `spec_approve` asks through, so nothing extra is configured.
      */
     approval?: () => ApprovalLike | undefined
+    /** Diagnostics sink for the split-review policy read (AC-002): log only, never a refusal. */
+    log?: (message: string) => void
     /**
      * The clock for wall-clock-derived numbers (delivery metrics).
      *
@@ -997,6 +999,7 @@ function splitReviewAskRefusal(deps: SequenceDeps, ctx: CallContext, stage: Stag
         stageId: stage.id,
         approval: deps.approval,
         agent: ctx.agent,
+        ...(deps.log === undefined ? {} : { log: deps.log }),
         signal: ctx.signal,
     })
 }

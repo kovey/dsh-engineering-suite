@@ -2096,6 +2096,14 @@ P3 之前的写法把两件"可选覆盖"说成了前提（"任一段没配 `mod
 - **审批 = 宿主同一条接缝，无额外配置**：`split-review` 通过 `ctx.get('approval')` 问人，与
   `spec_approve` 是**同一条**宿主接缝——跟随当前运行界面（tui / web / desktop），配置了 IM 即走 IM。
   宿主根本没有这个接缝时按名字拒绝（「宿主没有 approval 接缝」），不会自动通过（fail closed）。
+- **审批策略 `never` 不是"人工打回"**：宿主审批服务在 `request()` 内部先看本会话策略——`never` 时不派发
+  任何提示面，直接返回 `rejected`。那个 `rejected` 与"人按了打回"逐字相同；记进 `reviews.jsonl` 会白耗
+  一轮 `maxReworkRounds`，两轮就足以让一份合格计划在**一张卡都没弹过**的情况下降级为 plain implement。
+  所以 `split-review` 在提问**之前**用 `approval.effectivePolicy(agent.session)` 读策略（结构性读取，
+  该方法在宿主类型里是 private，运行时存在）：`never` → 直接 BLOCK 并说明"提示被禁用、本轮未记录成
+  '人工打回'、不计入拆分审核轮数、切到 ask 后重新 advance"（`reviews.jsonl` 一行不写）；读不到
+  （服务不暴露 `effectivePolicy` / 无 `agent.session` / 调用抛错 / 返回非字符串）→ 照原逻辑提问，
+  只记一条日志——**读不到策略不是拒绝工作的理由**。这是宿主策略，不是套件故障。
 - **只有 `split.enabled` 是真开关**：它决定"这个仓库要不要派 worker"；模型、审批通道、`autoDispatch`
   都不是拆分能否运行的前提。
 

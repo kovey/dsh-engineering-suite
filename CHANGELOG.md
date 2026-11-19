@@ -1,5 +1,31 @@
 ## [未发布]
 
+### 修复 · 审批策略 `never` 不再被记成"人工打回"：没弹过卡就不该耗拆分审核轮数
+
+真实故障：一个 mission 有 5 个子任务的合格 plan，**一张审核卡都没看到**就被降级成 plain implement。
+根因不在拆分逻辑，而在宿主审批策略：`dsh-user-approval` 在 `decide()` 里先看会话策略，`never` 时
+**不发起任何提问**、直接返回 `rejected`；`split-approval.ts` 把它当成人工打回写进 `reviews.jsonl`
+（approver 只有 `approval`、没有回答者），两行就凑满 `maxReworkRounds=2` 触发降级。
+
+- **提问前先读策略（AC-001）**：新增 `packages/dsh-orchestrator/src/split-approval-policy.ts`，
+  `split-review` 在 `approval.request(...)` **之前**用 `effectivePolicy(agent.session)`（结构性读取：
+  宿主类型里是 private，运行时存在）判断本会话能否弹提示。`never` → 直接 BLOCK，文案写明
+  「本会话审批策略为 never（提示被禁用）：宿主不会弹任何审批卡，而是直接返回 rejected」
+  「所以这次没有记录成'人工打回'，也不计入拆分审核轮数」「把审批策略切到 ask 后重新 advance 即可审核」，
+  **不写 `reviews.jsonl`**、不涨轮数、不降级。这是宿主策略，不是套件故障。
+- **读不到策略照常提问（AC-002）**：服务不暴露 `effectivePolicy`（旧宿主）、调用方没有 `agent.session`、
+  调用抛错、返回非字符串 → 都按原逻辑提问，只记一条日志（`split-approval.ts` 的 `log` 接缝经
+  `sequence.ts` 接到插件自己的日志文件；`orchestrator` 服务路径同样接线）。**读不到策略不是拒绝工作的
+  理由**；`allowed-once`/`rejected`/`cancelled`/`unavailable` 四条既有路径的判定一字未改。
+- **测试**：`packages/dsh-orchestrator/test/split-review-approval.test.ts` 13 例（原 9 + 新 4）——
+  `effectivePolicy → never` → BLOCK + `reviews.jsonl` 0 行 + `splitRejectionCount=0` + 连续两次 advance
+  仍为 0 且不降级；`→ ask` → 照常提问一次并写 approved；接缝无 `effectivePolicy` → 照常提问；
+  `effectivePolicy` 抛错 → 记日志并照常提问（断言日志含「effectivePolicy 抛错」）。
+  **既有 rejected/cancelled/unavailable/no-seam 断言全部保留**。
+- **文档**：`docs/ARCHITECTURE.md` §5.38.2 B′ 增加"审批策略 never 不是人工打回"；`docs/SPLIT-RUNBOOK.md`
+  §1 增加同一条运维说明、§7 增加"没看到卡的两种原因"诊断顺序。`bash scripts/verify.sh --quiet` → exit 0；
+  `bash scripts/standards-check.sh --quiet` → exit 0。
+
 ### 修复 · 角色文件的模型类引用统一为"未配置 → 宿主默认，拼错仍报错"；降级措辞不再与"不值得拆"混淆
 
 P4 把 `models.json` 的 `worker`/`planner` 改成"可选覆盖"（配了用配的，没配走宿主默认），但角色文件的

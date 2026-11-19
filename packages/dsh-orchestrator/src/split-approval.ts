@@ -15,7 +15,11 @@
  *    rounds), and the stage rolls back to `split` for a re-plan;
  *  - `cancelled` / `unavailable` → NO record at all: nobody decided, so the
  *    stage stays entered and can be retried;
- *  - no seam mounted → refused by name (「宿主没有 approval 接缝」), never assumed.
+ *  - no seam mounted → refused by name (「宿主没有 approval 接缝」), never assumed;
+ *  - session policy `never` → refused by name BEFORE asking, because the host's
+ *    `request()` answers `rejected` without ever showing a card — counting that
+ *    as a human rejection would degrade the plan without anyone judging it
+ *    (see `split-approval-policy.ts`).
  *
  * A stale review (`plan 已改动`) re-asks and, when rejected, records why the old
  * decision no longer applied. Nothing here trusts the answerer's prose: the
@@ -29,6 +33,7 @@ import path from 'node:path'
 import { approverName, normalizeApprovalReply, renderApprovalContext, type ApprovalLike, type ApprovalOutcome } from 'dsh-eng-core'
 import { readSplitPlan, recordSplitReview, splitReviewStatus, type SplitPlan, type SplitReviewRecord } from 'dsh-eng-core/split'
 import type { GateFacts } from './gate-facts.js'
+import { neverPolicyRefusal, readSessionApprovalPolicy } from './split-approval-policy.js'
 
 /** What the ask decided for this advance. */
 export type SplitReviewAskKind = 'skipped' | 'approved' | 'rejected' | 'blocked'
@@ -54,6 +59,11 @@ export interface SplitReviewAskInput {
     approval?: ApprovalLike
     /** The calling agent (passed to the seam). */
     agent?: unknown
+    /**
+     * Diagnostics sink. Used ONLY for "the session policy could not be read":
+     * that is a log line, never a refusal (AC-002).
+     */
+    log?: (message: string) => void
     signal?: AbortSignal
     /** Timestamp override (tests). */
     at?: number
@@ -196,6 +206,15 @@ export async function askSplitReview(input: SplitReviewAskInput): Promise<SplitR
     const status = splitReviewStatus(facts.store.layout, missionId)
     if (status.ok) return { kind: 'skipped', detail: status.detail }
     if (input.approval === undefined) return noSeam()
+    // BEFORE asking: a `never` session gets no card, only an automatic
+    // `rejected`. Recording that as a human rejection would burn a rework round
+    // — so it is read here and refused by name instead (AC-001).
+    const policy = readSessionApprovalPolicy(input.approval, input.agent)
+    if (policy.problem !== undefined) input.log?.(`split-review：读不到本会话审批策略（${policy.problem}），按原逻辑照常提问`)
+    if (policy.policy === 'never') {
+        input.log?.('split-review：本会话审批策略为 never（提示被禁用）：不提问、不写审核记录，直接 BLOCK')
+        return { kind: 'blocked', ...neverPolicyRefusal() }
+    }
     const stale =
         status.state === 'stale'
             ? `plan 已改动（旧审核摘要 ${status.record?.planDigest.slice(0, 12) ?? '(无)'}，当前摘要 ${stored.digest.slice(0, 12)}），必须重新审核`
@@ -226,6 +245,8 @@ export interface SplitReviewGateInput {
     /** The host approval seam accessor (`SequenceDeps.approval`), read here. */
     approval?: () => ApprovalLike | undefined
     agent?: unknown
+    /** Diagnostics sink forwarded to {@link askSplitReview} (policy read). */
+    log?: (message: string) => void
     signal?: AbortSignal
 }
 
@@ -245,6 +266,7 @@ export async function splitReviewGateRefusal(input: SplitReviewGateInput): Promi
         facts: input.facts,
         approval: input.approval?.(),
         ...(input.agent === undefined ? {} : { agent: input.agent }),
+        ...(input.log === undefined ? {} : { log: input.log }),
         ...(input.signal === undefined ? {} : { signal: input.signal }),
     })
     if (asked.kind !== 'blocked') return undefined

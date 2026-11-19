@@ -14,7 +14,7 @@ import path from 'node:path'
 import test from 'node:test'
 import { MissionStoreRegistry, resolveLayout, type Layout, type MissionStore } from 'dsh-eng-core'
 import { appendDelegation } from 'dsh-eng-core/delegations'
-import { readSplitReview, readSplitReviews, recordSplitReview, saveSplitPlan, splitPlanDigest, type SplitPlan } from 'dsh-eng-core/split'
+import { readSplitReview, readSplitReviews, recordSplitReview, saveSplitPlan, splitPlanDigest, splitRejectionCount, type SplitPlan } from 'dsh-eng-core/split'
 import { createFakeHost, runText, tempWorkspace, type FakeHost } from 'dsh-eng-core/testing'
 import { apply } from '../dist/index.js'
 
@@ -23,14 +23,44 @@ const PLUGIN_TOOLS = ['spec_create', 'test_design_review', 'team_delegate', 'qua
 
 type ApprovalOutcome = 'allowed-once' | 'rejected' | 'cancelled' | 'unavailable'
 
+/**
+ * What the fake session policy reporter answers. `throws` models a host whose
+ * policy store is broken; `absent` is the DEFAULT fake (no `effectivePolicy` at
+ * all) and is covered by the pre-existing tests + the explicit TC-2502 test.
+ */
+type PolicyCase = 'never' | 'ask' | 'throws'
+
 const hosts: FakeHost[] = []
 
 test.after(() => {
     for (const fake of hosts.splice(0)) fake.dispose()
 })
 
+/** The reporter the patched approval service exposes (`effectivePolicy(session)`). */
+function policyReporter(policy: PolicyCase): (session: unknown) => string {
+    if (policy === 'throws') {
+        return () => {
+            throw new Error('policy store unavailable')
+        }
+    }
+    return () => policy
+}
+
+/**
+ * Give the fake approval service a real `effectivePolicy`, delegating `request`
+ * to the original fake so `fake.approvalRequests` still counts the cards.
+ */
+function provideApprovalPolicy(fake: FakeHost, policy: PolicyCase): void {
+    const context = fake.ctx as unknown as {
+        get: (name: string) => unknown
+        provide: (name: string, value: unknown) => unknown
+    }
+    const seam = context.get('approval') as Record<string, unknown>
+    context.provide('approval', { ...seam, effectivePolicy: policyReporter(policy) })
+}
+
 /** Assemble the plugin with a fake approval seam answering `outcome` every time. */
-function host(options: { approvalOutcome?: ApprovalOutcome; withApproval?: boolean } = {}): FakeHost {
+function host(options: { approvalOutcome?: ApprovalOutcome; withApproval?: boolean; policy?: PolicyCase } = {}): FakeHost {
     const cwd = tempWorkspace('orchestrator-split-approval-')
     const fake = createFakeHost({
         cwd,
@@ -42,6 +72,7 @@ function host(options: { approvalOutcome?: ApprovalOutcome; withApproval?: boole
     for (const tool of PLUGIN_TOOLS) {
         fake.tools.set(tool, { name: tool, description: 'stub', parameters: {}, execute: async () => 'ok' } as never)
     }
+    if (options.policy !== undefined) provideApprovalPolicy(fake, options.policy)
     return fake
 }
 
@@ -193,6 +224,81 @@ test('no approval seam refuses by name: 宿主没有 approval 接缝, never an a
     assert.equal(reviewRows(layout), 0)
     assert.equal(storeFor(cwd).read('m-split')?.stage, 'split-review')
     assert.equal(fake.approvalRequests.length, 0)
+})
+
+// --- the session policy: `never` is not a human rejection ------------------
+
+test('an approval policy of never BLOCKS by name, without a card or a review row (TC-2504 / TC-2505 / AC-001)', async () => {
+    const fake = host({ policy: 'never' })
+    const { cwd, layout } = missionAt(fake, 'split-review')
+    saveSplitPlan(layout, 'm-split', goodPlan())
+
+    const text = await orchestrate(fake, { action: 'advance' })
+    // The three sentences are the contract: what the host does, what the suite
+    // did NOT record, and the one action that changes the outcome.
+    assert.match(text, /本会话审批策略为 never（提示被禁用）：宿主不会弹任何审批卡，而是直接返回 rejected/)
+    assert.match(text, /本会话审批策略为 never（不弹任何提示），无法人工审核拆分/)
+    assert.match(text, /所以这次没有记录成'人工打回'，也不计入拆分审核轮数/)
+    assert.match(text, /把审批策略切到 ask 后重新 advance 即可审核/)
+    assert.match(text, /这是宿主策略，不是套件故障/)
+    // Nothing was asked, nothing was recorded: the host's policy answered, not a
+    // person — so reviews.jsonl (and the rejection count) stay untouched.
+    assert.equal(fake.approvalRequests.length, 0, 'never must not render a card')
+    assert.equal(reviewRows(layout), 0)
+    assert.equal(splitRejectionCount(layout, 'm-split'), 0)
+    assert.equal(readSplitReview(layout, 'm-split'), undefined)
+    assert.equal(stageState(cwd, 'split-review'), undefined, 'the stage stays entered, not settled')
+    assert.equal(storeFor(cwd).read('m-split')?.stage, 'split-review')
+    assert.equal(fs.existsSync(path.join(layout.missionsDir, 'm-split', 'stages', 'implement.json')), false)
+})
+
+test('a never policy never spends a rework round: two advances keep 0 rejections and never degrade (TC-2506 / AC-003)', async () => {
+    const fake = host({ policy: 'never' })
+    const { cwd, layout } = missionAt(fake, 'split-review')
+    saveSplitPlan(layout, 'm-split', goodPlan())
+
+    assert.match(await orchestrate(fake, { action: 'advance' }), /本会话审批策略为 never/)
+    assert.match(await orchestrate(fake, { action: 'advance' }), /本会话审批策略为 never/)
+    assert.equal(splitRejectionCount(layout, 'm-split'), 0, 'policy refusals never count as rejections')
+    assert.equal(reviewRows(layout), 0)
+    assert.equal(storeFor(cwd).read('m-split')?.stage, 'split-review', 'still waiting for a review, not degraded')
+    // Degrading would pass `split` and skip `split-review`; neither happened.
+    assert.equal(stageState(cwd, 'split'), undefined)
+    assert.equal(fs.existsSync(path.join(layout.missionsDir, 'm-split', 'stages', 'split.json')), false)
+})
+
+test('an approval policy of ask asks exactly once and records the approval (TC-2501 / TC-2503 / AC-002)', async () => {
+    const fake = host({ policy: 'ask', approvalOutcome: 'allowed-once' })
+    const { cwd, layout } = missionAt(fake, 'split-review')
+    saveSplitPlan(layout, 'm-split', goodPlan())
+
+    const text = await orchestrate(fake, { action: 'advance' })
+    assert.match(text, /→ 下一阶段 implement/)
+    assert.equal(fake.approvalRequests.length, 1)
+    assert.equal(readSplitReview(layout, 'm-split')?.decision, 'approved')
+    assert.equal(splitRejectionCount(layout, 'm-split'), 0)
+    assert.equal(storeFor(cwd).read('m-split')?.stage, 'implement')
+})
+
+test('a seam without effectivePolicy still asks; a throwing reporter only logs (TC-2502 / TC-2507 / AC-002)', async () => {
+    // The default fake has no `effectivePolicy` at all: the old-host shape.
+    const absent = host({ approvalOutcome: 'allowed-once' })
+    const first = missionAt(absent, 'split-review')
+    saveSplitPlan(first.layout, 'm-split', goodPlan())
+    assert.match(await orchestrate(absent, { action: 'advance' }), /→ 下一阶段 implement/)
+    assert.equal(absent.approvalRequests.length, 1, 'an unreadable policy must not refuse the review')
+    assert.equal(readSplitReview(first.layout, 'm-split')?.decision, 'approved')
+
+    // A reporter that throws is "unknown", never "never": ask anyway, log why.
+    const throwing = host({ approvalOutcome: 'allowed-once', policy: 'throws' })
+    const second = missionAt(throwing, 'split-review')
+    saveSplitPlan(second.layout, 'm-split', goodPlan())
+    assert.match(await orchestrate(throwing, { action: 'advance' }), /→ 下一阶段 implement/)
+    assert.equal(throwing.approvalRequests.length, 1)
+    assert.equal(readSplitReview(second.layout, 'm-split')?.decision, 'approved')
+    const log = fs.readFileSync(path.join(second.cwd, 'orchestrator.log'), 'utf8')
+    assert.match(log, /读不到本会话审批策略/)
+    assert.match(log, /effectivePolicy 抛错：policy store unavailable/)
 })
 
 // --- plan edits must be re-reviewed ---------------------------------------

@@ -52,6 +52,12 @@ profile**（`.dsh/**` 与 profile 都在信任根里，Agent 写不了）。
 - **审批不是额外配置**：`split-review` 通过宿主同一条审批接缝（`ctx.get('approval')`，与 `spec_approve`
   **同一条**）问人——跟随当前运行界面（tui / web / desktop），配置了 IM 即走 IM。宿主根本没有这个接缝时
   按名字拒绝（「宿主没有 approval 接缝」），不会自动通过；不需要为本插件额外接线。
+- **审批策略 `never` 时不会弹卡，也不会记成打回**：宿主审批服务在该会话策略为 `never` 时直接返回
+  `rejected`（不派发任何提示面）。`split-review` 在提问前读 `effectivePolicy(agent.session)`：`never` →
+  直接 BLOCK 并说明「提示被禁用、本轮未记录成'人工打回'、不计入 `maxReworkRounds`、切到 ask 后重新
+  advance」，`reviews.jsonl` 一行不写。所以"一张审核卡都没看到就被降级"不会是套件的轮数逻辑造成的：
+  先看一下本会话的审批策略。这是宿主策略，不是套件故障；读不到策略（旧宿主/无 session/抛错）时仍按
+  原逻辑提问，只记日志。
 - **只有 `split.enabled` 是真开关**：模型段、审批通道、`autoDispatch` 都不是"拆分能否运行"的前提。
 
 `enabled: true` 之后，流水线是：
@@ -258,3 +264,7 @@ console.log(e.reasons.join("\n")); console.log(e.tokens)' \
 - **真派发需要真 profile + 真 `dsh`**：本仓库的验收跑覆盖的是 SKIP 分支与它的四条反证，不证明"真 worker
   一定写出合格 commit"；那一条只能在 `DSH_SMOKE_REAL=1` 的真机路径上得到证据。
 - **没有 token 数据就不要假装有**：`usage` 缺失是宿主接缝的事实，不是可以插值的空白。
+- **"没看到卡"有两种原因，别混为一谈**：① 策略是 `never`（宿主不弹卡、直接 rejected，套件已在提问前
+  BLOCK，见 §1）；② 接缝没有应答者（`unavailable`，阶段保持 entered）。两者都不会写 `reviews.jsonl`；
+  只有 `ask` 策略下"人真的按了打回"才会记一行。诊断顺序：先看本会话审批策略，再看 `reviews.jsonl`
+  与阶段状态。

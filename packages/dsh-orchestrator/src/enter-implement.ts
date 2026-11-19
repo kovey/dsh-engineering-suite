@@ -99,6 +99,8 @@ export interface OrchestratorServiceDeps {
      * for every non-split pipeline.
      */
     approval?: () => ApprovalLike | undefined
+    /** Diagnostics sink (the split-review policy read); absent = no log line. */
+    log?: (message: string) => void
 }
 
 /** Build the service object registered as `orchestrator`. */
@@ -108,6 +110,7 @@ export function createOrchestratorService(deps: OrchestratorServiceDeps): Orches
         stores: deps.stores,
         probesFor: deps.probesFor,
         ...(deps.approval === undefined ? {} : { approval: deps.approval }),
+        ...(deps.log === undefined ? {} : { log: deps.log }),
     }
     return { enterImplement: (missionId, cwd) => safelyEnter(sequence, missionId, cwd ?? process.cwd()) }
 }
