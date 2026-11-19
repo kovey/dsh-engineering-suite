@@ -24,6 +24,7 @@ import {
     readPolicySnapshot,
     sessionIdOf,
     type AgentLike,
+    type ApprovalLike,
     type MissionRecord,
     type MissionStore,
     type MissionStoreRegistry,
@@ -31,8 +32,10 @@ import {
     type StageResult,
 } from 'dsh-eng-core'
 import type { OrchestratorConfig } from './config.js'
-import { entryGateRefusal } from './advance-guards.js'
-import { dispatchStage, shouldDispatch, type DispatchDeps, type DispatchOutcome } from './dispatch.js'
+import { blockedRefusal, entryGateRefusal } from './advance-guards.js'
+import { dispatchStageEntry } from './split-stage-dispatch.js'
+import { shouldDispatch, type DispatchDeps, type DispatchOutcome } from './dispatch.js'
+import type { GateFacts, GateOutcome } from './gate-facts.js'
 import { evaluateGate, type Verdict } from './gates.js'
 import { MAX_MAX_IN_FLIGHT, MAX_METRICS_WINDOW_DAYS, collectMetrics, renderMetrics } from './metrics.js'
 import {
@@ -45,9 +48,13 @@ import {
     stageById,
     successorOf,
 } from './pipeline.js'
-import { buildRetrospective, ledgerPath, persistRetrospective, readLedger, renderHistory, type Retrospective } from './retrospective.js'
+import { readLedger, renderHistory } from './retrospective.js'
+import { renderRetrospectiveTail, retroAction, safeRetrospective } from './retro-report.js'
 import type { StageConfig } from './pipeline.js'
 import { describeMount, refusalForMissingPlugins, requiredPluginStates, type PluginProbe } from './probes.js'
+import { laneAfterPass } from './split-advance.js'
+import { splitReviewGateRefusal } from './split-approval.js'
+import { splitTransitionRefusal } from './split-gates.js'
 import { stageRoleDelegationCheck } from './stage-role.js'
 
 const TEXT_OUTPUT = { type: 'string' } as const
@@ -80,10 +87,26 @@ function routeField(deps: SequenceDeps, stage: StageConfig): { difficulty?: Stag
     }
 }
 
-
 /** The attempt budget of one stage (`config.defaultMaxAttempts` when unset). */
 function budgetOf(deps: SequenceDeps, stage: StageConfig): number {
     return stage.maxAttempts ?? deps.config.defaultMaxAttempts
+}
+
+/**
+ * The facts one gate evaluation reads, including the split workflow's
+ * profile-level `models.json` defaults (`config.split.models`).
+ *
+ * Built in one place so every call site answers "where do the split thresholds
+ * come from" the same way — a stage evaluated without them would silently use
+ * the built-in defaults instead of the deployment's own.
+ */
+function gateFacts(deps: SequenceDeps, store: MissionStore, mission: MissionRecord, current: StageResult | undefined): GateFacts {
+    return {
+        store,
+        mission,
+        current,
+        ...(deps.config.split.models === undefined ? {} : { models: deps.config.split.models }),
+    }
 }
 
 /** Every action the single tool exposes. */
@@ -118,6 +141,14 @@ export interface SequenceDeps {
      * once at assembly.
      */
     probesFor: (agent: AgentLike | undefined) => Record<string, PluginProbe>
+    /**
+     * The host approval seam, read at call time (`ctx.get('approval')`).
+     *
+     * Used by the `split-review` stage: a human must approve the plan before any
+     * worker is dispatched. Absent = the stage refuses by name ("无审批通道");
+     * it is never treated as "approved".
+     */
+    approval?: () => ApprovalLike | undefined
     /**
      * The clock for wall-clock-derived numbers (delivery metrics).
      *
@@ -292,7 +323,7 @@ async function recordAndDispatch(
             },
         }
     }
-    const dispatch = await dispatchStage(deps.dispatch, {
+    const dispatch = await dispatchStageEntry(deps.dispatch, {
         stage,
         mission: recorded.mission,
         cwd: ctx.cwd,
@@ -675,37 +706,6 @@ async function startAction(deps: SequenceDeps, probes: Record<string, PluginProb
 }
 
 /**
- * The circuit breaker's latch: a `blocked` mission stays blocked until a human
- * explicitly releases it. Without this, `resume`/`advance` would quietly turn
- * the breaker's verdict into ordinary progress.
- */
-function blockedRefusal(mission: MissionRecord, action: string): string | undefined {
-    if (mission.status !== 'blocked') return undefined
-    const mandate = mandateState(mission)
-    const withdrawn = mandate.kind === 'present' ? mandate.mandate.withdrawn : undefined
-    // A stopped mission is `blocked` too, but it is a STRONGER state than the
-    // breaker: `unblock` will refuse it (the authorisation is gone), so the
-    // message must not send the caller into that loop.
-    if (withdrawn !== undefined) {
-        return [
-            `mission ${mission.id} 已被人工停止（blocked；授权已由 ${withdrawn.by} 于 ${formatTime(withdrawn.at)} 撤回：${withdrawn.reason}），拒绝执行 ${action}。`,
-            '撤回是一个人的停止决定：unblock 也会因"授权已撤回"被拒绝，这条 mission 不能再继续。',
-            '',
-            '下一步：需要继续这项工作就新建 mission（spec_create → spec_approve）；只需查看现状用 orchestrate({ action: "status" })。',
-        ].join('\n')
-    }
-    return [
-        `mission ${mission.id} 处于熔断状态（blocked），拒绝执行 ${action}。`,
-        '熔断是给人看的结论：继续推进只会重复同一轮失败。',
-        '',
-        '下一步（人工决定）：',
-        '1. 修复根因后，用 orchestrate({ action: "unblock", summary: "<为什么可以继续>" }) 解除熔断；',
-        '2. 或新建 mission（spec_create）重来；',
-        '3. 若是流程配置不合理（阶段过粗、上限过低），调整 config.stages / defaultMaxAttempts 后重启会话。',
-    ].join('\n')
-}
-
-/**
  * Approvers a record cannot judge: a legacy/unnamed decision (`by: 'approval'`
  * is how the terminal path has always recorded "a human, unnamed"), not a
  * person's own id. Refusing those would break every pre-mandate mission.
@@ -979,6 +979,25 @@ function stopAction(deps: SequenceDeps, ctx: CallContext, args: OrchestrateArgs)
     ].join('\n')
 }
 
+/**
+ * The human review of a split plan, before the stage is settled (AC-003).
+ *
+ * The four-answer mapping and the refusal text live in `split-approval.ts`; this
+ * wrapper only decides whether the gate applies and hands over the caller's
+ * context. `cancelled`/`unavailable`/no-seam are REFUSALS that leave the stage
+ * `entered` — re-planning cannot fix "nobody answered".
+ */
+function splitReviewAskRefusal(deps: SequenceDeps, ctx: CallContext, stage: StageConfig, current: StageResult | undefined): Promise<string | undefined> | undefined {
+    if (ctx.mission === undefined || stage.gate.kind !== 'split-review') return undefined
+    return splitReviewGateRefusal({
+        facts: gateFacts(deps, ctx.store, ctx.mission, current),
+        stageId: stage.id,
+        approval: deps.approval,
+        agent: ctx.agent,
+        signal: ctx.signal,
+    })
+}
+
 /** `advance` — settle the current stage and enter the next one. */
 async function advanceAction(deps: SequenceDeps, probes: Record<string, PluginProbe>, ctx: CallContext, args: OrchestrateArgs): Promise<string> {
     const blocked = ctx.mission === undefined ? undefined : blockedRefusal(ctx.mission, args.action)
@@ -1029,8 +1048,11 @@ async function advanceAction(deps: SequenceDeps, probes: Record<string, PluginPr
     }
 
     const current = stageResultOf(ctx.store, mission.id, stage.id)
+    // 1.5 human review (split): a person approves the plan before workers exist.
+    const reviewRefusal = await splitReviewAskRefusal(deps, ctx, stage, current)
+    if (reviewRefusal !== undefined) return reviewRefusal
     const verdict: Verdict = args.verdict ?? 'PASS'
-    const outcome = evaluateGate(stage.gate, { store: ctx.store, mission, current }, args.verdict)
+    const outcome = evaluateGate(stage.gate, gateFacts(deps, ctx.store, mission, current), args.verdict)
     const leavesStage = stage.gate.phase === 'exit'
 
     // 2. entry gate — refuse without touching the record (retrying must be free).
@@ -1041,8 +1063,11 @@ async function advanceAction(deps: SequenceDeps, probes: Record<string, PluginPr
         return await rollback(deps, probes, ctx, mission, stage, args, outcome.state ?? verdict, outcome.detail, outcome.fix)
     }
     // 4. the successor must be enterable before this stage is recorded as
-    //    passed: no settled progress into a stage that cannot start.
-    const target = successorOf(pipeline, stage)
+    //    passed: no settled progress into a stage that cannot start. The lane
+    //    also carries the stages this pass SKIPS (split-review, when the split
+    //    threshold says the plan is not worth splitting).
+    const lane = laneAfterPass(pipeline, stage, outcome)
+    const target = lane.target
     if (target !== undefined) {
         const blockedNext = entryBlockedBy(deps, probes, ctx, target, mission)
         if (blockedNext !== undefined) {
@@ -1078,28 +1103,49 @@ async function advanceAction(deps: SequenceDeps, probes: Record<string, PluginPr
         ...(current?.dispatch === undefined ? {} : { dispatch: current.dispatch }),
     }
     ctx.store.writeStageResult(mission.id, settled)
+    for (const skipped of lane.skipped) ctx.store.writeStageResult(mission.id, skipped)
 
     const next = target
     if (next === undefined) {
-        const finished = ctx.store.setStatus(mission.id, 'delivered') ?? mission
-        // docs.md §8 第四阶段：mission 结束即沉淀（规则式折叠，无需模型）。
-        const retro = safeRetrospective(deps, ctx, finished)
-        return [
-            `阶段 ${stage.id} 已通过（第 ${settled.attempt} 次，门禁裁决 ${settled.gateState}，${outcome.detail}）。`,
-            ...(roleWarning.length === 0 ? [] : ['', ...roleWarning]),
-            `${missionTag(finished)} 已是最后一个阶段，流水线结束，状态 ${finished.status}。`,
-            `阶段结果：.dsh/missions/${mission.id}/stages/${stage.id}.json`,
-            '交付物：.dsh/missions/' + mission.id + '/receipts/ 与 audit/ 下的审计记录。',
-            ...(retro === undefined ? [] : ['', ...renderRetrospectiveTail(retro)]),
-            '',
-            `下一步：任务已交付。需要新的迭代时调用 orchestrate({ action: "rerun", stageId: "<要重开的阶段>" })；新的需求用 action: "start" 开新 mission。`,
-        ].join('\n')
+        return deliveredAfterPass({ deps, ctx, mission, stage, settled, outcome, roleWarning })
     }
+    // A gate detail may be multi-line (`split-plan` lists models.json fallbacks):
+    // the first line completes the sentence, the rest are printed under it so a
+    // fallback is never hidden inside a report line.
+    const detail = outcome.detail.split('\n')
     return [
-        `阶段 ${stage.id} 已通过（第 ${settled.attempt} 次，门禁裁决 ${settled.gateState}，${outcome.detail}）→ 下一阶段 ${next.id}。`,
+        `阶段 ${stage.id} 已通过（第 ${settled.attempt} 次，门禁裁决 ${settled.gateState}，${detail[0] ?? ''}）→ 下一阶段 ${next.id}。`,
+        ...detail.slice(1),
+        ...(lane.note === undefined ? [] : [lane.note]),
         ...(roleWarning.length === 0 ? [] : ['', ...roleWarning]),
         '',
         ...(await enterStage(deps, probes, ctx, next, args.summary)),
+    ].join('\n')
+}
+
+/** Everything happened: report the end of the pipeline (docs.md §8 folding). */
+function deliveredAfterPass(facts: {
+    deps: SequenceDeps
+    ctx: CallContext
+    mission: MissionRecord
+    stage: StageConfig
+    settled: StageResultWithRole
+    outcome: GateOutcome
+    roleWarning: string[]
+}): string {
+    const finished = facts.ctx.store.setStatus(facts.mission.id, 'delivered') ?? facts.mission
+    const retro = safeRetrospective(facts.deps, facts.ctx, finished)
+    const detail = facts.outcome.detail.split('\n')
+    return [
+        `阶段 ${facts.stage.id} 已通过（第 ${facts.settled.attempt} 次，门禁裁决 ${facts.settled.gateState}，${detail[0] ?? ''}）。`,
+        ...detail.slice(1),
+        ...(facts.roleWarning.length === 0 ? [] : ['', ...facts.roleWarning]),
+        `${missionTag(finished)} 已是最后一个阶段，流水线结束，状态 ${finished.status}。`,
+        `阶段结果：.dsh/missions/${facts.mission.id}/stages/${facts.stage.id}.json`,
+        '交付物：.dsh/missions/' + facts.mission.id + '/receipts/ 与 audit/ 下的审计记录。',
+        ...(retro === undefined ? [] : ['', ...renderRetrospectiveTail(retro)]),
+        '',
+        '下一步：任务已交付。需要新的迭代时调用 orchestrate({ action: "rerun", stageId: "<要重开的阶段>" })；新的需求用 action: "start" 开新 mission。',
     ].join('\n')
 }
 
@@ -1213,7 +1259,11 @@ function entryBlockedBy(
         ctx.store.setStatus(mission.id, 'blocked')
         return breakerReport(deps, mission, stage, attempt - 1, `阶段 ${stage.id} 已达到尝试上限，无法再次进入`, '人工检查失败原因并修复根因，或调整 config.stages 的 maxAttempts / config.defaultMaxAttempts 后重启会话，再用 orchestrate({ action: "rerun", stageId: "' + stage.id + '" }) 重开该阶段。')
     }
-    return undefined
+    // The split workflow's own entry conditions (`split-review`: the plan must
+    // pass the three checks; `implement`: the plan must still be the reviewed
+    // one). They belong to the TRANSITION: a stage that cannot be entered must
+    // not be recorded as passed on the way in.
+    return splitTransitionRefusal(gateFacts(deps, ctx.store, mission, current), stage)
 }
 
 /**
@@ -1244,7 +1294,7 @@ async function enterStage(
     // GAP-9: the entry gate is checked BEFORE a child is dispatched. Dispatching
     // into a stage whose entry gate is unmet would spend tokens on work the
     // pipeline has explicitly said must not start yet.
-    const entryProbe = evaluateGate(stage.gate, { store: ctx.store, mission, current })
+    const entryProbe = evaluateGate(stage.gate, gateFacts(deps, ctx.store, mission, current))
     const entryBlocked = stage.gate.phase === 'entry' && isGated(stage.gate) && !entryProbe.ok
     const { recorded, dispatch } = await recordAndDispatch(
         deps,
@@ -1256,7 +1306,7 @@ async function enterStage(
         entryBlocked ? `进入门禁未满足（${entryProbe.detail}）：本次不自动派发` : undefined,
     )
     const history = renderHistory(readLedger(ctx.store))
-    const entry = evaluateGate(stage.gate, { store: ctx.store, mission: recorded.mission, current })
+    const entry = evaluateGate(stage.gate, gateFacts(deps, ctx.store, recorded.mission, current))
     const entryNote =
         stage.gate.phase === 'entry' && isGated(stage.gate)
             ? entry.ok
@@ -1348,7 +1398,7 @@ async function resumeAction(deps: SequenceDeps, probes: Record<string, PluginPro
         lines.push(...refusalForMissingPlugins(stage.id, missing).split('\n'), '', `下一步：补齐插件后重新调用 orchestrate({ action: "resume" })。`)
         return lines.join('\n')
     }
-    const entry = evaluateGate(stage.gate, { store: ctx.store, mission, current })
+    const entry = evaluateGate(stage.gate, gateFacts(deps, ctx.store, mission, current))
     if (!entry.ok && stage.gate.phase === 'entry') {
         lines.push(`进入门禁待满足：${entry.detail}`, `修复：${entry.fix ?? '满足门禁后重试。'}`, '', `下一步：${entry.fix ?? '满足门禁后重新调用 orchestrate({ action: "resume" })。'}`)
         return lines.join('\n')
@@ -1457,56 +1507,6 @@ function resolveMaxInFlight(value: number | undefined, fallback: number): { valu
         return { value: fallback, notes: [`maxInFlight=${String(value)} 不可用（要求 1–${MAX_MAX_IN_FLIGHT} 的整数），已改用配置值 ${fallback}`] }
     }
     return { value, notes: [] }
-}
-
-/** `retro` — fold the finished mission into a retrospective (docs.md §8 phase 4). */
-function retroAction(deps: SequenceDeps, ctx: CallContext): string {
-    const mission = ctx.mission
-    if (mission === undefined) {
-        return [
-            '当前会话没有 mission 可以复盘。',
-            '',
-            '下一步：先用 orchestrate({ action: "start" }) 开始一条流水线，或在有 mission 的会话里调用 state action: "retro"。',
-        ].join('\n')
-    }
-    const retro = buildRetrospective(ctx.store, mission, deps.config.stages)
-    const files = persistRetrospective(ctx.store, retro)
-    return [
-        `## 复盘（mission ${mission.id}，状态 ${mission.status}）`,
-        '',
-        `- 规格 revision：${retro.specRevisions}　门禁：PASS ${retro.gates.pass} / WARN ${retro.gates.warn} / BLOCK ${retro.gates.block}　回执：${retro.receipts}`,
-        `- 失败命令：${retro.failingCommands.map((entry) => `${entry.id}×${entry.count}`).join('、') || '无'}`,
-        `- 阶段回退：${retro.rollbacks.map((entry) => `${entry.stage}→${entry.to}×${entry.count}`).join('、') || '无'}`,
-        `- 重复尝试：${retro.reworkStages.map((entry) => `${entry.stage}×${entry.attempts}`).join('、') || '无'}　熔断：${retro.blocked ? '是' : '否'}`,
-        '',
-        '### 候选经验',
-        ...retro.lessons.map((lesson) => `- ${lesson}`),
-        '',
-        `工件：${path.relative(ctx.store.layout.cwd, files.markdown)}（+ .json）`,
-        `跨 run 台账：${path.relative(ctx.store.layout.cwd, files.ledger)}（只追加，下次开工前可 grep 历史模式）`,
-        '',
-        '下一步：用 memory_save 把其中真正可复用的 1–3 条写成 lesson（项目级；工具链事实才写 global），',
-        '下次同类任务开工时它们会被自动召回；其余条目留在 retrospective.md 里备查。',
-    ].join('\n')
-}
-
-/** Build + persist quietly; a retrospective must never break the transition. */
-function safeRetrospective(deps: SequenceDeps, ctx: CallContext, mission: MissionRecord): Retrospective | undefined {
-    try {
-        const retro = buildRetrospective(ctx.store, mission, deps.config.stages)
-        persistRetrospective(ctx.store, retro)
-        return retro
-    } catch {
-        return undefined
-    }
-}
-
-function renderRetrospectiveTail(retro: Retrospective): string[] {
-    return [
-        `复盘已生成：规格 revision ${retro.specRevisions}，门禁 BLOCK ${retro.gates.block} 次，回退 ${retro.rollbacks.length} 次。`,
-        ...retro.lessons.slice(0, 2).map((lesson) => `- ${lesson}`),
-        `完整复盘：.dsh/missions/${retro.missionId}/retrospective.md；跨 run 台账：${'.dsh/retrospectives.jsonl'}`,
-    ]
 }
 
 /** Register `orchestrate` (the plugin's single responsibility). */

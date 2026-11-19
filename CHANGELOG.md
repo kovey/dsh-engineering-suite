@@ -1,3 +1,44 @@
+## [未发布]
+
+### 新增 · P1 拆分派发执行器：审核过的计划现在真的会派出 worker（`split-runner`）
+
+上一轮把拆分的**判定**做完了（配置、三道校验、门槛、人工审核、worktree 库、返工率、导入器），
+但没有任何东西把"已审核的 plan"变成工作——所有 split 库都只有测试在调。这一轮补的是那个缺口：
+`implement` 阶段入口调用 `runSplitPlan`，按 `dependsOn` 拓扑排序、组内并行受 `maxParallel` 限制、
+每个子任务一个 worktree 一个 worker、完成后合并→导入→清理→记录。
+
+- **`packages/dsh-orchestrator/src/split-runner.ts`**（+ `split-run-order.ts` / `split-worker.ts` /
+  `split-run-finish.ts` / `split-run-git.ts` / `split-run-types.ts`）：`runSplitPlan(deps)` 一个入口。
+  五条不可协商的规则：① plan 必须仍是**被审核的那份**（磁盘摘要 = 审核记录的摘要；调用方另传的 plan
+  摘要不一致同样拒绝），未审核的拆分**不建 worktree、不派 worker**；② 组间串行、组内并行受
+  `maxParallel` 限制，`dependsOn` 未完成的子任务**在每次派发前断言**不启动（不是只在调度器里假设）；
+  ③ worker 用 `worker` 角色（persona + 工具白名单，`orchestrate` 结构性剔除）并从 **models.json** 取模型：
+  正常 `worker` 段，返工率超过 `quality.maxReworkRatio` 后改用 `planner` 段（AC-011），任一段没有
+  `model` 时**拒绝该任务**而不是回退宿主默认；④ commit 标题必须以 `<taskId>:` 开头，否则记返工并在
+  `problems` 里点名 commit 与标题；⑤ 不签发回执、不写门禁记录。
+- **worker 真正落在自己的 worktree 里**：`dsh-eng-core` 的派发接缝新增 `cwd`（`SubagentStartRequest.cwd`，
+  rc.1 走 `spec.request`、rc.2 读顶层），否则 worker 的本地 `.dsh/` 证据会写进主 mission 的台账——
+  正是 AC-007 禁止的污染。
+- **收尾顺序是契约**：merge（AC-008 的导入前提，`--no-ff`；失败即 `git merge --abort` 并记
+  `merge-conflict`）→ 逐任务 `importTaskEvidence`（四类拒绝照旧，绝不尽力而为）→ `cleanupTaskWorktree`
+  （有未导入则拒绝并打印清单，AC-009）→ `split/rework.json` + `missions/<id>/split/run.json`。
+- **接线**（`split-dispatch.ts`，`dispatch.ts` 里 implement 入口调用）：`config.split.enabled` 且该阶段入口
+  门禁是 `split-reviewed` 且有已审核、值得拆的 plan 时才派发；`not-worth-splitting` / `too-large` 走原
+  plain implement（不建 worktree、不派 worker）。**不依赖 `autoDispatch.enabled`**：打开 split 就是
+  "这个仓库派 worker"的决定，再加一道开关会让功能默认死亡。派发**不结算**阶段。
+- **测试**：`packages/dsh-orchestrator/test/split-runner.test.ts`（12 例，真实 git 夹具 + 可控的假
+  `subagents`：同组两 worker 在第一个完成前都已启动、`maxParallel=1` 退化串行、依赖反转的组仍按拓扑序
+  启动、依赖失败后**后续任务零启动**、超阈值任务改用 `deepseek-reasoner`、缺 commit 前缀被点名、
+  未审核/有环/自依赖/摘要不一致四种拒绝且不建 worktree）与 `split-dispatch.test.ts`（2 例，走真实
+  `orchestrate advance` 从 split-review 进入 implement：`startActivation` 收到两个 worktree 路径与
+  `deepseek-chat`、`orchestrator:worker` preset 已注册、run.json 两个任务 `failed`——假的子代理不产
+  commit——且 mission 仍停在 implement）。`dsh-eng-core` 的派发接缝补 1 例（`cwd` 在 rc.1/rc.2 两种形状
+  都在、不传时不存在）。
+- **证据**：`packages/dsh-orchestrator` 149 例全过、`packages/dsh-eng-core` 328 例全过（1 skip，宿主无
+  `ps` 的环境项）；`bash scripts/verify.sh --quiet` → exit 0；`bash scripts/standards-check.sh --quiet` → exit 0。
+- **文档**：`docs/ARCHITECTURE.md` §5.38（流水线变化、写入模型、为什么合并与导入在这个顺序、
+  部分 scope 门禁为何永不构成交付依据）。
+
 ## [0.8.14] — 2026-11-18
 
 ### 变更 · 把宿主审计阶段抽成 `scripts/host-audit-stage.sh`，用 C21 的反证钉住 SKIP 分支

@@ -1817,6 +1817,113 @@ mission 从未进入流水线）→ 这条规则不判定，"已审批"就足以
 - 两包 `node --test test/*.test.ts` 全绿（spec-gate 202、orchestrator 113），`tsc --noEmit` 通过，
   `bash scripts/standards-check.sh --quiet` 无新增/恶化违规。
 
+### 5.38 拆分真的会派发：`runSplitPlan` 的顺序、写入模型与"部分 scope 不是交付依据"
+
+§5.37 之后 P1 的所有零件都在（`models.json`、三道校验、门槛、人工审核、worktree 库、返工率、导入器），
+但**没有生产调用点**：`grep` 一遍 `saveSplitPlan|createTaskWorktree|importTaskEvidence|computeRework`
+在 `packages/*/src` 里一处调用都没有，全在测试里。这一节补的是最后一块——把"已审核的 plan"变成工作，
+以及由此产生的三条写入/证据规则。
+
+**A. 流水线与接线**
+
+```
+spec-clarify → test-design-review → spec-approve → split → split-review → implement → quality-verify → delivery
+                                                    ↑         ↑            ↑
+                                        planner 落 plan   人工审核      runner 派发（本节）
+```
+
+`implement` 阶段入口（`gate.kind === 'split-reviewed'`）在**派发**环节调用 `runSplitPlan`。三个前提缺一
+不可：`config.split.enabled`、磁盘上有 plan、且该 plan 的摘要**仍等于**人工审核记录的摘要。`not-worth-splitting`
+与 `too-large` 走原 plain implement（不建 worktree、不派 worker）；未审核/摘要不一致/依赖有环**拒绝派发**
+并写入 `split/run.json`（state=`refused`）。三条刻意的选择：
+
+- **不依赖 `autoDispatch.enabled`**：`split.enabled` 本身就是"这个仓库要派 worker"的决定；再叠一道默认关闭的
+  开关，会让整个 P1 在默认配置下永远不派发（"接好了但从来不会跑"）。普通阶段的自动派发语义不变。
+- **派发不结算**：`implement` 仍是 `entered`，退出仍要过它自己的门禁；`dispatchLines` 的"派发不结算本阶段"
+  一行对拆分派发同样成立。
+- **失败是结果不是异常**：没有 `ctx.subagents`、没有 role-guard、provider 不支持 preset，都在
+  **建 worktree 之前**被拒绝（`state=refused`），不会留下半个任务。
+
+**B. 顺序与并发：`parallelGroups` 是上限，不是日程表**
+
+| 规则 | 实现 | 为什么 |
+|------|------|--------|
+| `dependsOn` 拓扑排序 | 组级 Kahn（任务级环单独检测并点名） | plan 里组的书写顺序可能与依赖相反；按书写顺序跑会启动一个依赖未完成的子任务 |
+| 组间串行 | `for (group of ordered)` | 组是"这一批可以同时跑"的声明，跨组并行会把上限变成建议 |
+| 组内并行受 `maxParallel` 限制 | 按 `maxParallel` 切块，块内 `Promise.all`、块间串行 | 上限来自 `models.json`（`split.maxParallel`），调用方可再调低；`1` = 退化串行 |
+| 依赖未完成不得启动 | **每次派发前**再断言一次（`unmetDeps`） | 调度器正确不等于派发正确：断言放在真正启动前，测试能钉住"依赖失败后后续任务零启动" |
+| 依赖失败/阻塞 | 后续子任务记 `blocked`，不启动 | 让"没做完"可见，而不是靠超时或空 commit 混过去 |
+
+**C. 每个子任务：一个 worktree、一个 worker、一个带前缀的 commit**
+
+1. `createTaskWorktree` 在 `<root>/worktrees/<missionId>/<taskId>` 建分支 `split/<missionId>/<taskId>`
+   （该目录已 gitignore；命令只会出现在主树的 `git worktree list` 里）。
+2. worker 用 **`worker` 角色**派发（`packages/dsh-role-guard/roles/worker.md`：可写、无门禁工具、
+   `skills: []`），preset id `orchestrator:worker`，`orchestrate` 从子作用域结构性剔除（与阶段派发共用
+   `withoutOrchestrate`）。
+3. **`cwd` 落在 worktree 上**：派发接缝新增 `SubagentStartRequest.cwd`（rc.1 读 `spec.request`、rc.2 读顶层）。
+   不传 `cwd` 时 worker 继承父会话目录，它的本地 `.dsh/…/evidence.jsonl` 会直接写进**主 mission 的台账**——
+   这正是 AC-007 说的"污染主树"，而且是很自然的一步错。测试同时断言两种形状都有 `cwd`。
+4. **模型来自 `models.json`**（不是宿主默认，也不靠角色文件里的字面量）：正常用 `worker` 段；返工率
+   （需要重做的子任务 ÷ 已开始子任务）超过 `quality.maxReworkRatio` 后，**后续**子任务改用 `planner` 段并告警
+   （AC-011，不中止）。任一段没配 `model` → 该任务不派发、记失败并点名"不会回退宿主默认"。
+5. commit 标题必须以 `<taskId>:` 开头；runner 在合并/记录前校验，不符则记 `acceptance-failed`，并把
+   commit 与标题原样写进 `problems`（"fail closed，不尽力而为"）。
+
+**D. 写入模型：worker 只写自己 worktree 里的台账，主 mission 只由导入器写**
+
+```
+worktree/.dsh/missions/<id>/evidence.jsonl     ← worker 写（本地、worktree 内）
+        │  merge（runner，--no-ff；失败 → git merge --abort + merge-conflict）
+        ▼
+main/.dsh/missions/<id>/evidence.jsonl         ← importTaskEvidence 写（唯一写者）
+main/.dsh/missions/<id>/evidence-sources.jsonl ← 来源映射 taskId/worktree/branch/commit
+main/.dsh/missions/<id>/split/run.json         ← runner 写（每个任务 state/commit/imported/cleanedUp）
+main/.dsh/missions/<id>/split/rework.json      ← 返工率与阈值（AC-011）
+```
+
+- **必须先合并再导入**：导入器用 `git merge-base --is-ancestor` 逐条核验，未合并的 commit 一律拒绝。所以
+  runner 在导入前把每个已完成任务的**分支**合并进主树（`--no-ff`，合并提交本身就是"这一支落地"的记录）。
+  失败时 `git merge --abort` 收尾并把该任务记 `merge-conflict`——把冲突标记和 `MERGE_HEAD` 留在主树里，
+  会毒化之后每一次合并与每一次"干净树"检查。
+- **导入先于清理**：`cleanupTaskWorktree` 自己会先扫"还有没有未导入的本地 evidence"，有就**拒绝并打印待
+  导入清单**（AC-009）。没有待导入时 `git worktree remove` 失败也不会退化成删目录。
+- **runner 不写的东西**：mission.json、`gates/*.json`、回执。它只写 `split/run.json`、`split/rework.json`
+  与一条 `manual` 证据（返工率告警，AC-011 要求写进拆分报告）。
+- **导入的拒绝是一批全拒**：任一行的 shape/归属/合并状态不合格，整批不写并在 `problems` 里点名——
+  部分落地会让"这批证据过没过"无法从台账重建。
+
+**E. 交付权威：部分 scope 的门禁永不构成交付依据（AC-010）**
+
+worker 在自己的 worktree 里跑的门禁是**部分 scope**：它只看到那一个分支，没看到合并后的主树。
+所以 `run.json` 的 `ok` 只说明"子任务都完成且证据都导入了"，**不是**交付。交付仍是：
+合并后的主树完整跑一次质量门禁 → 回执由 lead 在整体通过后签发。runner 的返回值与报告文案都不含
+"已交付"字样，`run.json` 里也没有任何回执/gate 记录字段——这是结构性的，不靠措辞。
+
+**F. 测试与可复核证据**
+
+- `packages/dsh-orchestrator/test/split-runner.test.ts`（12 例，真实 git 夹具 + 可控假 `subagents`）：
+  同组两 worker 在第一个完成前都已 `startActivation`；`maxParallel=1` 只启动一个；plan 把依赖组的顺序写反
+  仍先跑依赖；依赖失败后**后续任务零启动**且记 `blocked`；返工率 0.5 时第二个任务收到
+  `deepseek-reasoner`（`rework.json` 同时记录 0.5 / 0.3）；缺 `<taskId>:` 前缀被点名；未审核 / 有环 /
+  自依赖 / 摘要不一致四种拒绝且 `worktrees/` 目录都没被创建；成功流程 `imported=2`、两个 worktree 都被清理、
+  `run.json` 每个任务 `state/commit` 齐全。
+- `packages/dsh-orchestrator/test/split-dispatch.test.ts`（2 例，真实 `orchestrate advance`）：从
+  `split-review` 批准后进入 `implement`，两个 `startActivation` 收到两个 worktree 路径与 `deepseek-chat`，
+  `orchestrator:worker` preset 已注册，假的子代理不产 commit → 两个任务记 `failed`，mission 仍停在
+  `implement`（派发不结算）；不值得拆的 plan 一个 worker 都不派、也不写 `run.json`。
+- `packages/dsh-eng-core/test/delegation.test.ts` 补 1 例：`cwd` 在 rc.1/rc.2 两种形状都在，不传时不存在。
+
+**诚实边界**
+
+- 本节的测试用**假 `subagents`**（真的 worktree、真的 git、真的导入器，假的是 agent 进程）：它证明的是
+  调度、模型路由、commit 契约与写入模型，不证明"真 worker 会写出合格的 commit"。
+- 合并是 runner 做的（AC-008 要求"合并后导入"），但**主树完整门禁与回执仍是 lead 的**；本节的接线
+  只覆盖到"派发 + 收尾记录"。
+- 子任务失败**不会自动重试**：`attempts` 记 1，下一轮从 `split` 重新拆分/审核（返工率会把它记进去）。
+- plan.json 的生产写入路径仍是"调用方把 planner 的 JSON 落盘"（`saveSplitPlan` 目前只有测试在用）；
+  runner/门禁/导入器都按**磁盘上的 plan 与摘要**工作，所以这条路径不影响一致性，但没有专门的写入工具。
+
 ## 6. 为什么这样切分
 
 - **一个关注点一个插件**：门禁可以单独失效（例如先只上 quality-gate），不影响其它环节。

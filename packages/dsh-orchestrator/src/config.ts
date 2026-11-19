@@ -13,7 +13,9 @@
 
 import type { LayoutOptions } from 'dsh-eng-core'
 import { resolveMetrics } from './config-metrics.js'
+import { resolveSplitWorkflow, type SplitWorkflowConfig } from './config-split.js'
 import { DEFAULT_STAGES, resolvePipeline, type Difficulty, type Pipeline, type RouteConfig } from './pipeline.js'
+import { withSplitStages } from './split-stages.js'
 import { resolveStageRoleDelegation, type StageRoleDelegationMode } from './stage-role.js'
 
 /** One capability probe: the tool and/or service a plugin registers. */
@@ -21,6 +23,9 @@ export interface ProbeConfig {
     tool?: string
     service?: string
 }
+
+/** The split workflow's host configuration (`config.split`). */
+export type { SplitWorkflowConfig } from './config-split.js'
 
 /** Resolved plugin configuration. */
 export interface OrchestratorConfig {
@@ -136,6 +141,8 @@ export interface OrchestratorConfig {
         enabled: boolean
         order: number
     }
+    /** The split workflow (two extra stages, `models.json` defaults). */
+    split: SplitWorkflowConfig
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -269,31 +276,45 @@ export function resolveRouting(value: unknown): Partial<Record<Difficulty, Route
  * ratchet; the contract is unchanged.
  */
 
+/**
+ * Read the per-plugin probe overrides (`probes`).
+ *
+ * Shape-only: an entry naming neither a tool nor a service is dropped, because a
+ * probe that probes nothing would report "not mounted" forever.
+ */
+function resolveProbes(value: unknown): Record<string, ProbeConfig> {
+    const probes: Record<string, ProbeConfig> = {}
+    if (!isRecord(value)) return probes
+    for (const [plugin, entry] of Object.entries(value)) {
+        if (!isRecord(entry)) continue
+        const tool = entry['tool']
+        const service = entry['service']
+        const probe: ProbeConfig = {
+            ...(typeof tool === 'string' && tool !== '' ? { tool } : {}),
+            ...(typeof service === 'string' && service !== '' ? { service } : {}),
+        }
+        if (probe.tool !== undefined || probe.service !== undefined) probes[plugin] = probe
+    }
+    return probes
+}
+
 export function resolveConfig(input: unknown): ResolvedConfig {
     const raw = isRecord(input) ? input : {}
     const prompt = isRecord(raw['prompt']) ? raw['prompt'] : {}
     const layout = isRecord(raw['layout']) ? raw['layout'] : {}
     const turnStop = isRecord(raw['turnStop']) ? raw['turnStop'] : {}
     const defaultMaxAttempts = Math.max(1, Math.floor(num(raw['defaultMaxAttempts'], 3)))
-    const { stages, issues } = resolvePipeline(raw['stages'], defaultMaxAttempts)
+    const split = resolveSplitWorkflow(raw['split'])
+    const resolvedPipeline = resolvePipeline(raw['stages'], defaultMaxAttempts)
+    // Only the DEFAULT pipeline is extended: a host that wrote its own stage
+    // list names its own stages (and can list split/split-review explicitly).
+    const stages = split.enabled && raw['stages'] === undefined ? withSplitStages(resolvedPipeline.stages) : resolvedPipeline.stages
+    const issues: string[] = [...split.issues, ...resolvedPipeline.issues]
     // A typo in this key must not relax a role requirement: the parser reports
     // the rejected value and keeps `'reject'` (fail closed).
     const roleDelegation = resolveStageRoleDelegation(raw['stageRoleDelegation'])
     issues.push(...roleDelegation.issues)
-    const probes: Record<string, ProbeConfig> = {}
-    const rawProbes = raw['probes']
-    if (isRecord(rawProbes)) {
-        for (const [plugin, value] of Object.entries(rawProbes)) {
-            if (!isRecord(value)) continue
-            const tool = value['tool']
-            const service = value['service']
-            const probe: ProbeConfig = {
-                ...(typeof tool === 'string' && tool !== '' ? { tool } : {}),
-                ...(typeof service === 'string' && service !== '' ? { service } : {}),
-            }
-            if (probe.tool !== undefined || probe.service !== undefined) probes[plugin] = probe
-        }
-    }
+    const probes = resolveProbes(raw['probes'])
 
     return {
         config: {
@@ -322,6 +343,7 @@ export function resolveConfig(input: unknown): ResolvedConfig {
                 enabled: bool(prompt['enabled'], true),
                 order: num(prompt['order'], 660),
             },
+            split,
         },
         issues,
     }

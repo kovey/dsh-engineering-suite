@@ -81,15 +81,19 @@ export interface DelegationAgentOptions {
 }
 
 /**
- * The part of `SubagentStartRequest` this seam supplies.
- *
- * `persona` and `toolFilter` are deliberately absent: 0.2.2-rc.1 removed both. They
- * exist only on {@link DelegationLegacyRequest}, which models an OLD host.
+ * The part of `SubagentStartRequest` this seam supplies. `persona`/`toolFilter` are
+ * deliberately absent (0.2.2-rc.1 removed both; they exist only on {@link DelegationLegacyRequest}).
  */
 export interface DelegationRequest {
     prompt: { type: 'text'; text: string }[]
     parent: AgentLike
     agentOptions?: DelegationAgentOptions
+    /**
+     * Initial child directory (`SubagentStartRequest.cwd`); omitted = inherit the parent's.
+     * Load-bearing for the split runner: a worker outside its worktree writes its local
+     * `.dsh/` evidence into the MAIN mission's ledger (the pollution AC-007 forbids).
+     */
+    cwd?: string
     /** Absolute delegation-depth cap; the provider refuses it without `depthLimit`. */
     maxDepth?: number
 }
@@ -121,10 +125,7 @@ export interface DelegationActivationLike {
     dispose: () => Promise<void>
 }
 
-/**
- * The old host's request: persona, a tool filter AND the signal rode along in
- * it. Kept so a pre-0.2.2 host keeps delegating instead of failing outright.
- */
+/** The old host's request: persona/toolFilter/signal ride along; kept so a pre-0.2.2 host still delegates. */
 export interface DelegationLegacyRequest extends DelegationRequest {
     label?: string
     signal?: AbortSignal
@@ -184,10 +185,9 @@ export interface DelegationOwner {
 }
 
 // --- the five refusals ------------------------------------------------------
-//
-// Every premise is checked BEFORE a child is started, and a missing one is an
-// actionable refusal with the exact package/command to fix it. Refusing costs
-// one delegation; a degraded start silently hands a child the parent's rights.
+// Every premise is checked BEFORE a child is started; a missing one is an actionable
+// refusal (the fix is named). Refusing costs one delegation; a degraded start hands
+// the child the parent's rights.
 
 /** Both dispatch APIs are absent: nothing can start a child. */
 export function missingDispatchRefusal(owner: DelegationOwner): string {
@@ -673,6 +673,8 @@ export interface StartDelegationInput {
     parent: AgentLike
     signal: AbortSignal
     agentOptions?: DelegationAgentOptions
+    /** Directory the child starts in (`SubagentStartRequest.cwd`); omitted = inherit the parent's. */
+    cwd?: string
     maxDepth?: number
     /**
      * What the LEGACY request carries: an old host still accepts the persona and
@@ -701,11 +703,8 @@ function startFailure(provider: string, how: string, error: unknown, detail?: st
 const noopDispose = async (): Promise<void> => undefined
 
 /**
- * Start one child through the plan's path.
- *
- * Both paths normalise to {@link DelegationRun}, so a caller has exactly one
- * shape to handle and cannot accidentally leak an activation the host expects
- * to be disposed.
+ * Start one child through the plan's path. Both paths normalise to
+ * {@link DelegationRun}, so a caller has one shape and cannot leak a live activation.
  * @param subagents - the service (the plan already proved the path exists).
  * @param input - provider, prompt, parent, signal, the guard's restriction.
  * @returns the normalised child run.
@@ -718,6 +717,7 @@ export async function startDelegation(subagents: DelegationServices, input: Star
         prompt: [{ type: 'text', text: input.prompt }],
         parent: input.parent,
         ...(input.agentOptions === undefined ? {} : { agentOptions: input.agentOptions }),
+        ...(input.cwd === undefined ? {} : { cwd: input.cwd }),
         ...(input.maxDepth === undefined ? {} : { maxDepth: input.maxDepth }),
     }
     if (input.plan.kind === 'activation') {

@@ -11,6 +11,7 @@ import { fileURLToPath } from 'node:url'
 import { listDir, readText, resolvePath, type Logger } from 'dsh-eng-core'
 import type { Layout } from 'dsh-eng-core'
 import type { RoleGuardConfig } from './config.js'
+import { resolveModelClassRoles } from './model-class.js'
 import { isRoleError, parseRole, roleFromConfig, RoleRegistry } from './roles.js'
 
 /** Absolute path of the `roles/` directory shipped inside this package. */
@@ -63,6 +64,10 @@ export function loadRoles(config: RoleGuardConfig, layout: Layout, logger: Logge
         }
         registry.add(role)
     }
+    // LAST, after every layer: `model: @planner` is resolved against the
+    // workspace's `models.json`, and a workspace role override must be able to
+    // use the syntax exactly like a builtin one.
+    resolveModelClassRoles(registry, layout, logger)
     return registry
 }
 
@@ -95,6 +100,31 @@ function directorySignature(dirs: readonly string[]): string {
 }
 
 /**
+ * A file's cheap signature (`mtime:size`), or `missing`.
+ *
+ * `models.json` participates in the role cache key because `model: @planner` is
+ * resolved AT LOAD TIME: editing the project's model table must re-resolve the
+ * roles, otherwise a session keeps running on a class that no longer exists.
+ * Both candidate locations are covered (the namespace dir and the legacy one),
+ * exactly like `loadProjectConfig` reads them.
+ */
+function fileSignature(file: string): string {
+    try {
+        const stat = fs.statSync(file)
+        return `${stat.mtimeMs}:${stat.size}`
+    } catch {
+        return 'missing'
+    }
+}
+
+/** The `models.json` halves of the role cache signature. */
+function modelsSignature(layout: Layout): string {
+    return [path.join(layout.configDir ?? layout.rootDir, 'models.json'), path.join(layout.legacyRootDir, 'models.json')]
+        .map((file) => `${file}:${fileSignature(file)}`)
+        .join('|')
+}
+
+/**
  * Per-workspace role registries, cached by the resolved roles directory.
  *
  * The cache revalidates cheaply (directory listing + mtimes) so an operator who
@@ -121,7 +151,7 @@ export class RoleRegistryCache {
     /** Resolve (and cache) the registry for one workspace. */
     for(layout: Layout): RoleRegistry {
         const key = `${layout.rolesDir}|${layout.rootDir}`
-        const signature = directorySignature(this.dirsFor(layout))
+        const signature = `${directorySignature(this.dirsFor(layout))}|${modelsSignature(layout)}`
         const cached = this.caches.get(key)
         if (cached !== undefined && cached.signature === signature) return cached.registry
         const registry = loadRoles(this.config, layout, this.logger)

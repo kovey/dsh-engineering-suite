@@ -47,6 +47,7 @@ import { renderChildOutput, stopReasonText } from './child-output.js'
 import type { RoleGuardConfig } from './config.js'
 import { delegationWarnings } from './delegation-warnings.js'
 import type { RoleRegistryCache } from './loader.js'
+import { modelClassRefusal } from './model-class.js'
 import { rolePresetInput } from './presets.js'
 import { resolveRoute, routeLine } from './route.js'
 import type { Role } from './roles.js'
@@ -303,6 +304,35 @@ function safeAgentTeams(read: () => unknown): unknown {
     }
 }
 
+/**
+ * The full view of one role (`role_list { role }`).
+ *
+ * The model line names an unresolved `@class` reference too: a role whose model
+ * class is missing must LOOK unusable here, before someone tries to dispatch it.
+ * @param role - the resolved role.
+ */
+function renderRoleDetail(role: Role): string {
+    const model =
+        role.provider === undefined && role.model === undefined
+            ? '(继承父 Agent)'
+            : `${role.provider ?? ''}${role.model === undefined ? '' : `/${role.model}`}`
+    return [
+        `id: ${role.id}`,
+        `name: ${role.name}`,
+        `mode: ${role.mode}`,
+        `tools: ${role.tools.join(', ') || '(继承全部，deny: ' + role.deny.join(', ') + ')'}`,
+        `skills: ${role.skills.length > 0 ? `${role.skills.join(', ')}（宿主在调用时强制）` : '(未声明 = 不限制)'}`,
+        `model: ${model}`,
+        ...(role.modelProblems === undefined || role.modelProblems.length === 0
+            ? []
+            : ['model 问题（不会被静默回退）：', ...role.modelProblems.map((problem) => `- ${problem}`)]),
+        `source: ${role.source}`,
+        '',
+        '--- persona ---',
+        role.persona,
+    ].join('\n')
+}
+
 /** Register the role-guard tools. */
 export function registerTools(
     ctx: { tools: { register: (definition: never) => () => void } },
@@ -379,6 +409,10 @@ export function registerTools(
                     const available = registry.list().map((entry) => entry.id).join(', ')
                     throw new Error(`未知角色 "${roleId}"。可用角色：${available || '(无)'}。先用 role_list 查看。`)
                 }
+                // `model: @planner` that did not resolve is a refusal, not a
+                // fallback: the child would otherwise run on the host default.
+                const modelRefusal = modelClassRefusal(role)
+                if (modelRefusal !== undefined) throw new Error(modelRefusal)
                 if (agent === undefined) throw new Error('team_delegate 需要调用方 agent。')
                 const subagents = deps.subagents()
                 if (subagents === undefined) {
@@ -544,30 +578,21 @@ export function registerTools(
                 if (args.role !== undefined && args.role !== '') {
                     const role = registry.get(args.role)
                     if (role === undefined) throw new Error(`未知角色 "${args.role}"。`)
-                    return [
-                        `id: ${role.id}`,
-                        `name: ${role.name}`,
-                        `mode: ${role.mode}`,
-                        `tools: ${role.tools.join(', ') || '(继承全部，deny: ' + role.deny.join(', ') + ')'}`,
-                        `skills: ${role.skills.length > 0 ? `${role.skills.join(', ')}（宿主在调用时强制）` : '(未声明 = 不限制)'}`,
-                        `model: ${role.provider === undefined && role.model === undefined ? '(继承父 Agent)' : `${role.provider ?? ''}${role.model === undefined ? '' : `/${role.model}`}`}`,
-                        `source: ${role.source}`,
-                        '',
-                        '--- persona ---',
-                        role.persona,
-                    ].join('\n')
+                    return renderRoleDetail(role)
                 }
                 const rows = registry.list().map((role) => {
                     const tools = role.tools.length > 0 ? role.tools.join(' ') : `* -${role.deny.join(' -')}`
                     return `| ${role.id} | ${role.name} | ${role.mode} | ${tools} | ${role.skills.join(' ') || '-'} | ${role.model ?? '(继承)'} | ${role.source} |`
                 })
                 const problems = registry.problems()
+                const modelProblems = registry.list().flatMap((role) => role.modelProblems ?? [])
                 return [
                     '| id | 名称 | 模式 | 工具白名单 | 技能白名单 | 模型 | 来源 |',
                     '|----|------|------|------------|------------|------|------|',
                     ...rows,
                     '',
                     problems.length === 0 ? '所有角色文件解析正常。' : `角色文件问题：\n${problems.map((problem) => `- ${problem}`).join('\n')}`,
+                    ...(modelProblems.length === 0 ? [] : ['', '模型类引用问题（这些角色不会被派发，也不会回退宿主默认）：', ...modelProblems.map((problem) => `- ${problem}`)]),
                 ].join('\n')
             },
         }),

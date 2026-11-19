@@ -6,11 +6,16 @@
  * an invalid user configuration never reaches the runtime — it is rejected here
  * so the caller can log a warning and keep the default pipeline.
  *
+ * The gate kinds and their labels live in `gate-kinds.ts` (this file is on the
+ * structural ratchet). The split segment of the pipeline lives in
+ * `split-stages.ts` and is spliced in by `config.ts` when the host enables it.
+ *
  * @module dsh-orchestrator/pipeline
  */
 
-/** One deterministic entry/exit condition, named by the fact it asserts. */
-export type GateKind = 'spec-approved' | 'test-design' | 'quality-pass' | 'standards-pass' | 'deploy-go' | 'deploy-verified' | 'receipt' | 'none'
+import { DEFAULT_GATE_LABEL, GATE_KINDS, defaultGatePhase, type GateKind } from './gate-kinds.js'
+
+export type { GateKind }
 
 /** A gate as a user writes it in config: a known kind, or an explicit spec. */
 export type GateInput =
@@ -139,19 +144,6 @@ export type Pipeline = StageConfig[]
 /** The verdict the transition policy maps onto a stage result. */
 export type Verdict = 'PASS' | 'WARN' | 'BLOCK'
 
-const GATE_KINDS: readonly GateKind[] = ['spec-approved', 'test-design', 'quality-pass', 'standards-pass', 'deploy-go', 'deploy-verified', 'receipt', 'none']
-
-const DEFAULT_GATE_LABEL: Record<GateKind, string> = {
-    'spec-approved': '规格已审批（mission.spec.approvedAt）',
-    'test-design': '测试设计已登记（mission.testDesign）',
-    'quality-pass': '质量门禁 PASS 且晚于本阶段进入时间（store.lastGate）',
-    'standards-pass': '规范门禁 PASS 且晚于本阶段进入时间（dsh-standards-gate 的门禁记录）',
-    'deploy-go': '部署已执行且通过（dsh-deploy-gate 的门禁记录，晚于本阶段进入时间）',
-    'deploy-verified': '上线后验证通过（dsh-deploy-gate 的门禁记录，晚于本阶段进入时间）',
-    receipt: '已签发交付回执（store.readReceipts）',
-    none: '无门禁',
-}
-
 /**
  * The default pipeline — docs.md §5, ids are a contract.
  *
@@ -255,7 +247,11 @@ export const DEFAULT_STAGES: readonly StageConfig[] = [
         difficulty: 'deep', // 写代码是最难的一步，值得用最强的模型
         prompt: '按规格实现代码',
         requiredPlugins: ['dsh-role-guard'],
-        gate: { kind: 'none', phase: 'entry', label: DEFAULT_GATE_LABEL.none, verdict: 'pass-or-warn' },
+        // The entry condition is the split workflow's: a mission without a plan
+        // is a plain implement (passes), a mission with a plan may only start
+        // while the plan is still the REVIEWED one. Everything else about this
+        // stage stays as it was.
+        gate: { kind: 'split-reviewed', phase: 'entry', label: DEFAULT_GATE_LABEL['split-reviewed'], verdict: 'pass-or-warn' },
         role: 'developer',
         onFail: 'spec-approve',
         next: 'quality-verify',
@@ -343,7 +339,7 @@ function normalizeGate(value: unknown, where: string, issues: string[]): GateSpe
         issues.push(`${where}: gate.verdict 必须是 "pass-only" 或 "pass-or-warn"（条件边：门禁 WARN 时是否放行）`)
         return undefined
     }
-    const resolvedPhase: 'entry' | 'exit' = phase === 'entry' || phase === 'exit' ? phase : kind === 'quality-pass' || kind === 'receipt' ? 'exit' : 'entry'
+    const resolvedPhase: 'entry' | 'exit' = phase === 'entry' || phase === 'exit' ? phase : defaultGatePhase(kind)
     return {
         kind,
         phase: resolvedPhase,

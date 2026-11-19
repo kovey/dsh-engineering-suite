@@ -1,0 +1,175 @@
+/**
+ * The shapes the split runner produces and the seams it reads.
+ *
+ * Kept apart from the runner so the wiring (`split-dispatch.ts`), the tests and a
+ * later reader of `split/run.json` all describe the same record — and so the
+ * runner file stays inside the structural size limits.
+ *
+ * The `worktrees` seam is the reason the runner is testable without spawning real
+ * agents: every git side effect (create a worktree, read its HEAD, merge a task
+ * branch, remove the worktree) goes through one object whose production value is
+ * `split-run-git.ts` and whose test value is a plain in-memory fake. The DEFAULT
+ * is the real one, so a caller that forgets the seam still runs on git; it is not
+ * an "opt in to real git" switch that could make a deployment silently skip the
+ * worktree step.
+ *
+ * @module dsh-orchestrator/split-run-types
+ */
+
+import path from 'node:path'
+import type { AgentLike, DelegationPresets, DelegationServices, Layout } from 'dsh-eng-core'
+import type { CleanupWorktreeResult, CreateWorktreeResult, ModelsConfig, ReworkReport, ReworkSignal, SplitPlan } from 'dsh-eng-core/split'
+
+/** How one task ended (a task that never started says so). */
+export type SplitTaskState = 'pending' | 'done' | 'failed' | 'blocked'
+
+/** One task's outcome inside one run. */
+export interface SplitTaskRun {
+    id: string
+    state: SplitTaskState
+    /** The commit the task branch produced (absent when nothing was committed). */
+    commit?: string
+    /** Dispatch attempts (0 = never started). */
+    attempts: number
+    /** Which model class the worker ran on (planner = escalated, AC-011). */
+    modelClass?: 'worker' | 'planner'
+    model?: string
+    provider?: string
+    worktree?: string
+    branch?: string
+    /** Evidence rows imported into the main mission from this task. */
+    imported: number
+    /** Whether the worktree was removed (false when a pending import refused it). */
+    cleanedUp: boolean
+    /** Rework facts observed for this task (AC-011). */
+    signals: ReworkSignal[]
+    problems: string[]
+}
+
+/** Why the run produced the tasks it produced. */
+export type SplitRunState =
+    /** Workers were dispatched (the normal outcome). */
+    | 'ran'
+    /** AC-005: plain implement, no worktrees and no workers. */
+    | 'not-worth-splitting'
+    /** AC-005: too large — should be several missions. */
+    | 'too-large'
+    /** The plan is not the reviewed one, or the graph is unschedulable. */
+    | 'refused'
+
+/** Everything one {@link runSplitPlan} call reports (also written to `split/run.json`). */
+export interface SplitRunResult {
+    /** `true` only when every task finished and every one of its rows was imported. */
+    ok: boolean
+    state: SplitRunState
+    planDigest?: string
+    tasks: SplitTaskRun[]
+    /** Total evidence rows imported into the main mission. */
+    imported: number
+    /** The rework ratio and the escalation decision (AC-011). */
+    rework: ReworkReport
+    problems: string[]
+    warnings: string[]
+    /** Absolute path of `split/run.json` (absent when nothing was written). */
+    file?: string
+}
+
+/** What one worktree's HEAD says. */
+export interface TaskCommit {
+    ok: boolean
+    commit?: string
+    /** The commit's subject line (the taskId prefix is checked against it). */
+    subject?: string
+    problems: string[]
+}
+
+/** What one branch merge did. */
+export interface TaskMerge {
+    ok: boolean
+    /** `true` when this call merged something, `false` when it was already merged. */
+    merged: boolean
+    problems: string[]
+}
+
+/** The git side effects the runner performs, behind one testable seam. */
+export interface SplitWorktrees {
+    create(input: { mainTree: string; missionId: string; taskId: string; base?: string }): CreateWorktreeResult
+    head(worktree: string): TaskCommit
+    merge(input: { mainTree: string; branch: string; taskId: string }): TaskMerge
+    cleanup(input: { mainTree: string; missionId: string; taskId: string }): CleanupWorktreeResult
+}
+
+/** The role-guard answer the runner needs (structural: no cross-package import). */
+export interface SplitRolePlan {
+    persona: string
+    toolFilter?: { allow?: readonly string[]; deny?: readonly string[] }
+}
+
+/** The role-guard seam, narrowed to the one question the runner asks. */
+export interface SplitRoleGuard {
+    plan(request: { role: string; cwd?: string; agent?: AgentLike }): SplitRolePlan
+    /** Record the child's role (the skill whitelist is enforced from this row). */
+    bind?(request: { role: string; sessionId: string; cwd?: string; agent?: AgentLike }): unknown
+}
+
+/** Everything one run needs (one object: the runner takes exactly one parameter). */
+export interface SplitRunnerDeps {
+    layout: Layout
+    missionId: string
+    /** The main work tree (defaults to `layout.cwd`). */
+    cwd?: string
+    /** The plan to run; omitted = `split/plan.json`. A digest mismatch refuses. */
+    plan?: SplitPlan
+    /** The effective `models.json` of this workspace. */
+    models: ModelsConfig
+    /** Ceiling on one group's concurrency (defaults to `models.split.maxParallel`). */
+    maxParallel?: number
+    /** `ctx.subagents`; absent = refuse (fail closed, never "do it in prose"). */
+    subagents?: DelegationServices
+    /** The preset registry of the dispatching plugin (`agentPresets`). */
+    presets?: DelegationPresets
+    /** The role-guard service: the worker's identity and tool whitelist. */
+    roleGuard?: () => SplitRoleGuard | undefined
+    /** `ctx.subagents` provider name. */
+    provider: string
+    agent?: AgentLike
+    signal?: AbortSignal
+    maxDepth?: number
+    /** Deadline for one worker; 0/absent = no deadline. */
+    taskTimeoutMs?: number
+    /** Worktree/merge seam (tests); production defaults to real git. */
+    worktrees?: SplitWorktrees
+    /** Where progress lines go (default: nowhere — the artifacts are the record). */
+    log?: (line: string) => void
+    /** Clock override (tests make `run.json` reproducible). */
+    now?: () => number
+}
+
+/**
+ * One run's mutable state, shared by the runner and its finishing steps.
+ *
+ * A plain record (not a class): the finish helpers are pure functions over it, so
+ * "what happened" is exactly what `split/run.json` holds.
+ */
+export interface SplitRunBook {
+    layout: Layout
+    missionId: string
+    /** Absolute workspace root (the main work tree). */
+    mainTree: string
+    planDigest: string
+    models: ModelsConfig
+    maxParallel: number
+    seam: SplitWorktrees
+    /** Run start (epoch ms). */
+    at: number
+    /** One record per plan task, in plan order (even tasks that never started). */
+    tasks: SplitTaskRun[]
+    problems: string[]
+    warnings: string[]
+    log: (line: string) => void
+}
+
+/** `missions/<id>/split/run.json` — the durable record of one dispatch. */
+export function splitRunFile(layout: Layout, missionId: string): string {
+    return path.join(layout.missionsDir, missionId, 'split', 'run.json')
+}

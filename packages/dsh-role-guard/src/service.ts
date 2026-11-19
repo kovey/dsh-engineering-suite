@@ -24,6 +24,7 @@
 import fs from 'node:fs'
 import type { AgentLike, Layout, LayoutOptions, MissionStoreRegistry } from 'dsh-eng-core'
 import type { RoleBinding, RoleBindingStore } from './bindings.js'
+import { modelClassRefusal } from './model-class.js'
 import { roleRoute, resolveRoute, type EffectiveRoute } from './route.js'
 import type { Role } from './roles.js'
 import { recordStageDelegation } from './stage-delegations.js'
@@ -143,6 +144,15 @@ export function createRolePlanner(deps: RolePlannerDeps): RoleGuardService {
             if (refusal !== undefined) {
                 deps.logger?.warn(`service.plan 拒绝角色 ${role.id}：${refusal.split('\n')[0] ?? refusal}`)
                 throw new Error(refusal)
+            }
+            // SAME rule as `team_delegate`: a `model: @class` reference that did
+            // not resolve is a refusal here too — an autonomous dispatcher must
+            // not fall back to the host default where the model-facing path does
+            // not.
+            const modelRefusal = modelClassRefusal(role)
+            if (modelRefusal !== undefined) {
+                deps.logger?.warn(`service.plan 拒绝角色 ${role.id}：${modelRefusal.split('\n')[0] ?? modelRefusal}`)
+                throw new Error(modelRefusal)
             }
             return {
                 role: role.id,

@@ -34,6 +34,15 @@ export interface Role {
     model?: string
     reasoningEffort?: string
     maxTokens?: number
+    /**
+     * Problems resolving a `model: @class` reference (`model-class.ts`).
+     *
+     * Non-empty means "this role named a model class that has no model": every
+     * dispatch path refuses it by name. Falling back to the host default here
+     * would silently run a planner on the cheapest available model — the exact
+     * downgrade the class reference exists to make visible.
+     */
+    modelProblems?: readonly string[]
     /** The role's persona, registered as the child's shadowing persona section. */
     persona: string
     /** Where the role came from (`builtin`, a file path, or `config`). */

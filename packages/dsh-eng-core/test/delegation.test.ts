@@ -439,6 +439,38 @@ test('0.2.2-rc.2 host: a FLAT activation spec still starts (that host never read
     assert.deepEqual(started, [{ preset: 'test:one', depth: 1, parent: 'agent-9' }])
 })
 
+test('the child directory rides in both activation shapes, and is absent when the caller gives none', async () => {
+    // The split runner places each worker inside its own worktree; a `cwd` that
+    // is silently dropped would start the worker in the main tree, where its
+    // local evidence lands in the MAIN mission ledger (AC-007's pollution).
+    const specs: { request?: { cwd?: string }; cwd?: string }[] = []
+    const services: DelegationServices = {
+        startActivation: async (spec) => {
+            specs.push(spec as { request?: { cwd?: string }; cwd?: string })
+            return { childId: `child-${specs.length}`, result: Promise.resolve(result()), dispose: async () => undefined }
+        },
+        list: () => ['spawn'],
+        getProvider: (name) => ({ name, capabilities: { agentPreset: true } }),
+    }
+    const base = {
+        owner: OWNER,
+        provider: 'spawn',
+        plan: { kind: 'activation', presetId: 'test:one' } as const,
+        label: 'cwd',
+        prompt: 'hi',
+        parent: { id: 'agent-1' },
+        signal: new AbortController().signal,
+    }
+    const withCwd = await startDelegation(services, { ...base, cwd: '/tmp/worktrees/m1/T-001' })
+    await withCwd.dispose()
+    assert.equal(specs[0]?.request?.cwd, '/tmp/worktrees/m1/T-001', 'rc.1 reads spec.request')
+    assert.equal(specs[0]?.cwd, '/tmp/worktrees/m1/T-001', 'rc.2 reads the flat spec')
+    const withoutCwd = await startDelegation(services, base)
+    await withoutCwd.dispose()
+    assert.equal(specs[1]?.request?.cwd, undefined)
+    assert.equal(specs[1]?.cwd, undefined)
+})
+
 test('a legacy start carries persona/toolFilter in the request and still normalises', async () => {
     const host = legacyServices({ withDispose: false })
     const run = await startDelegation(host.services, {

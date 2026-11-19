@@ -25,8 +25,8 @@
 import path from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import { MissionStoreRegistry, createDelegationPresets, createLogger, expandHome, sessionIdOf } from 'dsh-eng-core'
-import type { AgentLike, Logger } from 'dsh-eng-core'
-import { resolveConfig } from './config.js'
+import type { AgentLike, ApprovalLike, Logger } from 'dsh-eng-core'
+import { resolveConfig, type OrchestratorConfig } from './config.js'
 import { ORCHESTRATOR_SERVICE, createOrchestratorService } from './enter-implement.js'
 import { AutoAdvanceSessions, autoAdvanceStages, createAutoAdvanceHook } from './hooks.js'
 import { createProbes, mergeProbes } from './probes.js'
@@ -129,6 +129,7 @@ export function apply(ctx: Context, config: unknown = {}): void {
         }
 
         const clockService = clockFrom(context)
+        const approvalSeam = approvalSeamOf(context)
 
         const tools = registerTools(context as never, {
             config: resolved,
@@ -137,6 +138,7 @@ export function apply(ctx: Context, config: unknown = {}): void {
             // view of a delegated child may differ from the root's.
             probesFor: (agent) => createProbes(context, resolved.probes, agent),
             dispatch: dispatchDeps,
+            approval: approvalSeam,
             // A host MAY provide a `clock` service; a real deployment does not, so
             // metrics keep using the wall clock. Tests provide a frozen one, which
             // is what makes "two runs are byte-identical" a provable property
@@ -145,12 +147,7 @@ export function apply(ctx: Context, config: unknown = {}): void {
         })
 
         const disposers: (() => void)[] = [...tools.disposers]
-        // The optional `orchestrator` service: `spec_approve` asks it to walk the
-        // mission up to `implement` (AC-001). It is provided, never injected, so a
-        // runtime without `provide` — or a sibling plugin that never asks — is not
-        // an error; `enterImplement` reuses the `advance` code path, no dispatching.
-        const service = createOrchestratorService({ config: resolved, stores, probesFor: () => createProbes(context, resolved.probes, undefined) })
-        disposers.push(provideOptionalService(context, ORCHESTRATOR_SERVICE, service, logger))
+        disposers.push(registerOrchestratorService(context, resolved, stores, approvalSeam, logger))
         // The automatic transition (docs.md §4.2 自动触发下一阶段): opt-in per
         // stage, gate-driven, and a no-op — one array check — when no stage
         // declares `autoAdvance: true`.
@@ -210,6 +207,42 @@ export function apply(ctx: Context, config: unknown = {}): void {
     } catch (error) {
         logger.error('apply failed:', error)
     }
+}
+
+/**
+ * The host approval seam, read per call.
+ *
+ * The split review asks a HUMAN through it. It is an accessor, not a captured
+ * value: a host that withdraws the service mid-session must make the next review
+ * refuse ("无审批通道"), not keep using a stale reference.
+ * @param context - host context.
+ */
+function approvalSeamOf(context: ContextLike): () => ApprovalLike | undefined {
+    return (): ApprovalLike | undefined => context.get('approval') as ApprovalLike | undefined
+}
+
+/**
+ * Register the optional `orchestrator` service (`spec_approve` asks it to walk
+ * the mission up to `implement`, AC-001).
+ *
+ * It is provided, never injected, so a runtime without `provide` — or a sibling
+ * plugin that never asks — is not an error; `enterImplement` reuses the `advance`
+ * code path and never dispatches a child.
+ */
+function registerOrchestratorService(
+    context: ContextLike,
+    config: OrchestratorConfig,
+    stores: MissionStoreRegistry,
+    approval: () => ApprovalLike | undefined,
+    logger: Logger,
+): () => void {
+    const service = createOrchestratorService({
+        config,
+        stores,
+        probesFor: () => createProbes(context, config.probes, undefined),
+        approval,
+    })
+    return provideOptionalService(context, ORCHESTRATOR_SERVICE, service, logger)
 }
 
 /**

@@ -30,6 +30,10 @@
       "types": "./dist/context-error.d.ts",
       "default": "./dist/context-error.js"
     },
+    "./split": {
+      "types": "./dist/split.d.ts",
+      "default": "./dist/split.js"
+    },
     "./package.json": "./package.json"
   },
   "files": [

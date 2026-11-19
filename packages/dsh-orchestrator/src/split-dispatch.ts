@@ -1,0 +1,126 @@
+/**
+ * Where the split workflow becomes PRODUCTION: entering `implement` RUNS the plan.
+ *
+ * The runner (`split-runner.ts`) is a library; this module is the one call site
+ * that makes it happen without a model in the loop. It answers four questions
+ * before delegating anything, and every "no" has its own outcome:
+ *
+ *  - Is the split workflow enabled (`config.split.enabled`)? No → plain
+ *    `implement`, exactly as before (returns `undefined`, so the ordinary stage
+ *    dispatch runs).
+ *  - Is this the stage whose entry gate is `split-reviewed` (i.e. `implement`)?
+ *    No → plain dispatch.
+ *  - Is there a plan on disk, and is it STILL the reviewed one? A stale/rejected/
+ *    missing review is a refusal — never a fallthrough, because falling through
+ *    would let the plain `implement` path do work the plan was supposed to split
+ *    (and the negative constraint says no worker runs on an unreviewed split).
+ *  - Is splitting worth it (AC-005)? `not-worth-splitting` / `too-large` → plain
+ *    `implement`; the split gate already recorded that verdict.
+ *
+ * Not gated by `autoDispatch.enabled` on purpose: enabling `split` IS the
+ * deployment decision to dispatch workers, and requiring a second switch would
+ * leave the feature dead by default. It is still "dispatch ≠ settlement": the
+ * `implement` stage remains `entered` until its exit gate passes, and the receipt
+ * is the lead's (AC-010).
+ *
+ * @module dsh-orchestrator/split-dispatch
+ */
+
+import { resolveLayout, type AgentLike, type MissionRecord } from 'dsh-eng-core'
+import { decideSplit, loadModelsConfig, readSplitPlan, splitReviewStatus } from 'dsh-eng-core/split'
+import type { DispatchDeps, DispatchOutcome } from './dispatch.js'
+import type { StageConfig } from './pipeline.js'
+import { runSplitPlan } from './split-runner.js'
+import type { SplitRunResult } from './split-run-types.js'
+
+/** What the dispatcher already knows about the stage it is entering. */
+export interface SplitDispatchInput {
+    stage: StageConfig
+    mission: MissionRecord
+    cwd: string
+    agent?: AgentLike
+    signal?: AbortSignal
+    attempt?: number
+}
+
+/** The model classes the run actually used, as one report phrase. */
+function describeRoutes(result: SplitRunResult): string {
+    const used = [...new Set(result.tasks.filter((task) => task.model !== undefined).map((task) => `${task.modelClass}=${task.provider === undefined ? '' : `${task.provider}/`}${task.model}`))]
+    return used.length === 0 ? '(没有启动 worker)' : used.join('、')
+}
+
+/** One line per task (`T-001 done`), so the report says who did what. */
+function describeTasks(result: SplitRunResult): string {
+    return result.tasks.map((task) => `${task.id} ${task.state}`).join('、') || '(没有子任务)'
+}
+
+/**
+ * Turn a run result into the stage dispatcher's outcome (never a settlement).
+ *
+ * The per-task detail and the rework numbers live in `split/run.json`
+ * (`outputFile`); the report carries one compact line so a stage entry does not
+ * turn into a wall of text.
+ */
+function outcomeOf(result: SplitRunResult, modelProblems: readonly string[]): DispatchOutcome {
+    const modelNotes = modelProblems.length === 0 ? '' : `；models.json 有 ${modelProblems.length} 条回退/忽略（首条：${modelProblems[0] ?? ''}）`
+    if (result.state === 'refused') {
+        return {
+            dispatched: false,
+            note: [`拆分派发未执行：${result.problems[0] ?? '派发前提不成立'}`, ...(result.file === undefined ? [] : [`记录：${result.file}`])].join('\n'),
+        }
+    }
+    const headline = `拆分派发：${result.tasks.length} 个子任务（${describeTasks(result)}），导入 ${result.imported} 条证据，返工率 ${result.rework.reworked}/${result.rework.started} = ${result.rework.ratio.toFixed(3)}（阈值 ${result.rework.threshold}${result.rework.escalate ? '，已升级 planner 模型' : ''}）`
+    return {
+        dispatched: true,
+        runId: `split-${(result.planDigest ?? '').slice(0, 12) || 'plan'}`,
+        ...(result.file === undefined ? {} : { outputFile: result.file }),
+        stopReason: result.ok ? 'completed' : 'error',
+        roleNote: `${headline}；每个子任务一个 worktree + worker 角色（模型 ${describeRoutes(result)}；orchestrate 已从 worker 作用域剔除）${modelNotes}`,
+        ...(result.ok ? {} : { error: result.problems.length === 0 ? '部分子任务未完成（见 run.json）' : result.problems.join('；') }),
+    }
+}
+
+/**
+ * Run the reviewed split plan when this stage entry is the one that should.
+ *
+ * @param deps - the dispatcher's deps (config, subagents, role-guard, presets).
+ * @param input - the stage being entered, the mission and the caller's context.
+ * @returns the outcome to report, or `undefined` to let the ordinary stage
+ *   dispatch run (plain `implement`).
+ */
+export async function splitDispatch(deps: DispatchDeps, input: SplitDispatchInput): Promise<DispatchOutcome | undefined> {
+    // `?.` on purpose: a hand-wired dispatch deps (a unit test, an older
+    // embedding that predates the split workflow) has no `split` section at all,
+    // and that must mean "not enabled", never a crash in the dispatcher.
+    if (deps.config.split?.enabled !== true) return undefined
+    if (input.stage.gate.kind !== 'split-reviewed') return undefined
+    const layout = resolveLayout(input.cwd, deps.config.layout)
+    const stored = readSplitPlan(layout, input.mission.id)
+    if (stored === undefined) return undefined
+    const review = splitReviewStatus(layout, input.mission.id)
+    if (!review.ok) {
+        return { dispatched: false, note: `拆分派发未执行：${review.detail}（未经审核的拆分不允许派发 worker）` }
+    }
+    const models = loadModelsConfig(layout, { profile: deps.config.split.models })
+    if (decideSplit(stored.plan, models.config.split).decision !== 'split') return undefined
+    const result = await runSplitPlan({
+        layout,
+        missionId: input.mission.id,
+        cwd: input.cwd,
+        plan: stored.plan,
+        models: models.config,
+        maxParallel: models.config.split.maxParallel,
+        ...(deps.subagents() === undefined ? {} : { subagents: deps.subagents() }),
+        ...(deps.presets === undefined ? {} : { presets: deps.presets }),
+        ...(deps.roleGuard === undefined ? {} : { roleGuard: deps.roleGuard }),
+        provider: deps.config.autoDispatch.provider,
+        ...(input.agent === undefined ? {} : { agent: input.agent }),
+        ...(input.signal === undefined ? {} : { signal: input.signal }),
+        maxDepth: deps.config.autoDispatch.maxDepth,
+        taskTimeoutMs: deps.config.autoDispatch.timeoutMs,
+    })
+    const outcome = outcomeOf(result, models.problems)
+    // The attempt rides along like it does for the ordinary stage dispatch, so the
+    // stage artifact names which entry produced this run.
+    return input.attempt === undefined ? outcome : { ...outcome, attempt: input.attempt }
+}

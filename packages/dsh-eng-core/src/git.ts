@@ -9,7 +9,7 @@
  * @module dsh-eng-core/git
  */
 
-import { execFileSync } from 'node:child_process'
+import { execFileSync, spawnSync } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
 import { sha256 } from './digest.js'
@@ -127,4 +127,40 @@ export function gitDiffSummary(cwd: string, maxBytes = 4_000): string {
     if (!stat.ok) return '(git diff unavailable)'
     const text = stat.out.trim() === '' ? '(no changes against HEAD)' : stat.out.trim()
     return text.length <= maxBytes ? text : `${text.slice(0, maxBytes)}\n…[truncated]`
+}
+
+/**
+ * One commit's merge state (AC-008: 证据的 commit 必须已被合并进主树).
+ *
+ * `git merge-base --is-ancestor <commit> <ref>` is the question "is that commit
+ * part of this history", answered by git itself — never by a branch name the
+ * caller typed. It is spawned with `-C <mainTree>` and an ABSOLUTE tree path so
+ * the answer is about the tree named, not about the process cwd.
+ *
+ * A non-zero/unknown outcome is never "merged": exit code 1 means "not an
+ * ancestor", anything else (128: bad object, missing repo) means "could not
+ * check", and both keep the evidence out of the ledger.
+ */
+export interface AncestorCheck {
+    /** `true` only when git exited 0 (the commit IS in the tree's history). */
+    merged: boolean
+    /** git's exit code, or `null` when git could not be started. */
+    exitCode: number | null
+    /** Why the check could not run (spawn failure only). */
+    error?: string
+}
+
+/**
+ * Whether `commit` is already part of `ref`'s history in `mainTree`.
+ * @param mainTree - absolute path of the main work tree.
+ * @param commit - the commit to look for (hex; validated by the caller).
+ * @param ref - the ref to search from (default `HEAD`).
+ */
+export function isMergedInto(mainTree: string, commit: string, ref = 'HEAD'): AncestorCheck {
+    const result = spawnSync('git', ['-C', mainTree, 'merge-base', '--is-ancestor', commit, ref], {
+        encoding: 'utf8',
+        timeout: 15_000,
+    })
+    if (result.error !== undefined) return { merged: false, exitCode: null, error: result.error.message }
+    return { merged: result.status === 0, exitCode: result.status }
 }

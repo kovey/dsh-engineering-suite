@@ -33,8 +33,11 @@ export function sectionText(config: RoleGuardConfig, registry: RoleRegistry | un
         for (const role of roles) {
             const tools = role.tools.length > 0 ? role.tools.join('/') : `全部（deny: ${role.deny.join('/') || '无'}）`
             const skills = role.skills.length > 0 ? role.skills.join('/') : '不限'
+            // A role whose `model: @class` did not resolve is listed but marked:
+            // "available" and "dispatchable" must not read the same in the prompt.
+            const blocked = (role.modelProblems ?? []).length > 0 ? '；⚠️ 模型类未配置，派发会被拒绝（见 role_list）' : ''
             lines.push(
-                `- \`${role.id}\`（${role.name}，${role.mode === 'read' ? '只读' : '可写'}）：${role.description || '（未填写说明）'}；工具：${tools}；技能：${skills}`,
+                `- \`${role.id}\`（${role.name}，${role.mode === 'read' ? '只读' : '可写'}）：${role.description || '（未填写说明）'}；工具：${tools}；技能：${skills}${blocked}`,
             )
         }
         lines.push('')

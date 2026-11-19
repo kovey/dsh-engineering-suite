@@ -28,4 +28,8 @@ coverage/
 /.dsh/engineering-suite/deploy/
 /.dsh/engineering-suite/interaction/
 /.dsh/engineering-suite/coverage/
+# 子任务 worktree（AC-006）：每个并行子任务一个独立 checkout，里面的文件是
+# 工作副本而不是仓库内容；不忽略的话它们会以未跟踪文件的形式出现在主树的
+# `git status` 里，把每一次"干净工作区"检查变成脏。
+/.dsh/engineering-suite/worktrees/
 /.dsh/engineering-suite/*.jsonl

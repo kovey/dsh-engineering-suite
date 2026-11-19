@@ -49,12 +49,27 @@ persona: |
 
 查找顺序（**后者覆盖前者**）：
 
-1. 本包自带 `roles/`（`developer` / `reviewer` / `qa`）；
+1. 本包自带 `roles/`（`developer` / `reviewer` / `qa` / `planner` / `worker`）；
 2. 工作区 `<root>/roles/*.md`（默认 `.dsh/roles/`）；
 3. 配置里的 `roleDirs`；
 4. 配置里的内联 `roles: [...]`。
 
 解析失败的角色**不会**让插件崩：错误会出现在 `role_list` 输出里，其余角色照常可用。
+
+### 模型类引用（`model: @planner`）
+
+角色文件的 `model` 除了字面量 `provider/model`，也可以写 **模型类引用**：
+
+```markdown
+model: '@planner'        # 用项目级 models.json 的 planner 段填充 provider/model/reasoningEffort
+```
+
+类定义在 `<root>/models.json`（`planner` / `worker` 两段，见 `dsh-eng-core/split`）。解析规则：
+
+- 字面量 `provider/model` **原样保留**；
+- `@` 引用在角色加载时解析，`models.json` 改动会触发角色重载；
+- 该类**没有配置 model** 时：角色仍出现在 `role_list` 里（并列出问题），但 `team_delegate` 与
+  `role-guard` 服务都会**明确拒绝**派发，**绝不回退宿主默认模型**——那会把"拆分/实现"悄悄跑在别的模型上。
 
 ## 工具
 

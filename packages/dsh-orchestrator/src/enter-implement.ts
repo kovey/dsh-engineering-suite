@@ -27,7 +27,7 @@
  * @module dsh-orchestrator/enter-implement
  */
 
-import type { AgentLike, MissionRecord, MissionStore, MissionStoreRegistry } from 'dsh-eng-core'
+import type { AgentLike, ApprovalLike, MissionRecord, MissionStore, MissionStoreRegistry } from 'dsh-eng-core'
 import type { OrchestratorConfig } from './config.js'
 import { evaluateGate } from './gates.js'
 import { isGated, stageById, type StageConfig } from './pipeline.js'
@@ -46,8 +46,18 @@ export const ENTER_IMPLEMENT_TARGET = 'implement'
  * The default pipeline reaches `implement` from its first stage in three
  * settlements; the fourth is slack for a custom pipeline. A bound (not a loop
  * until "it worked") is what makes "no skipping" provable.
+ *
+ * When the host enables the split workflow the pipeline grows by two stages
+ * between `spec-approve` and `implement`, so the bound is derived from the
+ * pipeline length — a fixed constant would strand an approved mission at
+ * `split-review` with a message about the stage order.
  */
 export const ENTER_IMPLEMENT_MAX_STEPS = 4
+
+/** The step budget of one walk: the documented bound, or enough for THIS pipeline. */
+function stepBudget(stages: readonly StageConfig[]): number {
+    return Math.max(ENTER_IMPLEMENT_MAX_STEPS, stages.length + 1)
+}
 
 /** The answer of {@link OrchestratorService.enterImplement}. */
 export interface EnterImplementResult {
@@ -82,11 +92,23 @@ export interface OrchestratorServiceDeps {
      * the honest question (a synthetic agent would answer a different one).
      */
     probesFor: (agent: AgentLike | undefined) => Record<string, PluginProbe>
+    /**
+     * The host approval seam. Forwarded to the shared sequence so a walk that
+     * reaches the split workflow can ask a human (`split-review`) instead of
+     * being unable to settle the stage; absent keeps the walk's old behaviour
+     * for every non-split pipeline.
+     */
+    approval?: () => ApprovalLike | undefined
 }
 
 /** Build the service object registered as `orchestrator`. */
 export function createOrchestratorService(deps: OrchestratorServiceDeps): OrchestratorService {
-    const sequence: SequenceDeps = { config: deps.config, stores: deps.stores, probesFor: deps.probesFor }
+    const sequence: SequenceDeps = {
+        config: deps.config,
+        stores: deps.stores,
+        probesFor: deps.probesFor,
+        ...(deps.approval === undefined ? {} : { approval: deps.approval }),
+    }
     return { enterImplement: (missionId, cwd) => safelyEnter(sequence, missionId, cwd ?? process.cwd()) }
 }
 
@@ -125,7 +147,8 @@ async function enterImplement(sequence: SequenceDeps, missionId: string, cwd: st
             message: `当前流水线没有 ${ENTER_IMPLEMENT_TARGET} 阶段（config.stages: ${sequence.config.stages.map((stage) => stage.id).join(' → ') || '(空)'}）：无法进入 implement。`,
         }
     }
-    for (let step = 0; step < ENTER_IMPLEMENT_MAX_STEPS; step += 1) {
+    const budget = stepBudget(sequence.config.stages)
+    for (let step = 0; step < budget; step += 1) {
         const latest = store.read(missionId) ?? mission
         const stage = stageById(sequence.config.stages, latest.stage)
         if (stage === undefined) return notInPipeline(latest, cwd)
@@ -147,7 +170,7 @@ async function enterImplement(sequence: SequenceDeps, missionId: string, cwd: st
     return {
         ok: false,
         ...(latest?.stage === undefined ? {} : { stage: latest.stage }),
-        message: `已推进 ${ENTER_IMPLEMENT_MAX_STEPS} 步仍未到达 ${ENTER_IMPLEMENT_TARGET}（当前阶段 ${latest?.stage ?? '(未知)'}）：请检查 config.stages 的流水线顺序。`,
+        message: `已推进 ${budget} 步仍未到达 ${ENTER_IMPLEMENT_TARGET}（当前阶段 ${latest?.stage ?? '(未知)'}）：请检查 config.stages 的流水线顺序。`,
     }
 }
 
@@ -167,7 +190,12 @@ function reached(stages: readonly StageConfig[], stage: StageConfig, target: Sta
 function entryBlocked(sequence: SequenceDeps, store: MissionStore, mission: MissionRecord, stage: StageConfig): string | undefined {
     if (stage.gate.phase !== 'entry' || !isGated(stage.gate)) return undefined
     const current = readStageResult(store, mission.id, stage.id)
-    const outcome = evaluateGate(stage.gate, { store, mission, current })
+    const outcome = evaluateGate(stage.gate, {
+        store,
+        mission,
+        current,
+        ...(sequence.config.split.models === undefined ? {} : { models: sequence.config.split.models }),
+    })
     if (outcome.ok) return undefined
     return `${outcome.detail}${outcome.fix === undefined ? '' : `；修复：${outcome.fix}`}`
 }
