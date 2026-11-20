@@ -1,5 +1,42 @@
 ## [未发布]
 
+### 功能 · 拆分审核与需求审批同体验：可读的 `plan.md` + 同一份只读预览 + TUI 菜单
+
+真实落差：`spec_approve` 在 nvim-tui 里给 `ui.picker` 菜单 + 打开文档的**只读预览**（viewer → panel →
+float 降级），而 `split-review` 只有一张宿主 approval 文字卡——被审核的是 `split/plan.json`，审核的人
+既没有可读文档，也打不开它。这一轮把两者拉平，并把预览实现收敛成一份（不改变任何交付判定：不写门禁、
+不被 `mission_complete` 读取）。
+
+- **`split/plan.md`（AC-001）**：新增 `packages/dsh-eng-core/src/split-plan-md.ts` 与
+  `split-plan-write.ts`，`saveSplitPlan` 一次写两份——`plan.json`（门禁/派发/导入认的摘要）与 `plan.md`
+  （标题、摘要、任务表 id/目标/路径/覆盖 AC/依赖、并行组、三道校验结果、写入时的审核状态）。**同一写入点**：
+  任何写 `plan.json` 的路径都会重写 md，`split_plan` 工具把它刚跑的三道校验一并写进去；先写 JSON 再读审核
+  状态渲染，所以重拆后文档会写"必须重新审核"而不是重复旧批准。没跑校验的库路径如实写"本次写入未附校验
+  结果"，不伪造通过。
+- **预览只保留一份（AC-003）**：把 `spec-gate/src/review.ts` 里的 `previewArtifact`/面板/浮窗降级/`q` 关闭
+  的 viewer 抽到新子路径 `dsh-eng-core/preview`（`preview-open.ts` 类型与文件级原语、`preview-surface.ts`
+  展示与状态），`dsh-spec-gate` 与 `dsh-orchestrator` 都从 eng-core 引入，**仓库里没有第二份实现**。降级
+  顺序与提示文案逐字不变；一个进程只保留一个预览面；面板 slot 由调用方给（spec 仍是 `dsh-spec-gate:review`）。
+- **TUI 菜单（AC-002）**：新增 `packages/dsh-orchestrator/src/split-review-tui.ts`。宿主提供
+  `ctx.get('nvim-tui')` 且暴露 `picker` 时，`split-review` 的菜单是四项——「查看拆分计划（只读预览，q 关闭）」/
+  「✅ 批准并派发」/「🛑 打回重写」/「取消」；查看用 eng-core 的预览打开 `plan.md`，关闭后回到菜单（最多 20 步、
+  15 分钟截止、跟随 signal），**不写任何记录**；打回用第二个 picker 问原因（Esc 回菜单，不是"无理由打回"）。
+  决策映射与记录写入抽到 `split-approval-decide.ts`，两条路径共用（记录 `source: "tui"`）。
+- **无 TUI 与 `never`（AC-004）**：没有 nvim-tui 时仍走宿主 approval 接缝，但 `artifacts` 改指向
+  **`split/plan.md`**（可读版本），facts 带 `子任务`/`并行组`/`审核轮次`；TUI 在但 `picker` 不可用 → 一条日志后
+  交给接缝。策略 `never` 仍在**两条路径之前**读：有 TUI 也直接 BLOCK、零记录、不涨 `maxReworkRounds`、文案不变。
+  四条决策（allowed-once/rejected/cancelled/unavailable）映射不变。
+- **测试（AC-005）**：新增 `dsh-eng-core/test/split-plan-md.test.ts`（5 例：两份文件同写、改计划重写、未跑/
+  失败校验的如实标注、写入后读审核状态、split 目录边界）与 `dsh-orchestrator/test/split-review-tui.test.ts`
+  （10 例：菜单四项与标题摘要、查看不写记录、批准、打回+原因、Esc 回菜单、无 TUI 的 artifacts、无 seam 的
+  TUI、无 picker 交接、never 两条路径、改过的计划重审新摘要）；`split-plan-tool.test.ts` 追加 1 例
+  （`split_plan` 产出 `plan.md` 且汇报点名它）。`dsh-spec-gate` 既有 **202 例全通过**（预览抽取后行为不变）。
+- **文档**：`docs/ARCHITECTURE.md` 新增 §5.38.3（并在 §5.38.2 末尾交叉引用）；`docs/SPLIT-RUNBOOK.md`
+  §1 改写"审批体验/plan.md/never 在菜单路径之前"，新增 §5.0 "审一次拆分"（菜单 + `plan.md` 样例），
+  §7 补"没看到卡的三种原因"与"plan.md 只是投影"。
+- `bash scripts/verify.sh --quiet` → exit 0；`bash scripts/standards-check.sh --quiet` → exit 0
+  （抽取后新增文件均在 300 行/深度/导出面阈值内，`spec-gate/src/review.ts` 从 718 行降到 398 行）。
+
 ### 修复 · 审批策略 `never` 不再被记成"人工打回"：没弹过卡就不该耗拆分审核轮数
 
 真实故障：一个 mission 有 5 个子任务的合格 plan，**一张审核卡都没看到**就被降级成 plain implement。

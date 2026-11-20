@@ -4,14 +4,9 @@
  * Before this tool the only writer of `split/plan.json` was a caller holding the
  * library (`saveSplitPlan`), which meant the three automatic checks could be
  * skipped by writing the file by hand. The tool makes the checked path the easy
- * path:
- *
- *  1. read the CURRENT mission's specification (its acceptance criteria are the
- *     oracle — a criterion the spec does not have covers nothing);
- *  2. run the three checks (`validateSplitPlan`): every task maps a real AC, no
- *     two tasks of one parallel group own overlapping paths, every AC is covered;
- *  3. write `missions/<id>/split/plan.json` only when all three pass, and return
- *     the digest a review must quote.
+ * path: read the mission's specification (its criteria are the oracle), run the
+ * three checks (`validateSplitPlan`), and write `plan.json` + the readable
+ * `plan.md` only when all three pass — returning the digest a review must quote.
  *
  * The one refusal that is NOT about validity: a mission whose plan already exists
  * and whose content would change (different digest) must say `force: true`.
@@ -44,6 +39,8 @@ export interface ApplySplitPlanInput {
     missionId: string
     /** The mission's specification (the AC oracle). */
     spec: unknown
+    /** Mission title, rendered into the readable `plan.md`. */
+    title?: string
     tasks: unknown
     parallelGroups?: unknown
     force?: boolean
@@ -54,6 +51,8 @@ export interface ApplySplitPlanResult {
     ok: boolean
     /** Absolute path written (only when `ok`). */
     file?: string
+    /** Absolute path of the readable `plan.md` written with it (only when `ok`). */
+    markdownFile?: string
     /** The digest a review must quote (only when `ok`). */
     digest?: string
     validation: SplitValidation
@@ -82,12 +81,10 @@ export interface SplitPlanToolDeps {
 }
 
 /**
- * One group per task, in plan order.
- *
- * The conservative default on purpose: a plan that does not SAY which tasks may
- * run together runs them one at a time (the scheduler's groups are serial). A
- * default that grouped everything would turn "the planner forgot parallelGroups"
- * into overlapping worktrees.
+ * One group per task, in plan order — the conservative default on purpose: a
+ * plan that does not SAY which tasks may run together runs them one at a time.
+ * Grouping everything would turn "the planner forgot parallelGroups" into
+ * overlapping worktrees.
  */
 function defaultGroups(tasks: unknown): string[][] {
     if (!Array.isArray(tasks)) return []
@@ -142,10 +139,14 @@ export function applySplitPlan(input: ApplySplitPlanInput): ApplySplitPlanResult
     if (existing !== undefined && existing.digest !== digest && input.force !== true) {
         return { ok: false, validation, problems: digestChangeProblems(existing.digest, digest), taskCount, groupCount, replaced: true, reviewInvalidated: true }
     }
-    const saved = saveSplitPlan(input.layout, input.missionId, draft)
+    const saved = saveSplitPlan(input.layout, input.missionId, draft, {
+        validation,
+        ...(input.title === undefined ? {} : { title: input.title }),
+    })
     return {
         ok: true,
         file: saved.file,
+        markdownFile: saved.markdownFile,
         digest: saved.digest,
         validation,
         problems: [],
@@ -179,6 +180,7 @@ function successLines(mission: MissionRecord, result: ApplySplitPlanResult): str
           : '还没有审核记录：下一步是人工审核（split-review），审核前不会派发 worker。'
     return [
         `拆分计划已写入：${result.file ?? '(未知路径)'}（mission ${mission.id}）`,
+        `- 可读版本：${result.markdownFile ?? '(未知路径)'}（人工审核打开的就是它；plan.json 变了就同步重写）`,
         `- 摘要：${digest.slice(0, 12)}（审核必须引用这个摘要）`,
         `- 子任务：${result.taskCount} 个；并行组：${result.groupCount} 个`,
         `- 覆盖验收标准：${result.validation.covered.join('、') || '(无)'}`,
@@ -218,6 +220,7 @@ export function runSplitPlanTool(deps: SplitPlanToolDeps, args: SplitPlanToolArg
         layout: store.layout,
         missionId: mission.id,
         spec: mission.spec,
+        title: mission.title,
         tasks: args.tasks,
         ...(args.parallelGroups === undefined ? {} : { parallelGroups: args.parallelGroups }),
         ...(args.force === true ? { force: true } : {}),

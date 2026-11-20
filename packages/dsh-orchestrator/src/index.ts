@@ -140,8 +140,8 @@ export function apply(ctx: Context, config: unknown = {}): void {
             probesFor: (agent) => createProbes(context, resolved.probes, agent),
             dispatch: dispatchDeps,
             approval: approvalSeam,
-            // `split-review` reads the session approval policy before asking; a
-            // read failure is a log line (AC-002), never a refusal.
+            nvimTui: () => context.get('nvim-tui'), // split-review 的菜单 + 只读预览；无 TUI 时走 approval 接缝
+            // split-review 先读本会话审批策略；读失败只是日志（AC-002），不是拒绝。
             log: (message) => logger.info(message),
             // A host MAY provide a `clock`; tests freeze it so two runs are byte-identical.
             ...(clockService === undefined ? {} : { now: clockService }),
@@ -247,6 +247,9 @@ function registerOrchestratorService(
         stores,
         probesFor: () => createProbes(context, config.probes, undefined),
         approval,
+        // `spec_approve` may walk an approved mission into `split-review`; that
+        // review asks in the SAME shape as the spec review on the TUI.
+        nvimTui: () => context.get('nvim-tui'),
         log: (message) => logger.info(message),
     })
     return provideOptionalService(context, ORCHESTRATOR_SERVICE, service, logger)

@@ -2173,6 +2173,105 @@ P3 之前的写法把两件"可选覆盖"说成了前提（"任一段没配 `mod
   （无 `--force`）自己提供，而它拒绝时**不会**退化成删目录。
 - `split-clean` 不会代替你导入证据；本套件没有独立导入 CLI，待导入目录需要走 runner 收尾或既有导入路径。
 
+审核体验（可读的 `split/plan.md` + 与需求审批同一份只读预览 + TUI 菜单）见 §5.38.3。
+
+### 5.38.3 P5：拆分审核与需求审批同体验（菜单 + 只读预览）
+
+P3 之后"能不能派 worker"是硬门禁，但审核体验与 `spec_approve` 差一截：需求审批在 nvim-tui 里给
+`ui.picker` 菜单 + 打开文档的**只读预览**（viewer → panel → float 逐级降级），而拆分审核只有一张宿主
+approval 文字卡——计划里有什么、三道校验过没过，审核的人只能从文字里读，也打不开那个被审核的文档。
+这一轮把两者拉平，并把预览实现收敛成一份（P5 不改变任何交付判定：不写门禁、不被 `mission_complete`
+读取、不放宽既有断言）。
+
+**A. `split/plan.md`：计划的人类可读版本（AC-001）**
+
+`saveSplitPlan`（`dsh-eng-core/src/split-plan-write.ts`）现在一次写两份：
+
+| 文件 | 内容 | 谁读 |
+|------|------|------|
+| `split/plan.json` | 计划本体；摘要 = 审核绑定的身份 | 门禁、runner、导入器 |
+| `split/plan.md` | 标题、摘要、任务表（id/目标/路径/覆盖 AC/依赖）、并行组、三道校验结果、写入时的审核状态 | 人（TUI 预览打开的就是它） |
+
+- **同一写入点**：不是"再跑一个命令生成文档"。任何写 `plan.json` 的路径都会重写 md；`split_plan` 工具把
+  它刚跑的三道校验一并写进去，所以编辑过计划就不可能留下旧文档。
+- **审核状态是写入快照**：`review.json` / `reviews.jsonl` 仍是权威，md 明说"审核决定本身不重写本文件，
+  下一次写 plan.json 时才重写"。实现上先写 JSON、**再**读审核状态渲染，因此"plan 改了 → 摘要变了 →
+  旧审核失效"会如实出现在文档里（`必须重新审核`），不会重复一个已经不适用的批准。
+- **没跑校验就如实说**：直接调用库写入（不经 `split_plan`）的 md 写"本次写入未附校验结果"，不伪造通过；
+  校验未通过（只有库路径可能）会标 ❌ 并逐条列出问题。
+
+**B. 预览只保留一份：`dsh-eng-core/preview`（AC-003）**
+
+`previewArtifact`、面板/浮窗降级、`q` 关闭的只读 viewer 原本只存在于 `dsh-spec-gate/src/review.ts`。
+拆分审核也要"打开计划看"——复制第二份必然分叉（一个修了 panel 降级、另一个没修），因此抽进 eng-core 的
+新子路径 `dsh-eng-core/preview`（`preview-open.ts` 放类型与文件级原语、`preview-surface.ts` 放展示与状态），
+**spec-gate 与 orchestrator 都从这里引入**，仓库里不存在第二份实现：
+
+| 导出 | 作用 |
+|------|------|
+| `previewArtifact(api, target, label, { slot })` | 打开只读预览，返回落点（`viewer`/`panel`/`float`/`tab`/`failed`） |
+| `waitForPreview(api, placement, deadline, signal)` | viewer 占屏时等 `q` 关闭（关掉/超时都返回，不无限阻塞） |
+| `releasePreview(api)` | 释放当前预览面（判决定下来时调用） |
+| `describePreview(target, placement)` | 同一套人类可读提示（两个插件用同一句话） |
+| `readPreviewLines` / `openPath` / 类型 | 有界读文件、标签页打开的三条路由、宿主结构化类型 |
+
+- **降级顺序不变**：TUI 自带 `show_lines_float` 只读 viewer → `ui.panel` → `ui.float` → 新标签页 → `failed`
+  （并给出 notice）。这与 P4 前的 spec 预览逐级一致，只是搬了家。
+- **一个进程一个预览面**：模块记住自己开了什么，第二次预览先释放第一个（屏幕只有一个；两个插件同时展示
+  两份文档正是人看不见的状态）。
+- **面板 slot 由调用方给**：spec 用 `dsh-spec-gate:review`（与其原实现一致），拆分用
+  `dsh-orchestrator:split-review`；缺省是通用的 `dsh-review:preview`。
+
+**C. 拆分审核的 TUI 路径（AC-002）**
+
+宿主提供 `ctx.get('nvim-tui')` 且它暴露 `picker` 时，`split-review` 用与 `spec_approve` 同形的菜单
+（`dsh-orchestrator/src/split-review-tui.ts`）：
+
+| 菜单项 | 行为 |
+|--------|------|
+| 查看拆分计划（只读预览，q 关闭） — `<相对路径 plan.md>` | 用 `dsh-eng-core/preview` 打开 `split/plan.md`；`q` 关掉后菜单回来，**不写任何记录** |
+| ✅ 批准并派发 | 写 `approved`（绑定菜单标题里那个摘要）并进入 `implement` |
+| 🛑 打回重写 | 第二个 picker 问原因（含"其它，我直接在对话里说明"；Esc 返回菜单，绝不当成"无理由打回"），写 `rejected` 并回退 `split` |
+| 取消 | 不写记录，阶段保持 `entered` |
+
+- 菜单标题带 mission、摘要前 12 位、子任务数/并行组数——审核的人不用打开文档也知道在审什么；
+- 循环最多 20 步、有 15 分钟截止时间、跟随 turn 的 `signal`（与 spec 审核同构）；
+- 记录里 `source: "tui"`；`approver` 仍是 `approval`（TUI 不提供人类身份，与 `spec_approve` 的记录一致）；
+- 决策映射与记录写入在 `split-approval-decide.ts`，TUI 与 approval 两条路径共用，`source` 是唯一区别。
+
+**D. 无 TUI 与 `never`（AC-004）**
+
+- 宿主没有 nvim-tui（desktop / web / headless / IM）→ 仍走 `ctx.get('approval')`：reason 是同一份审阅材料，
+  `artifacts` 指向 **`split/plan.md`**（可读版本，不是 JSON），facts 带 `子任务` / `并行组` / `审核轮次`。
+- TUI 在但 `picker` 不可用 → 一条日志后交给 approval 接缝，不是"审核失败"（与 spec 审核的"路由不能回答就
+  交给下一个"同一条规则）。
+- **`never` 在两条路径之前读**：即使宿主有 TUI，策略 `never` 也直接 BLOCK（零记录、不涨
+  `maxReworkRounds`、文案不变）——TUI 菜单不是绕过"别问我"的通道。
+- 四条决策（`allowed-once` / `rejected` / `cancelled` / `unavailable`）的映射与既有语义一字未改；
+  `cancelled`/`unavailable` 仍是"没有决定 = 不放行"，阶段保持 `entered`。
+
+**E. 测试**
+
+- `dsh-eng-core/test/split-plan-md.test.ts`（5 例）：一次写入产出两份、任务表/并行组/三道校验/审核状态齐全；
+  改计划**重写**而不是追加；没跑校验如实标注、校验失败逐条列出；写入后再读审核状态（批准可见、重拆变
+  stale）；split 目录只有 `plan.json` + `plan.md` 且不写门禁。
+- `dsh-orchestrator/test/split-review-tui.test.ts`（10 例）：菜单四项（含值）与标题里的摘要/计数；查看 →
+  预览打开 `plan.md`（内容含任务表与校验）→ 菜单回来且零记录；批准 → `approved` + `source=tui` + 进
+  `implement`；打回 → 第二个 picker 问原因 → `rejected` + 回退；原因 popup Esc → 回菜单；无 TUI → seam 的
+  reason 含 `split/plan.md` / 摘要 / 子任务 / 并行组；只有 TUI 没有 seam 也能审；TUI 无 picker → 交给 seam；
+  `never` 两条路径都 BLOCK 且零记录；TUI 下改过的计划重审并批准**新**摘要。
+- `dsh-orchestrator/test/split-plan-tool.test.ts` 追加 1 例：`split_plan` 写入后 `plan.md` 存在、含任务表与
+  "三道校验全部通过"，工具的汇报里点名可读版本。
+- `dsh-spec-gate` 既有 202 例全通过（预览抽取后行为不变；面板/浮窗降级与 `q` 关闭的用例仍是原来的断言）。
+
+**诚实边界（P5）**
+
+- `plan.md` 是**投影**：门禁与交付只认 `plan.json` 的摘要与 `review.json`，改 md 不改变任何裁决。
+- 审核决定不会立刻重写 `plan.md`（写入快照）；想看到最新状态看 `review.json`/`reviews.jsonl`，或在下一次
+  重拆时让文档刷新。这是刻意的：让"审核"这一步不产生额外写盘。
+- 预览是"尽力展示"：宿主没有 viewer/panel/float 时退到标签页，再不行只给 notice；它不证明人真的读了。
+- 未演练的真实 nvim-tui：本仓库的用例用结构化假宿主（viewer/panel/float 三条路都覆盖），真机观感仍需人工看一眼。
+
 ## 6. 为什么这样切分
 
 - **一个关注点一个插件**：门禁可以单独失效（例如先只上 quality-gate），不影响其它环节。

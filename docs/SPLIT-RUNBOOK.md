@@ -49,15 +49,20 @@ profile**（`.dsh/**` 与 profile 都在信任根里，Agent 写不了）。
   `modelNotes` 记一句「worker 模型未配置，使用宿主默认」，缺模型**不**计入返工率（返工率只由真失败/
   冲突/超时产生）。需要升级而 `planner` 未配时降级到已配置的 `worker`（否则宿主默认），并在
   `split/rework.json` 与告警行写「无法升级到 planner：未配置，继续使用 …」。
-- **审批不是额外配置**：`split-review` 通过宿主同一条审批接缝（`ctx.get('approval')`，与 `spec_approve`
-  **同一条**）问人——跟随当前运行界面（tui / web / desktop），配置了 IM 即走 IM。宿主根本没有这个接缝时
-  按名字拒绝（「宿主没有 approval 接缝」），不会自动通过；不需要为本插件额外接线。
+- **审批不是额外配置**：`split-review` 问人的方式与 `spec_approve` **同一套体验**——宿主提供
+  `nvim-tui` 扩展 API 时给 `ui.picker` 菜单（查看计划 / 批准并派发 / 打回重写 / 取消），选"查看"用**同一份
+  只读预览**打开 `split/plan.md`（`q` 关闭回到菜单，见 §5.38.3）；没有 nvim-tui（desktop / web / headless）
+  时走宿主同一条审批接缝（`ctx.get('approval')`），卡片里带着 `split/plan.md` 这个可读工件与摘要/任务数/
+  并行组数，配置了 IM 即走 IM。宿主两条面都没有时按名字拒绝（「宿主没有 approval 接缝」），不会自动通过。
+- **审核的是 `plan.md`，绑定的是 `plan.json` 的摘要**：每次写/更新计划都会同时重写
+  `missions/<id>/split/plan.md`（标题、摘要、任务表、并行组、三道校验结果、审核状态），人看的是它；
+  门禁、派发与导入仍只认 `plan.json` 的摘要与 `review.json`。改 `plan.md` 不改变任何裁决。
 - **审批策略 `never` 时不会弹卡，也不会记成打回**：宿主审批服务在该会话策略为 `never` 时直接返回
   `rejected`（不派发任何提示面）。`split-review` 在提问前读 `effectivePolicy(agent.session)`：`never` →
   直接 BLOCK 并说明「提示被禁用、本轮未记录成'人工打回'、不计入 `maxReworkRounds`、切到 ask 后重新
-  advance」，`reviews.jsonl` 一行不写。所以"一张审核卡都没看到就被降级"不会是套件的轮数逻辑造成的：
-  先看一下本会话的审批策略。这是宿主策略，不是套件故障；读不到策略（旧宿主/无 session/抛错）时仍按
-  原逻辑提问，只记日志。
+  advance」，`reviews.jsonl` 一行不写。**这条在 TUI 菜单路径之前生效**：有 nvim-tui 也不会绕过"别问我"。
+  所以"一张审核卡都没看到就被降级"不会是套件的轮数逻辑造成的：先看一下本会话的审批策略。这是宿主策略，
+  不是套件故障；读不到策略（旧宿主/无 session/抛错）时仍按原逻辑提问，只记日志。
 - **只有 `split.enabled` 是真开关**：模型段、审批通道、`autoDispatch` 都不是"拆分能否运行"的前提。
 
 `enabled: true` 之后，流水线是：
@@ -151,6 +156,60 @@ bash scripts/split-smoke.sh
 | `DSH_SMOKE_REAL=yes`（拼错） | **exit 2** |
 
 ## 5. 三条运维命令
+
+### 5.0 审一次拆分：菜单里看 `plan.md`，再决定
+
+审核本身没有 CLI——它是一个人做的决定，入口是 `split-review` 阶段。在 nvim-tui 里它长这样（与
+`spec_approve` 同形）：
+
+```
+拆分计划审核（mission m-1 · 摘要 1a2b3c4d5e6f · 子任务 3 / 并行组 1）
+  > 查看拆分计划（只读预览，q 关闭） — .dsh/engineering-suite/missions/m-1/split/plan.md
+    ✅ 批准并派发（写审核记录，进入 implement）
+    🛑 打回重写（说明要改什么，回到 split 重新拆）
+    取消（不写审核记录，阶段保持 entered）
+```
+
+选"查看"会用与需求审批**同一份**只读预览打开 `plan.md`（`q` 关闭后菜单回来，不写任何记录）：
+
+```markdown
+# 拆分计划：给 CLI 加一个 --json 输出
+
+- Mission：`m-1`
+- plan 摘要：`1a2b3c4d5e6f`（审核绑定这个摘要；改动 plan 就换摘要，必须重新审核）
+- 子任务：3 个；并行组：1 个
+- 写入时间：2026-11-20 10:02:11Z
+
+## 子任务
+
+| id | 目标 | 路径 | 覆盖 AC | 依赖 |
+|----|------|------|---------|------|
+| T-001 | 抽出序列化层 | `packages/cli/src/serialize/**` | AC-001 | - |
+| T-002 | 接上 --json | `packages/cli/src/flags/**` | AC-002 | T-001 |
+| T-003 | 补文档 | `docs/**` | AC-003 | T-002 |
+
+## 并行组
+
+- 组 1：`T-001`、`T-002`、`T-003`
+
+## 三道自动校验
+
+整体结论：✅ 三道校验全部通过
+
+| 校验 | 结果 | 说明 |
+|------|------|------|
+| 1. 每个子任务映射真实验收标准 | ✅ 通过 | 子任务 3 个；映射的标准都在规格里 |
+| 2. 并行组内路径不重叠 | ✅ 通过 | 并行组 1 个；组内两两比较路径 |
+| 3. 每个验收标准都被覆盖 | ✅ 通过 | 覆盖：AC-001、AC-002、AC-003 |
+
+## 审核状态
+
+- 写入时的状态：plan 摘要 `1a2b3c4d5e6f` 还没有人工审核记录（split/review.json 缺失）
+```
+
+没有 nvim-tui（desktop / web / headless / IM）时同一份材料走宿主审批卡：卡片里带 `split/plan.md`、
+摘要、子任务数与并行组数。两种情况下的决定含义完全一样：批准写 `approved` 并放行派发；打回写 `rejected`
+（占一轮 `maxReworkRounds`）并回退重拆；取消/Esc 一行不写、阶段保持 entered。
 
 ### 5.1 看状态：`orchestrate({ action: "status" })` 的 `## 拆分` 段
 
@@ -264,7 +323,10 @@ console.log(e.reasons.join("\n")); console.log(e.tokens)' \
 - **真派发需要真 profile + 真 `dsh`**：本仓库的验收跑覆盖的是 SKIP 分支与它的四条反证，不证明"真 worker
   一定写出合格 commit"；那一条只能在 `DSH_SMOKE_REAL=1` 的真机路径上得到证据。
 - **没有 token 数据就不要假装有**：`usage` 缺失是宿主接缝的事实，不是可以插值的空白。
-- **"没看到卡"有两种原因，别混为一谈**：① 策略是 `never`（宿主不弹卡、直接 rejected，套件已在提问前
-  BLOCK，见 §1）；② 接缝没有应答者（`unavailable`，阶段保持 entered）。两者都不会写 `reviews.jsonl`；
-  只有 `ask` 策略下"人真的按了打回"才会记一行。诊断顺序：先看本会话审批策略，再看 `reviews.jsonl`
-  与阶段状态。
+- **"没看到卡"有三种原因，别混为一谈**：① 策略是 `never`（宿主不弹卡、直接 rejected，套件已在提问前
+  BLOCK，见 §1）；② 接缝没有应答者（`unavailable`，阶段保持 entered）；③ 宿主是 nvim-tui——此时没有
+  "卡"，而是一个菜单（§5.0），选"查看计划"只会打开只读预览、不写记录，只有点了批准/打回才有记录。
+  三者都不会在没人决定时写 `reviews.jsonl`；只有"人真的按了打回"才会记一行。诊断顺序：先看运行界面与
+  本会话审批策略，再看 `reviews.jsonl` 与阶段状态。
+- **`plan.md` 只是给人看的投影**：它由写 `plan.json` 的过程生成（同一写入点），审核决定不会立刻重写它；
+  改它不改变任何裁决（门禁与派发只认 `plan.json` 的摘要与 `review.json`）。

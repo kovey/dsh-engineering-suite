@@ -1,194 +1,42 @@
 /**
- * The human review of a split plan, through the host approval seam (AC-003).
+ * The human review of a split plan: WHICH surface asks, on both routes.
  *
  * The split workflow's second stage exists so that a PERSON — not the model that
- * wrote the plan — decides whether the decomposition may dispatch workers. The
- * seam is the host's own (`ctx.get('approval')`) — the SAME one `spec_approve`
- * asks through, so an IM card, a TUI popup or a terminal prompt all work without
- * this plugin knowing which one answered, and nothing extra has to be configured.
+ * wrote the plan — decides whether the decomposition may dispatch workers. Two
+ * surfaces can ask, and they are the same ones `spec_approve` uses:
  *
- * Four answers, one mapping, fail closed:
+ *  - **`nvim-tui`** (`ctx.get('nvim-tui')`): the menu + read-only preview of
+ *    `split/plan.md` (`split-review-tui.ts`), so a reviewer can READ the plan;
+ *  - **the host approval seam** (`ctx.get('approval')`): one blocking question
+ *    whose reason is the same review sheet and whose artifacts name
+ *    `split/plan.md` — desktop / web / headless / IM, nothing extra configured.
  *
- *  - `allowed-once` → the review record is written for EXACTLY the digest the
- *    person saw, and the exit gate passes;
- *  - `rejected` → a rejection record is written (it is what bounds the rework
- *    rounds), and the stage rolls back to `split` for a re-plan;
- *  - `cancelled` / `unavailable` → NO record at all: nobody decided, so the
- *    stage stays entered and can be retried;
- *  - no seam mounted → refused by name (「宿主没有 approval 接缝」), never assumed;
- *  - session policy `never` → refused by name BEFORE asking, because the host's
- *    `request()` answers `rejected` without ever showing a card — counting that
- *    as a human rejection would degrade the plan without anyone judging it
- *    (see `split-approval-policy.ts`).
+ * This module decides the ROUTE and the policy guard; what an answer MEANS (the
+ * four-answer mapping and the review record) lives in `split-approval-decide.ts`
+ * and is shared by both routes, so they cannot drift apart.
+ *
+ * The policy guard exists because a `never` session gets an automatic `rejected`
+ * with no card shown: recording that as a human rejection would burn a rework
+ * round without anyone judging the plan (see `split-approval-policy.ts`). It is
+ * read BEFORE either route asks — the TUI route bypasses the host prompt, so it
+ * must not bypass the person's "do not ask me" setting either (AC-004).
  *
  * A stale review (`plan 已改动`) re-asks and, when rejected, records why the old
- * decision no longer applied. Nothing here trusts the answerer's prose: the
- * decision word is the whole input, and the digest binding is re-checked when
- * the record is written.
+ * decision no longer applied.
  *
  * @module dsh-orchestrator/split-approval
  */
 
 import path from 'node:path'
-import { approverName, normalizeApprovalReply, renderApprovalContext, type ApprovalLike, type ApprovalOutcome } from 'dsh-eng-core'
-import { readSplitPlan, recordSplitReview, splitReviewStatus, type SplitPlan, type SplitReviewRecord } from 'dsh-eng-core/split'
+import { normalizeApprovalReply, renderApprovalContext, type ApprovalLike, type ApprovalOutcome } from 'dsh-eng-core'
+import { readSplitPlan, splitReviewStatus, type StoredSplitPlan } from 'dsh-eng-core/split'
 import type { GateFacts } from './gate-facts.js'
 import { neverPolicyRefusal, readSessionApprovalPolicy } from './split-approval-policy.js'
+import { decide, noSeam, type SplitReviewAskInput, type SplitReviewAskResult } from './split-approval-decide.js'
+import { reviewPrompt, splitMenuTitle, splitPlanArtifacts } from './split-review-prompt.js'
+import { nvimTuiMenuOf, splitReviewMenu, SPLIT_REVIEW_TIMEOUT_MS, type NvimTuiMenuApi } from './split-review-tui.js'
 
-/** What the ask decided for this advance. */
-export type SplitReviewAskKind = 'skipped' | 'approved' | 'rejected' | 'blocked'
-
-/** The answer of {@link askSplitReview}. */
-export interface SplitReviewAskResult {
-    /** `skipped`/`approved`/`rejected` let the caller continue; `blocked` refuses. */
-    kind: SplitReviewAskKind
-    /** Chinese explanation for the report. */
-    detail: string
-    /** The concrete next step, when blocked. */
-    fix?: string
-    /** The normalised decision, when a person answered. */
-    answer?: ApprovalOutcome['decision']
-    /** The written review record, when one was written. */
-    record?: SplitReviewRecord
-}
-
-/** Input of {@link askSplitReview}. */
-export interface SplitReviewAskInput {
-    facts: GateFacts
-    /** The host approval seam, read at call time. */
-    approval?: ApprovalLike
-    /** The calling agent (passed to the seam). */
-    agent?: unknown
-    /**
-     * Diagnostics sink. Used ONLY for "the session policy could not be read":
-     * that is a log line, never a refusal (AC-002).
-     */
-    log?: (message: string) => void
-    signal?: AbortSignal
-    /** Timestamp override (tests). */
-    at?: number
-}
-
-/** The listed tasks of a plan, capped so one card stays readable. */
-function taskLines(plan: SplitPlan): string[] {
-    const shown = plan.tasks.slice(0, 12).map((task) => {
-        const deps = task.dependsOn.length === 0 ? '' : `；依赖 ${task.dependsOn.join(',')}`
-        return `- ${task.id}：${task.goal}（paths ${task.paths.join(' ') || '-'}；AC ${task.acceptance.join(',') || '-'}${deps}）`
-    })
-    if (plan.tasks.length > shown.length) shown.push(`- …（另有 ${plan.tasks.length - shown.length} 条，见 plan.json）`)
-    return shown
-}
-
-/** The prose a human reads before deciding. */
-function reviewPrompt(facts: GateFacts, plan: SplitPlan, digest: string, stale: string | undefined): string {
-    return [
-        `拆分计划审核（mission ${facts.mission.id} · ${facts.mission.title}）`,
-        '',
-        `plan 摘要：${digest}`,
-        `子任务 ${plan.tasks.length} 条，并行组 ${plan.parallelGroups.length} 个。`,
-        ...(stale === undefined ? [] : ['', `注意：${stale}`]),
-        '',
-        '任务：',
-        ...taskLines(plan),
-        '',
-        '批准后才会派发第一个 worker；打回则重新拆分。',
-    ].join('\n')
-}
-
-/** Relative path of the plan, for the card's artifact list. */
-function planRelative(facts: GateFacts): string[] {
-    return [path.relative(facts.store.layout.cwd, path.join(facts.store.layout.missionsDir, facts.mission.id, 'split', 'plan.json'))]
-}
-
-/** The refusal for "nobody could be asked": never an approval. */
-function noSeam(): SplitReviewAskResult {
-    return {
-        kind: 'blocked',
-        detail:
-            '宿主没有 approval 接缝：ctx.get("approval") 为空，无法人工审核这份拆分；本轮未写任何审核记录。' +
-            'split-review 与 spec_approve 使用同一条宿主接缝（跟随当前运行界面 tui/web/desktop；配置了 IM 即走 IM），不需要任何额外配置。',
-        fix: '让宿主装配它本来就有的人工审批面（终端 / desktop / web TUI 的审批插件，或 IM 通道）后重试；拆分审核是硬门禁，没有"自动通过"这条路径（除非由人把 split.reviewRequired 关掉，那仍是宿主的决定）。',
-    }
-}
-
-/** One decision to write: the seam's answer, and what the human was shown. */
-interface RecordRequest {
-    facts: GateFacts
-    input: SplitReviewAskInput
-    /** The digest the person SAW (re-checked against the plan on disk). */
-    digest: string
-    outcome: ApprovalOutcome
-    decision: 'approved' | 'rejected'
-    note?: string
-}
-
-/** Record one decision; a recording failure is a refusal, never a silent pass. */
-function record(request: RecordRequest): { record?: SplitReviewRecord; problem?: string } {
-    const { facts, input, digest, outcome, decision, note } = request
-    const written = recordSplitReview(facts.store.layout, facts.mission.id, {
-        approver: approverName(outcome),
-        decision,
-        // An edit made while the card was open refuses here, by digest.
-        planDigest: digest,
-        ...(note === undefined ? {} : { note }),
-        at: input.at ?? outcome.at ?? Date.now(),
-        ...(outcome.source === '' || outcome.source === 'unknown' ? {} : { source: outcome.source }),
-    })
-    if (written.ok) return { record: written.record }
-    return { problem: written.problems.join('；') }
-}
-
-/** The written-approval branch. */
-function approved(facts: GateFacts, input: SplitReviewAskInput, digest: string, outcome: ApprovalOutcome): SplitReviewAskResult {
-    const written = record({ facts, input, digest, outcome, decision: 'approved' })
-    if (written.record === undefined) {
-        return {
-            kind: 'blocked',
-            answer: outcome.decision,
-            detail: `人工批准了拆分，但审核记录写入失败：${written.problem ?? '未知原因'}。这通常意味着 plan 在等卡期间被改动（摘要不再匹配），那正是"必须重审"的情形。`,
-            fix: '确认 plan 已定稿后重新 advance 并重新审核；未写进审核记录的批准不构成放行。',
-        }
-    }
-    return { kind: 'approved', answer: outcome.decision, record: written.record, detail: `人工已批准拆分（第 ${written.record.round} 轮，by ${written.record.approver}）` }
-}
-
-/** The written-rejection branch (the rejection bounds the rework rounds). */
-function rejected(facts: GateFacts, input: SplitReviewAskInput, digest: string, outcome: ApprovalOutcome, note: string | undefined): SplitReviewAskResult {
-    const written = record({ facts, input, digest, outcome, decision: 'rejected', ...(note === undefined ? {} : { note }) })
-    if (written.record === undefined) {
-        return { kind: 'blocked', answer: outcome.decision, detail: `审核被拒，但审核记录写入失败：${written.problem ?? '未知原因'}`, fix: '修好 plan 目录后重新 advance。' }
-    }
-    return {
-        kind: 'rejected',
-        answer: outcome.decision,
-        record: written.record,
-        detail: `审核被拒（第 ${written.record.round} 轮，by ${written.record.approver}${note === undefined ? '' : `：${note}`}）：需要重新拆分`,
-    }
-}
-
-/** Map the answerer's decision to the review record (the whole contract). */
-function decide(facts: GateFacts, input: SplitReviewAskInput, digest: string, outcome: ApprovalOutcome, stale: string | undefined): SplitReviewAskResult {
-    switch (outcome.decision) {
-        case 'allowed-once':
-            return approved(facts, input, digest, outcome)
-        case 'rejected':
-            return rejected(facts, input, digest, outcome, stale)
-        case 'cancelled':
-            return {
-                kind: 'blocked',
-                answer: outcome.decision,
-                detail: '审核被取消（cancelled）：没有决定 = 不放行；本轮未写任何审核记录，拆分计划保持待审。',
-                fix: '重新 advance 并再次审核；或先修好拆分计划再送审。',
-            }
-        default:
-            return {
-                kind: 'blocked',
-                answer: outcome.decision,
-                detail: '没有应答者（unavailable）：审批通道没有给出任何决定；本轮未写任何审核记录。',
-                fix: '确认审批通道可达（IM 会话仍然有效 / 有人在看卡）后重新 advance。',
-            }
-    }
-}
+export type { SplitReviewAskInput, SplitReviewAskKind, SplitReviewAskResult } from './split-approval-decide.js'
 
 /**
  * Ask a human whether this plan may dispatch workers.
@@ -205,10 +53,12 @@ export async function askSplitReview(input: SplitReviewAskInput): Promise<SplitR
     if (stored === undefined) return { kind: 'skipped', detail: `mission ${missionId} 没有拆分计划：无需审核` }
     const status = splitReviewStatus(facts.store.layout, missionId)
     if (status.ok) return { kind: 'skipped', detail: status.detail }
-    if (input.approval === undefined) return noSeam()
-    // BEFORE asking: a `never` session gets no card, only an automatic
-    // `rejected`. Recording that as a human rejection would burn a rework round
-    // — so it is read here and refused by name instead (AC-001).
+    const tui = nvimTuiMenuOf(input.nvimTui)
+    // Neither route mounted: refuse by name (a missing channel is never a pass).
+    if (input.approval === undefined && tui === undefined) return noSeam()
+    // BEFORE asking — on EITHER route: a `never` session gets no card, only an
+    // automatic `rejected`. Recording that as a human rejection would burn a
+    // rework round, so it is read here and refused by name instead (AC-004).
     const policy = readSessionApprovalPolicy(input.approval, input.agent)
     if (policy.problem !== undefined) input.log?.(`split-review：读不到本会话审批策略（${policy.problem}），按原逻辑照常提问`)
     if (policy.policy === 'never') {
@@ -219,17 +69,70 @@ export async function askSplitReview(input: SplitReviewAskInput): Promise<SplitR
         status.state === 'stale'
             ? `plan 已改动（旧审核摘要 ${status.record?.planDigest.slice(0, 12) ?? '(无)'}，当前摘要 ${stored.digest.slice(0, 12)}），必须重新审核`
             : undefined
+    // Same experience as spec_approve when the host is the TUI: menu + read-only
+    // preview. A TUI that cannot ask hands over to the seam instead of failing.
+    const viaTui = await askThroughTui(input, tui, stored, stale)
+    if (viaTui !== undefined) return viaTui
+    return askThroughSeam(facts, input, stored, stale)
+}
+
+/** Ask through the TUI menu (the spec review's shape), or hand over when it cannot ask. */
+async function askThroughTui(
+    input: SplitReviewAskInput,
+    tui: NvimTuiMenuApi | undefined,
+    stored: StoredSplitPlan,
+    stale: string | undefined,
+): Promise<SplitReviewAskResult | undefined> {
+    if (tui === undefined) return undefined
+    const layout = input.facts.store.layout
+    const outcome = await splitReviewMenu({
+        api: tui,
+        title: splitMenuTitle(input.facts, stored),
+        planFile: path.join(layout.missionsDir, input.facts.mission.id, 'split', 'plan.md'),
+        cwd: layout.cwd,
+        timeoutMs: SPLIT_REVIEW_TIMEOUT_MS,
+        ...(input.signal === undefined ? {} : { signal: input.signal }),
+        ...(input.log === undefined ? {} : { log: input.log }),
+    })
+    if (outcome.decision === 'unavailable') {
+        input.log?.('split-review：nvim-tui 的提问通道不可用（没有 picker）：回落到宿主 approval 接缝')
+        return undefined
+    }
+    // The TUI's vocabulary is mapped ONCE, here, into the seam's: approve →
+    // `allowed-once`, everything else keeps its word. The record write below
+    // cannot tell which route asked (`source` does), so both routes cannot drift.
+    const decision = outcome.decision === 'approved' ? 'allowed-once' : outcome.decision
+    const normalized: ApprovalOutcome = {
+        decision,
+        by: 'approval',
+        messageId: '',
+        source: 'tui',
+        allowed: decision === 'allowed-once',
+        ...(input.at === undefined ? {} : { at: input.at }),
+    }
+    return decide(input.facts, input, stored.digest, normalized, outcome.note ?? stale)
+}
+
+/** Ask through the generic host seam (desktop / web / headless / IM). */
+async function askThroughSeam(
+    facts: GateFacts,
+    input: SplitReviewAskInput,
+    stored: StoredSplitPlan,
+    stale: string | undefined,
+): Promise<SplitReviewAskResult> {
+    const approval = input.approval
+    if (approval === undefined) return noSeam()
     const prompt = reviewPrompt(facts, stored.plan, stored.digest, stale)
     const reason = renderApprovalContext(prompt, {
         kind: 'split',
-        missionId,
+        missionId: facts.mission.id,
         title: facts.mission.title,
         revision: stored.digest,
-        artifacts: planRelative(facts),
-        facts: { 子任务: stored.plan.tasks.length, 并行组: stored.plan.parallelGroups.length, 审核轮次: status.record?.round ?? 0 },
+        artifacts: splitPlanArtifacts(facts),
+        facts: { 子任务: stored.plan.tasks.length, 并行组: stored.plan.parallelGroups.length, 审核轮次: splitReviewStatus(facts.store.layout, facts.mission.id).record?.round ?? 0 },
         channelHints: { buttons: ['批准', '打回'], requiresReason: true },
     })
-    const reply = await input.approval.request({
+    const reply = await approval.request({
         ...(input.agent === undefined ? {} : { agent: input.agent }),
         toolName: 'orchestrate',
         reason,
@@ -244,6 +147,8 @@ export interface SplitReviewGateInput {
     stageId: string
     /** The host approval seam accessor (`SequenceDeps.approval`), read here. */
     approval?: () => ApprovalLike | undefined
+    /** The host's OPTIONAL `nvim-tui` accessor (`SequenceDeps.nvimTui`). */
+    nvimTui?: () => unknown
     agent?: unknown
     /** Diagnostics sink forwarded to {@link askSplitReview} (policy read). */
     log?: (message: string) => void
@@ -265,6 +170,7 @@ export async function splitReviewGateRefusal(input: SplitReviewGateInput): Promi
     const asked = await askSplitReview({
         facts: input.facts,
         approval: input.approval?.(),
+        ...(input.nvimTui === undefined ? {} : { nvimTui: input.nvimTui() }),
         ...(input.agent === undefined ? {} : { agent: input.agent }),
         ...(input.log === undefined ? {} : { log: input.log }),
         ...(input.signal === undefined ? {} : { signal: input.signal }),

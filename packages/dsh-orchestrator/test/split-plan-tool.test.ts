@@ -228,6 +228,26 @@ test('the digest is stable: key order and a second write do not change it', () =
     assert.equal(splitPlanDigest(plan), splitPlanDigest(reordered))
 })
 
+test('every written plan also produces the readable plan.md the review opens (AC-001 / TC-2601)', async () => {
+    const cwd = tempWorkspace('split-plan-md-tool-')
+    const fake = host(cwd)
+    missionWithSpec(fake)
+
+    const text = await call(fake, { tasks: tasks(), parallelGroups: [['T-001', 'T-002', 'T-003']] })
+
+    const layout = resolveLayout(cwd)
+    const file = path.join(layout.missionsDir, 'm1', 'split', 'plan.md')
+    assert.equal(fs.existsSync(file), true, 'split_plan must render plan.md next to plan.json')
+    const md = fs.readFileSync(file, 'utf8')
+    // The mission title, the task table and the checks the tool really ran.
+    assert.match(md, /^# 拆分计划：写 plan 测试$/m)
+    assert.match(md, /\| T-001 \| 做 a \| `packages\/a\/\*\*` \| AC-001 \| - \|/)
+    assert.match(md, /整体结论：✅ 三道校验全部通过/)
+    assert.match(md, /覆盖：AC-001、AC-002、AC-003/)
+    // The tool's report names the readable version too.
+    assert.match(text, /可读版本：.*split\/plan\.md/)
+})
+
 test('a session without a mission is told to start one (no plan is written for nobody)', async () => {
     const cwd = tempWorkspace('split-plan-nomission-')
     const fake = host(cwd)

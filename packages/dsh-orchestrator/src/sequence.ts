@@ -151,6 +151,8 @@ export interface SequenceDeps {
      * same host seam `spec_approve` asks through, so nothing extra is configured.
      */
     approval?: () => ApprovalLike | undefined
+    /** The host's OPTIONAL `nvim-tui` API (`ctx.get('nvim-tui')`): the split review's menu + preview. */
+    nvimTui?: () => unknown
     /** Diagnostics sink for the split-review policy read (AC-002): log only, never a refusal. */
     log?: (message: string) => void
     /**
@@ -253,8 +255,8 @@ function stageResultsOf(store: MissionStore, missionId: string): StageResult[] {
 
 /**
  * The entry time a stage keeps: re-entering an already-`entered` record is a
- * resume (断点恢复), so the original `enteredAt` — and therefore the freshness
- * window the exit gates compare against — must not be reset.
+ * resume (断点恢复), so the original `enteredAt` — and the freshness window the
+ * exit gates compare against — must not be reset.
  */
 function entryTimeOf(current: StageResult | undefined): number | undefined {
     return current !== undefined && current.state === 'entered' ? current.enteredAt : undefined
@@ -454,14 +456,12 @@ function stageHeader(
     ]
     const role = roleInstruction(stage)
     if (role !== undefined) {
-        // The orchestrator declares the role; dsh-role-guard is what makes it
-        // real (persona + tool whitelist), so the text names the exact call.
+        // The orchestrator only DECLARES the role; dsh-role-guard enforces it.
         lines.push(`角色：${stage.role} —— ${role}（角色定义与工具白名单由 dsh-role-guard 执行）`)
     }
     const route = resolveStageRoute(stage, deps.config.routing)
     if (route.source !== 'none' || stage.difficulty !== undefined) {
-        // Declaration, like the role: the orchestrator cannot change the
-        // session's model, so it names the route and the call that applies it.
+        // Declaration only: names the route and the call that applies it.
         const target =
             route.model === undefined
                 ? undefined
@@ -987,10 +987,10 @@ function stopAction(deps: SequenceDeps, ctx: CallContext, args: OrchestrateArgs)
 /**
  * The human review of a split plan, before the stage is settled (AC-003).
  *
- * The four-answer mapping and the refusal text live in `split-approval.ts`; this
- * wrapper only decides whether the gate applies and hands over the caller's
- * context. `cancelled`/`unavailable`/no-seam are REFUSALS that leave the stage
- * `entered` — re-planning cannot fix "nobody answered".
+ * The routes, the four-answer mapping and the refusal text live in
+ * `split-approval.ts`; this wrapper only decides whether the gate applies and
+ * hands the caller's context over. `cancelled`/`unavailable`/no-seam are
+ * REFUSALS that leave the stage `entered`.
  */
 function splitReviewAskRefusal(deps: SequenceDeps, ctx: CallContext, stage: StageConfig, current: StageResult | undefined): Promise<string | undefined> | undefined {
     if (ctx.mission === undefined || stage.gate.kind !== 'split-review') return undefined
@@ -998,6 +998,7 @@ function splitReviewAskRefusal(deps: SequenceDeps, ctx: CallContext, stage: Stag
         facts: gateFacts(deps, ctx.store, ctx.mission, current),
         stageId: stage.id,
         approval: deps.approval,
+        ...(deps.nvimTui === undefined ? {} : { nvimTui: deps.nvimTui }),
         agent: ctx.agent,
         ...(deps.log === undefined ? {} : { log: deps.log }),
         signal: ctx.signal,

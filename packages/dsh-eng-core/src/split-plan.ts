@@ -18,7 +18,7 @@
 
 import path from 'node:path'
 import { sha256 } from './digest.js'
-import { readJson, writeJsonAtomic } from './io.js'
+import { readJson } from './io.js'
 import { assertSafeId, missionDir, type Layout } from './paths.js'
 
 /** One task of a split plan (AC-002). */
@@ -94,23 +94,6 @@ export function splitReviewFile(layout: Layout, missionId: string): string {
 /** `missions/<id>/split/reviews.jsonl` (every decision, append-only). */
 export function splitReviewsFile(layout: Layout, missionId: string): string {
     return path.join(splitDir(layout, missionId), 'reviews.jsonl')
-}
-
-/**
- * Write one plan and return its digest.
- * @param layout - the workspace layout.
- * @param missionId - the mission the plan belongs to.
- * @param plan - the plan to persist (written as given, not normalised).
- * @returns the absolute file path and the digest a review must quote.
- */
-export function saveSplitPlan(layout: Layout, missionId: string, plan: SplitPlan): { file: string; digest: string } {
-    const file = splitPlanFile(layout, missionId)
-    // The digest is over what is WRITTEN, not over the argument: the stored
-    // plan gains its `missionId`, and a digest that ignores it would let a plan
-    // reviewed under one mission be replayed under another.
-    const stored: SplitPlan = { ...plan, missionId: plan.missionId ?? missionId }
-    writeJsonAtomic(file, stored)
-    return { file, digest: splitPlanDigest(stored) }
 }
 
 /**

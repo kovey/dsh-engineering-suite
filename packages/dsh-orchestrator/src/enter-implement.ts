@@ -99,6 +99,12 @@ export interface OrchestratorServiceDeps {
      * for every non-split pipeline.
      */
     approval?: () => ApprovalLike | undefined
+    /**
+     * The host's OPTIONAL `nvim-tui` extension API. Forwarded for the same
+     * reason: a walk that reaches `split-review` asks with the menu + read-only
+     * preview when the host is the TUI, and with the seam otherwise.
+     */
+    nvimTui?: () => unknown
     /** Diagnostics sink (the split-review policy read); absent = no log line. */
     log?: (message: string) => void
 }
@@ -110,6 +116,7 @@ export function createOrchestratorService(deps: OrchestratorServiceDeps): Orches
         stores: deps.stores,
         probesFor: deps.probesFor,
         ...(deps.approval === undefined ? {} : { approval: deps.approval }),
+        ...(deps.nvimTui === undefined ? {} : { nvimTui: deps.nvimTui }),
         ...(deps.log === undefined ? {} : { log: deps.log }),
     }
     return { enterImplement: (missionId, cwd) => safelyEnter(sequence, missionId, cwd ?? process.cwd()) }

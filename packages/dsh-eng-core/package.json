@@ -34,6 +34,10 @@
       "types": "./dist/split.d.ts",
       "default": "./dist/split.js"
     },
+    "./preview": {
+      "types": "./dist/preview.d.ts",
+      "default": "./dist/preview.js"
+    },
     "./package.json": "./package.json"
   },
   "files": [
