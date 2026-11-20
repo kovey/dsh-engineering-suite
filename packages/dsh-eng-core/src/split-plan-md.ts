@@ -4,10 +4,10 @@
  * `plan.json` is the reviewed artifact (its digest is what a review binds to),
  * but a JSON file is not a document: a reviewer asked to decide "may these
  * workers run?" used to get a task list rendered into an approval card, with the
- * three automatic checks summarized in one sentence. Every plan write now also
- * renders this Markdown — title, digest, task table, parallel groups, the three
- * checks, and the review standing — so the SAME file can be opened in the
- * read-only preview the specification approval uses (AC-001).
+ * automatic checks summarized in one sentence. Every plan write now also renders
+ * this Markdown — title, digest, task table, parallel groups, the checks (the
+ * per-task AC budget included), and the review standing — so the SAME file can
+ * be opened in the read-only preview the specification approval uses (AC-001).
  *
  * Two rules keep it honest:
  *
@@ -43,7 +43,7 @@ export interface SplitPlanMarkdownInput {
     missionId: string
     /** Mission title, when the caller knows it (the heading reads better). */
     title?: string
-    /** The three automatic checks, when the writer ran them. */
+    /** The automatic checks (per-task AC budget included), when the writer ran them. */
     validation?: SplitValidation
     /** The review standing at write time. */
     review?: SplitPlanMarkdownReview
@@ -101,31 +101,33 @@ function groupLines(plan: SplitPlan): string[] {
 /** The problems of one check, by the codes that belong to it. */
 const CHECK_CODES: readonly (readonly string[])[] = [
     ['task-without-ac', 'unknown-ac', 'dependency'],
+    ['ac-over-budget'],
     ['paths-overlap'],
     ['ac-uncovered'],
 ]
 
-/** One "three checks" row. */
+/** One check row of the table. */
 function checkRow(index: number, title: string, problems: readonly SplitProblem[], detail: string): string {
     const mark = problems.length === 0 ? '✅ 通过' : `❌ 未通过（${problems.length} 条）`
     return `| ${index}. ${cell(title)} | ${mark} | ${cell(detail)} |`
 }
 
-/** The three automatic checks, as a table — plus whatever else the validator found. */
+/** The automatic checks, as a table — plus whatever else the validator found. */
 function checksLines(validation: SplitValidation | undefined, plan: SplitPlan): string[] {
     if (validation === undefined) {
-        return ['（本次写入未附校验结果：`split_plan` 会运行三道校验并把结果写在这里；直接调用 `saveSplitPlan` 的写入路径不运行校验。）']
+        return ['（本次写入未附校验结果：`split_plan` 会运行四道校验并把结果写在这里；直接调用 `saveSplitPlan` 的写入路径不运行校验。）']
     }
     const of = (index: number): SplitProblem[] => validation.problems.filter((problem) => CHECK_CODES[index]?.includes(problem.code) === true)
     const covered = validation.covered.length === 0 ? '（无）' : validation.covered.join('、')
     const rows = [
         checkRow(1, '每个子任务映射真实验收标准', of(0), `子任务 ${plan.tasks.length} 个；` + (validation.uncovered.length === 0 ? '映射的标准都在规格里' : `未覆盖：${validation.uncovered.join('、')}`)),
-        checkRow(2, '并行组内路径不重叠', of(1), `并行组 ${plan.parallelGroups.length} 个；组内两两比较路径`),
-        checkRow(3, '每个验收标准都被覆盖', of(2), `覆盖：${covered}`),
+        checkRow(2, `每个子任务最多映射 ${validation.maxAcceptancePerTask} 条验收标准`, of(1), '上限来自 models.json 的 split.maxAcceptancePerTask（缺省 3；这里是本次校验实际使用的值）'),
+        checkRow(3, '并行组内路径不重叠', of(2), `并行组 ${plan.parallelGroups.length} 个；组内两两比较路径`),
+        checkRow(4, '每个验收标准都被覆盖', of(3), `覆盖：${covered}`),
     ]
     const other = validation.problems.filter((problem) => CHECK_CODES.every((codes) => !codes.includes(problem.code)))
     return [
-        `整体结论：${validation.ok ? '✅ 三道校验全部通过' : '❌ 存在未通过项（详见下表与问题清单）'}`,
+        `整体结论：${validation.ok ? '✅ 四道校验全部通过' : '❌ 存在未通过项（详见下表与问题清单）'}`,
         '',
         '| 校验 | 结果 | 说明 |',
         '|------|------|------|',
@@ -159,7 +161,7 @@ export function renderSplitPlanMarkdown(input: SplitPlanMarkdownInput): string {
         '',
         ...groupLines(input.plan),
         '',
-        '## 三道自动校验',
+        '## 四道自动校验',
         '',
         ...checksLines(input.validation, input.plan),
         '',

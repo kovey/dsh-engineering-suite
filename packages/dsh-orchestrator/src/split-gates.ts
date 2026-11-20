@@ -3,16 +3,18 @@
  *
  * Three deterministic facts, no model in the loop:
  *
- *  - `split-plan` (exit of `split`): the plan on disk passes the three automatic
- *    checks AND the AC-005 threshold. A `not-worth-splitting` verdict is a PASS
- *    with a skip instruction (plain implement); `too-large` is a refusal whose
- *    text says the real fix — several missions.
+ *  - `split-plan` (exit of `split`): the plan on disk passes the four automatic
+ *    checks (including the per-task AC budget) AND the AC-005 threshold. A
+ *    `not-worth-splitting` verdict is a PASS with a skip instruction (plain
+ *    implement); `too-large` is a refusal whose text says the real fix — several
+ *    missions.
  *  - `split-review` (exit of `split-review`): a review record exists, it says
  *    `approved`, and its digest is the digest of the plan on disk. Everything
  *    else — missing, rejected, stale — blocks.
  *  - `split-reviewed` (entry of `implement`): "no plan, or a plan whose reviewed
- *    digest still matches". This is what makes "plan 改动必须重审" true at the
- *    moment work starts, not only at the review stage.
+ *    digest still matches" — and a plan that maps too many criteria onto one task
+ *    is refused HERE too, so a hand-written plan cannot reach `implement` through
+ *    the "one task → not worth splitting" exit (AC-002 of the AC-budget mission).
  *
  * `models.json` problems are appended to every detail: a fallback (a default
  * `maxTasks`, no planner model) is exactly the kind of thing a human must see
@@ -100,18 +102,19 @@ export function splitPlanOutcome(facts: GateFacts): GateOutcome {
     const stored = readSplitPlan(facts.store.layout, missionId)
     if (stored === undefined) {
         return planRefusal(
-            `mission ${missionId} 还没有拆分计划（split/plan.json 缺失）：三道自动校验无从运行`,
+            `mission ${missionId} 还没有拆分计划（split/plan.json 缺失）：四道自动校验无从运行`,
             'planner 把拆分计划写到 missions/' + missionId + '/split/plan.json（tasks[{id,goal,paths,acceptance,dependsOn,parallel}]、coverage、parallelGroups），然后重新 advance 本阶段。',
         )
     }
-    const validation = validateSplitPlan(stored.plan, facts.mission.spec ?? {})
+    const models = modelsOf(facts)
+    const budget = models.config.split.maxAcceptancePerTask
+    const validation = validateSplitPlan(stored.plan, facts.mission.spec ?? {}, { maxAcceptancePerTask: budget })
     if (!validation.ok) {
         return planRefusal(
-            [`三道自动校验未通过（${validation.problems.length} 项），本轮 plan 不予送审：`, ...validation.problems.map((problem) => `- ${problem.detail}`)].join('\n'),
-            '按上面的 problem 修 plan.json：每条任务至少映射一条真实 AC；同一并行组内 paths 不相交；spec 的每条 AC 都被覆盖。修好后重新 advance。',
+            [`四道自动校验未通过（${validation.problems.length} 项），本轮 plan 不予送审：`, ...validation.problems.map((problem) => `- ${problem.detail}`)].join('\n'),
+            `按上面的 problem 修 plan.json：每条任务至少映射一条真实 AC 且最多 ${budget} 条（split.maxAcceptancePerTask）；同一并行组内 paths 不相交；spec 的每条 AC 都被覆盖。修好后重新 advance。`,
         )
     }
-    const models = modelsOf(facts)
     const decision = decideSplit(stored.plan, models.config.split)
     const notes = fallbackLines(facts)
     if (decision.decision === 'too-large') {
@@ -134,7 +137,7 @@ export function splitPlanOutcome(facts: GateFacts): GateOutcome {
         ok: true,
         state: 'PASS',
         detail: [
-            `拆分计划通过三道自动校验（${stored.plan.tasks.length} 条子任务、${stored.plan.parallelGroups.length} 个并行组），plan 摘要 ${stored.digest.slice(0, 12)}：等待 split-review 人工审核`,
+            `拆分计划通过四道自动校验（${stored.plan.tasks.length} 条子任务、${stored.plan.parallelGroups.length} 个并行组，每任务最多 ${budget} 条 AC），plan 摘要 ${stored.digest.slice(0, 12)}：等待 split-review 人工审核`,
             ...notes,
         ].join('\n'),
     }
@@ -174,7 +177,22 @@ export function splitReviewedOutcome(facts: GateFacts): GateOutcome {
         const notes = fallbackLines(facts)
         return { ok: true, state: 'PASS', detail: ['没有拆分计划：本 mission 走 plain implement（不建 worktree、不派 worker）', ...notes].join('\n') }
     }
-    const decision = decideSplit(stored.plan, modelsOf(facts).config.split)
+    const models = modelsOf(facts)
+    const budget = models.config.split.maxAcceptancePerTask
+    // AC-002/AC-003: "one task" only means "not worth splitting" when that task
+    // carries at most the budget. A single task mapping twelve criteria is a
+    // mission wearing a task id — it must be re-split, not quietly sent down the
+    // plain implement path because the plan happens to hold one task.
+    const overBudget = validateSplitPlan(stored.plan, facts.mission.spec ?? {}, { maxAcceptancePerTask: budget }).problems.filter(
+        (problem) => problem.code === 'ac-over-budget',
+    )
+    if (overBudget.length > 0) {
+        return planRefusal(
+            [`拆分计划不满足每任务 AC 预算（${overBudget.length} 项），不能当作"不值得拆"：`, ...overBudget.map((problem) => `- ${problem.detail}`), ...fallbackLines(facts)].join('\n'),
+            `按 AC 边界拆小（每个子任务最多 ${budget} 条验收标准，split.maxAcceptancePerTask）后重新写 missions/${facts.mission.id}/split/plan.json 并重新 advance；单任务计划只有 AC 数不超过预算时才可能被判"不值得拆"。`,
+        )
+    }
+    const decision = decideSplit(stored.plan, models.config.split)
     if (decision.decision === 'not-worth-splitting') {
         return { ok: true, state: 'PASS', detail: `${decision.reasons[0] ?? '不值得拆分'}：走 plain implement，不要求拆分审核` }
     }

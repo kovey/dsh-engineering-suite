@@ -47,7 +47,7 @@ export const DEFAULT_GATE_LABEL: Record<GateKind, string> = {
     'deploy-go': '部署已执行且通过（dsh-deploy-gate 的门禁记录，晚于本阶段进入时间）',
     'deploy-verified': '上线后验证通过（dsh-deploy-gate 的门禁记录，晚于本阶段进入时间）',
     receipt: '已签发交付回执（store.readReceipts）',
-    'split-plan': '拆分计划已落盘且三道自动校验通过（missions/<id>/split/plan.json）',
+    'split-plan': '拆分计划已落盘且四道自动校验通过（含每任务 AC 预算；missions/<id>/split/plan.json）',
     'split-review': '拆分计划已人工审核且 plan 摘要匹配（missions/<id>/split/review.json）',
     'split-reviewed': '没有待审核的拆分计划，或已审核的摘要与当前 plan 一致',
     none: '无门禁',

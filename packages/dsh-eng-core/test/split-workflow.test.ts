@@ -68,7 +68,7 @@ test('no models.json: every class falls back to the host defaults and is NAMED (
     const resolved = loadModelsConfig(layout)
     assert.equal(resolved.present, false)
     assert.deepEqual(resolved.config, DEFAULT_MODELS_CONFIG)
-    assert.deepEqual(resolved.config.split, { reviewRequired: true, maxTasks: 8, maxParallel: 3, maxReworkRounds: 2 })
+    assert.deepEqual(resolved.config.split, { reviewRequired: true, maxTasks: 8, maxParallel: 3, maxReworkRounds: 2, maxAcceptancePerTask: 3 })
     assert.equal(resolved.config.quality.maxReworkRatio, 0.3)
     assert.deepEqual(resolved.sources, { planner: 'default', worker: 'default', split: 'default', quality: 'default' })
     // Never silent: one line per class, pointing at the file that was consulted.
@@ -86,7 +86,7 @@ test('the project file wins over the profile, and both win over the host default
     const { layout } = workspace({
         planner: { model: 'deepseek/deepseek-reasoner', reasoningEffort: 'high' },
         worker: { model: 'deepseek/deepseek-chat' },
-        split: { reviewRequired: false, maxTasks: 4, maxParallel: 2, maxReworkRounds: 1 },
+        split: { reviewRequired: false, maxTasks: 4, maxParallel: 2, maxReworkRounds: 1, maxAcceptancePerTask: 5 },
         quality: { maxReworkRatio: 0.5 },
     })
     const resolved = loadModelsConfig(layout, { profile: { planner: { model: 'profile-model' }, worker: { model: 'profile-worker' } } })
@@ -98,6 +98,7 @@ test('the project file wins over the profile, and both win over the host default
     assert.equal(resolved.config.split.maxTasks, 4)
     assert.equal(resolved.config.split.maxParallel, 2)
     assert.equal(resolved.config.split.maxReworkRounds, 1)
+    assert.equal(resolved.config.split.maxAcceptancePerTask, 5)
     assert.equal(resolved.config.quality.maxReworkRatio, 0.5)
     assert.deepEqual(resolved.sources, { planner: 'project', worker: 'project', split: 'project', quality: 'project' })
     assert.deepEqual(resolved.problems, [])
@@ -125,7 +126,7 @@ test('a partially declared class reports every field it took from the default (n
     const resolved = loadModelsConfig(layout)
     assert.equal(resolved.config.split.maxTasks, 5)
     assert.equal(resolved.config.split.maxParallel, 3)
-    for (const field of ['reviewRequired', 'maxParallel', 'maxReworkRounds']) {
+    for (const field of ['reviewRequired', 'maxParallel', 'maxReworkRounds', 'maxAcceptancePerTask']) {
         assert.ok(
             resolved.problems.some((problem) => problem.includes(`split.${field}`) && problem.includes('回退默认')),
             `missing fallback note for split.${field}: ${resolved.problems.join(' | ')}`,
@@ -136,7 +137,7 @@ test('a partially declared class reports every field it took from the default (n
 test('invalid values are reported and replaced by the default, never guessed', () => {
     const { layout } = workspace({
         planner: { model: 42 },
-        split: { maxTasks: 0, maxParallel: 'many', reviewRequired: 'yes', maxReworkRounds: -1 },
+        split: { maxTasks: 0, maxParallel: 'many', reviewRequired: 'yes', maxReworkRounds: -1, maxAcceptancePerTask: 11 },
         quality: { maxReworkRatio: 2 },
     })
     const resolved = loadModelsConfig(layout)
@@ -145,8 +146,9 @@ test('invalid values are reported and replaced by the default, never guessed', (
     assert.equal(resolved.config.split.maxParallel, 3)
     assert.equal(resolved.config.split.reviewRequired, true)
     assert.equal(resolved.config.split.maxReworkRounds, 2)
+    assert.equal(resolved.config.split.maxAcceptancePerTask, 3)
     assert.equal(resolved.config.quality.maxReworkRatio, 0.3)
-    for (const fragment of ['planner 段 的 model', 'maxTasks', 'maxParallel', 'reviewRequired', 'maxReworkRounds', 'maxReworkRatio']) {
+    for (const fragment of ['planner 段 的 model', 'maxTasks', 'maxParallel', 'reviewRequired', 'maxReworkRounds', 'maxAcceptancePerTask', 'maxReworkRatio']) {
         assert.ok(
             resolved.problems.some((problem) => problem.includes(fragment)),
             `missing problem for ${fragment}: ${resolved.problems.join(' | ')}`,
@@ -266,9 +268,105 @@ test('the plan digest ignores key order but not content (the review binds to con
     assert.notEqual(splitPlanDigest(plan), splitPlanDigest(edited))
 })
 
+// --- the per-task AC budget (AC-001 / AC-003) ----------------------------
+
+/** A plan with ONE task mapping `ids` — the shape "a whole mission in one task" has. */
+function singleTaskPlan(ids: string[]): SplitPlan {
+    return {
+        tasks: [{ id: 't1', goal: '全部', paths: ['packages/**'], acceptance: ids, dependsOn: [], parallel: false }],
+        coverage: Object.fromEntries(ids.map((id) => [id, ['t1']])),
+        parallelGroups: [['t1']],
+    }
+}
+
+/** Criteria `AC-001`…`AC-0NN`, in order. */
+function criteriaIds(count: number): string[] {
+    return Array.from({ length: count }, (_, index) => `AC-${String(index + 1).padStart(3, '0')}`)
+}
+
+test('a task mapping EXACTLY the budget passes, and the default budget is 3 (TC-2701)', () => {
+    const ids = criteriaIds(3)
+    const validation = validateSplitPlan(singleTaskPlan(ids), spec(...ids))
+    assert.equal(validation.ok, true, JSON.stringify(validation.problems))
+    assert.deepEqual(validation.problems, [])
+    assert.equal(validation.maxAcceptancePerTask, 3)
+})
+
+test('a task over the budget is refused, naming the task, the count and the limit (AC-001)', () => {
+    const ids = criteriaIds(12)
+    const validation = validateSplitPlan(singleTaskPlan(ids), spec(...ids))
+    assert.equal(validation.ok, false)
+    const problem = validation.problems.find((entry) => entry.code === 'ac-over-budget')
+    assert.ok(problem !== undefined, JSON.stringify(validation.problems))
+    assert.equal(problem.taskId, 't1')
+    assert.equal(problem.detail, '任务 t1 映射了 12 条验收标准（上限 3）：请按 AC 边界拆小')
+})
+
+test('the budget is configurable: split.maxAcceptancePerTask=2 refuses a 3-criterion task (TC-2703)', () => {
+    const { layout } = workspace({ split: { maxAcceptancePerTask: 2 } })
+    const configured = loadModelsConfig(layout).config.split
+    assert.equal(configured.maxAcceptancePerTask, 2)
+    const ids = criteriaIds(3)
+    const validation = validateSplitPlan(singleTaskPlan(ids), spec(...ids), { maxAcceptancePerTask: configured.maxAcceptancePerTask })
+    assert.equal(validation.ok, false)
+    assert.equal(validation.maxAcceptancePerTask, 2)
+    const problem = validation.problems.find((entry) => entry.code === 'ac-over-budget')
+    assert.equal(problem?.detail, '任务 t1 映射了 3 条验收标准（上限 2）：请按 AC 边界拆小')
+})
+
+test('split.maxAcceptancePerTask is bounded to 1..10, and a rejected value falls back to 3 by name (AC-001)', () => {
+    for (const good of [1, 10]) {
+        const resolved = loadModelsConfig(workspace({ split: { maxAcceptancePerTask: good } }).layout)
+        assert.equal(resolved.config.split.maxAcceptancePerTask, good)
+    }
+    for (const bad of [0, 11, 2.5, '3']) {
+        const resolved = loadModelsConfig(workspace({ split: { maxAcceptancePerTask: bad } }).layout)
+        assert.equal(resolved.config.split.maxAcceptancePerTask, 3, `maxAcceptancePerTask=${JSON.stringify(bad)} must fall back to 3`)
+        assert.ok(
+            resolved.problems.some((problem) => problem.includes('maxAcceptancePerTask') && problem.includes('1..10')),
+            `missing bounded problem for ${JSON.stringify(bad)}: ${resolved.problems.join(' | ')}`,
+        )
+    }
+})
+
+test('13 criteria need at least five tasks: four always break the budget, five can pass (TC-2702 / AC-003)', () => {
+    const ids = criteriaIds(13)
+    const criteria = spec(...ids)
+    // Distribute the criteria over n tasks as evenly as the ids allow.
+    const planOf = (count: number): SplitPlan => {
+        const tasks = Array.from({ length: count }, (_, index) => ({
+            id: `t${index + 1}`,
+            goal: `第 ${index + 1} 个任务`,
+            paths: [`packages/t${index + 1}/**`],
+            acceptance: ids.filter((_, position) => position % count === index),
+            dependsOn: [],
+            parallel: false,
+        }))
+        return {
+            tasks,
+            coverage: Object.fromEntries(tasks.flatMap((task) => task.acceptance.map((id) => [id, [task.id]]))),
+            parallelGroups: tasks.map((task) => [task.id]),
+        }
+    }
+    for (const count of [2, 3, 4]) {
+        const validation = validateSplitPlan(planOf(count), criteria)
+        assert.equal(validation.ok, false, `${count} tasks cannot hold 13 criteria: ${JSON.stringify(validation.problems)}`)
+        assert.ok(validation.problems.some((problem) => problem.code === 'ac-over-budget'))
+    }
+    const five = planOf(5)
+    assert.equal(validateSplitPlan(five, criteria).ok, true)
+    assert.equal(decideSplit(five, DEFAULT_MODELS_CONFIG.split).decision, 'split')
+    // Why the validator must run BEFORE the threshold: decideSplit only counts
+    // tasks, so the one-task plan still reads "not worth splitting" — that is
+    // exactly the silent path the budget closes (AC-002/AC-003).
+    assert.equal(decideSplit(singleTaskPlan(ids), DEFAULT_MODELS_CONFIG.split).decision, 'not-worth-splitting')
+})
+
 // --- the threshold (AC-005) ----------------------------------------------
 
-test('one task is not worth splitting (TC-2017)', () => {
+// TC-2706: the budget does not change this answer — one task with ONE criterion
+// is under the budget, so "not worth splitting" stays a legitimate PASS.
+test('one task is not worth splitting (TC-2017 / TC-2706)', () => {
     const plan: SplitPlan = {
         tasks: [{ id: 't1', goal: '全部', paths: ['packages/**'], acceptance: ['AC-001'], dependsOn: [], parallel: false }],
         coverage: { 'AC-001': ['t1'] },
@@ -277,6 +375,7 @@ test('one task is not worth splitting (TC-2017)', () => {
     const decision = decideSplit(plan, DEFAULT_MODELS_CONFIG.split)
     assert.equal(decision.decision, 'not-worth-splitting')
     assert.match(decision.reasons[0] ?? '', /少于 2 条/)
+    assert.equal(validateSplitPlan(plan, spec('AC-001')).ok, true, 'one criterion is inside the default budget')
 })
 
 test('two tasks with exactly the same paths are not worth splitting either', () => {

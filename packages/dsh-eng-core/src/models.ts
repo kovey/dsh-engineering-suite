@@ -11,7 +11,8 @@
  * <root>/models.json
  *   planner { model, reasoningEffort, provider }
  *   worker  { model, reasoningEffort, provider }
- *   split   { reviewRequired, maxTasks, maxParallel, maxReworkRounds, taskTimeoutMs, maxAttempts }
+ *   split   { reviewRequired, maxTasks, maxParallel, maxReworkRounds, taskTimeoutMs, maxAttempts,
+ *             maxAcceptancePerTask }
  *   quality { maxReworkRatio }
  * ```
  *
@@ -36,6 +37,9 @@ import { isRecord, parseQualitySection, parseSplitSection, type QualitySettings,
 export type { QualitySettings, SplitSettings } from './models-sections.js'
 // AC-002 of P3: the retry ceiling lives with the section that declares it, and is
 // resolved at the point of use (an absent `maxAttempts` means the documented 1).
+// The per-task AC budget follows the same rule (absent = documented 3) and is
+// resolved by `models-sections.ts`'s `splitMaxAcceptancePerTask`, next to its
+// constants — the barrel stays inside the export-count ratchet.
 export { DEFAULT_SPLIT_MAX_ATTEMPTS, MAX_SPLIT_ATTEMPTS, splitMaxAttempts } from './models-sections.js'
 
 /** One model class (`planner` / `worker`). */
@@ -77,7 +81,7 @@ export interface ModelsConfigResolution {
 export const DEFAULT_MODELS_CONFIG: ModelsConfig = {
     planner: {},
     worker: {},
-    split: { reviewRequired: true, maxTasks: 8, maxParallel: 3, maxReworkRounds: 2 },
+    split: { reviewRequired: true, maxTasks: 8, maxParallel: 3, maxReworkRounds: 2, maxAcceptancePerTask: 3 },
     quality: { maxReworkRatio: 0.3 },
 }
 
@@ -94,7 +98,7 @@ export interface ModelsLayer {
 const SECTION_DEFAULTS: Record<ModelsClass, string> = {
     planner: 'planner{model,reasoningEffort}',
     worker: 'worker{model,reasoningEffort}',
-    split: 'split{reviewRequired,maxTasks,maxParallel,maxReworkRounds,taskTimeoutMs,maxAttempts}',
+    split: 'split{reviewRequired,maxTasks,maxParallel,maxReworkRounds,taskTimeoutMs,maxAttempts,maxAcceptancePerTask}',
     quality: 'quality{maxReworkRatio}',
 }
 

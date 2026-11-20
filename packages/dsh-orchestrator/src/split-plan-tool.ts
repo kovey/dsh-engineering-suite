@@ -2,11 +2,12 @@
  * `split_plan` — the write entry of the split workflow (AC-001).
  *
  * Before this tool the only writer of `split/plan.json` was a caller holding the
- * library (`saveSplitPlan`), which meant the three automatic checks could be
- * skipped by writing the file by hand. The tool makes the checked path the easy
- * path: read the mission's specification (its criteria are the oracle), run the
- * three checks (`validateSplitPlan`), and write `plan.json` + the readable
- * `plan.md` only when all three pass — returning the digest a review must quote.
+ * library (`saveSplitPlan`), which meant the automatic checks could be skipped by
+ * writing the file by hand. The tool makes the checked path the easy path: read
+ * the mission's specification (its criteria are the oracle), run the checks
+ * (`validateSplitPlan`, including the per-task AC budget from `models.json`), and
+ * write `plan.json` + the readable `plan.md` only when all of them pass —
+ * returning the digest a review must quote.
  *
  * The one refusal that is NOT about validity: a mission whose plan already exists
  * and whose content would change (different digest) must say `force: true`.
@@ -21,7 +22,16 @@
 
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { sessionIdOf, type AgentLike, type Layout, type MissionRecord, type MissionStoreRegistry } from 'dsh-eng-core'
-import { readSplitPlan, saveSplitPlan, splitPlanDigest, validateSplitPlan, type SplitPlan, type SplitValidation } from 'dsh-eng-core/split'
+import {
+    loadModelsConfig,
+    readSplitPlan,
+    saveSplitPlan,
+    splitPlanDigest,
+    validateSplitPlan,
+    type SplitPlan,
+    type SplitValidation,
+} from 'dsh-eng-core/split'
+import { SPLIT_PLAN_PARAMETERS } from './split-plan-tool-schema.js'
 
 /** Arguments of `split_plan` (untrusted: validated by `validateSplitPlan`). */
 export interface SplitPlanToolArgs {
@@ -41,6 +51,8 @@ export interface ApplySplitPlanInput {
     spec: unknown
     /** Mission title, rendered into the readable `plan.md`. */
     title?: string
+    /** Profile-level `models.json` defaults (`config.split.models`), like the gates. */
+    profile?: unknown
     tasks: unknown
     parallelGroups?: unknown
     force?: boolean
@@ -78,6 +90,8 @@ export interface ToolRegistrationSink {
 /** The part of `SequenceDeps` this tool needs (structural: no import cycle). */
 export interface SplitPlanToolDeps {
     stores: MissionStoreRegistry
+    /** `config.split.models`: the profile layer of the project's `models.json`. */
+    config?: { split?: { models?: unknown } }
 }
 
 /**
@@ -130,7 +144,8 @@ export function applySplitPlan(input: ApplySplitPlanInput): ApplySplitPlanResult
     const draft = { tasks: input.tasks, parallelGroups: groups, coverage: coverageOf(input.tasks) } as unknown as SplitPlan
     const taskCount = Array.isArray(input.tasks) ? input.tasks.length : 0
     const groupCount = Array.isArray(groups) ? groups.length : 0
-    const validation = validateSplitPlan(draft, input.spec)
+    const models = loadModelsConfig(input.layout, { profile: input.profile })
+    const validation = validateSplitPlan(draft, input.spec, { maxAcceptancePerTask: models.config.split.maxAcceptancePerTask })
     if (!validation.ok) {
         return { ok: false, validation, problems: validation.problems.map((problem) => problem.detail), taskCount, groupCount, replaced: false, reviewInvalidated: false }
     }
@@ -159,14 +174,14 @@ export function applySplitPlan(input: ApplySplitPlanInput): ApplySplitPlanResult
 
 /** The report of a refused write (validation problems, or the force requirement). */
 function refusalLines(result: ApplySplitPlanResult): string[] {
-    const heading = result.reviewInvalidated ? '拆分计划未写入：内容变化需要显式 force' : `拆分计划未写入：三道自动校验未通过（${result.problems.length} 条）`
+    const heading = result.reviewInvalidated ? '拆分计划未写入：内容变化需要显式 force' : `拆分计划未写入：四道自动校验未通过（${result.problems.length} 条）`
     return [
         heading,
         ...result.problems.map((problem) => `- ${problem}`),
         '',
         result.reviewInvalidated
             ? '下一步：确认要改这份计划后，带 force: true 重新调用 split_plan；然后重新审核（split-review 阶段/人工审批）。'
-            : '下一步：按上面的问题修好 tasks / parallelGroups，再调用一次 split_plan（校验不过不会写入任何文件）。',
+            : `下一步：按上面的问题修好 tasks / parallelGroups（每个子任务最多映射 ${result.validation.maxAcceptancePerTask} 条验收标准），再调用一次 split_plan（校验不过不会写入任何文件）。`,
     ]
 }
 
@@ -183,6 +198,7 @@ function successLines(mission: MissionRecord, result: ApplySplitPlanResult): str
         `- 可读版本：${result.markdownFile ?? '(未知路径)'}（人工审核打开的就是它；plan.json 变了就同步重写）`,
         `- 摘要：${digest.slice(0, 12)}（审核必须引用这个摘要）`,
         `- 子任务：${result.taskCount} 个；并行组：${result.groupCount} 个`,
+        `- 每任务 AC 上限：${result.validation.maxAcceptancePerTask} 条（models.json 的 split.maxAcceptancePerTask；超预算的计划不会写入）`,
         `- 覆盖验收标准：${result.validation.covered.join('、') || '(无)'}`,
         `- 审核状态：${review}`,
         '',
@@ -221,6 +237,7 @@ export function runSplitPlanTool(deps: SplitPlanToolDeps, args: SplitPlanToolArg
         missionId: mission.id,
         spec: mission.spec,
         title: mission.title,
+        profile: deps.config?.split?.models,
         tasks: args.tasks,
         ...(args.parallelGroups === undefined ? {} : { parallelGroups: args.parallelGroups }),
         ...(args.force === true ? { force: true } : {}),
@@ -228,49 +245,12 @@ export function runSplitPlanTool(deps: SplitPlanToolDeps, args: SplitPlanToolArg
     return [...(result.ok ? successLines(mission, result) : refusalLines(result))].join('\n')
 }
 
-/** One task's schema fields (a separate const: the nesting is data, and the file depth rule counts braces). */
-const SPLIT_TASK_PROPERTIES = {
-    id: { type: 'string', description: 'Stable task id (`T-001`); also the worktree/branch suffix and the required commit prefix.' },
-    goal: { type: 'string', description: 'What this task must achieve.' },
-    paths: { type: 'array', items: { type: 'string' }, description: 'Workspace-relative paths this task owns (globs allowed).' },
-    acceptance: { type: 'array', items: { type: 'string' }, description: 'Acceptance criteria ids (`AC-001`) this task satisfies — they must exist in the mission spec.' },
-    dependsOn: { type: 'array', items: { type: 'string' }, description: 'Task ids that must finish before this one starts.' },
-    parallel: { type: 'boolean', description: 'Whether this task may run next to its group\'s other tasks.' },
-} as const
-
-/** One task of the plan, as the tool transports it. */
-const SPLIT_TASK_SCHEMA = {
-    type: 'object',
-    additionalProperties: true,
-    properties: SPLIT_TASK_PROPERTIES,
-    description: 'One task: at least one real acceptance criterion and at least one path.',
-} as const
-
-/** The parameter schema of `split_plan` (module scope: the nesting is data, not logic). */
-const SPLIT_PLAN_PARAMETERS = {
-    tasks: {
-        type: 'array',
-        required: true,
-        items: SPLIT_TASK_SCHEMA,
-        description: 'The tasks of the plan. Each one needs at least one real acceptance criterion and at least one path.',
-    },
-    parallelGroups: {
-        type: 'array',
-        items: { type: 'array', items: { type: 'string' } },
-        description: 'Groups of task ids that may run at the same time. Every task must appear in exactly one group; no two tasks of a group may own overlapping paths. Omitted = one group per task (serial execution).',
-    },
-    force: {
-        type: 'boolean',
-        description: 'Write a plan whose digest differs from the one on disk. Refused without it ("改动需要重新审核"); the existing review record then no longer matches, so a new review is required before any dispatch.',
-    },
-} as const
-
 /** The `defineTool` definition of `split_plan` (one place: the tool IS its schema). */
 function splitPlanDefinition(deps: SplitPlanToolDeps): unknown {
     return defineTool({
         name: 'split_plan',
         description:
-            'Write the split plan of the current mission (dsh-orchestrator): validate the tasks against the mission\'s acceptance criteria (every task maps a REAL criterion, no overlapping paths inside one parallel group, every criterion covered) and only then write .dsh/…/missions/<id>/split/plan.json. A plan that fails a check is NOT written and the problems are listed. When a plan already exists with a different digest, the write is refused unless force: true — editing a reviewed plan invalidates its review, so it needs a deliberate re-plan. Returns the digest a review must quote. Omitted parallelGroups = one group per task (serial); no worker runs until a person approves the plan.',
+            'Write the split plan of the current mission (dsh-orchestrator): validate the tasks against the mission\'s acceptance criteria (every task maps a REAL criterion AND at most split.maxAcceptancePerTask of them — default 3, so a whole mission cannot hide in one task — no overlapping paths inside one parallel group, every criterion covered) and only then write .dsh/…/missions/<id>/split/plan.json. A plan that fails a check is NOT written and the problems are listed. When a plan already exists with a different digest, the write is refused unless force: true — editing a reviewed plan invalidates its review, so it needs a deliberate re-plan. Returns the digest a review must quote. Omitted parallelGroups = one group per task (serial); no worker runs until a person approves the plan.',
         parameters: SPLIT_PLAN_PARAMETERS,
         output: { schema: { type: 'string' }, render: (_args: unknown, value: string) => [{ type: 'text', text: value }] },
         async execute(args: SplitPlanToolArgs, exec: unknown) {

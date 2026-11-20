@@ -2190,10 +2190,10 @@ approval 文字卡——计划里有什么、三道校验过没过，审核的�
 | 文件 | 内容 | 谁读 |
 |------|------|------|
 | `split/plan.json` | 计划本体；摘要 = 审核绑定的身份 | 门禁、runner、导入器 |
-| `split/plan.md` | 标题、摘要、任务表（id/目标/路径/覆盖 AC/依赖）、并行组、三道校验结果、写入时的审核状态 | 人（TUI 预览打开的就是它） |
+| `split/plan.md` | 标题、摘要、任务表（id/目标/路径/覆盖 AC/依赖）、并行组、自动校验结果（§5.38.4 起为四道）、写入时的审核状态 | 人（TUI 预览打开的就是它） |
 
 - **同一写入点**：不是"再跑一个命令生成文档"。任何写 `plan.json` 的路径都会重写 md；`split_plan` 工具把
-  它刚跑的三道校验一并写进去，所以编辑过计划就不可能留下旧文档。
+  它刚跑的自动校验一并写进去，所以编辑过计划就不可能留下旧文档。
 - **审核状态是写入快照**：`review.json` / `reviews.jsonl` 仍是权威，md 明说"审核决定本身不重写本文件，
   下一次写 plan.json 时才重写"。实现上先写 JSON、**再**读审核状态渲染，因此"plan 改了 → 摘要变了 →
   旧审核失效"会如实出现在文档里（`必须重新审核`），不会重复一个已经不适用的批准。
@@ -2252,16 +2252,16 @@ approval 文字卡——计划里有什么、三道校验过没过，审核的�
 
 **E. 测试**
 
-- `dsh-eng-core/test/split-plan-md.test.ts`（5 例）：一次写入产出两份、任务表/并行组/三道校验/审核状态齐全；
-  改计划**重写**而不是追加；没跑校验如实标注、校验失败逐条列出；写入后再读审核状态（批准可见、重拆变
-  stale）；split 目录只有 `plan.json` + `plan.md` 且不写门禁。
+- `dsh-eng-core/test/split-plan-md.test.ts`（5 例）：一次写入产出两份、任务表/并行组/自动校验（§5.38.4
+  起为四道）/审核状态齐全；改计划**重写**而不是追加；没跑校验如实标注、校验失败逐条列出；写入后再读审核
+  状态（批准可见、重拆变 stale）；split 目录只有 `plan.json` + `plan.md` 且不写门禁。
 - `dsh-orchestrator/test/split-review-tui.test.ts`（10 例）：菜单四项（含值）与标题里的摘要/计数；查看 →
   预览打开 `plan.md`（内容含任务表与校验）→ 菜单回来且零记录；批准 → `approved` + `source=tui` + 进
   `implement`；打回 → 第二个 picker 问原因 → `rejected` + 回退；原因 popup Esc → 回菜单；无 TUI → seam 的
   reason 含 `split/plan.md` / 摘要 / 子任务 / 并行组；只有 TUI 没有 seam 也能审；TUI 无 picker → 交给 seam；
   `never` 两条路径都 BLOCK 且零记录；TUI 下改过的计划重审并批准**新**摘要。
 - `dsh-orchestrator/test/split-plan-tool.test.ts` 追加 1 例：`split_plan` 写入后 `plan.md` 存在、含任务表与
-  "三道校验全部通过"，工具的汇报里点名可读版本。
+  "四道校验全部通过"，工具的汇报里点名可读版本。
 - `dsh-spec-gate` 既有 202 例全通过（预览抽取后行为不变；面板/浮窗降级与 `q` 关闭的用例仍是原来的断言）。
 
 **诚实边界（P5）**
@@ -2271,6 +2271,93 @@ approval 文字卡——计划里有什么、三道校验过没过，审核的�
   重拆时让文档刷新。这是刻意的：让"审核"这一步不产生额外写盘。
 - 预览是"尽力展示"：宿主没有 viewer/panel/float 时退到标签页，再不行只给 notice；它不证明人真的读了。
 - 未演练的真实 nvim-tui：本仓库的用例用结构化假宿主（viewer/panel/float 三条路都覆盖），真机观感仍需人工看一眼。
+
+### 5.38.4 每个子任务最多三条 AC：把"拆分粒度"变成硬预算
+
+§5.38.1 的 `split_plan` 让校验成为写入口，§5.38.2 的门槛回答"值不值得拆"，但两者都**不限制一个
+子任务能装多少验收标准**。真实后果：连续 5 个 mission 的 plan 都是**单任务**（覆盖 11~13 条 AC、
+19~32 个路径），于是先撞上 `tasks < 2 → not-worth-splitting`，流水线从未要求拆分——"拆成子任务"在
+纸面上存在，在数据上从未发生。
+
+这一节加一条**硬预算**（AC-001）：`models.json` 的 `split.maxAcceptancePerTask`（缺省 3，允许 1..10）。
+
+**A. 配置与解析**
+
+| 字段 | 含义 | 缺省 / 边界 |
+|------|------|-------------|
+| `split.maxAcceptancePerTask` | 一个子任务**最多**映射几条验收标准 | 缺省 3；允许 1..10；非法值点名后回退 3 |
+
+- 它在 `DEFAULT_MODELS_CONFIG.split` 里有一个**真实**的缺省值（与 `maxAttempts` 不同）：回退到 3 会
+  改变判定（原本能过的 plan 可能被拒），所以 `mergeSection` 会像 `maxTasks` 一样把"未配置 → 回退默认 3"
+  写进 `problems`，而不是静默生效。
+- 解析用与 `maxAttempts` 同一个 `boundedInt`：`0` / `11` / `2.5` / `"3"` 都被点名、忽略，由缺省 3 兜底；
+  使用点再用 `splitMaxAcceptancePerTask` 收口一次（手写 `ModelsConfig` 的嵌入方也拿不到越界预算）。
+
+**B. 校验落点：第四道，与前三道同级**
+
+`validateSplitPlan(plan, spec, { maxAcceptancePerTask })` 新增一条**硬校验**：任一任务
+`acceptance.length > 预算` → `problems` 里 `code: 'ac-over-budget'`，原文：
+
+> 任务 `<id>` 映射了 N 条验收标准（上限 M）：请按 AC 边界拆小
+
+它与"每个子任务映射真实 AC（且至少一条）/ 同组路径不相交 / AC 全覆盖"**同级**：`ok=false`，
+`split_plan` 不写盘、`split` 阶段 BLOCK（AC-002）。没有任何"警告后继续"的分支。
+
+预算的传递链只有一条：`models.json`（项目）> `config.split.models`（profile）> 内建 3 →
+`loadModelsConfig` 解析 → `split_plan` 工具、`split-plan` 门禁、`plan.md` 渲染各取同一份
+`config.split.maxAcceptancePerTask`；工具与门禁都不会退回各自的"默认 3"。
+
+**C. "单任务 → 不值得拆"不再吞掉粗计划（AC-003）**
+
+`decideSplit` 的判定没变（任务数 <2 / 路径完全相同 → `not-worth-splitting`），改变的是**顺序**：
+`split` 阶段先跑四道校验，再问门槛。所以单任务 plan 只有在它的 AC 数 ≤ 预算时才可能拿到
+`not-worth-splitting`；13 条 AC 的单任务先被第四道校验拒掉（"必须按 AC 边界拆小"），
+**至少 5 个任务**（⌈13/3⌉）才可能通过。
+
+`implement` 入口（`split-reviewed`）也复算这条预算：那是一份**磁盘上的** plan，可能是手写/旧版本
+留下的。只跑门槛的话，一个 12 条 AC 的单任务仍会拿到 `not-worth-splitting` 并被当成 plain
+implement——正是要关掉的静默路径。
+
+**D. `plan.md` 的四道校验**
+
+人审核打开的那份文档里，"自动校验"表从三行变四行，预算与它是否通过都写进去：
+
+```
+## 四道自动校验
+
+整体结论：✅ 四道校验全部通过
+
+| 校验 | 结果 | 说明 |
+|------|------|------|
+| 1. 每个子任务映射真实验收标准 | ✅ 通过 | 子任务 2 个；映射的标准都在规格里 |
+| 2. 每个子任务最多映射 3 条验收标准 | ✅ 通过 | 上限来自 models.json 的 split.maxAcceptancePerTask（缺省 3；这里是本次校验实际使用的值） |
+| 3. 并行组内路径不重叠 | ✅ 通过 | 并行组 1 个；组内两两比较路径 |
+| 4. 每个验收标准都被覆盖 | ✅ 通过 | 覆盖：AC-001、AC-002 |
+```
+
+超预算时第 2 行标 ❌ 并给出条数；具体是哪个任务、几条 AC 写在门禁/工具的 refusal 报告里
+（`plan.md` 是投影，不重复裁决）。
+
+**E. 测试**
+
+- `dsh-eng-core/test/split-workflow.test.ts`：等于预算（3 条）通过、12 条被拒且 problems 原文点名、
+  `maxAcceptancePerTask=2` 时 3 条被拒（配置真的生效）、1..10 边界与非法值回退、
+  13 条 AC 时 2/3/4 个任务都被拒而 5 个任务通过（并断言 `decideSplit` 单独会把单任务读成
+  "不值得拆"——这正是校验必须先跑的理由）。
+- `dsh-eng-core/test/split-plan-md.test.ts`：失败的第 2 行标 ❌、上限写进说明。
+- `dsh-orchestrator/test/split-plan-tool.test.ts`：单任务 12 条 AC 被 `split_plan` 拒绝，`plan.json`
+  未写入。
+- `dsh-orchestrator/test/split-stages.test.ts`：同样的 plan 让 `split` 阶段 BLOCK 且**不**出现
+  "不值得拆分"；`implement` 入口拒绝超预算的单任务 plan（不是 "not worth splitting"）。
+
+**诚实边界（§5.38.4）**
+
+- 预算是**每任务上限**，不是平均值：它不阻止 `maxTasks` 个任务各自 3 条 AC 的宽计划，也不判断
+  "这样切好不好"——那是审核人的问题。
+- `plan.md` 里的上限是**本次校验实际使用的值**（`SplitValidation.maxAcceptancePerTask`），不是重新
+  读配置得来的；没有校验结果的库写入不渲染这张表。
+- 门槛（`decideSplit`）本身**没有**预算概念：绕过 `validateSplitPlan` 直接调用它的地方，看到的仍是
+  旧的"单任务不值得拆"结论。门禁与工具的组合顺序才是权威。
 
 ## 6. 为什么这样切分
 

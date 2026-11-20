@@ -51,8 +51,8 @@ function storeFor(cwd: string): MissionStore {
     return new MissionStoreRegistry().for(cwd)
 }
 
-/** A mission parked on a stage with an approved spec (three criteria). */
-function missionAt(fake: FakeHost, stage: string, id = 'm-split'): { store: MissionStore; cwd: string; layout: Layout } {
+/** A mission parked on a stage with an approved spec (`criteria` acceptance criteria, default 3). */
+function missionAt(fake: FakeHost, stage: string, id = 'm-split', options: { criteria?: number } = {}): { store: MissionStore; cwd: string; layout: Layout } {
     const store = storeFor(fake.cwd)
     store.create({ id, title: '拆分测试', cwd: fake.cwd, sessionId: 'session-1' })
     // Bind the session: `orchestrate` resolves the mission through the binding.
@@ -64,11 +64,10 @@ function missionAt(fake: FakeHost, stage: string, id = 'm-split'): { store: Miss
             title: '拆分测试',
             background: '',
             requirements: [],
-            acceptanceCriteria: [
-                { id: 'AC-001', text: 'a' },
-                { id: 'AC-002', text: 'b' },
-                { id: 'AC-003', text: 'c' },
-            ],
+            acceptanceCriteria: Array.from({ length: options.criteria ?? 3 }, (_, index) => ({
+                id: `AC-${String(index + 1).padStart(3, '0')}`,
+                text: `criterion ${index + 1}`,
+            })),
             fileBoundaries: ['packages/**'],
             negativeConstraints: [],
             revision: 1,
@@ -115,7 +114,7 @@ test('enabling split inserts the two stages between spec-approve and implement, 
     const text = await orchestrate(fake, { action: 'stages' })
     const ids = [...text.matchAll(/^\d+\. ([\w-]+) — /gm)].map((match) => match[1])
     assert.deepEqual(ids, ['spec-clarify', 'test-design-review', 'spec-approve', 'split', 'split-review', 'implement', 'quality-verify', 'delivery'])
-    assert.match(text, /split[\s\S]{0,200}拆分计划已落盘且三道自动校验通过/)
+    assert.match(text, /split[\s\S]{0,200}拆分计划已落盘且四道自动校验通过/)
     assert.match(text, /split-review[\s\S]{0,200}已人工审核且 plan 摘要匹配/)
     assert.match(text, /implement[\s\S]{0,400}没有待审核的拆分计划/)
 })
@@ -138,7 +137,7 @@ test('a plan that fails the automatic checks BLOCKS the split stage, naming the 
     saveSplitPlan(layout, 'm-split', plan)
 
     const text = await orchestrate(fake, { action: 'advance', verdict: 'PASS' })
-    assert.match(text, /三道自动校验未通过/)
+    assert.match(text, /四道自动校验未通过/)
     assert.match(text, /子任务 t2 没有映射任何验收标准/)
     // The stage stays OPEN for a re-plan: nothing was settled, nothing advanced.
     assert.equal(storeFor(cwd).read('m-split')?.stage, 'split')
@@ -147,7 +146,7 @@ test('a plan that fails the automatic checks BLOCKS the split stage, naming the 
     assert.equal(fs.existsSync(path.join(layout.missionsDir, 'm-split', 'stages', 'implement.json')), false)
     // Retrying is free: the same refusal comes back, no attempt was burned.
     const again = await orchestrate(fake, { action: 'advance', verdict: 'PASS' })
-    assert.match(again, /三道自动校验未通过/)
+    assert.match(again, /四道自动校验未通过/)
 })
 
 test('a plan over maxTasks is refused and points at several missions (AC-005)', async () => {
@@ -167,13 +166,54 @@ test('a plan over maxTasks is refused and points at several missions (AC-005)', 
     assert.equal(fs.existsSync(path.join(layout.missionsDir, 'm-split', 'stages', 'implement.json')), false)
 })
 
+test('a single task carrying twelve criteria is BLOCKED at the split stage, not waved through as "not worth splitting" (TC-2705)', async () => {
+    const fake = host()
+    const { cwd, layout } = missionAt(fake, 'split', 'm-split', { criteria: 12 })
+    const criteria = Array.from({ length: 12 }, (_, index) => `AC-${String(index + 1).padStart(3, '0')}`)
+    saveSplitPlan(layout, 'm-split', {
+        tasks: [{ id: 't1', goal: '全部', paths: ['packages/**'], acceptance: criteria, dependsOn: [], parallel: false }],
+        coverage: Object.fromEntries(criteria.map((criterion) => [criterion, ['t1']])),
+        parallelGroups: [['t1']],
+    })
+
+    const text = await orchestrate(fake, { action: 'advance', verdict: 'PASS' })
+    // The plan is refused by the validator BEFORE the threshold can call one task
+    // "not worth splitting": the stage stays open for a re-split.
+    assert.match(text, /四道自动校验未通过/)
+    assert.match(text, /任务 t1 映射了 12 条验收标准（上限 3）：请按 AC 边界拆小/)
+    assert.doesNotMatch(text, /不值得拆分/)
+    assert.equal(storeFor(cwd).read('m-split')?.stage, 'split')
+    assert.equal(fs.existsSync(path.join(layout.missionsDir, 'm-split', 'stages', 'split.json')), false)
+})
+
+test('implement refuses an over-budget single-task plan instead of treating it as "not worth splitting" (AC-003)', async () => {
+    const fake = host()
+    const { cwd, layout } = missionAt(fake, 'implement', 'm-split', { criteria: 12 })
+    const criteria = Array.from({ length: 12 }, (_, index) => `AC-${String(index + 1).padStart(3, '0')}`)
+    // A hand-written plan (no review): without the budget this is exactly the
+    // silent path — one task → not-worth-splitting → plain implement.
+    saveSplitPlan(layout, 'm-split', {
+        tasks: [{ id: 't1', goal: '全部', paths: ['packages/**'], acceptance: criteria, dependsOn: [], parallel: false }],
+        coverage: Object.fromEntries(criteria.map((criterion) => [criterion, ['t1']])),
+        parallelGroups: [['t1']],
+    })
+
+    const text = await orchestrate(fake, { action: 'advance', verdict: 'PASS' })
+    assert.match(text, /阶段 implement 不能进入/)
+    assert.match(text, /每任务 AC 预算/)
+    assert.match(text, /任务 t1 映射了 12 条验收标准（上限 3）/)
+    assert.match(text, /按 AC 边界拆小/)
+    assert.equal(storeFor(cwd).read('m-split')?.stage, 'implement')
+    assert.equal(fs.existsSync(path.join(layout.missionsDir, 'm-split', 'stages', 'quality-verify.json')), false)
+})
+
 test('a passing plan waits for review: the split stage settles and split-review is entered', async () => {
     const fake = host()
     const { cwd, layout } = missionAt(fake, 'split')
     saveSplitPlan(layout, 'm-split', goodPlan())
     const text = await orchestrate(fake, { action: 'advance', verdict: 'PASS' })
     assert.match(text, /→ 下一阶段 split-review/)
-    assert.match(text, /通过三道自动校验/)
+    assert.match(text, /通过四道自动校验/)
     assert.equal(stageFile(cwd, 'm-split', 'split').state, 'passed')
     assert.equal(storeFor(cwd).read('m-split')?.stage, 'split-review')
 })

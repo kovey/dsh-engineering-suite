@@ -1,23 +1,23 @@
 /**
- * The three automatic checks of a split plan (AC-004).
- *
- * They are the gate in front of the HUMAN review: a plan that does not map every
- * task to a real acceptance criterion, that puts overlapping paths in one
- * parallel group, or that leaves a criterion uncovered is never shown to a
- * reviewer. They are structural on purpose — "is this a good decomposition" is
- * the reviewer's question, not this module's. The threshold decision lives in
- * `split-threshold.ts`; every function here is pure.
+ * The automatic checks of a split plan (AC-004): every task maps REAL acceptance
+ * criteria — and no more than the per-task budget — no two tasks of one parallel
+ * group own overlapping paths, and every criterion is covered. They are the gate
+ * in front of the HUMAN review, and structural on purpose: "is this a good
+ * decomposition" is the reviewer's question, not this module's. The threshold
+ * decision lives in `split-threshold.ts`; every function here is pure.
  *
  * @module dsh-eng-core/split-validate
  */
 
-import { pathMatchesPattern } from './paths.js'
+import { splitMaxAcceptancePerTask } from './models-sections.js'
+import { groupOverlapProblems } from './split-overlap.js'
 import type { SplitPlan, SplitTask } from './split-plan.js'
 
 /** Why one plan is not sendable for review. */
 export type SplitProblemCode =
     | 'shape'
     | 'task-without-ac'
+    | 'ac-over-budget'
     | 'unknown-ac'
     | 'paths-overlap'
     | 'ac-uncovered'
@@ -40,6 +40,8 @@ export interface SplitValidation {
     covered: string[]
     /** Specification criteria nothing covers, sorted. */
     uncovered: string[]
+    /** The per-task criteria budget the check enforced (AC-001). */
+    maxAcceptancePerTask: number
 }
 
 /** Acceptance criterion ids of a specification (objects or plain strings). */
@@ -174,10 +176,13 @@ function readCoverage(
     return coverage
 }
 
-/** AC-004 check 1 for one task: at least one criterion, all of them real. */
-function checkTaskCriteria(task: SplitTask, criteria: readonly string[], problems: SplitProblem[]): void {
+/** AC-004 check 1 for one task: at least one real criterion, and at most `budget` of them. */
+function checkTaskCriteria(task: SplitTask, criteria: readonly string[], budget: number, problems: SplitProblem[]): void {
     if (task.acceptance.length === 0) {
         problems.push({ code: 'task-without-ac', taskId: task.id, detail: `子任务 ${task.id} 没有映射任何验收标准（acceptance 为空）` })
+    }
+    if (task.acceptance.length > budget) {
+        problems.push({ code: 'ac-over-budget', taskId: task.id, detail: `任务 ${task.id} 映射了 ${task.acceptance.length} 条验收标准（上限 ${budget}）：请按 AC 边界拆小` })
     }
     for (const criterion of task.acceptance) {
         if (!criteria.includes(criterion)) {
@@ -194,66 +199,13 @@ function checkDependencies(task: SplitTask, ids: ReadonlySet<string>, problems: 
         }
     }
 }
-/** AC-004 check 1: every task maps at least one criterion that really exists. */
-function checkTaskAcceptance(tasks: readonly SplitTask[], criteria: readonly string[], problems: SplitProblem[]): void {
+/** AC-004 check 1: every task maps at least one real criterion, and at most `budget` of them. */
+function checkTaskAcceptance(tasks: readonly SplitTask[], criteria: readonly string[], budget: number, problems: SplitProblem[]): void {
     const ids = new Set(tasks.map((task) => task.id))
     for (const task of tasks) {
-        checkTaskCriteria(task, criteria, problems)
+        checkTaskCriteria(task, criteria, budget, problems)
         checkDependencies(task, ids, problems)
     }
-}
-
-/**
- * Whether two path patterns can address the same file.
- *
- * Both directions are tried, plus directory containment. NECESSARY, not a proof:
- * globs that intersect without either matching the other's literal text are not
- * provably disjoint (and not provably overlapping either), so they are allowed.
- */
-export function pathsOverlap(left: string, right: string): boolean {
-    const a = left.replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/, '')
-    const b = right.replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/, '')
-    if (a === '' || b === '') return false
-    if (a === b) return true
-    return pathMatchesPattern(a, b) || pathMatchesPattern(b, a)
-}
-
-/** Every overlapping path pair between two tasks (`a ↔ b` strings). */
-function conflictsOf(first: SplitTask, second: SplitTask): string[] {
-    const conflicts: string[] = []
-    for (const one of first.paths) {
-        for (const other of second.paths) {
-            if (pathsOverlap(one, other)) conflicts.push(`${one} ↔ ${other}`)
-        }
-    }
-    return conflicts
-}
-
-/** The AC-004 check-2 problems of one pair of tasks. */
-function overlapProblems(first: SplitTask, second: SplitTask, groupIndex: number): SplitProblem[] {
-    return conflictsOf(first, second).map((conflict) => ({
-        code: 'paths-overlap' as const,
-        taskId: first.id,
-        detail: `并行组 ${groupIndex} 内子任务 ${first.id} 与 ${second.id} 的路径重叠：${conflict}`,
-    }))
-}
-
-/** AC-004 check 2 problems of one parallel group. */
-function groupConflicts(group: readonly string[], index: number, byId: ReadonlyMap<string, SplitTask>): SplitProblem[] {
-    const problems: SplitProblem[] = []
-    const tasks = group.map((id) => byId.get(id)).filter((task): task is SplitTask => task !== undefined)
-    for (let left = 0; left < tasks.length; left += 1) {
-        const first = tasks[left] as SplitTask
-        for (let right = left + 1; right < tasks.length; right += 1) {
-            problems.push(...overlapProblems(first, tasks[right] as SplitTask, index))
-        }
-    }
-    return problems
-}
-
-/** AC-004 check 2: no two tasks of one parallel group own the same path. */
-function checkGroupPaths(groups: readonly (readonly string[])[], byId: ReadonlyMap<string, SplitTask>, problems: SplitProblem[]): void {
-    groups.forEach((group, index) => problems.push(...groupConflicts(group, index, byId)))
 }
 
 /** AC-004 check 3: every specification criterion is covered by some task. */
@@ -276,25 +228,28 @@ function checkCoverage(
 }
 
 /**
- * Run the three automatic checks of AC-004.
+ * Run the automatic checks of AC-004.
  *
  * @param plan - the plan as read from disk (untrusted).
  * @param spec - the mission specification (`{ acceptanceCriteria }`).
- * @returns `ok` only when all three checks pass, plus every problem found.
+ * @param options - `maxAcceptancePerTask` (`models.json` `split` section); absent
+ *   means the documented 3, so a caller that forgets it still enforces a budget.
+ * @returns `ok` only when every check passes, plus every problem found.
  */
-export function validateSplitPlan(plan: unknown, spec: unknown): SplitValidation {
+export function validateSplitPlan(plan: unknown, spec: unknown, options: { maxAcceptancePerTask?: number } = {}): SplitValidation {
     const problems: SplitProblem[] = []
     const criteria = specCriteriaOf(spec)
+    const budget = splitMaxAcceptancePerTask(options)
     if (typeof plan !== 'object' || plan === null || Array.isArray(plan)) {
-        return { ok: false, problems: [{ code: 'shape', detail: 'plan 必须是对象' }], covered: [], uncovered: criteria }
+        return { ok: false, problems: [{ code: 'shape', detail: 'plan 必须是对象' }], covered: [], uncovered: criteria, maxAcceptancePerTask: budget }
     }
     const record = plan as Record<string, unknown>
     const tasks = readTasks(record['tasks'], problems)
     const byId = new Map(tasks.map((task) => [task.id, task]))
     const groups = readGroups(record['parallelGroups'], new Set(byId.keys()), problems)
     const coverage = readCoverage(record['coverage'], new Set(byId.keys()), criteria, problems)
-    checkTaskAcceptance(tasks, criteria, problems)
-    checkGroupPaths(groups, byId, problems)
+    checkTaskAcceptance(tasks, criteria, budget, problems)
+    problems.push(...groupOverlapProblems(groups, byId))
     const { covered, uncovered } = checkCoverage(tasks, coverage, criteria, problems)
-    return { ok: problems.length === 0, problems, covered, uncovered }
+    return { ok: problems.length === 0, problems, covered, uncovered, maxAcceptancePerTask: budget }
 }

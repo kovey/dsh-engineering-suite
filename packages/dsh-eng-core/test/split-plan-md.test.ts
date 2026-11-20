@@ -78,12 +78,13 @@ test('a plan write produces plan.json AND plan.md: digest, task table, groups, c
     assert.match(md, /\| id \| 目标 \| 路径 \| 覆盖 AC \| 依赖 \|/)
     assert.match(md, /\| T-001 \| 做 a \| `packages\/a\/\*\*` \| AC-001 \| - \|/)
     assert.match(md, /\| T-002 \| 做 b \| `packages\/b\/\*\*` \| AC-002 \| T-001 \|/)
-    // Groups and the three checks, with their verdict.
+    // Groups and the four checks, with their verdict.
     assert.match(md, /- 组 1：`T-001`、`T-002`/)
-    assert.match(md, /整体结论：✅ 三道校验全部通过/)
+    assert.match(md, /整体结论：✅ 四道校验全部通过/)
     assert.match(md, /1\. 每个子任务映射真实验收标准 \| ✅ 通过/)
-    assert.match(md, /2\. 并行组内路径不重叠 \| ✅ 通过/)
-    assert.match(md, /3\. 每个验收标准都被覆盖 \| ✅ 通过/)
+    assert.match(md, /2\. 每个子任务最多映射 3 条验收标准 \| ✅ 通过/)
+    assert.match(md, /3\. 并行组内路径不重叠 \| ✅ 通过/)
+    assert.match(md, /4\. 每个验收标准都被覆盖 \| ✅ 通过/)
     assert.match(md, /覆盖：AC-001、AC-002/)
     // The standing section exists and is honest about being a write-time snapshot.
     assert.match(md, /## 审核状态/)
@@ -115,7 +116,7 @@ test('the checks section says what was NOT run, and lists the problems of a fail
     saveSplitPlan(layout, 'no-checks', plan())
     const bare = markdownOf(layout, 'no-checks')
     assert.match(bare, /本次写入未附校验结果/)
-    assert.match(bare, /`split_plan` 会运行三道校验/)
+    assert.match(bare, /`split_plan` 会运行四道校验/)
 
     // A failed plan (only reachable through the library, the tool refuses to
     // write it): the failing check is marked and its problem is quoted.
@@ -128,6 +129,26 @@ test('the checks section says what was NOT run, and lists the problems of a fail
     assert.match(md, /整体结论：❌ 存在未通过项/)
     assert.match(md, /1\. 每个子任务映射真实验收标准 \| ❌ 未通过/)
     assert.match(md, /AC-999/)
+})
+
+test('the per-task AC budget is its own check row: an over-budget plan is marked ❌ with the problem', () => {
+    const { layout } = workspace()
+    const fourSpec = {
+        acceptanceCriteria: ['AC-001', 'AC-002', 'AC-003', 'AC-004'].map((id) => ({ id, text: id })),
+    }
+    const overBudget: SplitPlan = {
+        tasks: [{ id: 'T-001', goal: '全部', paths: ['packages/**'], acceptance: ['AC-001', 'AC-002', 'AC-003', 'AC-004'], dependsOn: [], parallel: false }],
+        coverage: { 'AC-001': ['T-001'], 'AC-002': ['T-001'], 'AC-003': ['T-001'], 'AC-004': ['T-001'] },
+        parallelGroups: [['T-001']],
+    }
+    const validation = validateSplitPlan(overBudget, fourSpec)
+    assert.equal(validation.ok, false)
+    saveSplitPlan(layout, 'over-budget', overBudget, { validation })
+    const md = markdownOf(layout, 'over-budget')
+    assert.match(md, /2\. 每个子任务最多映射 3 条验收标准 \| ❌ 未通过（1 条）/)
+    // The table shows the budget and the verdict; the per-task detail lives in
+    // the validator's problems (the refusal report quotes it verbatim).
+    assert.match(md, /上限来自 models\.json 的 split\.maxAcceptancePerTask（缺省 3/)
 })
 
 test('the standing is read AFTER the write: an approval shows up, a re-plan makes it stale', () => {

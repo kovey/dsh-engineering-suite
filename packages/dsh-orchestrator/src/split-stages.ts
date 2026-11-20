@@ -29,7 +29,7 @@ const SPLIT_STAGES: readonly StageConfig[] = [
     {
         id: 'split',
         difficulty: 'deep', // 拆任务是最需要推理的一步（planner 模型）
-        prompt: '拆分任务：planner 产出拆分计划并通过三道自动校验',
+        prompt: '拆分任务：planner 产出拆分计划并通过四道自动校验（含每任务 AC 预算）',
         requiredPlugins: [],
         // `entry` phase on purpose: a plan that does not validate means the
         // stage's work is not done yet, so the advance is REFUSED and the stage

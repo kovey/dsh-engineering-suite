@@ -212,7 +212,7 @@ test('choosing 查看打开 plan.md in the shared read-only preview, then the me
     const shown = tui.viewers[0]?.lines.join('\n') ?? ''
     assert.match(shown, /^# 拆分计划/m)
     assert.match(shown, /\| t1 \| 做 a \|/, 'the reviewer sees the task table, not a summary')
-    assert.match(shown, /## 三道自动校验/)
+    assert.match(shown, /## 四道自动校验/)
     assert.match(tui.notices.join('\n'), /已打开只读预览/)
     // The menu came back after the viewer closed, and Esc there decides nothing.
     assert.equal(tui.pickers.length, 2)

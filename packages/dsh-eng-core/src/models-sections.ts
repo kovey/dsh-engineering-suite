@@ -45,6 +45,18 @@ export interface SplitSettings {
      * The effective value is {@link splitMaxAttempts} at the point of use.
      */
     maxAttempts?: number
+    /**
+     * Upper bound on the acceptance criteria ONE task may map (缺省 3, 1..10).
+     *
+     * A hard budget, not an average: the plan is refused when any single task
+     * carries more criteria than this. It is what stops "one task for the whole
+     * mission" from being a legal decomposition — a task that satisfies eleven
+     * criteria is a mission, and reviewing/dispatching it as one worker hides
+     * that. The built-in default IS in {@link DEFAULT_MODELS_CONFIG} (unlike
+     * `maxAttempts`): it changes behaviour, so a project that silently falls back
+     * to 3 must be told exactly like a fallback `maxTasks` is.
+     */
+    maxAcceptancePerTask: number
 }
 
 /**
@@ -59,6 +71,12 @@ export const MAX_SPLIT_ATTEMPTS = 3
 
 /** The effective `split.maxAttempts` when nothing declares one (AC-002: 缺省 1). */
 export const DEFAULT_SPLIT_MAX_ATTEMPTS = 1
+
+/** The hard ceiling of `split.maxAcceptancePerTask` (1..10). */
+export const MAX_ACCEPTANCE_PER_TASK = 10
+
+/** The effective `split.maxAcceptancePerTask` when nothing declares one. */
+export const DEFAULT_MAX_ACCEPTANCE_PER_TASK = 3
 
 /** Quality thresholds of the split workflow (`models.json`'s `quality` section). */
 export interface QualitySettings {
@@ -108,6 +126,23 @@ export function splitMaxAttempts(split: { maxAttempts?: number } | undefined): n
 }
 
 /**
+ * The effective per-task acceptance-criteria budget (AC-001).
+ *
+ * Resolved at the point of use like {@link splitMaxAttempts}, so a plan
+ * validator that receives a hand-built settings object (a test, an embedder)
+ * still enforces a bounded number: below 1 the budget would refuse every task
+ * and above {@link MAX_ACCEPTANCE_PER_TASK} it would stop being a granularity
+ * rule.
+ * @param split - the resolved `split` section (absent = documented default 3).
+ * @returns the budget in 1..{@link MAX_ACCEPTANCE_PER_TASK}.
+ */
+export function splitMaxAcceptancePerTask(split: { maxAcceptancePerTask?: number } | undefined): number {
+    const declared = split?.maxAcceptancePerTask
+    if (typeof declared !== 'number' || !Number.isFinite(declared)) return DEFAULT_MAX_ACCEPTANCE_PER_TASK
+    return Math.min(MAX_ACCEPTANCE_PER_TASK, Math.max(1, Math.floor(declared)))
+}
+
+/**
  * Read the `split` section.
  *
  * `taskTimeoutMs` is deliberately OPTIONAL and has no built-in default here: an
@@ -118,6 +153,11 @@ export function splitMaxAttempts(split: { maxAttempts?: number } | undefined): n
  * `maxAttempts` is optional for the same shape of reason (AC-002): absent means
  * the documented 1 attempt, resolved by {@link splitMaxAttempts}; a value outside
  * 1..{@link MAX_SPLIT_ATTEMPTS} is NAMED and left out so the default applies.
+ *
+ * `maxAcceptancePerTask` IS in the built-in defaults: falling back to 3 is a
+ * behaviour change (a plan that used to pass may now be refused), so it is
+ * reported like a fallback `maxTasks`; a value outside 1..10 is named and left
+ * out so the built-in default supplies it.
  */
 export function parseSplitSection(value: unknown, where: string, problems: string[]): Partial<SplitSettings> {
     const raw = isRecord(value) ? value : {}
@@ -131,6 +171,7 @@ export function parseSplitSection(value: unknown, where: string, problems: strin
     const maxReworkRounds = positiveInt(raw['maxReworkRounds'], `${where}.maxReworkRounds`, 0, problems)
     const taskTimeoutMs = positiveInt(raw['taskTimeoutMs'], `${where}.taskTimeoutMs`, 1, problems)
     const maxAttempts = boundedInt(raw['maxAttempts'], `${where}.maxAttempts`, 1, MAX_SPLIT_ATTEMPTS, problems)
+    const maxAcceptancePerTask = boundedInt(raw['maxAcceptancePerTask'], `${where}.maxAcceptancePerTask`, 1, MAX_ACCEPTANCE_PER_TASK, problems)
     return {
         ...(typeof reviewRequired === 'boolean' ? { reviewRequired } : {}),
         ...(maxTasks === undefined ? {} : { maxTasks }),
@@ -138,6 +179,7 @@ export function parseSplitSection(value: unknown, where: string, problems: strin
         ...(maxReworkRounds === undefined ? {} : { maxReworkRounds }),
         ...(taskTimeoutMs === undefined ? {} : { taskTimeoutMs }),
         ...(maxAttempts === undefined ? {} : { maxAttempts }),
+        ...(maxAcceptancePerTask === undefined ? {} : { maxAcceptancePerTask }),
     }
 }
 

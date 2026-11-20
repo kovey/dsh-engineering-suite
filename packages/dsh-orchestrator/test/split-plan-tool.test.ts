@@ -28,8 +28,8 @@ function host(cwd: string): FakeHost {
     return fake
 }
 
-/** A mission bound to the fake host's session, with a three-criterion spec. */
-function missionWithSpec(fake: FakeHost, options: { spec?: boolean } = {}): MissionStore {
+/** A mission bound to the fake host's session, with `criteria` acceptance criteria (default 3). */
+function missionWithSpec(fake: FakeHost, options: { spec?: boolean; criteria?: number } = {}): MissionStore {
     const store = new MissionStoreRegistry().for(fake.cwd)
     store.create({ id: 'm1', title: '写 plan 测试', cwd: fake.cwd, sessionId: 'session-1' })
     store.bindSession('session-1', 'm1', 'split')
@@ -40,11 +40,10 @@ function missionWithSpec(fake: FakeHost, options: { spec?: boolean } = {}): Miss
             title: '写 plan 测试',
             background: '',
             requirements: [],
-            acceptanceCriteria: [
-                { id: 'AC-001', text: 'a' },
-                { id: 'AC-002', text: 'b' },
-                { id: 'AC-003', text: 'c' },
-            ],
+            acceptanceCriteria: Array.from({ length: options.criteria ?? 3 }, (_, index) => ({
+                id: `AC-${String(index + 1).padStart(3, '0')}`,
+                text: `criterion ${index + 1}`,
+            })),
             fileBoundaries: ['packages/**'],
             negativeConstraints: [],
             revision: 1,
@@ -116,7 +115,7 @@ test('check 1: a task mapping a criterion the spec does not have is refused, and
 
     const text = await call(fake, { tasks: bad, parallelGroups: [['T-001', 'T-002', 'T-003']] })
 
-    assert.match(text, /三道自动校验未通过/)
+    assert.match(text, /四道自动校验未通过/)
     assert.match(text, /AC-999/)
     assert.equal(fs.existsSync(path.join(resolveLayout(cwd).missionsDir, 'm1', 'split', 'plan.json')), false)
 })
@@ -131,6 +130,22 @@ test('check 1: a task with NO acceptance criterion is refused', async () => {
     const text = await call(fake, { tasks: bad, parallelGroups: [['T-001'], ['T-002'], ['T-003']] })
 
     assert.match(text, /没有映射任何验收标准/)
+    assert.equal(fs.existsSync(path.join(resolveLayout(cwd).missionsDir, 'm1', 'split', 'plan.json')), false)
+})
+
+test('the per-task AC budget: a single task carrying twelve criteria is refused and nothing is written (TC-2704)', async () => {
+    const cwd = tempWorkspace('split-plan-budget-')
+    const fake = host(cwd)
+    missionWithSpec(fake, { criteria: 12 })
+    const ids = Array.from({ length: 12 }, (_, index) => `AC-${String(index + 1).padStart(3, '0')}`)
+
+    const text = await call(fake, {
+        tasks: [{ id: 'T-001', goal: '全部', paths: ['packages/**'], acceptance: ids, dependsOn: [], parallel: false }],
+    })
+
+    assert.match(text, /四道自动校验未通过/)
+    assert.match(text, /任务 T-001 映射了 12 条验收标准（上限 3）：请按 AC 边界拆小/)
+    assert.match(text, /每个子任务最多映射 3 条验收标准/)
     assert.equal(fs.existsSync(path.join(resolveLayout(cwd).missionsDir, 'm1', 'split', 'plan.json')), false)
 })
 
@@ -242,7 +257,7 @@ test('every written plan also produces the readable plan.md the review opens (AC
     // The mission title, the task table and the checks the tool really ran.
     assert.match(md, /^# 拆分计划：写 plan 测试$/m)
     assert.match(md, /\| T-001 \| 做 a \| `packages\/a\/\*\*` \| AC-001 \| - \|/)
-    assert.match(md, /整体结论：✅ 三道校验全部通过/)
+    assert.match(md, /整体结论：✅ 四道校验全部通过/)
     assert.match(md, /覆盖：AC-001、AC-002、AC-003/)
     // The tool's report names the readable version too.
     assert.match(text, /可读版本：.*split\/plan\.md/)

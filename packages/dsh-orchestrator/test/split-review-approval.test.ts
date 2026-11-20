@@ -349,7 +349,7 @@ test('below maxReworkRounds the rejection still BLOCKS: the plan goes back for a
     // The re-plan round is still allowed: the split stage does not degrade yet.
     const next = await orchestrate(fake, { action: 'advance' })
     assert.match(next, /→ 下一阶段 split-review/)
-    assert.match(next, /通过三道自动校验/)
+    assert.match(next, /通过四道自动校验/)
 })
 
 test('at maxReworkRounds the split degrades to plain implement and records a skipped stage (AC-003)', async () => {

@@ -55,8 +55,8 @@ profile**（`.dsh/**` 与 profile 都在信任根里，Agent 写不了）。
   时走宿主同一条审批接缝（`ctx.get('approval')`），卡片里带着 `split/plan.md` 这个可读工件与摘要/任务数/
   并行组数，配置了 IM 即走 IM。宿主两条面都没有时按名字拒绝（「宿主没有 approval 接缝」），不会自动通过。
 - **审核的是 `plan.md`，绑定的是 `plan.json` 的摘要**：每次写/更新计划都会同时重写
-  `missions/<id>/split/plan.md`（标题、摘要、任务表、并行组、三道校验结果、审核状态），人看的是它；
-  门禁、派发与导入仍只认 `plan.json` 的摘要与 `review.json`。改 `plan.md` 不改变任何裁决。
+  `missions/<id>/split/plan.md`（标题、摘要、任务表、并行组、四道校验结果——含每任务 AC 上限、审核状态），
+  人看的是它；门禁、派发与导入仍只认 `plan.json` 的摘要与 `review.json`。改 `plan.md` 不改变任何裁决。
 - **审批策略 `never` 时不会弹卡，也不会记成打回**：宿主审批服务在该会话策略为 `never` 时直接返回
   `rejected`（不派发任何提示面）。`split-review` 在提问前读 `effectivePolicy(agent.session)`：`never` →
   直接 BLOCK 并说明「提示被禁用、本轮未记录成'人工打回'、不计入 `maxReworkRounds`、切到 ask 后重新
@@ -75,7 +75,7 @@ spec-clarify → test-design-review → spec-approve → split → split-review 
 的摘要；未审核 / 摘要已变 / 依赖有环都会**拒绝派发**并写 `split/run.json`（`state=refused`），不会建
 worktree、不会派 worker。
 
-## 2. 项目侧 `models.json`（含重试上限 `maxAttempts`）
+## 2. 项目侧 `models.json`（含重试上限 `maxAttempts` 与每任务 AC 上限）
 
 放在布局根（`<repo>/.dsh/engineering-suite/models.json`；没有命名空间目录的老仓库是
 `<repo>/.dsh/models.json`）：
@@ -90,7 +90,8 @@ worktree、不会派 worker。
     "maxParallel": 2,
     "maxReworkRounds": 2,
     "taskTimeoutMs": 600000,
-    "maxAttempts": 2
+    "maxAttempts": 2,
+    "maxAcceptancePerTask": 3
   },
   "quality": { "maxReworkRatio": 0.3 }
 }
@@ -101,6 +102,7 @@ worktree、不会派 worker。
 | `split.maxParallel` | 一组内同时跑几个 worker（上限，不是日程表） | 默认 3；`1` = 退化串行 |
 | `split.taskTimeoutMs` | 单个 worker 的截止时间 | 缺省跟随宿主 `autoDispatch.timeoutMs`，再缺省 600000 |
 | `split.maxAttempts` | 一个子任务允许的**派发尝试次数** | 缺省 1（不重试），允许 1..3，非法值点名后回退 1 |
+| `split.maxAcceptancePerTask` | 一个子任务**最多**映射几条验收标准；超出即 plan 不合格 | 缺省 3，允许 1..10，非法值点名后回退 3 |
 | `quality.maxReworkRatio` | 返工率超过它就**把后续**子任务升级到 `planner` 模型（不中止） | 默认 0.3 |
 
 `maxAttempts` 的语义（AC-002）：
@@ -111,6 +113,18 @@ worktree、不会派 worker。
 - 用尽仍失败 → 该任务 `state: needs-resplit`，它的 `dependsOn` 后继**一律 blocked 并点名它**；
 - **不可重试的失败仍是 `failed`**：worktree 建不出来——重新拆一次也不会好，要修环境。**模型类没配
   `model` 不在此列**：那是可选覆盖，任务照常派发（走宿主默认），见 §1。
+
+`maxAcceptancePerTask` 的语义（AC-001 / AC-003）：
+
+- 每条子任务的 `acceptance` 长度不得超过它；**超出即 plan 不合格**（`ac-over-budget`，problems 原文
+  「任务 `<id>` 映射了 N 条验收标准（上限 M）：请按 AC 边界拆小」），`split_plan` 不写盘、`split` 阶段
+  BLOCK，没有任何"警告后继续"的分支；
+- 它是**每任务上限**，不是平均值：13 条 AC 的 spec 至少需要 ⌈13/3⌉ = 5 个子任务才可能通过；4 个子任务
+  无论怎么分，总有一个装 4 条以上；
+- 单任务 plan 只有在 AC 数 ≤ 预算时才可能被判 `not-worth-splitting`；`implement` 入口对磁盘上的 plan
+  会复算这条预算，所以手写的"一个任务装 12 条 AC"不会绕过拆分审核变成 plain implement；
+- `plan.md` 的"四道自动校验"表第 2 行写明上限与是否通过（上限取本次校验实际使用的值）；具体违规的
+  任务在门禁/工具的 refusal 报告里点名。
 
 ## 3. 真机接入：`DSH_SMOKE_REAL=1` 的步骤与判据
 
@@ -192,15 +206,16 @@ bash scripts/split-smoke.sh
 
 - 组 1：`T-001`、`T-002`、`T-003`
 
-## 三道自动校验
+## 四道自动校验
 
-整体结论：✅ 三道校验全部通过
+整体结论：✅ 四道校验全部通过
 
 | 校验 | 结果 | 说明 |
 |------|------|------|
 | 1. 每个子任务映射真实验收标准 | ✅ 通过 | 子任务 3 个；映射的标准都在规格里 |
-| 2. 并行组内路径不重叠 | ✅ 通过 | 并行组 1 个；组内两两比较路径 |
-| 3. 每个验收标准都被覆盖 | ✅ 通过 | 覆盖：AC-001、AC-002、AC-003 |
+| 2. 每个子任务最多映射 3 条验收标准 | ✅ 通过 | 上限来自 models.json 的 split.maxAcceptancePerTask（缺省 3；这里是本次校验实际使用的值） |
+| 3. 并行组内路径不重叠 | ✅ 通过 | 并行组 1 个；组内两两比较路径 |
+| 4. 每个验收标准都被覆盖 | ✅ 通过 | 覆盖：AC-001、AC-002、AC-003 |
 
 ## 审核状态
 
@@ -277,6 +292,19 @@ console.log(e.reasons.join("\n")); console.log(e.tokens)' \
 
 ## 6. 判定规则速查
 
+### 6.0 plan 是否合格：四道自动校验（AC-001 / AC-002）
+
+| 校验 | 失败时 | problems 原文 / 关键字段 |
+|------|--------|---------------------------|
+| 1. 每个子任务映射真实验收标准 | BLOCK（不写盘、不送审） | `task-without-ac` / `unknown-ac` / `dependency` |
+| 2. 每个子任务最多映射 `split.maxAcceptancePerTask` 条 AC（缺省 3） | BLOCK（不写盘、不送审） | `ac-over-budget`：`任务 <id> 映射了 N 条验收标准（上限 M）：请按 AC 边界拆小` |
+| 3. 同一并行组内路径不重叠 | BLOCK | `paths-overlap`，点名两个任务与两个路径 |
+| 4. 每个验收标准都被覆盖 | BLOCK | `ac-uncovered`，点名未覆盖的 AC |
+
+四道都通过的 plan 还要过 §5.38.2 的门槛（`maxTasks` / `maxParallel` / 任务数 <2 / 路径完全相同）才决定
+"派发"还是"不值得拆"。**顺序是先校验、后门槛**：单任务 plan 只有在 AC 数 ≤ 预算时才可能被判
+`not-worth-splitting`；否则先被第 2 道校验拒掉，要求重拆。
+
 ### 6.1 `economics.verdict`（AC-001）
 
 `serialEstimateMs` = 各子任务 `durationMs` 之和（含每个任务一次性的 worktree `prepareMs`）；
@@ -330,3 +358,6 @@ console.log(e.reasons.join("\n")); console.log(e.tokens)' \
   本会话审批策略，再看 `reviews.jsonl` 与阶段状态。
 - **`plan.md` 只是给人看的投影**：它由写 `plan.json` 的过程生成（同一写入点），审核决定不会立刻重写它；
   改它不改变任何裁决（门禁与派发只认 `plan.json` 的摘要与 `review.json`）。
+- **AC 预算是"每任务上限"，不是"拆得好"**：它不阻止 `maxTasks` 个任务各自 3 条 AC 的宽计划，也不评价
+  切分质量（那是审核人的问题）；`plan.md` 第 2 行写的是本次校验实际使用的上限，不是重新读配置得来的。
+  门槛（`decideSplit`）本身没有预算概念——只有"先校验、后门槛"的组合顺序才是权威。

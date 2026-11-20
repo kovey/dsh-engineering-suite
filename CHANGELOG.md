@@ -1,5 +1,41 @@
 ## [未发布]
 
+### 功能 · 每任务 AC 预算：一个子任务最多三条验收标准（`split.maxAcceptancePerTask`）
+
+真实落差：连续 5 个 mission 的 plan 都是**单任务**（覆盖 11~13 条 AC、19~32 个路径），先撞上
+`tasks < 2 → not-worth-splitting`，于是流水线从未要求拆分——"拆成子任务"在纸面上存在，在数据上从未发生。
+这一轮把拆分粒度变成**硬预算**：一个子任务最多映射 `split.maxAcceptancePerTask`（缺省 3，允许 1..10）
+条验收标准，超出即 plan 不合格，不允许写盘、不允许送审。
+
+- **配置（AC-001）**：`packages/dsh-eng-core/src/models-sections.ts` 的 `SplitSettings` 新增
+  `maxAcceptancePerTask`，`DEFAULT_MODELS_CONFIG.split` 缺省 **3**，解析用 `boundedInt` 限定 1..10
+  （`0` / `11` / `2.5` / `"3"` 点名后忽略，由缺省兜底）；使用点用新增的 `splitMaxAcceptancePerTask`
+  再收口一次。与 `maxAttempts` 不同，它有一个**真实**的内建默认值：回退到 3 会改变判定，所以
+  `mergeSection` 会像 `maxTasks` 一样把"未配置 → 回退默认 3"写进 `problems`，不静默生效。
+- **第四道硬校验（AC-001 / AC-002）**：`validateSplitPlan(plan, spec, { maxAcceptancePerTask })` 新增
+  `ac-over-budget`——任一任务 `acceptance.length > 预算` → problems 原文
+  「任务 `<id>` 映射了 N 条验收标准（上限 M）：请按 AC 边界拆小」。它与既有三道同级：
+  `split_plan` 拒绝写入并列出 problems，`split` 阶段 BLOCK 并要求按 AC 边界拆小；没有任何"警告后继续"。
+  校验族里与路径重叠相关的纯比较抽到新模块 `split-overlap.ts`（原文件正好卡在 300 行棘轮上），
+  `pathsOverlap` 仍从 `dsh-eng-core/split` 导出。
+- **单任务不再静默通过（AC-003）**：`split` 阶段先校验、后问门槛，所以单任务 plan 只有在 AC 数 ≤ 预算时
+  才可能 `not-worth-splitting`；13 条 AC 至少需要 5 个子任务（⌈13/3⌉）才可能通过。`implement` 入口
+  （`split-reviewed`）对磁盘上的 plan 复算同一条预算，手写的"一个任务装 12 条 AC"不会绕过审核变成
+  plain implement。
+- **调用链与 `plan.md`（AC-001）**：`split_plan` 工具（profile 层 `config.split.models` 也参与）、
+  `split` 门禁、`plan.md` 渲染都从同一份 `models.split` 拿预算；`plan.md` 的"自动校验"表从三行变
+  **四行**（第 2 行「每个子任务最多映射 N 条验收标准」，上限取本次校验实际使用的值），
+  `SplitValidation.maxAcceptancePerTask` 是它的来源。
+- **测试（AC-004）**：`split-workflow.test.ts` 新增 5 例（等于预算通过、12 条被拒且 problems 原文点名、
+  `maxAcceptancePerTask=2` 时 3 条被拒、1..10 边界与非法值回退、13 条 AC 时 2/3/4 个任务都失败而 5 个
+  通过并断言 `decideSplit` 单独仍把单任务读成"不值得拆"）；`split-plan-md.test.ts` 新增 1 例（第 2 行
+  ❌ 与上限文案）；`split-plan-tool.test.ts` 新增 1 例（12 条 AC 单任务被拒、`plan.json` 未写入）；
+  `split-stages.test.ts` 新增 2 例（`split` BLOCK 且不出现"不值得拆分"、`implement` 入口拒绝超预算单任务）。
+  既有断言按新语义更新（"三道"→"四道"、`DEFAULT_MODELS_CONFIG.split` 多一个字段、完整配置夹具补上
+  新字段），**不放宽、不删除**。
+- **文档**：`docs/ARCHITECTURE.md` 新增 §5.38.4（配置/校验落点/顺序/`plan.md`/测试/诚实边界）；
+  `docs/SPLIT-RUNBOOK.md` §1、§2（字段表与语义）、§5.0 样例、新增 §6.0 判定速查、§7 边界；本文件。
+
 ### 功能 · 拆分审核与需求审批同体验：可读的 `plan.md` + 同一份只读预览 + TUI 菜单
 
 真实落差：`spec_approve` 在 nvim-tui 里给 `ui.picker` 菜单 + 打开文档的**只读预览**（viewer → panel →
