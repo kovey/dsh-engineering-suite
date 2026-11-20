@@ -2,20 +2,26 @@
  * How ONE task is attempted, retried WITHIN BOUNDS, and what an exhausted task
  * leaves behind (AC-002 of P3).
  *
- * The rules in four sentences:
+ * The rules in five sentences:
  *
  *  1. **One worktree, several attempts.** The worktree is created once, before
- *     the first attempt; a retry re-dispatches a worker into the SAME directory
- *     (so a worker's local `.dsh/` ledger accumulates across attempts and the
- *     import/cleanup discipline is untouched — nothing here deletes anything).
- *  2. **Retries are bounded by `split.maxAttempts`** (default 1, hard ceiling 3,
+ *     the first attempt, at a recorded BASE commit; a retry re-dispatches a
+ *     worker into the SAME directory (so a worker's local `.dsh/` ledger
+ *     accumulates across attempts and the import/cleanup discipline is untouched
+ *     — nothing here deletes anything).
+ *  2. **A task's commits are `base..HEAD`, never bare `HEAD`.** A worker that
+ *     committed nothing leaves HEAD on the base commit; that commit may be
+ *     somebody else's (a dsh-memory session-end auto-commit is the real case),
+ *     and its subject takes part in NO judgment. `0` new commits is its own
+ *     failure ("no commit"), distinct from "committed with a wrong subject".
+ *  3. **Retries are bounded by `split.maxAttempts`** (default 1, hard ceiling 3,
  *     see `splitMaxAttempts`). Every attempt increments `attempts`.
- *  3. **Each failed attempt counts as rework.** The signal (`acceptance-failed`,
+ *  4. **Each failed attempt counts as rework.** The signal (`acceptance-failed`,
  *     `timeout`) stays on the task even when a later attempt succeeds: the task
  *     really was worked on twice, and the rework ratio exists to show that. A
  *     model class nobody configured is NOT a failure and never enters this
  *     signal (P4 AC-001) — the task runs on the host default instead.
- *  4. **Exhausted is not `failed`.** A task that used every allowed attempt is
+ *  5. **Exhausted is not `failed`.** A task that used every allowed attempt is
  *     `needs-resplit`: re-dispatching the same plan unchanged would fail again,
  *     so it must go back through split/review. Its `dependsOn` successors are
  *     `blocked` and name it. A NON-retryable cause (the worktree could not be
@@ -45,7 +51,45 @@ interface AttemptTarget {
     record: SplitTaskRun
     dispatch: WorkerDispatch
     worktree: string
+    /** The base recorded at creation (full commit id): the task's commits are `base..HEAD`. */
+    base: string
     route: NextTaskRoute
+}
+
+/** The first 8 characters of a commit id (the short hash reports use). */
+export function shortCommit(commit: string): string {
+    return commit.slice(0, 8)
+}
+
+/**
+ * Whether one commit subject carries THIS task's id: `T-001:` at the start.
+ *
+ * A full-width colon (`T-001：`) counts too: it is the same prefix typed with an
+ * IME on, and rejecting it would rework a worker for punctuation.
+ */
+export function carriesTaskPrefix(subject: string, taskId: string): boolean {
+    return subject.startsWith(`${taskId}:`) || subject.startsWith(`${taskId}：`)
+}
+
+/** AC-002/AC-003: zero NEW commits — a different fact from a wrong prefix. */
+export function noCommitProblem(base: string): string {
+    return `worker 没有产生提交（HEAD 仍是基线 ${shortCommit(base)}）：无法证明这次任务做过任何事`
+}
+
+/**
+ * AC-002: the task committed, but none of its new subjects carries its id.
+ *
+ * The base commit's subject is NOT quoted anywhere: it belongs to whatever the
+ * branch started on, and naming it as the task's commit is the bug this text
+ * replaces. The list is the subjects of `base..HEAD`, capped at three.
+ */
+export function missingPrefixProblem(input: { taskId: string; count: number; base: string; head: string; subjects: readonly string[] }): string {
+    const listed = input.subjects
+        .slice(0, 3)
+        .map((subject) => JSON.stringify(subject))
+        .join('、')
+    const more = input.subjects.length > 3 ? `（共 ${input.count} 个，只列前 3 个）` : ''
+    return `本次 ${input.count} 个新提交里没有一个带 "${input.taskId}:" 前缀（base ${shortCommit(input.base)} → HEAD ${shortCommit(input.head)}）：无法证明它属于子任务 ${input.taskId}。新提交标题${more}：${listed}`
 }
 
 /**
@@ -68,14 +112,25 @@ async function attemptOnce(book: SplitRunBook, deps: SplitRunnerDeps, target: At
         return { problems: [failure.detail], signal: failure.timeout === true ? 'timeout' : 'acceptance-failed', retryable: true }
     }
     const head = book.seam.head(target.worktree)
-    target.record.commit = head.commit
     if (!head.ok || head.commit === undefined) {
         return { problems: head.problems.length > 0 ? head.problems : ['读不到 worktree 的 HEAD commit'], signal: 'acceptance-failed', retryable: true }
     }
-    const prefix = `${target.task.id}:`
-    if (!(head.subject ?? '').startsWith(prefix)) {
+    // AC-002: judge the DIFF SET `base..HEAD`, in this order. `0` new commits is
+    // its own failure and the title is never read at all (AC-003): the HEAD is
+    // still the base commit, and that commit's subject may belong to another
+    // plugin — quoting it as "the task's commit" is exactly the misjudgment that
+    // rejected a worker for a dsh-memory session-end auto-commit.
+    const own = book.seam.commits(target.worktree, target.base)
+    if (!own.ok) {
+        return { problems: own.problems.length > 0 ? own.problems : [`无法读取 ${target.worktree} 相对基线 ${shortCommit(target.base)} 的新提交`], signal: 'acceptance-failed', retryable: true }
+    }
+    if (own.count === 0) {
+        return { problems: [noCommitProblem(target.base)], signal: 'acceptance-failed', retryable: true }
+    }
+    target.record.commit = head.commit
+    if (!own.subjects.some((subject) => carriesTaskPrefix(subject, target.task.id))) {
         return {
-            problems: [`commit ${head.commit.slice(0, 12)} 的标题 ${JSON.stringify(head.subject ?? '')} 不带前缀 "${prefix}"：无法证明它属于子任务 ${target.task.id}`],
+            problems: [missingPrefixProblem({ taskId: target.task.id, count: own.count, base: target.base, head: head.commit, subjects: own.subjects })],
             signal: 'acceptance-failed',
             retryable: true,
         }
@@ -191,7 +246,18 @@ export async function dispatchTask(book: SplitRunBook, deps: SplitRunnerDeps, ta
     // AC-001: the FIRST preparation is timed (retries reuse the worktree and are
     // not preparation). It is a part of the task's duration, not an extra cost.
     const prepareStart = book.now()
-    const created = book.seam.create({ mainTree: book.mainTree, missionId: book.missionId, taskId: task.id })
+    // AC-001: the base is the main tree's HEAD read BEFORE the worktree exists,
+    // and it is pinned as the branch's start point. Recording it is what makes
+    // "the worker's commits" a diff set later (`base..HEAD`) instead of "whatever
+    // HEAD happens to be" — which is how another plugin's commit got judged as
+    // this task's output.
+    const baseHead = book.seam.head(book.mainTree)
+    if (!baseHead.ok || baseHead.commit === undefined) {
+        record.prepareMs = Math.max(0, book.now() - prepareStart)
+        failTask(book, record, baseHead.problems.length > 0 ? baseHead.problems : ['读不到主树 HEAD：无法记录子任务的 base'], 'acceptance-failed')
+        return
+    }
+    const created = book.seam.create({ mainTree: book.mainTree, missionId: book.missionId, taskId: task.id, base: baseHead.commit })
     record.prepareMs = Math.max(0, book.now() - prepareStart)
     record.worktree = created.worktree
     record.branch = created.branch
@@ -199,5 +265,6 @@ export async function dispatchTask(book: SplitRunBook, deps: SplitRunnerDeps, ta
         failTask(book, record, created.problems, 'acceptance-failed')
         return
     }
-    await runAttempts(book, deps, { task, record, dispatch, worktree: created.worktree, route })
+    record.base = shortCommit(baseHead.commit)
+    await runAttempts(book, deps, { task, record, dispatch, worktree: created.worktree, base: baseHead.commit, route })
 }

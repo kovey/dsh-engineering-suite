@@ -337,6 +337,37 @@ console.log(e.reasons.join("\n")); console.log(e.tokens)' \
 `run.json` 缺失或解析失败时：**不做状态猜测**——目录全部按 `orphan` 列出，并在 `problems` 里点名
 那个读不出来的文件。
 
+### 6.4 子任务的提交 = `base..HEAD` 的差集（基线提交不参与判定）
+
+一个子任务"有没有提交"不看 worktree 的裸 `HEAD`，看它相对**基线**新增了什么：`base` 是建 worktree 之前
+主树的 HEAD（也是分支的起点），写进 `run.json` 的 `tasks[].base`（短哈希）。判定顺序是确定的：
+
+| 事实（`git rev-list --count base..HEAD`） | 判定 | `problems` 原文 |
+|------------------------------------------|------|-----------------|
+| `0` | 失败（`acceptance-failed` → `needs-resplit`），**标题一字不读** | `worker 没有产生提交（HEAD 仍是基线 <base8>）：无法证明这次任务做过任何事` |
+| `≥1` 且任一标题以 `<taskId>:` 开头（容忍全角 `：`） | `done` | — |
+| `≥1` 但都不带前缀 | 失败（`acceptance-failed` → `needs-resplit`） | `本次 N 个新提交里没有一个带 "<taskId>:" 前缀（base <base8> → HEAD <head8>）：无法证明它属于子任务 <taskId>。新提交标题："…"`（最多列 3 个） |
+
+**为什么必须这样**：真实故障里 worker 一个提交都没产生，worktree 的 HEAD 还是基线，而基线恰好是 dsh-memory
+的 session-end 自动提交；旧实现拿裸 HEAD 的标题去校验前缀，于是**别人的提交**被当成这个任务的证据拒掉，
+任务进入 `needs-resplit`，它的后继全 `blocked`。所以有两句话要记住：
+
+- **基线提交的标题不参与任何判定**：它看起来像工具提交（`dsh-memory: …`）也好、像任务提交（`T-001: …`）
+  也好，`0` 个新提交就是 `0` —— 后者尤其重要，任何"读 HEAD 标题"的实现都会在那里误判成通过；
+- **门槛没有放宽**：无提交仍然失败，只是失败原因从"前缀不符"变成"没有产生提交"。
+
+诊断（都从产物出发，不猜）：
+
+```bash
+# 1) 这个任务自己新增了哪些提交？（base 取自 run.json 的 tasks[].base）
+git -C <worktree> log --oneline <base>..HEAD
+# 2) 如果这里为空：worker 没提交，重派/重拆之前先问"它卡在哪"，别去改标题
+# 3) 如果这里非空但没有 <taskId>: 开头的那条：说明它提交了、只是标题不合规 → 按返工处理
+```
+
+`run.json` 里该任务的 `commit` 只在 `count ≥ 1` 时才有值：读到一个 `commit` 不代表"任务完成"，它只代表
+"这个分支相对基线至少多了一条提交"。
+
 ## 7. 诚实边界
 
 - **度量与恢复不参与交付判定**：`economics` 与 doctor 的输出不写门禁、不被 `mission_complete` 读取

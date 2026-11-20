@@ -8,8 +8,13 @@
  *  - `create` / `cleanup` are the already-tested library calls
  *    (`createTaskWorktree` / `cleanupTaskWorktree`), including AC-009's refusal to
  *    remove a worktree whose evidence is still unimported;
- *  - `head` answers "what did this task actually commit" — the commit id and its
- *    subject, which is what the `<taskId>:` prefix check reads;
+ *  - `head` answers "what is this tree's HEAD" — the main tree's HEAD becomes the
+ *    task's recorded base before the worktree exists, the worktree's HEAD after;
+ *  - `commits` answers "what did the worker commit" as the DIFF SET `base..HEAD`
+ *    (count + subjects). A worker that committed nothing leaves HEAD on the base
+ *    commit, and the base commit takes part in NO judgment (it may be another
+ *    plugin's session-end auto-commit) — the `<taskId>:` prefix check reads only
+ *    the subjects of commits the worker added;
  *  - `merge` merges the task BRANCH into the main tree, because AC-008's importer
  *    only accepts commits that are already in the main tree's history. A failed
  *    merge is aborted (`git merge --abort`) and reported: leaving conflict
@@ -21,7 +26,7 @@
 
 import { spawnSync } from 'node:child_process'
 import { cleanupTaskWorktree, createTaskWorktree } from 'dsh-eng-core/split'
-import type { SplitWorktrees, TaskCommit, TaskMerge } from './split-run-types.js'
+import type { SplitWorktrees, TaskCommit, TaskCommits, TaskMerge } from './split-run-types.js'
 
 /** One git invocation; never throws (a refusal is a result). */
 function git(cwd: string, args: readonly string[]): { status: number | null; stdout: string; stderr: string; error?: string } {
@@ -44,8 +49,35 @@ function reasonOf(result: { status: number | null; stderr: string; error?: strin
 }
 
 /**
- * Read one worktree's HEAD commit and subject.
+ * Read the commits one worktree's HEAD has on top of `base` (AC-002).
+ *
+ * This is the task's OWN work: `base` is the commit the worktree was created on,
+ * so a worker that committed nothing answers `count: 0` here no matter what the
+ * base commit's subject happens to be. Reading `git log -1` instead would read
+ * somebody else's commit (the base) and judge its subject as if the worker wrote
+ * it — the failure mode this function exists to remove.
+ *
  * @param worktree - absolute path of the task worktree.
+ * @param base - the commit-ish recorded when the worktree was created.
+ */
+export function taskCommits(worktree: string, base: string): TaskCommits {
+    const range = `${base}..HEAD`
+    const counted = git(worktree, ['rev-list', '--count', range])
+    const count = Number.parseInt(counted.stdout.trim(), 10)
+    if (counted.status !== 0 || !Number.isInteger(count) || count < 0) {
+        return { ok: false, count: 0, subjects: [], problems: [`无法读取 ${worktree} 相对基线 ${base} 的新提交数（${reasonOf(counted)}）：子任务没有可核验的 commit`] }
+    }
+    if (count === 0) return { ok: true, count: 0, subjects: [], problems: [] }
+    const logged = git(worktree, ['log', '--format=%s', range])
+    if (logged.status !== 0) {
+        return { ok: false, count, subjects: [], problems: [`无法读取 ${worktree} 相对基线 ${base} 的新提交标题（${reasonOf(logged)}）：无法校验子任务前缀`] }
+    }
+    return { ok: true, count, subjects: logged.stdout.split('\n').filter((line) => line !== ''), problems: [] }
+}
+
+/**
+ * Read one tree's HEAD commit id.
+ * @param worktree - absolute path of the worktree (the main tree included).
  */
 export function headCommit(worktree: string): TaskCommit {
     const rev = git(worktree, ['rev-parse', 'HEAD'])
@@ -53,8 +85,7 @@ export function headCommit(worktree: string): TaskCommit {
     if (rev.status !== 0 || commit === '') {
         return { ok: false, problems: [`无法读取 worktree ${worktree} 的 HEAD（${reasonOf(rev)}）：子任务没有产出可核验的 commit`] }
     }
-    const subject = git(worktree, ['log', '-1', '--format=%s']).stdout.trim()
-    return { ok: true, commit, subject, problems: [] }
+    return { ok: true, commit, problems: [] }
 }
 
 /**
@@ -81,12 +112,13 @@ export function mergeTaskBranch(input: { mainTree: string; branch: string; taskI
 
 /**
  * The real worktree seam (what a deployment runs).
- * @returns the four operations, all safe to call repeatedly.
+ * @returns the five operations, all safe to call repeatedly.
  */
 export function defaultSplitWorktrees(): SplitWorktrees {
     return {
         create: (input) => createTaskWorktree(input),
         head: headCommit,
+        commits: taskCommits,
         merge: mergeTaskBranch,
         cleanup: (input) => cleanupTaskWorktree(input),
     }

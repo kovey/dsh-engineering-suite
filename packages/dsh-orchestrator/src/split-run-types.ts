@@ -37,6 +37,16 @@ export interface SplitTaskRun {
     state: SplitTaskState
     /** The commit the task branch produced (absent when nothing was committed). */
     commit?: string
+    /**
+     * The commit this task's worktree STARTED on (short hash, AC-001): the main
+     * tree's HEAD at creation, pinned as the branch's start point.
+     *
+     * The task's own commits are `base..HEAD`. The base commit itself is never
+     * evidence that the worker did anything — it may be another plugin's commit
+     * (a dsh-memory session-end auto-commit is the case that named this bug), and
+     * its subject takes part in no decision.
+     */
+    base?: string
     /** Dispatch attempts (0 = never started; with retries this is 1..maxAttempts). */
     attempts: number
     /**
@@ -108,12 +118,32 @@ export interface SplitRunResult {
     reportFile?: string
 }
 
-/** What one worktree's HEAD says. */
+/**
+ * What one tree's HEAD says (the main tree for the base, the worktree after work).
+ *
+ * Deliberately carries NO subject: a title read here would be the BASE commit's
+ * title whenever the worker committed nothing, and the base commit's title must
+ * take part in no judgment (AC-003). Titles are only available through
+ * {@link TaskCommits}, which answers what the worker itself added.
+ */
 export interface TaskCommit {
     ok: boolean
     commit?: string
-    /** The commit's subject line (the taskId prefix is checked against it). */
-    subject?: string
+    problems: string[]
+}
+
+/**
+ * The commits `HEAD` has on top of one base: the task's OWN commits (AC-002).
+ *
+ * `count === 0` means the worker produced nothing and `HEAD` is still the base —
+ * a different fact from "committed with the wrong subject", and reported as such.
+ */
+export interface TaskCommits {
+    ok: boolean
+    /** `git rev-list --count <base>..HEAD` (0 = no commit of its own). */
+    count: number
+    /** The new commits' subjects, newest first (empty when `count` is 0). */
+    subjects: string[]
     problems: string[]
 }
 
@@ -128,7 +158,10 @@ export interface TaskMerge {
 /** The git side effects the runner performs, behind one testable seam. */
 export interface SplitWorktrees {
     create(input: { mainTree: string; missionId: string; taskId: string; base?: string }): CreateWorktreeResult
-    head(worktree: string): TaskCommit
+    /** One tree's HEAD: the main tree (to record a task's base) or a task worktree. */
+    head(tree: string): TaskCommit
+    /** The commits `HEAD` has on top of `base` (the task's own commits, AC-002). */
+    commits(worktree: string, base: string): TaskCommits
     merge(input: { mainTree: string; branch: string; taskId: string }): TaskMerge
     cleanup(input: { mainTree: string; missionId: string; taskId: string }): CleanupWorktreeResult
 }

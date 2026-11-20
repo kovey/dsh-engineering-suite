@@ -193,6 +193,13 @@ function finishWorker(workers: FakeWorkers, layout: Layout, taskId: string, opti
     return commit
 }
 
+/** Resolve one worker WITHOUT committing: HEAD stays on the base commit. */
+function finishWorkerWithoutCommit(workers: FakeWorkers, taskId: string): void {
+    const worker = workers.started.find((entry) => entry.taskId === taskId && !entry.finished)
+    assert.ok(worker !== undefined, `no pending worker for ${taskId}`)
+    worker.resolve()
+}
+
 // --- the runner's deps -----------------------------------------------------
 
 function fakePresets(): { presets: DelegationPresets; ids: string[] } {
@@ -235,7 +242,7 @@ function deps(cwd: string, workers: FakeWorkers, overrides: Partial<SplitRunnerD
 /** The stored `split/run.json` of a mission. */
 function runRecord(cwd: string): {
     state: string
-    tasks: { id: string; state: string; commit?: string; imported: number; cleanedUp: boolean; modelNote?: string }[]
+    tasks: { id: string; state: string; commit?: string; base?: string; imported: number; cleanedUp: boolean; modelNote?: string }[]
     imported: number
     modelNotes?: string[]
 } {
@@ -496,8 +503,9 @@ test('escalating without a planner model degrades to the worker model and warns,
 
 // --- the commit contract ---------------------------------------------------
 
-test('a commit without the `<taskId>:` prefix is rework, named with the commit and its subject', async () => {
+test('a new commit without the `<taskId>:` prefix is rework, named with the diff set and its subjects', async () => {
     const cwd = repo()
+    const base = git(cwd, ['rev-parse', 'HEAD'])
     mission(cwd, twoTasks([['T-001', 'T-002']]))
     const workers = fakeWorkers()
     const running = runSplitPlan(deps(cwd, workers))
@@ -511,8 +519,14 @@ test('a commit without the `<taskId>:` prefix is rework, named with the commit a
     // `needs-resplit`, not `failed`, and the commit/subject are still named.
     assert.equal(result.tasks[0]?.state, 'needs-resplit')
     assert.equal(result.tasks[0]?.commit, commit)
-    assert.match(result.tasks[0]?.problems.join('\n') ?? '', /不带前缀 "T-001:"/)
-    assert.match(result.tasks[0]?.problems.join('\n') ?? '', new RegExp(commit.slice(0, 12)))
+    const problems = result.tasks[0]?.problems.join('\n') ?? ''
+    // The NEW wording names the DIFF SET (base → HEAD), never the bare HEAD as
+    // "the commit": the old text `commit <head> 的标题 … 不带前缀` is what judged a
+    // base commit as the task's own output. Pinned exactly, in full.
+    assert.deepEqual(result.tasks[0]?.problems, [
+        `本次 1 个新提交里没有一个带 "T-001:" 前缀（base ${base.slice(0, 8)} → HEAD ${commit.slice(0, 8)}）：无法证明它属于子任务 T-001。新提交标题："feat: 忘了前缀"`,
+    ])
+    assert.doesNotMatch(problems, /不带前缀|commit [0-9a-f]{12}/)
     assert.deepEqual(result.tasks[0]?.signals, ['acceptance-failed'])
     // The unmerged, unimported rows keep the worktree alive (AC-009 in the runner).
     assert.equal(result.tasks[0]?.cleanedUp, false)
@@ -521,6 +535,106 @@ test('a commit without the `<taskId>:` prefix is rework, named with the commit a
     // The independent task still finished and was imported.
     assert.equal(result.tasks[1]?.state, 'done')
     assert.equal(result.imported, 1)
+})
+
+test('a worker that committed nothing is "no commit", even when the base is another plugin\'s session-end commit (TC-2803)', async () => {
+    const cwd = repo()
+    // The base is exactly the commit that named this bug: dsh-memory's auto-commit.
+    git(cwd, ['commit', '-q', '--allow-empty', '-m', 'dsh-memory: project memory: session end'])
+    const base = git(cwd, ['rev-parse', 'HEAD'])
+    mission(cwd, twoTasks([['T-001', 'T-002']]))
+    const workers = fakeWorkers()
+    const running = runSplitPlan(deps(cwd, workers))
+
+    await workers.waitFor(2)
+    finishWorkerWithoutCommit(workers, 'T-001')
+    finishWorker(workers, resolveLayout(cwd), 'T-002')
+    const result = await running
+
+    // AC-002/AC-003: `0` new commits is its own failure — never "the subject has
+    // no prefix" — and another plugin's subject is quoted nowhere.
+    const problems = result.tasks[0]?.problems.join('\n') ?? ''
+    assert.deepEqual(result.tasks[0]?.problems, [
+        `worker 没有产生提交（HEAD 仍是基线 ${base.slice(0, 8)}）：无法证明这次任务做过任何事`,
+    ])
+    assert.doesNotMatch(problems, /dsh-memory|前缀/)
+    assert.equal(result.tasks[0]?.state, 'needs-resplit')
+    // The base commit is NOT recorded as this task's commit (the old code did).
+    assert.equal(result.tasks[0]?.commit, undefined)
+    assert.equal(result.tasks[0]?.base, base.slice(0, 8))
+    // The gate is not relaxed: producing nothing still fails the task.
+    assert.equal(result.ok, false)
+    assert.equal(result.tasks[1]?.state, 'done')
+    assert.equal(result.imported, 1, 'only T-002 landed')
+})
+
+test('a base commit whose subject LOOKS like the task\'s commit is still not the task\'s commit (AC-003)', async () => {
+    const cwd = repo()
+    // The base "wears the prefix": anything that read HEAD's subject would pass
+    // this task although the worker did nothing at all.
+    git(cwd, ['commit', '-q', '--allow-empty', '-m', 'T-001: 基线看起来像任务提交'])
+    const base = git(cwd, ['rev-parse', 'HEAD'])
+    mission(cwd, twoTasks([['T-001', 'T-002']]))
+    const workers = fakeWorkers()
+    const running = runSplitPlan(deps(cwd, workers))
+
+    await workers.waitFor(2)
+    finishWorkerWithoutCommit(workers, 'T-001')
+    finishWorker(workers, resolveLayout(cwd), 'T-002')
+    const result = await running
+
+    assert.equal(result.tasks[0]?.state, 'needs-resplit', 'the base title must never count as the task\'s commit')
+    const problems = result.tasks[0]?.problems.join('\n') ?? ''
+    assert.match(problems, new RegExp(`worker 没有产生提交（HEAD 仍是基线 ${base.slice(0, 8)}）`))
+    assert.doesNotMatch(problems, /基线看起来像任务提交/)
+})
+
+test('a new commit with the `<taskId>:` prefix finishes the task, and run.json records the base it started on (TC-2801/TC-2805)', async () => {
+    const cwd = repo()
+    const base = git(cwd, ['rev-parse', 'HEAD'])
+    mission(cwd, twoTasks([['T-001', 'T-002']]))
+    const workers = fakeWorkers()
+    const running = runSplitPlan(deps(cwd, workers))
+
+    await workers.waitFor(2)
+    const commit = finishWorker(workers, resolveLayout(cwd), 'T-001')
+    finishWorker(workers, resolveLayout(cwd), 'T-002')
+    const result = await running
+
+    assert.equal(result.ok, true, result.problems.join(' | '))
+    assert.equal(result.tasks[0]?.state, 'done')
+    assert.equal(result.tasks[0]?.commit, commit)
+    // AC-001: every task record carries the base it started on, readable as a
+    // short hash — both tasks started on the same main-tree HEAD.
+    assert.deepEqual(
+        runRecord(cwd).tasks.map((entry) => entry.base),
+        [base.slice(0, 8), base.slice(0, 8)],
+    )
+})
+
+test('among several new commits, one carrying the `<taskId>:` prefix is enough (TC-2802)', async () => {
+    const cwd = repo()
+    mission(cwd, twoTasks([['T-001', 'T-002']]))
+    const layout = resolveLayout(cwd)
+    const workers = fakeWorkers()
+    const running = runSplitPlan(deps(cwd, workers))
+
+    await workers.waitFor(2)
+    const worker = workers.started.find((entry) => entry.taskId === 'T-001')
+    assert.ok(worker !== undefined)
+    // The judgment is "ANY commit of base..HEAD carries it": a worker that writes
+    // a plain commit first and the prefixed one second must not be reworked.
+    const worktree = worktreeOf(worker)
+    commitIn(worktree, 'feat: 先写实现')
+    const commit = commitIn(worktree, 'T-001: 补上前缀')
+    writeLocalEvidence(worktree, layout, 'T-001', commit)
+    worker.resolve()
+    finishWorker(workers, layout, 'T-002')
+    const result = await running
+
+    assert.equal(result.ok, true, result.problems.join(' | '))
+    assert.equal(result.tasks[0]?.state, 'done')
+    assert.equal(result.tasks[0]?.commit, commit)
 })
 
 // --- refusals -------------------------------------------------------------

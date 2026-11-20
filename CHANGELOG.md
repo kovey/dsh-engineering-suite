@@ -1,5 +1,31 @@
 ## [未发布]
 
+### 修复 · 子任务的提交按 `base..HEAD` 差集判定：基线提交不再被当成任务提交
+
+真实故障（golang/im 的 `mission-20261120-154004`）：一个 4 子任务的 plan 只跑了 T-001 就 `ok:false`，problem 写
+「commit b6d93db78821 的标题 "dsh-memory: project memory: session end" 不带前缀 "T-001:"」。根因不是 worker
+写错标题，而是它**没有产生任何提交**：worktree 的 HEAD 还停在**基线**上，而基线恰好是 dsh-memory 的
+session-end 自动提交。旧实现把裸 `HEAD` 当"任务提交"去校验前缀，于是另一个插件的提交被当成任务证据拒掉，
+T-001 判 `needs-resplit`，T-002/003/004 全 `blocked`。
+
+- **先记录 base（AC-001）**：runner 在建 worktree **之前**读主树 HEAD，写进 `run.json` 的 `tasks[].base`
+  （短哈希），并显式作为 `git worktree add` 的起点。`Worktrees` 接缝新增 `commits(worktree, base)`，
+  生产值 `taskCommits()` 用 `git rev-list --count` + `git log --format=%s` 取 `base..HEAD` 的提交数与标题。
+- **判定顺序（AC-002）**：`0` 个新提交 → 「worker 没有产生提交（HEAD 仍是基线 `<base8>`）：无法证明这次任务
+  做过任何事」，**标题一字不读**；`≥1` 个才逐个校验 `git log --format=%s base..HEAD`，任一标题以
+  `<taskId>:` 开头（容忍全角 `：`）即通过，都不匹配才报「本次 N 个新提交里没有一个带 `"<taskId>:"` 前缀
+  （base `<base8>` → HEAD `<head8>`）」并列出前 3 个标题。`tasks[].commit` 也只在 `count ≥ 1` 时才写：
+  旧实现会把基线 commit 记成"任务的 commit"。
+- **基线标题不参与任何判定（AC-003）**：`dsh-memory: project memory: session end` 与
+  `T-001: 基线看起来像任务提交` 两种形状各用一条用例钉住——worker 未提交时都报"没有产生提交"，后一种形状
+  正是"读 HEAD 标题的实现会误判为通过"的那条；门槛没有放宽，无提交仍然失败（`acceptance-failed` →
+  `needs-resplit`）。
+- **测试（AC-004）**：`split-runner.test.ts` 新增 4 例（无提交且 base 是 dsh-memory 提交、无提交且 base
+  标题像任务提交、有提交且前缀正确且 `run.json` 每任务带 base 短哈希、两个新提交只有其一有前缀即通过），
+  既有"缺前缀"用例的 2 条断言按新语义更新（旧文案 `commit <sha12> 的标题 … 不带前缀` 不再存在；
+  新断言用**完全相等**比对整句，未放宽、未删除）。`docs/ARCHITECTURE.md` 新增 §5.38.2 G 并更正 §5.38.1
+  C.5，`docs/SPLIT-RUNBOOK.md` 新增 §6.4（判定顺序表 + 诊断命令）。
+
 ### 功能 · 每任务 AC 预算：一个子任务最多三条验收标准（`split.maxAcceptancePerTask`）
 
 真实落差：连续 5 个 mission 的 plan 都是**单任务**（覆盖 11~13 条 AC、19~32 个路径），先撞上

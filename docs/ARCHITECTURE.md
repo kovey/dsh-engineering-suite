@@ -1877,8 +1877,9 @@ spec-clarify → test-design-review → spec-approve → split → split-review 
    `quality.maxReworkRatio` 后，**后续**子任务改走 `planner` 段并告警（AC-011，不中止）；`planner` 未配时
    降级到已配置的 `worker`（否则宿主默认），`split/rework.json` 的 `route.note` 与告警行写明
    「无法升级到 planner：未配置，继续使用 …」。
-5. commit 标题必须以 `<taskId>:` 开头；runner 在合并/记录前校验，不符则记 `acceptance-failed`，并把
-   commit 与标题原样写进 `problems`（"fail closed，不尽力而为"）。
+5. commit 标题必须以 `<taskId>:` 开头；runner 在合并/记录前校验的是**本任务新增的提交**（`base..HEAD` 的差集，
+   见本节 G），基线提交的标题不参与判定；不符则记 `acceptance-failed`，并把新提交的标题原样写进
+   `problems`（"fail closed，不尽力而为"）。
 
 **D. 写入模型：worker 只写自己 worktree 里的台账，主 mission 只由导入器写**
 
@@ -2163,6 +2164,36 @@ P3 之前的写法把两件"可选覆盖"说成了前提（"任一段没配 `mod
 - `split-workflow.test.ts` 追加 1 例：`maxAttempts` 的 1..3 / 非法值点名 / 缺省 1 / 上限夹取。
 - `scripts/selftest-ops.sh` **C23** 驱动 `split-clean.sh`：dry-run 列候选且一个不删、缺 `--mission` 与
   `--aply` 拼错都 exit 2、`--apply` 真删两个目录、有未导入证据时 dry-run 与 `--apply` 都 exit 1 且目录保留。
+
+**G. 任务提交 = `base..HEAD` 的差集，不是裸 `HEAD`**
+
+真实故障（golang/im 的 `mission-20261120-154004`）：4 个子任务只跑了 T-001 就以 `ok:false` 结束，problem 写
+「commit b6d93db78821 的标题 "dsh-memory: project memory: session end" 不带前缀 "T-001:"」。根因不是 worker 写错
+了标题，而是 worker **没有产生任何提交**：worktree 的 HEAD 还停在**基线**上，而基线恰好是 dsh-memory 的
+session-end 自动提交。旧实现把裸 `head()` 当"任务提交"去校验前缀，于是另一个插件的提交被当成任务证据拒掉，
+任务判 `needs-resplit`，T-002/003/004 全 `blocked`。
+
+修的是"这个事实从哪来"，四处一起改：
+
+| 事实 | 旧 | 新 |
+|------|----|----|
+| 一个任务"做了什么提交" | worktree 的裸 `HEAD`（可能仍是基线） | `git rev-list --count base..HEAD` 的**差集** |
+| base 从哪来 | 没有记录 | 建 worktree **之前**读主树 HEAD，写进 `run.json` 的 `tasks[].base`（短哈希），并**显式**作为 `git worktree add` 的起点 |
+| `0` 个新提交 | 读 HEAD 标题 → 报"前缀不符" | 直接报「worker 没有产生提交（HEAD 仍是基线 `<base8>`）：无法证明这次任务做过任何事」，**标题一字不读** |
+| `≥1` 个新提交 | 只看 HEAD 一个标题 | `git log --format=%s base..HEAD` 逐个看：任一标题以 `<taskId>:` 开头（容忍全角 `：`）即通过；都不匹配才报「本次 N 个新提交里没有一个带 `"<taskId>:"` 前缀（base `<base8>` → HEAD `<head8>`）」并列出前 3 个标题 |
+
+两条不变式：① **基线提交的标题不参与任何判定**——不管它看起来像工具提交（`dsh-memory: …`）还是像任务提交
+（`T-001: …`）：`0` 个新提交就是 `0`，用例把这两种形状分别钉住；② **门槛没有放宽**——无提交仍然失败
+（`acceptance-failed` → `needs-resplit`），变的只是失败原因那句文案，它现在说的是实际发生的事。base 取自
+建 worktree **之前**并显式传给 `git worktree add`，所以判定用的差集有确定起点，主树之后移动也不影响它；
+`record.commit` 也只在 `count ≥ 1` 时才写（旧实现会把基线 commit 记成"任务的 commit"）。
+
+测试（`split-runner.test.ts`，真临时 git 仓 + 假 worker）：base 是 `dsh-memory: project memory: session end`
+且 worker 未提交 → 报"没有产生提交"且标题一字不出现；base 标题是 `T-001: …`（**看起来像任务提交**）且 worker
+未提交 → 仍然报"没有产生提交"（任何读 HEAD 标题的实现都会在这里误判为通过）；有提交且前缀正确 → `done` 且
+`run.json` 每任务带 base 短哈希；有提交但无前缀 → 新文案（base → HEAD + 标题列表）精确相等；两个新提交只有
+其一有前缀 → 通过。既有"缺前缀"用例的 2 条断言按新语义更新（旧的"commit `<sha12>`…不带前缀"文案不再存在），
+**不放宽不删**。
 
 **诚实边界（P3）**
 
