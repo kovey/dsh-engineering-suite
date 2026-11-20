@@ -344,7 +344,8 @@ console.log(e.reasons.join("\n")); console.log(e.tokens)' \
 
 | 事实（`git rev-list --count base..HEAD`） | 判定 | `problems` 原文 |
 |------------------------------------------|------|-----------------|
-| `0` | 失败（`acceptance-failed` → `needs-resplit`），**标题一字不读** | `worker 没有产生提交（HEAD 仍是基线 <base8>）：无法证明这次任务做过任何事` |
+| `0` 且 worktree **干净**（`git status --porcelain` 为空） | 失败（`acceptance-failed` → `needs-resplit`），**标题一字不读** | `worker 没有产生提交（HEAD 仍是基线 <base8>）：无法证明这次任务做过任何事` |
+| `0` 但 worktree **有未提交改动** | runner 代提交（`<taskId>: <摘要>（run 由 runner 代提交）`）后**重新判定**，见 §6.5 | 成功时无 failure problem；代提交本身写一条 `runner 代提交：…` 的 note（见 §6.5） |
 | `≥1` 且任一标题以 `<taskId>:` 开头（容忍全角 `：`） | `done` | — |
 | `≥1` 但都不带前缀 | 失败（`acceptance-failed` → `needs-resplit`） | `本次 N 个新提交里没有一个带 "<taskId>:" 前缀（base <base8> → HEAD <head8>）：无法证明它属于子任务 <taskId>。新提交标题："…"`（最多列 3 个） |
 
@@ -368,6 +369,42 @@ git -C <worktree> log --oneline <base>..HEAD
 `run.json` 里该任务的 `commit` 只在 `count ≥ 1` 时才有值：读到一个 `commit` 不代表"任务完成"，它只代表
 "这个分支相对基线至少多了一条提交"。
 
+### 6.5 worker 必须提交；runner 只在它忘了时补一次
+
+`run.json` 的空 `commit` + 「没有产生提交」有两种完全不同的成因，必须分开反应：
+
+| 成因 | runner 的行为 | `run.json` 里的痕迹 |
+|------|---------------|---------------------|
+| worker 写了文件但**没提交** | 代提交 `git add -A && git commit -m "<taskId>: <摘要>（run 由 runner 代提交）"`，再按新的 `base..HEAD` 判定 → 通常 `done` | 该任务 `autocommit: true`；`tasks[].problems` 与 run 级 `warnings` 各有一条 `runner 代提交：<taskId> 的 worker 没有提交，但 worktree 有未提交改动，已由 runner 代提交 <commit8>（run.json 的 tasks[].autocommit=true）` |
+| worker **什么都没改** | **不代提交**，原句失败 | 无 `autocommit`；`problems` 仍是 `worker 没有产生提交（HEAD 仍是基线 <base8>）：无法证明这次任务做过任何事` |
+| 代提交本身失败（身份未配置 / hook 拒绝 / git 不在） | 不伪造 commit：任务失败，原样报出 git 的 stderr | `problems` 以 `runner 代提交失败：…` 开头（仍会附上"没有产生提交"那句） |
+
+worker 侧的契约（`split-worker.ts` 的 `workerPrompt` 第 3 条，原文）：
+
+```text
+3. **完成修改后必须提交**：在 worktree 里执行 `git add -A && git commit -m "<taskId>: <摘要>"`（例如 <taskId>: <目标>）。
+   runner 只认你在 <taskId> 分支上产生的提交，**不提交视为未完成**：它不会替你证明做过事；
+   若你留下未提交的改动，runner 会代提交并在 run.json 记 autocommit=true（那是兜底记录，不是你的产出）。
+```
+
+两条要记住的性质：
+
+- **代提交不进 `signals`**：返工率回答"这个任务被做了几次"，不是"谁补的提交"；代提交也不改变
+  `needs-resplit` 的语义（它只由 attempt 失败产生）。`autocommit: true` 是"这一轮的记录不完整"的信号，
+  值得在 review 时看一眼，但它不阻断交付、不写门禁。
+- **兜底不掩盖"什么都没做"**：清理过的 worktree 是干净的，`git status --porcelain` 为空 → 直接失败。
+  代提交只在**确实有改动**时发生，且提交里就是那些改动（`git add -A`）。
+
+诊断（都从产物出发）：
+
+```bash
+# 1) 这个任务为什么失败？先看 run.json 的 tasks[]：state / commit / autocommit / problems
+# 2) 有 autocommit: true：worker 改了但没提交，runner 补了。看那条 note 与 commit 的标题
+git -C <主树> log -1 --format=%s <tasks[].commit>
+# 3) 没有 autocommit 且 commit 为空：worker 确实什么都没改。别去改标题，先问它卡在哪
+# 4) worktree 还在（超时/待导入）时：git -C <worktree> status --porcelain 看它到底留下了什么
+```
+
 ## 7. 诚实边界
 
 - **度量与恢复不参与交付判定**：`economics` 与 doctor 的输出不写门禁、不被 `mission_complete` 读取
@@ -377,6 +414,9 @@ git -C <worktree> log --oneline <base>..HEAD
   lead 签发回执"。
 - **doctor 看不到未提交的文件**：它只按产物分类；`clean` 的删除原语是 `git worktree remove`（无
   `--force`），未提交/未忽略的文件会让 git 自己拒绝。分支永不删除，commit 仍可达。
+- **代提交不评价 worker 改得对不对**：它只把"有改动但没提交"变成一条可核验的 `<taskId>:` 提交；改动是否
+  满足验收标准仍由门禁与评审回答。被仓库忽略的路径（典型是 worktree 内的 `.dsh/` 本地台账）**不算改动**，
+  所以"只写了 evidence、没改代码"的 worker 依旧是"什么都没做"。
 - **clean 不会"顺手导入"**：本套件没有独立的导入 CLI；先把证据导入（走 runner 收尾或 `split_plan` 之后的
   导入路径），再清理。
 - **真派发需要真 profile + 真 `dsh`**：本仓库的验收跑覆盖的是 SKIP 分支与它的四条反证，不证明"真 worker

@@ -15,6 +15,10 @@
  *    commit, and the base commit takes part in NO judgment (it may be another
  *    plugin's session-end auto-commit) — the `<taskId>:` prefix check reads only
  *    the subjects of commits the worker added;
+ *  - `status` / `autocommit` are the fallback's git half (AC-002): "is the
+ *    worktree dirty" and "commit exactly that", so a worker that changed files but
+ *    forgot to commit still produces a `<taskId>:` commit the run can record —
+ *    while a CLEAN worktree still means "produced nothing" and stays a failure;
  *  - `merge` merges the task BRANCH into the main tree, because AC-008's importer
  *    only accepts commits that are already in the main tree's history. A failed
  *    merge is aborted (`git merge --abort`) and reported: leaving conflict
@@ -26,6 +30,7 @@
 
 import { spawnSync } from 'node:child_process'
 import { cleanupTaskWorktree, createTaskWorktree } from 'dsh-eng-core/split'
+import type { TaskAutocommit, TaskDirty } from './split-run-autocommit.js'
 import type { SplitWorktrees, TaskCommit, TaskCommits, TaskMerge } from './split-run-types.js'
 
 /** One git invocation; never throws (a refusal is a result). */
@@ -89,6 +94,54 @@ export function headCommit(worktree: string): TaskCommit {
 }
 
 /**
+ * Whether one worktree has uncommitted changes (AC-002's fallback condition).
+ *
+ * `git status --porcelain` is the narrowest honest question here: it reports
+ * tracked modifications AND untracked files (which is exactly "the worker wrote
+ * something") and says nothing about ignored paths — a worktree-local `.dsh/`
+ * ledger that the repository ignores does not make the tree "dirty", so the
+ * fallback cannot be triggered by evidence bookkeeping alone.
+ * @param worktree - absolute path of the task worktree.
+ */
+export function worktreeStatus(worktree: string): TaskDirty {
+    const status = git(worktree, ['status', '--porcelain'])
+    if (status.status !== 0) {
+        return {
+            ok: false,
+            dirty: false,
+            problems: [`无法读取 worktree ${worktree} 的工作区状态（${reasonOf(status)}）：无法判断 runner 是否该代提交`],
+        }
+    }
+    return { ok: true, dirty: status.stdout.trim() !== '', problems: [] }
+}
+
+/**
+ * Commit everything pending in one worktree — the runner's fallback (AC-002).
+ *
+ * `git add -A` + `git commit` (argv, no shell), with `commit.gpgsign=false` for
+ * the same reason the merge sets it: a host without signing configured must not
+ * turn "the worker forgot to commit" into "the run cannot record anything". A
+ * refusal (missing identity, a failing hook) is returned as-is: the caller reports
+ * the task as failed with git's own reason instead of inventing a commit.
+ * @param input - the worktree and the message (already carrying `<taskId>:`).
+ */
+export function commitWorktree(input: { worktree: string; message: string }): TaskAutocommit {
+    const added = git(input.worktree, ['add', '-A'])
+    if (added.status !== 0) {
+        return { ok: false, problems: [`runner 代提交失败：git add -A 在 ${input.worktree} 返回非零（${reasonOf(added)}）`] }
+    }
+    const committed = git(input.worktree, ['-c', 'commit.gpgsign=false', 'commit', '-m', input.message])
+    if (committed.status !== 0) {
+        return { ok: false, problems: [`runner 代提交失败：git commit 在 ${input.worktree} 返回非零（${reasonOf(committed)}）`] }
+    }
+    const head = headCommit(input.worktree)
+    if (!head.ok || head.commit === undefined) {
+        return { ok: false, problems: head.problems.length > 0 ? head.problems : [`runner 代提交后读不到 ${input.worktree} 的 HEAD`] }
+    }
+    return { ok: true, commit: head.commit, problems: [] }
+}
+
+/**
  * Merge one task branch into the main tree (no fast-forward: the merge commit is
  * the record that this branch landed).
  * @param input - main tree, branch and task id.
@@ -112,13 +165,15 @@ export function mergeTaskBranch(input: { mainTree: string; branch: string; taskI
 
 /**
  * The real worktree seam (what a deployment runs).
- * @returns the five operations, all safe to call repeatedly.
+ * @returns the seven operations, all safe to call repeatedly.
  */
 export function defaultSplitWorktrees(): SplitWorktrees {
     return {
         create: (input) => createTaskWorktree(input),
         head: headCommit,
         commits: taskCommits,
+        status: worktreeStatus,
+        autocommit: commitWorktree,
         merge: mergeTaskBranch,
         cleanup: (input) => cleanupTaskWorktree(input),
     }

@@ -1,5 +1,34 @@
 ## [未发布]
 
+### 功能 · worker 必须提交；它忘了时 runner 代提交一次，并在 `run.json` 记 `autocommit`
+
+真实故障（golang/im 的 `mission-20261120-165139`）：T-001 的 `base=13be61ce`、`commit` 为空，problem 写
+「worker 没有产生提交」，T-002..T-005 全 `blocked`。判定逻辑本身已在上一轮修好（提交按 `base..HEAD` 差集判定），
+根因在**派发**：worker 的 prompt 从未要求它提交——它改了文件、写了本地 evidence，然后结束了；runner 只看
+`base..HEAD`，于是"改了但没提交"与"什么都没做"在产物上无法区分，一个本可以完成的 plan 被判死。
+
+- **prompt 写死提交要求（AC-001）**：`packages/dsh-orchestrator/src/split-worker.ts` 的 `workerPrompt` 第 3 条
+  从"完成时产出一个 commit"改成硬要求：在 worktree 里执行 `git add -A && git commit -m "<taskId>: <摘要>"`，
+  并写明**不提交视为未完成**、runner 只认 worker 产生的提交、不会替它证明做过事。用例钉在**派发请求**上
+  （`request.prompt[0].text`），不是钉在源码字符串上。
+- **runner 兜底（AC-002）**：`split-run-autocommit.ts`（新模块）持有 `base..HEAD` 判定、前缀规则与兜底：
+  `0` 个新提交时先读 `git status --porcelain`（接缝新增 `SplitWorktrees.status`）——
+  **有改动** → `git add -A` + `git commit -m "<taskId>: <摘要>（run 由 runner 代提交）"`（`-c commit.gpgsign=false`，
+  与合并同一口径），然后**按新的差集重新判定**；**没改动** → 原句不变，仍 `needs-resplit`。兜底提交失败
+  （身份未配置、hook 拒绝）原样报出 git 的 stderr，不伪造 commit id。
+- **代提交留痕（AC-003）**：`run.json` 该任务记 `autocommit: true`，同一句
+  「runner 代提交：<taskId> 的 worker 没有提交，但 worktree 有未提交改动，已由 runner 代提交 <commit8>
+  （run.json 的 tasks[].autocommit=true）」写进该任务的 `problems` 与 run 级 `warnings`。它**不进 `signals`**：
+  返工率仍然回答"这个任务被做了几次"，不是"谁补的提交"。
+- **重构而非放宽**：`shortCommit` / 前缀判定 / 三句失败文案与"提交验证"搬进 `split-run-autocommit.ts`
+  （`split-run-attempt.ts` 已近 300 行、`split-run-types.ts` 导出面 14/15）；"缺前缀"路径仍然记录
+  `record.commit`（既有断言），既有用例的断言一条没改。
+- **测试（AC-004）**：`split-runner.test.ts` 新增 3 例（真临时 git 仓 + 假 worker）：prompt 写死 + worker 自提交
+  → `done` 且 `autocommit` 缺省；改了不提交 → 兜底 `done`、`autocommit: true`、note 同句、提交标题
+  `T-001: 做 T-001（run 由 runner 代提交）`、主树合并后可读到那个文件；什么都没改 → 原句**精确相等**、
+  无 `autocommit`、主树没有多出 T-001 的提交。`docs/ARCHITECTURE.md` §5.38.2 新增 H，`docs/SPLIT-RUNBOOK.md`
+  §6.4 判定表更新并新增 §6.5（含诊断命令）。
+
 ### 修复 · 子任务的提交按 `base..HEAD` 差集判定：基线提交不再被当成任务提交
 
 真实故障（golang/im 的 `mission-20261120-154004`）：一个 4 子任务的 plan 只跑了 T-001 就 `ok:false`，problem 写

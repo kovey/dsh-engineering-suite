@@ -193,10 +193,18 @@ function finishWorker(workers: FakeWorkers, layout: Layout, taskId: string, opti
     return commit
 }
 
-/** Resolve one worker WITHOUT committing: HEAD stays on the base commit. */
-function finishWorkerWithoutCommit(workers: FakeWorkers, taskId: string): void {
+/** Write a source file inside the worker's worktree, leaving it UNCOMMITTED (the bug this fixes). */
+function writeWithoutCommit(worktree: string, name: string): void {
+    const file = path.join(worktree, 'src', `${name}.ts`)
+    fs.mkdirSync(path.dirname(file), { recursive: true })
+    fs.writeFileSync(file, `export const value = ${JSON.stringify(name)}\n`)
+}
+
+/** Resolve one worker WITHOUT committing: HEAD stays on the base commit (optionally leaving changes). */
+function finishWorkerWithoutCommit(workers: FakeWorkers, taskId: string, options: { write?: string } = {}): void {
     const worker = workers.started.find((entry) => entry.taskId === taskId && !entry.finished)
     assert.ok(worker !== undefined, `no pending worker for ${taskId}`)
+    if (options.write !== undefined) writeWithoutCommit(worktreeOf(worker), options.write)
     worker.resolve()
 }
 
@@ -242,7 +250,17 @@ function deps(cwd: string, workers: FakeWorkers, overrides: Partial<SplitRunnerD
 /** The stored `split/run.json` of a mission. */
 function runRecord(cwd: string): {
     state: string
-    tasks: { id: string; state: string; commit?: string; base?: string; imported: number; cleanedUp: boolean; modelNote?: string }[]
+    tasks: {
+        id: string
+        state: string
+        commit?: string
+        base?: string
+        autocommit?: boolean
+        problems: string[]
+        imported: number
+        cleanedUp: boolean
+        modelNote?: string
+    }[]
     imported: number
     modelNotes?: string[]
 } {
@@ -635,6 +653,104 @@ test('among several new commits, one carrying the `<taskId>:` prefix is enough (
     assert.equal(result.ok, true, result.problems.join(' | '))
     assert.equal(result.tasks[0]?.state, 'done')
     assert.equal(result.tasks[0]?.commit, commit)
+})
+
+// --- the commit contract, part 2: "a worker MUST commit" (AC-001..AC-003) ----
+
+test('the worker prompt pins the commit command, and a worker that commits itself needs no fallback (AC-001 / TC-2901)', async () => {
+    const cwd = repo()
+    mission(cwd, twoTasks([['T-001', 'T-002']]))
+    const workers = fakeWorkers()
+    const running = runSplitPlan(deps(cwd, workers))
+
+    await workers.waitFor(2)
+    // AC-001 is asserted on the artifact the worker really receives — the
+    // activation's prompt — not on the source text that builds it.
+    for (const worker of workers.started) {
+        const prompt = worker.spec.request?.prompt?.[0]?.text ?? ''
+        assert.match(prompt, new RegExp(`git add -A && git commit -m "${worker.taskId}: <摘要>"`), `${worker.taskId} 的 prompt 必须写死提交命令`)
+        assert.match(prompt, /不提交视为未完成/)
+        assert.match(prompt, /不会替你证明做过事/)
+    }
+    finishWorker(workers, resolveLayout(cwd), 'T-001')
+    finishWorker(workers, resolveLayout(cwd), 'T-002')
+    const result = await running
+
+    assert.equal(result.ok, true, result.problems.join(' | '))
+    assert.deepEqual(result.tasks.map((entry) => entry.state), ['done', 'done'])
+    // TC-2901: the worker committed for itself, so the fallback never ran.
+    assert.deepEqual(result.tasks.map((entry) => entry.autocommit), [undefined, undefined])
+    assert.deepEqual(result.tasks.map((entry) => entry.problems), [[], []])
+    assert.deepEqual(
+        runRecord(cwd).tasks.map((entry) => entry.autocommit),
+        [undefined, undefined],
+    )
+})
+
+test('a worker that changed files but did not commit is finished by the runner, and run.json says so (AC-002/AC-003 / TC-2902 / TC-2904)', async () => {
+    const cwd = repo()
+    mission(cwd, twoTasks([['T-001', 'T-002']]))
+    const workers = fakeWorkers()
+    const running = runSplitPlan(deps(cwd, workers))
+
+    await workers.waitFor(2)
+    // The real failure: the worker wrote its files and then just stopped.
+    finishWorkerWithoutCommit(workers, 'T-001', { write: 'T-001' })
+    finishWorker(workers, resolveLayout(cwd), 'T-002')
+    const result = await running
+
+    assert.equal(result.ok, true, result.problems.join(' | '))
+    const task = result.tasks[0]
+    assert.equal(task?.state, 'done')
+    assert.equal(task?.autocommit, true)
+    assert.equal(typeof task?.commit, 'string', 'the fallback commit is the task\'s recorded commit')
+    const commit = String(task?.commit)
+    // AC-003: the task's problems carry the sentence; it is not silent.
+    const note = `runner 代提交：T-001 的 worker 没有提交，但 worktree 有未提交改动，已由 runner 代提交 ${commit.slice(0, 8)}（run.json 的 tasks[].autocommit=true）`
+    assert.deepEqual(task?.problems, [note])
+    // The note also reaches the run-level warnings (rework-plan lines live there
+    // too, so this is "included", not "the only entry").
+    assert.equal(result.warnings.filter((line) => line === note).length, 1)
+    // AC-002: the message carries the task prefix, so the commit is attributable,
+    // and the file the worker wrote really is in it.
+    assert.equal(git(cwd, ['log', '-1', '--format=%s', commit]), 'T-001: 做 T-001（run 由 runner 代提交）')
+    assert.match(git(cwd, ['show', `${commit}:src/T-001.ts`]), /T-001/)
+    // TC-2904: the durable record has the flag AND the explanation; the task whose
+    // worker committed itself has neither.
+    const record = runRecord(cwd)
+    assert.equal(record.tasks[0]?.autocommit, true)
+    assert.deepEqual(record.tasks[0]?.problems, [note])
+    assert.equal(record.tasks[1]?.autocommit, undefined)
+    assert.deepEqual(record.tasks[1]?.problems, [])
+})
+
+test('a worker that changed NOTHING is still "no commit", and the runner commits nothing for it (AC-002 negative / TC-2903)', async () => {
+    const cwd = repo()
+    const base = git(cwd, ['rev-parse', 'HEAD'])
+    mission(cwd, twoTasks([['T-001', 'T-002']]))
+    const workers = fakeWorkers()
+    const running = runSplitPlan(deps(cwd, workers))
+
+    await workers.waitFor(2)
+    finishWorkerWithoutCommit(workers, 'T-001')
+    finishWorker(workers, resolveLayout(cwd), 'T-002')
+    const result = await running
+
+    // The sentence is EXACTLY the one from before the fallback existed: a clean
+    // worktree means "produced nothing", and the fallback must not mask it.
+    assert.deepEqual(result.tasks[0]?.problems, [
+        `worker 没有产生提交（HEAD 仍是基线 ${base.slice(0, 8)}）：无法证明这次任务做过任何事`,
+    ])
+    assert.equal(result.tasks[0]?.state, 'needs-resplit')
+    assert.equal(result.tasks[0]?.commit, undefined)
+    assert.equal(result.tasks[0]?.autocommit, undefined)
+    assert.equal(result.ok, false)
+    const record = runRecord(cwd)
+    assert.equal(record.tasks[0]?.autocommit, undefined)
+    assert.deepEqual(record.tasks[0]?.problems, result.tasks[0]?.problems)
+    // Nothing was committed on T-001's behalf: the main tree only gained T-002's
+    // commit and its merge commit.
+    assert.equal(git(cwd, ['rev-list', '--count', `${base}..HEAD`]), '2')
 })
 
 // --- refusals -------------------------------------------------------------

@@ -13,7 +13,10 @@
  *     committed nothing leaves HEAD on the base commit; that commit may be
  *     somebody else's (a dsh-memory session-end auto-commit is the real case),
  *     and its subject takes part in NO judgment. `0` new commits is its own
- *     failure ("no commit"), distinct from "committed with a wrong subject".
+ *     failure ("no commit"), distinct from "committed with a wrong subject" —
+ *     with ONE exception: a DIRTY worktree means "changed but forgot to commit",
+ *     so the runner commits it and judges again (`split-run-autocommit.ts`).
+ *     A CLEAN worktree still fails as "no commit".
  *  3. **Retries are bounded by `split.maxAttempts`** (default 1, hard ceiling 3,
  *     see `splitMaxAttempts`). Every attempt increments `attempts`.
  *  4. **Each failed attempt counts as rework.** The signal (`acceptance-failed`,
@@ -32,6 +35,7 @@
  */
 
 import { splitMaxAttempts, type NextTaskRoute, type ReworkSignal, type SplitTask } from 'dsh-eng-core/split'
+import { shortCommit, verifyTaskCommit } from './split-run-autocommit.js'
 import { failTask, note, taskRecordOf } from './split-run-finish.js'
 import type { SplitRunBook, SplitRunnerDeps, SplitTaskRun } from './split-run-types.js'
 import { routeFor, startWorker, type WorkerDispatch } from './split-worker.js'
@@ -56,44 +60,21 @@ interface AttemptTarget {
     route: NextTaskRoute
 }
 
-/** The first 8 characters of a commit id (the short hash reports use). */
-export function shortCommit(commit: string): string {
-    return commit.slice(0, 8)
-}
-
-/**
- * Whether one commit subject carries THIS task's id: `T-001:` at the start.
- *
- * A full-width colon (`T-001：`) counts too: it is the same prefix typed with an
- * IME on, and rejecting it would rework a worker for punctuation.
- */
-export function carriesTaskPrefix(subject: string, taskId: string): boolean {
-    return subject.startsWith(`${taskId}:`) || subject.startsWith(`${taskId}：`)
-}
-
-/** AC-002/AC-003: zero NEW commits — a different fact from a wrong prefix. */
-export function noCommitProblem(base: string): string {
-    return `worker 没有产生提交（HEAD 仍是基线 ${shortCommit(base)}）：无法证明这次任务做过任何事`
-}
-
-/**
- * AC-002: the task committed, but none of its new subjects carries its id.
- *
- * The base commit's subject is NOT quoted anywhere: it belongs to whatever the
- * branch started on, and naming it as the task's commit is the bug this text
- * replaces. The list is the subjects of `base..HEAD`, capped at three.
- */
-export function missingPrefixProblem(input: { taskId: string; count: number; base: string; head: string; subjects: readonly string[] }): string {
-    const listed = input.subjects
-        .slice(0, 3)
-        .map((subject) => JSON.stringify(subject))
-        .join('、')
-    const more = input.subjects.length > 3 ? `（共 ${input.count} 个，只列前 3 个）` : ''
-    return `本次 ${input.count} 个新提交里没有一个带 "${input.taskId}:" 前缀（base ${shortCommit(input.base)} → HEAD ${shortCommit(input.head)}）：无法证明它属于子任务 ${input.taskId}。新提交标题${more}：${listed}`
+/** AC-003: a commit the RUNNER made is recorded on the task, and is never silent. */
+function recordAutocommit(book: SplitRunBook, record: SplitTaskRun, noteText: string | undefined): void {
+    record.autocommit = true
+    if (noteText === undefined) return
+    record.problems.push(noteText)
+    book.warnings.push(noteText)
+    book.log(noteText)
 }
 
 /**
  * Dispatch the worker once and verify the commit contract.
+ *
+ * The commit judgment (`base..HEAD`, the prefix, and the fallback that commits for
+ * a worker that forgot) lives in `split-run-autocommit.ts`; this function only
+ * decides what a non-ok verdict means for the attempt.
  *
  * @returns `undefined` when the task is done (the commit is on its branch), else
  *   the failure with its rework signal.
@@ -111,30 +92,14 @@ async function attemptOnce(book: SplitRunBook, deps: SplitRunnerDeps, target: At
         // cleanup steps can still consume what the worker wrote.
         return { problems: [failure.detail], signal: failure.timeout === true ? 'timeout' : 'acceptance-failed', retryable: true }
     }
-    const head = book.seam.head(target.worktree)
-    if (!head.ok || head.commit === undefined) {
-        return { problems: head.problems.length > 0 ? head.problems : ['读不到 worktree 的 HEAD commit'], signal: 'acceptance-failed', retryable: true }
-    }
-    // AC-002: judge the DIFF SET `base..HEAD`, in this order. `0` new commits is
-    // its own failure and the title is never read at all (AC-003): the HEAD is
-    // still the base commit, and that commit's subject may belong to another
-    // plugin — quoting it as "the task's commit" is exactly the misjudgment that
-    // rejected a worker for a dsh-memory session-end auto-commit.
-    const own = book.seam.commits(target.worktree, target.base)
-    if (!own.ok) {
-        return { problems: own.problems.length > 0 ? own.problems : [`无法读取 ${target.worktree} 相对基线 ${shortCommit(target.base)} 的新提交`], signal: 'acceptance-failed', retryable: true }
-    }
-    if (own.count === 0) {
-        return { problems: [noCommitProblem(target.base)], signal: 'acceptance-failed', retryable: true }
-    }
-    target.record.commit = head.commit
-    if (!own.subjects.some((subject) => carriesTaskPrefix(subject, target.task.id))) {
-        return {
-            problems: [missingPrefixProblem({ taskId: target.task.id, count: own.count, base: target.base, head: head.commit, subjects: own.subjects })],
-            signal: 'acceptance-failed',
-            retryable: true,
-        }
-    }
+    const verdict = verifyTaskCommit(book, { task: target.task, worktree: target.worktree, base: target.base })
+    // Recorded even when the verdict is "wrong prefix": `run.json` must be able to
+    // name the commit the worker actually pushed. Absent = no commit at all.
+    target.record.commit = verdict.commit
+    if (!verdict.ok) return { problems: verdict.problems, signal: 'acceptance-failed', retryable: true }
+    // AC-002: the record names the commit AND who made it (autocommit is absent
+    // when the worker committed itself — TC-2901's "缺省").
+    if (verdict.autocommit === true) recordAutocommit(book, target.record, verdict.note)
     return undefined
 }
 

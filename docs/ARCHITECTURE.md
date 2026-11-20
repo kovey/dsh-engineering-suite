@@ -2195,6 +2195,45 @@ session-end 自动提交。旧实现把裸 `head()` 当"任务提交"去校验�
 其一有前缀 → 通过。既有"缺前缀"用例的 2 条断言按新语义更新（旧的"commit `<sha12>`…不带前缀"文案不再存在），
 **不放宽不删**。
 
+**H. worker 必须提交，runner 只在它忘了时补一次（AC-001/AC-002/AC-003）**
+
+真实故障：golang/im 的 `mission-20261120-165139`，T-001 的 `base=13be61ce`、`commit` 为空，报
+「worker 没有产生提交」，T-002..T-005 全 `blocked`。G 修的是**判定**（不再把基线当任务提交），但根因在
+**派发**：worker 的 prompt 从未要求它提交——它改了文件、写了本地 evidence，然后就结束了；runner 只看
+`base..HEAD`，于是"改了但没提交"与"什么都没做"在产物上无法区分，一个本可以完成的 plan 被判死。
+
+两块一起补，语义相反且都必须留痕：
+
+- **prompt 写死（AC-001）**：`split-worker.ts` 的 `workerPrompt` 第 3 条从"完成时产出一个 commit"改成硬要求：
+  在 worktree 里执行 `git add -A && git commit -m "<taskId>: <摘要>"`，并写明**不提交视为未完成**、
+  runner 只认 worker 产生的提交、不会替它证明做过事。这一段由测试钉在**派发请求**上
+  （`request.prompt[0].text` 同时含 `git add -A && git commit -m "<taskId>:"`、"不提交视为未完成"），
+  不是钉在源码字符串上。
+- **runner 兜底（AC-002/AC-003）**：`base..HEAD` 为 0 时不再立刻失败，先读 worktree 的
+  `git status --porcelain`（`SplitWorktrees.status`）：
+  - **有改动** → 以 `<taskId>: <goal>（run 由 runner 代提交）` 提交（`SplitWorktrees.autocommit` =
+    `git add -A` + `git commit`，`-c commit.gpgsign=false`，与合并同一口径），**再按新的差集判定**；
+    `run.json` 该任务记 `autocommit: true`，同一句话写进它的 `problems` 与 run 级 `warnings`：
+    「runner 代提交：…（run.json 的 tasks[].autocommit=true）」。它**不进 `signals`**：返工率仍然回答
+    "这个任务被做了几次"，不是"谁补的提交"。
+  - **没改动** → 原句不变：「worker 没有产生提交（HEAD 仍是基线 `<base8>`）：无法证明这次任务做过任何事」，
+    仍是 `needs-resplit`。兜底**不掩盖**"什么都没做"——这是本轮的负面约束，用**完全相等**的整句断言钉住。
+  - **代提交失败**（身份未配置、hook 拒绝、`git` 不在）→ 原样报出 git 的 stderr 并让该任务失败，
+    不静默改判，也不伪造一个 commit id。
+- **判定与文本都搬进一个模块**：`split-run-autocommit.ts` 持有 `base..HEAD` 判定、前缀规则、三句失败文案、
+  代提交 message/note 与 `verifyTaskCommit()`；`split-run-attempt.ts` 只把 verdict 翻译成 attempt 的结果。
+  这么做有两个具体原因：`split-run-attempt.ts` 已接近 300 行上限，而 `split-run-types.ts` 的导出面已到 14/15
+  （新增类型无法再加）——所以 `status`/`autocommit` 的返回形状在接缝上内联声明，模块依赖保持单向
+  （`autocommit → types`、`git → autocommit`），`forbidCycles` 仍是 0。
+- **测试（AC-004）**：`split-runner.test.ts` 新增 3 例（真临时 git 仓 + 假 worker）：prompt 三句 + worker
+  自提交 → `done` 且 `autocommit` 缺省（TC-2901）；改了不提交 → 兜底提交 `done`，`run.json`
+  `autocommit: true`，problems/warnings 同句，提交标题为 `T-001: 做 T-001（run 由 runner 代提交）`，
+  主树合并后可读到那个文件（TC-2902/TC-2904）；什么都没改 → 原句精确相等、无 `autocommit`、无新提交
+  （主树只多了 T-002 的提交与合并提交）（TC-2903）。既有用例的断言**一条没改**（G 的 4 例与"缺前缀"用例
+  仍全部通过），只把测试夹具的 `runRecord()` 类型补上 `autocommit`/`problems` 两个只读字段。
+  另：`split-run-autocommit.ts` 里"缺前缀"路径仍然记录 `record.commit`（wrong prefix 是"提交了但标题不合规"，
+  `run.json` 必须能点名它），这是 G 的既有断言，重构中一并保持。
+
 **诚实边界（P3）**
 
 - `worth-parallel` 是"这一次运行的墙钟 vs 耗时之和"，不是"下次也划算"的预测；时钟冻结或运行过快时它给
@@ -2205,6 +2244,7 @@ session-end 自动提交。旧实现把裸 `head()` 当"任务提交"去校验�
 - `split-clean` 不会代替你导入证据；本套件没有独立导入 CLI，待导入目录需要走 runner 收尾或既有导入路径。
 
 审核体验（可读的 `split/plan.md` + 与需求审批同一份只读预览 + TUI 菜单）见 §5.38.3。
+
 
 ### 5.38.3 P5：拆分审核与需求审批同体验（菜单 + 只读预览）
 

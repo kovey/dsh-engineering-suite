@@ -110,7 +110,9 @@ function workerPrompt(book: SplitRunBook, task: SplitTask, worktree: string): st
         '## 规则',
         '1. 只改上面 paths 覆盖的文件；需要越界就停下来说明，不要偷偷改别的子任务的路径。',
         '2. **禁止**写 mission.json、主树的门禁记录（gates/）与回执（receipts/）：这些工具不在你的白名单里。',
-        `3. 完成时在当前分支上产出一个标题以 "${task.id}:" 开头的 commit（例如 ${task.id}: ${task.goal}）；runner 会校验这个前缀，不合格按返工处理。`,
+        `3. **完成修改后必须提交**：在 worktree 里执行 \`git add -A && git commit -m "${task.id}: <摘要>"\`（例如 ${task.id}: ${task.goal}）。` +
+            `**不提交视为未完成**：runner 只认你在 ${task.id} 分支上产生的提交，不会替你证明做过事；` +
+            '它只会在你留下未提交改动时代提交一次并在 run.json 记 autocommit=true（那是兜底记录，不是你的产出）。',
         '4. 你在 worktree 里跑的门禁只有部分 scope，**永不构成交付依据**；合并后的主树会完整重跑一次。',
         '5. 结束时用简短条目汇报：改了什么、命令与输出、没覆盖到的风险。',
     ].join('\n')

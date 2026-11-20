@@ -38,6 +38,12 @@ export interface SplitTaskRun {
     /** The commit the task branch produced (absent when nothing was committed). */
     commit?: string
     /**
+     * `true` when the RUNNER committed on the worker's behalf (AC-002/AC-003): the
+     * worker left changes uncommitted, so "0 new commits" did not mean "0 work".
+     * Absent = the worker committed itself (the normal case).
+     */
+    autocommit?: true
+    /**
      * The commit this task's worktree STARTED on (short hash, AC-001): the main
      * tree's HEAD at creation, pinned as the branch's start point.
      *
@@ -162,6 +168,16 @@ export interface SplitWorktrees {
     head(tree: string): TaskCommit
     /** The commits `HEAD` has on top of `base` (the task's own commits, AC-002). */
     commits(worktree: string, base: string): TaskCommits
+    /**
+     * Whether the worktree has uncommitted changes (`git status --porcelain`, AC-002).
+     *
+     * The return shape is inline on purpose: the fallback's module imports THIS
+     * module, so naming a type from it here would close a cycle the standards gate
+     * forbids (`forbidCycles`), and the two shapes are three/four scalar fields.
+     */
+    status(tree: string): { ok: boolean; dirty: boolean; problems: string[] }
+    /** Commit whatever is pending in the worktree — the runner's fallback (AC-002). */
+    autocommit(input: { worktree: string; message: string }): { ok: boolean; commit?: string; problems: string[] }
     merge(input: { mainTree: string; branch: string; taskId: string }): TaskMerge
     cleanup(input: { mainTree: string; missionId: string; taskId: string }): CleanupWorktreeResult
 }
