@@ -1011,6 +1011,15 @@ unavailable`。所以本插件在 `approvalVia != off` 时用 **`{ prepend: true
 
 外加 write-once 的 `missions/<id>/policy-fingerprint.json`（批准时刻的信任根逐文件摘要），用于事后回答"当时是什么规则"。
 
+**信任根里什么算策略**：指纹只覆盖**策略文件**（`.json` 与 `roles/**`；`*.jsonl` 一律不参与）。`missions/`、`audit/`、
+`state/`、`kb/`、`media/`、`interaction/`、`deploy/` 与 **`worktrees/`** 虽然在信任根之内，但都是**运行时目录**，
+不参与指纹——它们按运行/派发写入，不是人可以评审的规则。`worktrees/` 是拆分派发器（`createTaskWorktree`）为每个
+子任务建的 git 检出（`<布局根>/worktrees/<mission>/<task>`）：它是带着已提交 `.dsh/*.json` 的完整工作副本，曾被当成
+策略——建一个 worktree 就让指纹多出 `worktrees/<mission>/<task>/.dsh/quality-gate.json`，在飞 mission 的 mandate
+立刻陈旧、worker 的写操作被拒（真机故障："worker 写不进去 / 没有产生提交"）。"建/删 worktree"与"改
+`quality-gate.json`"必须被区分：前者是运行时状态，后者才是策略变化；反证用例见
+`packages/dsh-eng-core/test/trust-root-worktrees.test.ts`（建/删不变 + 改配置仍变）。
+
 **四条硬规则**（每条都在补一个真实的洞）：
 
 1. **不可变**：再次批准不覆盖旧 mandate；**要更宽的范围就开新 mission**（拒绝并说明）。否则"批准"会变成一个可以被悄悄放宽的字段。
@@ -1497,7 +1506,8 @@ Ruby 的覆盖率命令就是"跑测试"：报告由 `simplecov-lcov` 在 `spec_
   第一个外来写入也有真实的比较基准。
 
 **诚实的边界**：指纹只覆盖策略文件（`.json` 与 `roles/**`），不是 `.dsh/**` 的每个字节——mission 状态、审计、
-`*.jsonl` 台账是运行时数据，按设计不参与；静态建模覆盖的是这七类命令的常见形态，其它形态仍是 `undecidable`（在
+`*.jsonl` 台账、拆分派发的任务检出 `worktrees/` 是运行时数据，按设计不参与（清单见 §5.19）；静态建模覆盖的是
+这七类命令的常见形态，其它形态仍是 `undecidable`（在
 `strict` 策略下拒绝、`targets` 策略下是已文档化的盲区）；兜底依赖"套件工具名单"完整，新增套件工具必须加进
 `SUITE_TOOLS`（或通过 `suiteTools` 配置补充），否则它的合法写入会被当成越权。
 

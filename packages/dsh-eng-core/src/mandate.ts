@@ -13,10 +13,10 @@
  *     TRUST ROOT (`<cwd>/.dsh/`): every `*.json` file plus everything under
  *     `.dsh/roles/`, hashed as sha256 over `path\0content\0` pairs in sorted
  *     path order. Runtime directories (`missions/`, `audit/`, `state/`, `kb/`,
- *     `media/`, `interaction/`, `deploy/`) and every `*.jsonl` are excluded: they
- *     change on every run, so including them would make every mission
- *     permanently stale. A missing `.dsh/` is the stable version of an empty
- *     trust root ({@link EMPTY_POLICY_VERSION}) — documented, not an error.
+ *     `media/`, `interaction/`, `deploy/`, `worktrees/`) and every `*.jsonl` are
+ *     excluded: they change on every run, so including them would make every
+ *     mission permanently stale. A missing `.dsh/` is the stable version of an
+ *     empty trust root ({@link EMPTY_POLICY_VERSION}) — documented, not an error.
  *     No git, no network: the same files always produce the same version, and
  *     {@link policyFingerprint} also returns the file list so a report can name
  *     WHAT changed instead of only saying "something did".
@@ -70,10 +70,10 @@ export const MANDATE_VERSION = 1
 export const MANDATE_BASIS = 'spec-approved' as const
 
 /**
- * Runtime directories under the trust root: written on every run, therefore
- * never part of the policy fingerprint.
+ * Runtime directories under the trust root: written on every run — or on every
+ * task dispatch (`worktrees/` is the split runner's checkout), so never policy.
  */
-export const TRUST_ROOT_RUNTIME_DIRS: readonly string[] = ['missions', 'audit', 'state', 'kb', 'media', 'interaction', 'deploy']
+export const TRUST_ROOT_RUNTIME_DIRS: readonly string[] = ['missions', 'audit', 'state', 'kb', 'media', 'interaction', 'deploy', 'worktrees']
 
 /**
  * Directory/file-name prefixes that are runtime STATE even though they live under

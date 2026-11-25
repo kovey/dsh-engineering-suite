@@ -1,5 +1,27 @@
 ## [未发布]
 
+### 修复 · 任务 worktree 是运行时状态，不是信任根策略：建/删不再让在飞 mandate 过期
+
+真实故障（nvim-tui 实跑）：`split` 自动派发 worker 时 worker 写不进去，最终"worker 没有产生提交"。根因是
+`packages/dsh-eng-core/src/mandate.ts` 的 `TRUST_ROOT_RUNTIME_DIRS` 漏了 `worktrees`，而任务 worktree 建在
+**信任根之内**（`split-plan.ts` 的 `<布局根>/worktrees/<mission>/<task>`）。worktree 是检出，里面带着已提交的
+`.dsh/*.json`；于是"建一个 worktree"就让 `policyFingerprint().version` 变了，在飞 mission 的 mandate 立刻陈旧，
+worker 的写操作按"策略漂移"被拒。
+
+- **改动（AC-001）**：`TRUST_ROOT_RUNTIME_DIRS` 加入 `'worktrees'`（**只加这一个**）；`worktrees/**` 与
+  `missions/`、`audit/`、`state/` 同级，创建/删除任务 worktree 不再改变 `policyFingerprint().version`。
+  **升级后需重启宿主才生效**：该常量在模块加载时读入，`policyFingerprint` 用的是进程内已加载的 `dist`；
+  长驻宿主进程缓存的是旧构建，不重启则旧进程仍按旧的排除清单算指纹（会继续误判 mandate 过期）。
+- **反证（AC-001 / AC-002 / AC-003，`packages/dsh-eng-core/test/trust-root-worktrees.test.ts` 新增 4 例）**：真建
+  `createTaskWorktree` → 指纹不变（并断言 worktree 里确实有 `.dsh/quality-gate.json` 副本）；删掉它 → 仍不变；
+  同一仓库里改 `quality-gate.json` → 指纹**必须**变（`policyDifferences` 只点名这一个文件），新增
+  `.dsh/*.json` 仍计入、任何 `worktrees/**` 路径都不出现在指纹文件清单里——范围只放大了 `worktrees`；真实
+  场景：先建 worktree，再用审批时记录的同一 mandate 写 mission 与证据，`checkWorkspace` 的 `mandate.policy`
+  为 `ok`（修复前这条路径失败）。这 4 例在修复前全红，失败信息里能直接看到
+  `worktrees/m-1/t1/.dsh/quality-gate.json` 混进了指纹。
+- **文档（AC-004）**：`docs/ARCHITECTURE.md` §5.19 信任根一节写明 `worktrees/` 是运行时目录（与
+  `missions/`、`audit/` 并列），§5.31 的诚实边界同步；`scripts/verify.sh` 与 `scripts/standards-check.sh` 全绿。
+
 ### 功能 · 拆分开关收敛为项目级单一来源：项目 `models.json` 决定，profile 只作缺省
 
 真实落差：上一轮的 `team_delegate` 准入检查读**项目** `models.json` 的 `split.enabled`，而 orchestrator
