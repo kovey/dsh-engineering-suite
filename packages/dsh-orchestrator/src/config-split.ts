@@ -15,15 +15,14 @@
 /** The split workflow's host configuration. */
 export interface SplitWorkflowConfig {
     /**
-     * Whether the `split` / `split-review` stages are inserted between
-     * `spec-approve` and `implement`.
-     *
-     * Default `false`: splitting is a deployment decision (it needs planner and
-     * worker models plus an approval channel), and the six-stage pipeline is a
-     * contract existing profiles and tests rely on. Enabling it inserts the two
-     * stages at their documented position — nothing is renamed or reordered.
+     * The DEFAULT for the project's `models.json` `split.enabled` (缺省层): the
+     * `split` / `split-review` stages exist iff THIS project enables them. A
+     * project that declares the switch overrides this value, in both directions
+     * (`false` beats a profile `true`) — one switch, decided by the repository.
      */
     enabled: boolean
+    /** Whether the host DECLARED `enabled` (reported as `source: profile`; absent = the built-in `false`). */
+    enabledDeclared: boolean
     /**
      * Profile-level defaults for the project's `models.json` (same four
      * sections). Every fallback the resolver performs is reported.
@@ -43,12 +42,12 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  * @returns the effective section plus every rejected value.
  */
 export function resolveSplitWorkflow(value: unknown): SplitWorkflowConfig {
-    if (value === undefined) return { enabled: false, issues: [] }
-    if (!isRecord(value)) return { enabled: false, issues: ['split 必须是对象（收到非对象，已按未启用处理）'] }
+    if (value === undefined) return { enabled: false, enabledDeclared: false, issues: [] }
+    if (!isRecord(value)) return { enabled: false, enabledDeclared: false, issues: ['split 必须是对象（收到非对象，已按未启用处理）'] }
     const issues: string[] = []
     const enabled = value['enabled']
     if (enabled !== undefined && typeof enabled !== 'boolean') issues.push('split.enabled 必须是布尔值（已按 false 处理：不信猜测）')
     const models = value['models']
     if (models !== undefined && !isRecord(models)) issues.push('split.models 必须是对象（与 models.json 同形，已忽略 profile 默认值）')
-    return { enabled: enabled === true, ...(isRecord(models) ? { models } : {}), issues }
+    return { enabled: enabled === true, enabledDeclared: typeof enabled === 'boolean', ...(isRecord(models) ? { models } : {}), issues }
 }

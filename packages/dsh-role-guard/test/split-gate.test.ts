@@ -57,8 +57,8 @@ function approvedPlan(cwd: string, missionId: string): string {
 }
 
 /** Assemble role-guard into the fake host (modern activation seam, so starts are countable). */
-function host(cwd: string) {
-    const fake = createFakeHost({ cwd, withSubagents: true, withActivation: true, withAgentPresets: true })
+function host(cwd: string, services: Record<string, unknown> = {}) {
+    const fake = createFakeHost({ cwd, withSubagents: true, withActivation: true, withAgentPresets: true, services })
     for (const toolName of HOST_TOOLS) {
         fake.tools.set(toolName, { name: toolName, description: 'stub', parameters: {}, execute: async () => 'ok' })
     }
@@ -67,8 +67,8 @@ function host(cwd: string) {
 }
 
 /** Run one delegation and return its rendered text plus whether it created a child. */
-async function delegate(cwd: string) {
-    const fake = host(cwd)
+async function delegate(cwd: string, services: Record<string, unknown> = {}) {
+    const fake = host(cwd, services)
     const run = await fake.runTool('team_delegate', { role: 'developer', task: '实现 AC-001' })
     return { run, text: runText(run), starts: fake.activationSpecs.length, fake }
 }
@@ -190,4 +190,84 @@ test('models.json 把 split.enabled 写成非布尔值时按未开启处理，�
     assert.equal(starts, 1)
     assert.match(text, /warning: 拆分准入检查：.*\.enabled 必须是布尔值/)
     assert.match(text, /按未开启处理/)
+})
+
+// --- the effective switch: the orchestrator service decides (AC-002/AC-003) --
+
+/** A stand-in for `ctx.get('orchestrator')`: only `effectiveSplit` matters here. */
+function orchestratorService(enabled: boolean): { effectiveSplit: (cwd?: string) => { enabled: boolean; source: string } } {
+    return { effectiveSplit: () => ({ enabled, source: 'project' }) }
+}
+
+test('TC-3104: 读 orchestrator 服务（项目开启）时，非 implement 阶段拒绝且零子会话（AC-002）', async () => {
+    const cwd = workspace(false) // 项目文件故意不写：唯一来源是服务给出的生效值
+    missionAt(cwd, 'spec-approve')
+    const { run, text, starts, fake } = await delegate(cwd, { orchestrator: orchestratorService(true) })
+    assert.equal(run.isError, true, text)
+    assert.equal(starts, 0, 'a refusal must not start a child')
+    assert.match(text, /当前阶段：spec-approve/)
+    assert.match(text, /项目 models.json 的 split\.enabled 决定/)
+    // The service path is the primary one: no fallback line in the log.
+    const log = fs.readFileSync(path.join(cwd, 'role-guard.log'), 'utf8')
+    assert.doesNotMatch(log, /回退自读项目 models\.json/)
+    fake.dispose()
+})
+
+test('服务的生效值优先于项目文件：项目 false + 服务 true 仍拒绝，项目 true + 服务 false 放行（AC-002）', async () => {
+    const refusedCwd = workspace(false)
+    missionAt(refusedCwd, 'spec-approve')
+    const refused = await delegate(refusedCwd, { orchestrator: orchestratorService(true) })
+    assert.equal(refused.run.isError, true, 'the service value wins: a project `false` cannot reopen the bypass')
+    assert.equal(refused.starts, 0)
+
+    const allowedCwd = workspace(true)
+    missionAt(allowedCwd, 'spec-approve')
+    const allowed = await delegate(allowedCwd, { orchestrator: orchestratorService(false) })
+    assert.equal(allowed.run.isError, false, 'the service says the project does not split: delegation is unchanged')
+    assert.equal(allowed.starts, 1)
+})
+
+test('TC-3105: orchestrator 服务不可用时回退自读项目 models.json，并把原因写进日志（AC-003）', async () => {
+    const cwd = workspace(true)
+    missionAt(cwd, 'spec-approve')
+    const { run, text, starts, fake } = await delegate(cwd)
+    assert.equal(run.isError, true, 'the fallback still enforces the project switch — it is not a bypass')
+    assert.equal(starts, 0)
+    assert.match(text, /当前阶段：spec-approve/)
+    const log = fs.readFileSync(path.join(cwd, 'role-guard.log'), 'utf8')
+    assert.match(log, /回退自读项目 models\.json/)
+    assert.match(log, /没有挂载 orchestrator 服务/)
+    assert.match(log, /不是"跳过拆分"/)
+    fake.dispose()
+})
+
+test('服务返回不可用结果时同样回退（按项目文件判定），不静默放行（AC-003 边界）', async () => {
+    const cwd = workspace(true)
+    missionAt(cwd, 'spec-approve')
+    const broken = { effectiveSplit: () => ({ enabled: 'true' }) }
+    const { run, text, starts, fake } = await delegate(cwd, { orchestrator: broken })
+    assert.equal(run.isError, true, text)
+    assert.equal(starts, 0)
+    const log = fs.readFileSync(path.join(cwd, 'role-guard.log'), 'utf8')
+    assert.match(log, /enabled 不是布尔值/)
+    fake.dispose()
+})
+
+test('真实装配：orchestrator 提供的 effectiveSplit 被 team_delegate 读到（不再各自解析 models.json，AC-002）', async () => {
+    const cwd = workspace(true) // 项目文件开启；profile 完全没配（不写 split → 默认关闭）
+    missionAt(cwd, 'spec-approve')
+    const fake = host(cwd)
+    // The real plugin, assembled AFTER role-guard: the service is read per call.
+    const { apply: applyOrchestrator } = await import('../../dsh-orchestrator/dist/index.js')
+    applyOrchestrator(fake.ctx as never, { logFile: path.join(cwd, 'orchestrator.log') })
+    assert.equal(typeof (fake.ctx as { get: (name: string) => unknown }).get('orchestrator'), 'object', 'orchestrator provides its service')
+
+    const run = await fake.runTool('team_delegate', { role: 'developer', task: '实现 AC-001' })
+    const text = runText(run)
+    assert.equal(run.isError, true, text)
+    assert.equal(fake.activationSpecs.length, 0)
+    assert.match(text, /当前阶段：spec-approve/)
+    const log = fs.readFileSync(path.join(cwd, 'role-guard.log'), 'utf8')
+    assert.doesNotMatch(log, /回退自读项目 models\.json/, 'the service path was taken, not the fallback')
+    fake.dispose()
 })

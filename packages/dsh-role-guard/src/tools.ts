@@ -95,6 +95,13 @@ export interface ToolDeps {
     layoutFor: (agent: AgentLike | undefined) => Layout
     /** Mission store registry (for injecting the mission contract). */
     stores: MissionStoreRegistry
+    /**
+     * `ctx.get('orchestrator')`, read per call: its `effectiveSplit(cwd)` is the
+     * ONE effective split switch (the project file decides, the profile is the
+     * default). Absent on an old host → `split-gate.ts` falls back to reading the
+     * project file and logs why (AC-003).
+     */
+    orchestrator: () => unknown
     /** Durable session → role bindings, written when a child starts. */
     bindings: RoleBindingStore
     /** A logger, for refused dispatch paths and unwritable bindings. */
@@ -390,7 +397,13 @@ export function registerTools(
                 logModelClassFallback(role, deps.logger, 'team_delegate')
                 if (agent === undefined) throw new Error('team_delegate 需要调用方 agent。')
                 // Split admission (§5.38.5): a refusal starts NO child (see split-gate.ts).
-                const admission = splitAdmission({ layout, agent, stores: deps.stores, ...(deps.logger === undefined ? {} : { logger: deps.logger }) })
+                const admission = splitAdmission({
+                    layout,
+                    agent,
+                    stores: deps.stores,
+                    orchestrator: deps.orchestrator,
+                    ...(deps.logger === undefined ? {} : { logger: deps.logger }),
+                })
                 if (admission.refusal !== undefined) throw new Error(admission.refusal)
                 const subagents = deps.subagents()
                 if (subagents === undefined) throw new Error('宿主没有装配子代理服务（ctx.subagents）：请挂载 @deepseek-ai/dsh-subagent 与具体的 provider（如 @deepseek-ai/dsh-subagent-spawn-in-process）。')

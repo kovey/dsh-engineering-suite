@@ -1,5 +1,40 @@
 ## [未发布]
 
+### 功能 · 拆分开关收敛为项目级单一来源：项目 `models.json` 决定，profile 只作缺省
+
+真实落差：上一轮的 `team_delegate` 准入检查读**项目** `models.json` 的 `split.enabled`，而 orchestrator
+的流水线是否插 `split` / `split-review` 看**profile** 的 `orchestrator.config.split.enabled`。同一条规则
+两处声明，于是只有"两处都开"才成立：只开 profile 时准入检查按未开启放行（跳过拆分的缺口还在），只开项目
+时流水线根本没有 split 阶段。用户的要求很明确：**split 是否启用必须按项目决定，不接受两处开关。**
+
+- **优先级（AC-001）**：新增 `packages/dsh-orchestrator/src/effective-split.ts`，唯一来源是
+  **项目 `<布局根>/models.json` 的 `split.enabled`（显式）> profile 的 `orchestrator.config.split.enabled`
+  （缺省）> `false`**；同一仓库换 profile 启动结果一致，显式 `false` 也能压过 profile 的 `true`。返回的
+  `source`（`project` / `profile` / `default`）让报告能说清是哪一层决定的；阈值
+  （`maxTasks` / `maxParallel` / `maxAcceptancePerTask` / `maxAttempts` / `maxReworkRatio`）继续走
+  `dsh-eng-core/models` 的"项目文件 > profile `split.models` > 内建缺省"同一条规则。
+  profile 里多写一层 `split.models.split.enabled` 不再生效（会被点名，不会静默变成第二个开关）。
+- **流水线按工作区解析（AC-001）**：`resolveConfig` 不再在装配期插段（新增 `stagesDeclared`），
+  `stagesFor(cwd)` / `scopedDeps(deps, cwd)` 让 `runOrchestrate`、auto-advance 钩子与 `enterImplement`
+  都按**会话工作区**解析流水线；宿主自己声明 `stages` 时保持原样。prompt section 仍渲染宿主进程 cwd 的
+  生效流水线（`text()` 拿不到会话工作区，已写进诚实边界）。
+- **服务暴露（AC-002）**：`orchestrator` 服务在 `enterImplement` 之外新增
+  `effectiveSplit(cwd) → { enabled, source, settingsSource, settings{…}, file, problems }`；
+  `dsh-role-guard` 的 `split-gate.ts` **优先读这个服务**（`ctx.get('orchestrator')`），不再自己解析
+  `models.json`——两个插件用同一份生效值，"两处都开"的缺口从结构上消失。
+- **回退（AC-003）**：服务未挂载 / 没有 `effectiveSplit` / 返回不可用结果时，回退到自读项目 `models.json`，
+  并在 `role-guard` 日志写清原因；回退**仍按项目文件拦截**（`split.enabled: true` 时照样拒绝），结果里的
+  `source: service|project` 说明走的是哪条路径。
+- **行为不变（AC-004）**：生效值 `false` 时检查完全不做、一切照旧；`true` 时阶段/摘要两道判断的语义与
+  上一轮一致。既有断言一条没放宽。
+- **测试**：`packages/dsh-orchestrator/test/split-effective.test.ts`（新增 8 例：三种优先级组合、两者都关
+  的现状、`advance` 真的进入 `split` / 直接进入 `implement`、`effectiveSplit()` 的形状）；
+  `packages/dsh-role-guard/test/split-gate.test.ts` 10 → 15 例（读服务路径、服务优先于项目文件、回退路径与
+  日志原因、服务返回不可用结果、**真实装配两个插件**）。
+- **文档**：`docs/ARCHITECTURE.md` §5.38.5 的 A/B/E/F 与诚实边界、§5.38.2、§5.38.3 的开关表述改为
+  "只看项目文件，profile 只作缺省"；`docs/SPLIT-RUNBOOK.md` §1 给出 **A 项目开 / B 项目关**两份
+  `models.json` 样例、§1.1/§2/§7 同步改写。
+
 ### 功能 · 开启拆分后派单不能绕过 split：`team_delegate` 的准入检查
 
 真实落差：`split.enabled=true` 之后，`team_delegate` 仍然接受**任何阶段**的调用。一句工具调用就能把

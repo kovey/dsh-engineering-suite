@@ -133,8 +133,8 @@ export function apply(ctx: Context, config: unknown = {}): void {
         // The filter a role's preset carries, pruned against the GLOBAL tool view
         // on purpose: `tools.restrict` validates names against the global set, so
         // this is the same view it will accept — and it does not vary per
-        // delegating agent, which is what makes the registration fingerprint
-        // (assembly time) and the delegation-time one agree.
+        // delegating agent, which is what makes the registration fingerprint and
+        // the delegation-time one agree.
         const presetFilter = (role: Role): DelegationFilter | undefined => {
             try {
                 return planToolFilter(role, resolved, (toolName) => {
@@ -192,6 +192,7 @@ export function apply(ctx: Context, config: unknown = {}): void {
             presets,
             presetFilter,
             subagents: () => context.get('subagents') as DelegationServices | undefined,
+            orchestrator: () => safeGet(context, 'orchestrator'),
             agentTeams: () => safeGet(context, 'agentTeams'),
             visibleTool: (toolName, agent) => {
                 try {
@@ -210,8 +211,7 @@ export function apply(ctx: Context, config: unknown = {}): void {
         // (e.g. the orchestrator acting on stage entry) consumes the SAME
         // resolver through this service, so an auto-dispatched child cannot end
         // up with rights a delegated one would not get. Optional: a runtime
-        // without `provide` simply skips it, and orchestrator config covers the
-        // no-role-guard case.
+        // without `provide` skips it (orchestrator config covers that case).
         let serviceState: string
         if (typeof context.provide !== 'function') {
             serviceState = 'unavailable(no ctx.provide)'

@@ -8,7 +8,7 @@ profile**（`.dsh/**` 与 profile 都在信任根里，Agent 写不了）。
 
 目录：
 
-1. [打开 `split.enabled`（profile 侧）](#1-打开-splitenabledprofile-侧)
+1. [打开 `split.enabled`：**只看项目 `models.json`**](#1-打开-splitenabled只看项目-modelsjsonprofile-只作缺省)
    - [1.1 `team_delegate` 的准入检查：派单不能绕过 split](#11-team_delegate-的准入检查派单不能绕过-split)
 2. [项目侧 `models.json`（含重试上限 `maxAttempts`）](#2-项目侧-modelsjson含重试上限-maxattempts)
 3. [真机接入：`DSH_SMOKE_REAL=1` 的步骤与判据](#3-真机接入dsh_smoke_real1-的步骤与判据)
@@ -19,11 +19,43 @@ profile**（`.dsh/**` 与 profile 都在信任根里，Agent 写不了）。
 
 ---
 
-## 1. 打开 `split.enabled`（profile 侧）
+## 1. 打开 `split.enabled`：**只看项目 `models.json`**（profile 只作缺省）
 
 拆分的两个阶段（`split` / `split-review`）插在 `spec-approve` 与 `implement` 之间，默认**关**。
-开关在 orchestrator 插件的 `config.split.enabled`（profile 的 loader 行 / bundle patch 里的 `config` 段，
-与其它插件的配置同形）：
+开关只有一个来源：**项目** `<repo>/.dsh/engineering-suite/models.json`（没有命名空间目录的老仓库是
+`<repo>/.dsh/models.json`）里的 `split.enabled`。profile 的 `orchestrator.config.split.enabled` 只是
+**新项目的缺省**——项目写了显式值就由项目决定（写 `false` 也能压过 profile 的 `true`），没写才看 profile，
+两层都没写 = 关。
+
+同一台宿主服务多个仓库时，每个仓库按自己的文件决定；流水线（`orchestrate({ action: "stages" })` /
+`advance`）与 `team_delegate` 的准入检查用的是**同一个生效值**（`orchestrator` 服务的
+`effectiveSplit(cwd)`，返回里带 `source`：`project` / `profile` / `default`）。
+
+**A 项目：开**
+
+```json
+{
+  "split": { "enabled": true },
+  "worker": { "model": "deepseek/deepseek-chat", "reasoningEffort": "low" },
+  "planner": { "model": "deepseek/deepseek-reasoner", "reasoningEffort": "high" }
+}
+```
+
+（流水线：`… → spec-approve → split → split-review → implement → …`；`team_delegate` 在非 `implement`
+阶段拒绝派单。**只需要这一个文件**。）
+
+**B 项目：关**
+
+```json
+{
+  "split": { "enabled": false }
+}
+```
+
+（同一个 profile 下，这个仓库保持六阶段流水线，`team_delegate` 行为一字不变。显式 `false` 是"本项目
+不走拆分"的决定：profile 里 `enabled: true` 也不会打开它。）
+
+profile 侧**可以什么都不配**。要给"没写开关"的新项目一个缺省时才需要：
 
 ```yaml
 # profile 侧（由人改；本仓库不代改）
@@ -31,15 +63,16 @@ profile**（`.dsh/**` 与 profile 都在信任根里，Agent 写不了）。
   name: 'dsh-orchestrator'
   config:
     split:
-      enabled: true
-      # profile 级默认层：项目 models.json 优先，这里只在项目没写时兜底。
+      # 缺省层：只在项目 models.json 没写 split.enabled 时生效。
+      enabled: false
+      # 阈值/模型的缺省层：项目 models.json 优先，这里只在项目没写时兜底。
       # 形状与项目 models.json 的四个段完全一致（planner/worker/split/quality）。
       models:
         worker: { model: 'deepseek/deepseek-chat' }
         planner: { model: 'deepseek/deepseek-reasoner' }
 ```
 
-两个要点：
+要点：
 
 - **不依赖 `autoDispatch.enabled`**：`split.enabled` 本身就是"这个仓库要派 worker"的决定；再叠一道默认
   关闭的开关会让整个功能默认永不派发（§5.38 的 A 段）。
@@ -64,9 +97,10 @@ profile**（`.dsh/**` 与 profile 都在信任根里，Agent 写不了）。
   advance」，`reviews.jsonl` 一行不写。**这条在 TUI 菜单路径之前生效**：有 nvim-tui 也不会绕过"别问我"。
   所以"一张审核卡都没看到就被降级"不会是套件的轮数逻辑造成的：先看一下本会话的审批策略。这是宿主策略，
   不是套件故障；读不到策略（旧宿主/无 session/抛错）时仍按原逻辑提问，只记日志。
-- **只有 `split.enabled` 是真开关**：模型段、审批通道、`autoDispatch` 都不是"拆分能否运行"的前提。
+- **只有 `split.enabled` 是真开关**：项目 `models.json` 的 `split.enabled` 决定"这个仓库要不要派 worker"，
+  profile 的同名键只作缺省；模型段、审批通道、`autoDispatch` 都不是拆分能否运行的前提。
 
-`enabled: true` 之后，流水线是：
+项目的 `split.enabled: true` 之后，流水线是：
 
 ```
 spec-clarify → test-design-review → spec-approve → split → split-review → implement → quality-verify → delivery
@@ -82,16 +116,16 @@ worktree、不会派 worker。
 （`packages/dsh-role-guard/src/split-gate.ts`），通过了才创建子会话。拒绝是**拒绝**（工具报错、不创建
 子会话、不写委派台账），不是"警告后继续"。
 
-生效的开关是**项目** `models.json` 的 `split.enabled`（见 §2）；它与这里 profile 的
-`orchestrator.config.split.enabled` 说的是同一件事，必须**一起打开**——前者决定本检查是否生效，后者决定
-流水线里是否真的有 `split` / `split-review` 两个阶段。只开 profile 的一半，检查会按"未开启"放行（已知边界，
-见 §7）。
+生效的开关是**同一个生效值**：`team_delegate` 优先读 `orchestrator` 服务的 `effectiveSplit(cwd)`
+（项目 `models.json` 的 `split.enabled` 决定、profile 只作缺省，与插流水线的是同一份），所以"两处都开"
+的旧缺口在结构上没有了。宿主没挂载该服务（旧宿主 / 单插件安装）时回退到自读项目 `models.json`，并在
+`role-guard` 日志里写一句原因——回退仍按项目文件拦截，**不是**"跳过拆分"（已知边界见 §7）。
 
 | 当前事实 | 结果 |
 |----------|------|
-| `split.enabled !== true`（没写 / `false`） | 不检查，派发行为与以前一字不差 |
-| 开了拆分，但调用方**没有绑定 mission** | 不拦截；`role-guard` 日志留一句"按未绑定处理" |
-| 开了拆分，绑定还在但 mission 记录读不出来（损坏/丢失） | **拒绝**（fail closed）：读不到不等于没开拆分 |
+| 生效值不是 `true`（没写 / `false`） | 不检查，派发行为与以前一字不差 |
+| 生效值是 `true`，但调用方**没有绑定 mission** | 不拦截；`role-guard` 日志留一句"按未绑定处理" |
+| 生效值是 `true`，绑定还在但 mission 记录读不出来（损坏/丢失） | **拒绝**（fail closed）：读不到不等于没开拆分 |
 | 阶段不是 `implement`（`spec-clarify` / `test-design-review` / `spec-approve` / `split` / `split-review` …） | **拒绝**：先 advance 到 split 完成拆分与审核 |
 | `implement` + 磁盘上**没有** `split/plan.json` | 放行（"不值得拆"/轮数超限降级就是这条合法路径） |
 | `implement` + 有 plan，但 `split/review.json` 缺失 / `rejected` / 摘要与当前 plan 不一致 | **拒绝**：要求重新送审（文案给出两个短摘要） |
@@ -100,7 +134,7 @@ worktree、不会派 worker。
 阶段不对时的拒绝文案（节选）：
 
 ```
-team_delegate 拒绝：本仓库开启了拆分（models.json 的 split.enabled=true），派发前必须先经过 split 的拆分与 split-review 的审核；当前阶段 spec-approve 不允许派单。
+team_delegate 拒绝：本仓库的拆分已开启（项目 models.json 的 split.enabled 决定，profile 只作缺省），派发前必须先经过 split 的拆分与 split-review 的审核；当前阶段 spec-approve 不允许派单。
 - 当前阶段：spec-approve（mission <id>）—— 只有 implement 阶段才允许派单
 - 缺少的步骤：先走 split 阶段产出 split/plan.json（planner 拆分 + 四道自动校验），需要审核时再由人完成 split-review，然后才能进入 implement
 - 下一步：开启拆分后必须先 advance 到 split 完成拆分与审核（orchestrate({ action: "advance" }) 按流水线推进），再重试本次 team_delegate
@@ -143,17 +177,17 @@ team_delegate 拒绝：split/plan.json 还没有通过审核（stale），未审
 
 | 字段 | 含义 | 缺省 / 边界 |
 |------|------|-------------|
-| `split.enabled` | 本仓库声明"跑拆分"：`team_delegate` 的准入检查据此拦截"跳过 split 直接派单"（§1.1） | 缺省 `false`（不写 = 不检查、行为不变）；非布尔值点名后按未开启处理 |
+| `split.enabled` | 本仓库是否跑拆分（**唯一开关**）：决定流水线插不插 `split` / `split-review`，也决定 `team_delegate` 的准入检查拦不拦"跳过 split 直接派单"（§1、§1.1） | 缺省 `false`（不写 = 不检查、行为不变）；显式 `false` 压过 profile 的 `true`；非布尔值点名后按未开启处理 |
 | `split.maxParallel` | 一组内同时跑几个 worker（上限，不是日程表） | 默认 3；`1` = 退化串行 |
 | `split.taskTimeoutMs` | 单个 worker 的截止时间 | 缺省跟随宿主 `autoDispatch.timeoutMs`，再缺省 600000 |
 | `split.maxAttempts` | 一个子任务允许的**派发尝试次数** | 缺省 1（不重试），允许 1..3，非法值点名后回退 1 |
 | `split.maxAcceptancePerTask` | 一个子任务**最多**映射几条验收标准；超出即 plan 不合格 | 缺省 3，允许 1..10，非法值点名后回退 3 |
 | `quality.maxReworkRatio` | 返工率超过它就**把后续**子任务升级到 `planner` 模型（不中止） | 默认 0.3 |
 
-`split.enabled` 与 profile 的 `orchestrator.config.split.enabled`（§1）是**同一件事的两处声明**：profile 决定
-流水线里是否有 `split` / `split-review` 两个阶段，项目侧这份决定 `dsh-role-guard` 的派单准入检查是否生效
-（它读不到另一个插件的配置）。**两处一起打开**——只开 profile 的一半时，`team_delegate` 仍会放行"跳过 split
-直接派单"（§1.1、§7）。
+`split.enabled` 与 profile 的 `orchestrator.config.split.enabled`（§1）**不是两处开关**：项目文件的显式值
+是唯一决定，profile 只是新项目的缺省层。同一份生效值同时决定"流水线里有没有 `split` / `split-review`"和
+"`team_delegate` 的准入检查生不生效"，所以**不需要在两处一起配置**：只写项目文件就够，显式 `false` 也能
+关掉一个 profile 开着的缺省（§1.1、§7）。
 
 `maxAttempts` 的语义（AC-002）：
 
@@ -184,7 +218,7 @@ team_delegate 拒绝：split/plan.json 还没有通过审核（stale），未审
 
 ```bash
 export DSH_SMOKE_REAL=1
-export DSH_SMOKE_PROFILE=<你的 profile 名>      # 该 profile 必须已把本套件挂上且 split.enabled: true
+export DSH_SMOKE_PROFILE=<你的 profile 名>      # 该 profile 必须已把本套件挂上（临时仓库会在 models.json 里写 split.enabled）
 export DSH_SMOKE_MODEL=deepseek/deepseek-chat   # 临时仓库 models.json 的 worker/planner 模型
 # 可选：
 #   DSH_SMOKE_TIMEOUT=600      等待 dsh 会话的秒数
@@ -482,10 +516,12 @@ git -C <主树> log -1 --format=%s <tasks[].commit>
 - **AC 预算是"每任务上限"，不是"拆得好"**：它不阻止 `maxTasks` 个任务各自 3 条 AC 的宽计划，也不评价
   切分质量（那是审核人的问题）；`plan.md` 第 2 行写的是本次校验实际使用的上限，不是重新读配置得来的。
   门槛（`decideSplit`）本身没有预算概念——只有"先校验、后门槛"的组合顺序才是权威。
-- **派单准入检查读的是项目声明，不是宿主开关**：`team_delegate` 的准入检查（§1.1）只能读项目
-  `models.json` 的 `split.enabled`；profile 的 `orchestrator.config.split.enabled` 对它是不可见的。所以
-  "只开了 profile、没写项目声明"的部署里，`team_delegate` 仍会放行跳过 split 的派单——这不是"检查通过了"，
-  是检查没有生效。两处一起打开，并在升级 profile 时一起检查。
+- **开关只有一个来源；profile 只是缺省**：`team_delegate` 的准入检查（§1.1）与流水线读的是**同一个**
+  `effectiveSplit(cwd)`（`orchestrator` 服务；项目 `models.json` 的 `split.enabled` 优先、profile 只作缺省）。
+  两处不会再各读一处，"两处一起打开"不再是使用前提。旧宿主没有该服务时回退到自读项目文件并记日志——
+  这条回退路径看不到 profile，属于已知边界；项目文件写着 `true` 时它照样拦截。
+- **系统提示里的流水线是宿主级投影**：prompt section 渲染的是宿主进程 cwd 的生效流水线（`text()` 拿不到
+  会话工作区）；多项目宿主以 `orchestrate` / `team_delegate` 的按工作区判定为准，prompt 只是提示。
 - **没有 plan 就是放行**：`not-worth-splitting` / 降级 plain implement 的产物就是"没有可用 plan"，所以
   删掉 `split/plan.json` 在准入层面与这两个合法结果等价；拦截的是"跳过整个 split 阶段"，不是"没有 plan"
   这一状态。真正的防篡改在摘要绑定（派发与导入只认 `review.json` 引用的摘要）。

@@ -15,7 +15,6 @@ import type { LayoutOptions } from 'dsh-eng-core'
 import { resolveMetrics } from './config-metrics.js'
 import { resolveSplitWorkflow, type SplitWorkflowConfig } from './config-split.js'
 import { DEFAULT_STAGES, resolvePipeline, type Difficulty, type Pipeline, type RouteConfig } from './pipeline.js'
-import { withSplitStages } from './split-stages.js'
 import { resolveStageRoleDelegation, type StageRoleDelegationMode } from './stage-role.js'
 
 /** One capability probe: the tool and/or service a plugin registers. */
@@ -141,7 +140,9 @@ export interface OrchestratorConfig {
         enabled: boolean
         order: number
     }
-    /** The split workflow (two extra stages, `models.json` defaults). */
+    /** Whether the host declared its own `stages` (then that list is the pipeline as-is). */
+    stagesDeclared: boolean
+    /** The split workflow (project switch default, `models.json` defaults). */
     split: SplitWorkflowConfig
 }
 
@@ -306,9 +307,9 @@ export function resolveConfig(input: unknown): ResolvedConfig {
     const defaultMaxAttempts = Math.max(1, Math.floor(num(raw['defaultMaxAttempts'], 3)))
     const split = resolveSplitWorkflow(raw['split'])
     const resolvedPipeline = resolvePipeline(raw['stages'], defaultMaxAttempts)
-    // Only the DEFAULT pipeline is extended: a host that wrote its own stage
-    // list names its own stages (and can list split/split-review explicitly).
-    const stages = split.enabled && raw['stages'] === undefined ? withSplitStages(resolvedPipeline.stages) : resolvedPipeline.stages
+    // The split segment is spliced PER WORKSPACE by `effective-split.ts` (the
+    // project file decides); a host-declared list stays exactly as written.
+    const stages = resolvedPipeline.stages
     const issues: string[] = [...split.issues, ...resolvedPipeline.issues]
     // A typo in this key must not relax a role requirement: the parser reports
     // the rejected value and keeps `'reject'` (fail closed).
@@ -339,6 +340,7 @@ export function resolveConfig(input: unknown): ResolvedConfig {
                 maxAutoAdvancesPerTurn: Math.max(0, Math.floor(num(turnStop['maxAutoAdvancesPerTurn'], 2))),
             },
             metrics: resolveMetrics(raw['metrics']),
+            stagesDeclared: raw['stages'] !== undefined,
             prompt: {
                 enabled: bool(prompt['enabled'], true),
                 order: num(prompt['order'], 660),

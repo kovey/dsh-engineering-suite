@@ -28,6 +28,7 @@ import { MissionStoreRegistry, createDelegationPresets, createLogger, expandHome
 import type { AgentLike, ApprovalLike, Logger } from 'dsh-eng-core'
 import { resolveConfig, type OrchestratorConfig } from './config.js'
 import { ORCHESTRATOR_SERVICE, createOrchestratorService } from './enter-implement.js'
+import { createStagesResolver } from './effective-split.js'
 import { AutoAdvanceSessions, autoAdvanceStages, createAutoAdvanceHook } from './hooks.js'
 import { createProbes, mergeProbes } from './probes.js'
 import { PROMPT_SECTION, sectionText } from './prompt.js'
@@ -73,14 +74,12 @@ export function apply(ctx: Context, config: unknown = {}): void {
                 `config.stages 无效，已回退到默认流水线（${resolved.stages.map((stage) => stage.id).join(' → ')}）：\n- ${issues.join('\n- ')}`,
             )
         }
-        // GAP-10: report autoDispatch configuration problems too. Silently
-        // dispatching the DEFAULT stage list — or silently switching the feature
-        // off — is exactly the kind of surprise a host cannot debug.
+        // GAP-10: report autoDispatch configuration problems too — silently
+        // dispatching the DEFAULT list (or switching the feature off) is undebuggable.
         if (resolved.autoDispatch.issues.length > 0) {
             logger.warn(`config.autoDispatch 有问题（已按说明处理）：\n- ${resolved.autoDispatch.issues.join('\n- ')}`)
         }
-        // GAP-10 applies to the metrics keys too: `windowDays: "90"` must not look
-        // like it changed the window.
+        // GAP-10 applies to the metrics keys too: `windowDays: "90"` must not look like it changed the window.
         if (resolved.metrics.issues.length > 0) {
             logger.warn(`config.metrics 有问题（已按说明处理）：\n- ${resolved.metrics.issues.join('\n- ')}`)
         }
@@ -91,6 +90,8 @@ export function apply(ctx: Context, config: unknown = {}): void {
         }
         const context = ctx as unknown as ContextLike
         const stores = new MissionStoreRegistry({ ...resolved.layout, logger })
+        // The pipeline of ONE workspace: the project's `models.json` decides.
+        const stagesFor = createStagesResolver(resolved, stores)
         logger.info(`probes: ${Object.entries(mergeProbes(resolved.probes)).map(([plugin, probe]) => `${plugin}(${probe.tool ?? probe.service ?? '-'})`).join(', ')}`)
 
         // Autonomous dispatch: entering a stage can hand the work to a child
@@ -103,8 +104,7 @@ export function apply(ctx: Context, config: unknown = {}): void {
         // registry itself never throws into `apply` — a missing service becomes a
         // refusal at dispatch time, which is where the model can act on it.
         // The seam is dsh-eng-core's (`delegation.ts`); this registry remembers
-        // only which preset ids THIS plugin registered, so a preset somebody else
-        // declared under `orchestrator:<role>` is refused instead of trusted.
+        // only which preset ids THIS plugin registered (a foreign `orchestrator:<role>` is refused).
         const dispatchPresets = createDelegationPresets({
             presets: () => {
                 try {
@@ -135,6 +135,7 @@ export function apply(ctx: Context, config: unknown = {}): void {
         const sequenceDeps: SequenceDeps = {
             config: resolved,
             stores,
+            stagesFor,
             // Probes are scope-aware, so they are rebuilt per call: the registry
             // view of a delegated child may differ from the root's.
             probesFor: (agent) => createProbes(context, resolved.probes, agent),
@@ -163,11 +164,11 @@ export function apply(ctx: Context, config: unknown = {}): void {
                 createAutoAdvanceHook({
                     config: resolved,
                     stores,
+                    stagesFor,
                     probesFor: (agent) => createProbes(context, resolved.probes, agent),
-                    // BUG-1: the automatic transition enters stages through the
-                    // same code path as `advance`, so it needs the dispatch deps
-                    // too — otherwise the one path with NO model in the loop was
-                    // exactly the one that never dispatched.
+                    // BUG-1: enters stages through the SAME code path as `advance`,
+                    // so it needs the dispatch deps too (else the one path with no
+                    // model in the loop never dispatched).
                     dispatch: dispatchDeps,
                     sessions,
                     autoStages,
@@ -186,7 +187,7 @@ export function apply(ctx: Context, config: unknown = {}): void {
                 context.systemPrompt.section({
                     name: PROMPT_SECTION,
                     order: resolved.prompt.order,
-                    text: () => sectionText(resolved),
+                    text: () => sectionText({ ...resolved, stages: stagesFor(process.cwd()) }),
                 }),
             )
         }
@@ -214,13 +215,11 @@ export function apply(ctx: Context, config: unknown = {}): void {
 }
 
 /**
- * The host approval seam, read per call.
- *
- * The split review asks a HUMAN through it. It is an accessor, not a captured
- * value: a host that withdraws the service mid-session must make the next review
- * refuse (「宿主没有 approval 接缝」), not keep using a stale reference. That is
- * the same seam `spec_approve` asks through: TUI / desktop / web TUI natively,
- * IM when it is configured — never an extra switch of this plugin.
+ * The host approval seam, read per call. The split review asks a HUMAN through
+ * it. It is an accessor, not a captured value: a host that withdraws the service
+ * mid-session must make the next review refuse (「宿主没有 approval 接缝」), not
+ * keep using a stale reference — the same seam `spec_approve` asks through
+ * (TUI / desktop / web TUI natively, IM when configured), never an extra switch.
  * @param context - host context.
  */
 function approvalSeamOf(context: ContextLike): () => ApprovalLike | undefined {

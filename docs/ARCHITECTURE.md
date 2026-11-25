@@ -1839,7 +1839,8 @@ spec-clarify → test-design-review → spec-approve → split → split-review 
 ```
 
 `implement` 阶段入口（`gate.kind === 'split-reviewed'`）在**派发**环节调用 `runSplitPlan`。三个前提缺一
-不可：`config.split.enabled`、磁盘上有 plan、且该 plan 的摘要**仍等于**人工审核记录的摘要。`not-worth-splitting`
+不可：本仓库的拆分开关**生效**（项目 `models.json` 的 `split.enabled` 决定，profile 只作缺省，见 §5.38.5）、
+磁盘上有 plan、且该 plan 的摘要**仍等于**人工审核记录的摘要。`not-worth-splitting`
 与 `too-large` 走原 plain implement（不建 worktree、不派 worker）；未审核/摘要不一致/依赖有环**拒绝派发**
 并写入 `split/run.json`（state=`refused`）。三条刻意的选择：
 
@@ -2025,7 +2026,7 @@ reworkReasons[], imported}`，整体 `{rework:{ratio,threshold,escalate}, parall
 - `prepareTaskWorktree` 证明的是 pnpm 的调用形状（store/幂等/失败保留），不证明真实 registry 的安装一定成功。
 - `report.json` 是投影：删掉它不影响任何判定；反过来，它也不能用来证明"子任务做对了"。
 - 冒烟的 `simulated worker` 证明了导入器/清理器的真实行为，但**不证明真 worker 会写出合格 commit**；
-  真派发分支需要本机 `dsh` + 打开 `split.enabled` 的 profile，本仓库的验收跑只覆盖 SKIP 与反证。
+  真派发分支需要本机 `dsh` + 在**项目** `models.json` 里打开 `split.enabled` 的仓库，本仓库的验收跑只覆盖 SKIP 与反证。
 
 ### 5.38.2 P3：让拆分**可运营**：值不值得、重试有界、崩溃可恢复
 
@@ -2105,8 +2106,8 @@ P3 之前的写法把两件"可选覆盖"说成了前提（"任一段没配 `mod
   '人工打回'、不计入拆分审核轮数、切到 ask 后重新 advance"（`reviews.jsonl` 一行不写）；读不到
   （服务不暴露 `effectivePolicy` / 无 `agent.session` / 调用抛错 / 返回非字符串）→ 照原逻辑提问，
   只记一条日志——**读不到策略不是拒绝工作的理由**。这是宿主策略，不是套件故障。
-- **只有 `split.enabled` 是真开关**：它决定"这个仓库要不要派 worker"；模型、审批通道、`autoDispatch`
-  都不是拆分能否运行的前提。
+- **只有 `split.enabled` 是真开关**：它决定"这个仓库要不要派 worker"（项目 `models.json` 优先，profile 只作缺省）；
+  模型、审批通道、`autoDispatch` 都不是拆分能否运行的前提。
 
 **C. 只读 doctor + 显式 clean（AC-003）**
 
@@ -2140,10 +2141,10 @@ P3 之前的写法把两件"可选覆盖"说成了前提（"任一段没配 `mod
 
 **E. 真机接入文档（AC-004）**
 
-`docs/SPLIT-RUNBOOK.md`：profile 打开 `split.enabled` 的配置样例、项目 `models.json` 样例（含
-`maxAttempts`）、`DSH_SMOKE_REAL=1` 的步骤与判据（**`split/run.json` 的 `state=ran`**，不看 `dsh` 退出码）、
-无 `dsh` 时 SKIP 的边界与四条反证、以及三条运维命令（status / `split-clean --orphans` / 看 `report.json`）。
-本仓库**不代改任何 profile**。
+`docs/SPLIT-RUNBOOK.md`：项目 `models.json` 的开关样例（A 项目开 / B 项目关两份）、profile 只作缺省的
+配置样例、项目 `models.json` 样例（含 `maxAttempts`）、`DSH_SMOKE_REAL=1` 的步骤与判据（**`split/run.json`
+的 `state=ran`**，不看 `dsh` 退出码）、无 `dsh` 时 SKIP 的边界与四条反证、以及三条运维命令
+（status / `split-clean --orphans` / 看 `report.json`）。本仓库**不代改任何 profile**。
 
 **F. 测试**
 
@@ -2437,26 +2438,33 @@ implement——正是要关掉的静默路径。
 `split-review` 一次都没跑，而下游每个门禁仍然报绿。这一节补的是**准入**（admission）：开启拆分的仓库里，
 "先拆、再审核、最后派单"是流程而不是建议。
 
-**A. 检查落点与配置来源**
+**A. 检查落点与配置来源（单一来源：项目文件决定，profile 只作缺省）**
 
 | 事实 | 来源 | 位置 |
 |------|------|------|
-| 本仓库是否跑拆分 | **生效**的 `models.json` 的 `split.enabled`（`dsh-eng-core/split` 解析，缺省 false） | `packages/dsh-role-guard/src/split-gate.ts` |
-| 当前阶段 / 当前 mission | mission store（`resolveForAgent`，与写守卫、`advance` 同一规则） | 同上 |
+| 本仓库是否跑拆分 | **生效**的拆分开关：`orchestrator` 服务的 `effectiveSplit(cwd)`；优先级 **项目 `<布局根>/models.json` 的 `split.enabled`（显式）> profile 的 `orchestrator.config.split.enabled`（缺省）> `false`**，返回值带 `source`（`project` / `profile` / `default`） | `packages/dsh-orchestrator/src/effective-split.ts`（解析）、`packages/dsh-role-guard/src/split-gate.ts`（读取） |
+| 同一份生效值也决定流水线 | `split` / `split-review` 两个阶段**按工作区**插在 `spec-approve` 与 `implement` 之间；`orchestrate({ action: "stages" })` 与 `advance` 用的是同一个 `effectiveSplit` | `packages/dsh-orchestrator/src/effective-split.ts` |
+| 当前阶段 / 当前 mission | mission store（`resolveForAgent`，与写守卫、`advance` 同一规则） | `packages/dsh-role-guard/src/split-gate.ts` |
 | 拆分计划的摘要与审核状态 | `split/plan.json` + `split/review.json`（`readSplitPlan` / `splitReviewStatus`） | 同上 |
 | 调用点 | `team_delegate` 的 `execute`，在**任何子会话存在之前** | `packages/dsh-role-guard/src/tools.ts` |
 
-`split.enabled` 是 `SplitSettings` 的可选字段（没有内建缺省）：不写 = `false` = 检查完全不做，既有行为
-一字不变；写成非布尔值（`"true"`）由解析器**点名**并按未开启处理——"也许他想开"不是一种安全的读法。
+`split.enabled` 是 `SplitSettings` 的可选字段（没有内建缺省）：不写 = 该项目不跑拆分 = 检查完全不做，既有
+行为一字不变；写成非布尔值（`"true"`）由解析器**点名**并按未开启处理——"也许他想开"不是一种安全的读法。
+
+**一处开关，两种读法**：`dsh-role-guard` **优先读 orchestrator 服务**（`ctx.get('orchestrator').effectiveSplit(layout.cwd)`），
+因此两个插件永远按同一份生效值判断，"profile 开、项目没写"或"项目开、profile 没写"都不会再出现两个结论。
+未挂载该服务（旧宿主 / 单插件安装）、服务没有 `effectiveSplit`、或它返回不可用结果时，回退到**自读项目
+`models.json`**（AC-003）：回退会往 `role-guard` 日志写一行原因，且**仍按项目文件拦截**——回退是降级读取，
+不是"跳过拆分"。
 
 **B. 三种结果（只有第三种是新行为）**
 
 | 条件 | 结果 |
 |------|------|
-| `split.enabled !== true`（缺省 / `false` / 读不到） | 不检查、不拦截；读不到时结果里带 `warning:` 一行 |
-| 开启拆分、调用方**没有绑定 mission** | 不拦截（非 mission 的派发没有 split 阶段可跳），日志留一句 |
-| 开启拆分、绑定还在但 mission 记录读不出来（损坏/丢失） | **拒绝**（fail closed）：读不到不等于没开拆分 |
-| 开启拆分、绑定了可读的 mission | 见 C 的两道判断 |
+| 生效值不是 `true`（缺省 / `false` / 读不到） | 不检查、不拦截；读不到时结果里带 `warning:` 一行 |
+| 生效值是 `true`、调用方**没有绑定 mission** | 不拦截（非 mission 的派发没有 split 阶段可跳），日志留一句 |
+| 生效值是 `true`、绑定还在但 mission 记录读不出来（损坏/丢失） | **拒绝**（fail closed）：读不到不等于没开拆分 |
+| 生效值是 `true`、绑定了可读的 mission | 见 C 的两道判断 |
 
 **C. 两道判断：阶段，然后审核**
 
@@ -2473,15 +2481,15 @@ implement——正是要关掉的静默路径。
 
 `team_delegate` 在拒绝路径上 `throw`：没有 `StartActivation`、没有 `run.run.result`、没有委派台账行、
 没有角色绑定。用例断言 `activationSpecs.length === 0`——"文案说拒绝但其实启动了子会话"是实现缺陷，不是
-配置问题。唯一的 `warning:` 行属于"降级但放行"（读不到 `models.json`、`split.enabled` 写错类型、无
-mission 时的日志），与"开启拆分后直接派发"无关。
+配置问题。唯一的 `warning:` 行属于"降级但放行"（回退路径下读不到 `models.json`、`split.enabled` 写错类型、
+无 mission 时的日志），与"开启拆分后直接派发"无关。
 
 **E. 三句拒绝文案（原文）**
 
 阶段不对（`stage !== 'implement'`）：
 
 ```
-team_delegate 拒绝：本仓库开启了拆分（models.json 的 split.enabled=true），派发前必须先经过 split 的拆分与 split-review 的审核；当前阶段 spec-approve 不允许派单。
+team_delegate 拒绝：本仓库的拆分已开启（项目 models.json 的 split.enabled 决定，profile 只作缺省），派发前必须先经过 split 的拆分与 split-review 的审核；当前阶段 spec-approve 不允许派单。
 - 当前阶段：spec-approve（mission <id>）—— 只有 implement 阶段才允许派单
 - 当前 plan 摘要：(还没有 split/plan.json)
 - 缺少的步骤：先走 split 阶段产出 split/plan.json（planner 拆分 + 四道自动校验），需要审核时再由人完成 split-review，然后才能进入 implement
@@ -2503,7 +2511,7 @@ team_delegate 拒绝：split/plan.json 还没有通过审核（stale），未审
 读不出 mission（fail closed；`<id>` 是会话仍绑定的那个 mission）：
 
 ```
-team_delegate 拒绝：本仓库开启了拆分（models.json 的 split.enabled=true），但会话绑定的 mission <id> 读不出来，无法证明这次派发经过了 split 与 split-review。
+team_delegate 拒绝：本仓库的拆分已开启（项目 models.json 的 split.enabled 决定，profile 只作缺省），但会话绑定的 mission <id> 读不出来，无法证明这次派发经过了 split 与 split-review。
 - 问题：<布局根>/state/sessions/ 的绑定指向了一个读不出的 mission 记录（mission.json 缺失或损坏）
 - 下一步：修好 <布局根>/missions/ 下该 mission 的记录（或解绑会话）后重试；读不到不等于没开拆分。
 ```
@@ -2512,19 +2520,34 @@ team_delegate 拒绝：本仓库开启了拆分（models.json 的 split.enabled=
 
 **F. 测试**
 
-`packages/dsh-role-guard/test/split-gate.test.ts`（10 例）：`spec-approve` / `split` / `split-review` 三个
+`packages/dsh-role-guard/test/split-gate.test.ts`（15 例）：`spec-approve` / `split` / `split-review` 三个
 代表阶段拒绝（其中 `spec-approve` 与 `split` 断言 `activationSpecs.length === 0` 且文案含"先走 split"、
 当前阶段、缺少的步骤、"不值得拆…但必须先经过 split 阶段"）；`implement` + 无 plan 放行；`implement` +
 approved 且摘要一致放行（且不含拒绝文案）；plan 改动后 `stale` 拒绝（文案含两个短摘要与"重新送审"）；
-`split.enabled` 未配置时任何阶段都照常派发（结果不含"拆分"字样）；无 mission 不阻断但日志留痕；绑定的
-mission 记录损坏时 fail closed（零子会话）；`split.enabled: "true"` 按未开启处理并在结果里报 `warning:`。
+生效值未开启时任何阶段都照常派发（结果不含"拆分"字样）；无 mission 不阻断但日志留痕；绑定的
+mission 记录损坏时 fail closed（零子会话）；`split.enabled: "true"` 按未开启处理并在结果里报 `warning:`；
+**读服务路径**（服务给 `enabled: true`、项目文件故意不写 → 拒绝且零子会话、日志无回退行）、**服务的生效值
+优先于项目文件**（项目 `false` + 服务 `true` → 拒绝；项目 `true` + 服务 `false` → 放行）、**回退路径**
+（服务不可用 → 按项目文件拒绝且日志含回退原因）、**真实装配**（orchestrator 提供的 `effectiveSplit`
+被 `team_delegate` 读到）。
+
+`packages/dsh-orchestrator/test/split-effective.test.ts`（8 例）：三种优先级组合
+（项目 `true` + profile 未配 → 开；项目 `false` + profile `true` → 关；项目未配 + profile `true` → 开）、
+两者都没开 → 六阶段现状、`advance` 真的进入 `split` / 直接进入 `implement`、`effectiveSplit()` 的形状
+（`enabled` + `maxTasks` / `maxParallel` / `maxAcceptancePerTask` / `maxAttempts` / `maxReworkRatio` + `source`）。
 
 **诚实边界（§5.38.5）**
 
-- **宿主开关不可见**：决定流水线是否插 `split` / `split-review` 的是宿主 profile 的
-  `orchestrator.config.split.enabled`；`dsh-role-guard` 拿不到另一个插件的配置，读的是**项目**在
-  `models.json` 里对同一件事的声明。两者由人一起打开（`docs/SPLIT-RUNBOOK.md` §1.1、§2）。只开宿主
-  开关不写项目声明的部署，本检查按"未开启"放行——这是**已知边界**，不是"检查通过了"。
+- **开关只有一个来源，但 profile 仍是缺省**：项目 `<布局根>/models.json` 的 `split.enabled` 决定
+  "这个仓库走不走拆分"；profile 的 `orchestrator.config.split.enabled` 只在项目**没写**时兜底
+  （`effectiveSplit()` 返回的 `source` 说明是 `project` / `profile` / `default` 哪一层）。同一仓库换
+  profile 启动，结果一致；两个插件也不再各读一处（`docs/SPLIT-RUNBOOK.md` §1、§2 给 A 开 / B 关两份样例）。
+- **回退是降级读取，不是通过**：没有 orchestrator 服务时 `dsh-role-guard` 自读项目 `models.json` 并在
+  日志写原因；它仍按项目文件拦截（`split.enabled: false` / 未写才放行）。旧宿主上"只开 profile 的一半"
+  属于这一层的已知边界：回退读不到 profile，只会看到项目文件。
+- **系统提示里的流水线是宿主级投影**：`dsh-orchestrator` 的 prompt section 渲染的是**宿主进程 cwd** 的
+  生效流水线（`text()` 拿不到会话工作区）。工具与服务（`orchestrate`、`advance`、`enterImplement`、
+  `effectiveSplit`）都按**会话工作区**解析——以它们为准；多项目宿主里 prompt 只是提示，不是判定依据。
 - **没有 plan 就放行**：`not-worth-splitting` 与"降级 plain implement"是合法结果，而它们的产物就是
   "没有可用 plan"。所以删掉 `split/plan.json` 在准入层面等价于这两个结果；被拦住的仍然是"跳过整个
   split 阶段"。真正的防篡改在别处：`plan.md` 是投影，派发与导入只认摘要。

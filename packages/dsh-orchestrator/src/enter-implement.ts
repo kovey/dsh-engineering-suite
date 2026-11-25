@@ -29,6 +29,7 @@
 
 import type { AgentLike, ApprovalLike, MissionRecord, MissionStore, MissionStoreRegistry } from 'dsh-eng-core'
 import type { OrchestratorConfig } from './config.js'
+import { createStagesResolver, effectiveSplitFor, scopedDeps, type EffectiveSplit } from './effective-split.js'
 import { evaluateGate } from './gates.js'
 import { isGated, stageById, type StageConfig } from './pipeline.js'
 import type { PluginProbe } from './probes.js'
@@ -80,6 +81,15 @@ export interface OrchestratorService {
      *   it: the service has no calling session to read it from.
      */
     enterImplement: (missionId: string, cwd?: string) => Promise<EnterImplementResult>
+    /**
+     * The EFFECTIVE split workflow of one workspace (项目级单一来源): the switch,
+     * the thresholds, and the layer each came from. `dsh-role-guard` reads this
+     * instead of parsing `models.json` itself, so both plugins decide with the
+     * SAME value — the "两处都开" gap (AC-002) cannot reopen from either side.
+     * @param cwd - the workspace root. Omitted = the process cwd (the same
+     *   fallback `enterImplement` uses when the caller passes none).
+     */
+    effectiveSplit: (cwd?: string) => EffectiveSplit
 }
 
 /** What the service reads from the plugin instance. */
@@ -114,12 +124,16 @@ export function createOrchestratorService(deps: OrchestratorServiceDeps): Orches
     const sequence: SequenceDeps = {
         config: deps.config,
         stores: deps.stores,
+        stagesFor: createStagesResolver(deps.config, deps.stores),
         probesFor: deps.probesFor,
         ...(deps.approval === undefined ? {} : { approval: deps.approval }),
         ...(deps.nvimTui === undefined ? {} : { nvimTui: deps.nvimTui }),
         ...(deps.log === undefined ? {} : { log: deps.log }),
     }
-    return { enterImplement: (missionId, cwd) => safelyEnter(sequence, missionId, cwd ?? process.cwd()) }
+    return {
+        enterImplement: (missionId, cwd) => safelyEnter(sequence, missionId, cwd ?? process.cwd()),
+        effectiveSplit: (cwd) => effectiveSplitFor(deps.config, deps.stores.for(cwd ?? process.cwd()).layout),
+    }
 }
 
 /**
@@ -144,6 +158,8 @@ async function safelyEnter(sequence: SequenceDeps, missionId: string, cwd: strin
  * @param cwd - workspace root.
  */
 async function enterImplement(sequence: SequenceDeps, missionId: string, cwd: string): Promise<EnterImplementResult> {
+    // The pipeline is the PROJECT's decision (`models.json`); resolve it for THIS cwd.
+    sequence = scopedDeps(sequence, cwd)
     const store = sequence.stores.for(cwd)
     const mission = store.read(missionId)
     if (mission === undefined) {

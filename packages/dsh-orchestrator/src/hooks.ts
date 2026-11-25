@@ -36,6 +36,7 @@ import { evaluateGate } from './gates.js'
 import { isGated, roleInstruction, stageById, successorOf, type StageConfig } from './pipeline.js'
 import { requiredPluginStates, type PluginProbe } from './probes.js'
 import { runOrchestrate, type SequenceDeps } from './sequence.js'
+import { scopedDeps } from './effective-split.js'
 
 /** The slice of the turn-stopping payload the hook reads (see `@deepseek-ai/dsh-agent`). */
 interface TurnStoppingPayload {
@@ -189,12 +190,11 @@ async function evaluateAutoAdvance(deps: AutoAdvanceDeps, payload: TurnStoppingP
     if (sessionId === undefined) return
     const cwd = declaredCwdOf(agent)
     if (cwd === undefined) return
+    deps = scopedDeps(deps, cwd) // the pipeline is THIS project's decision (`models.json`)
     const store = deps.stores.for(cwd)
     // This stage's lines belong to THIS workspace's log file.
     const logger = deps.logger.for(cwd)
-    // The mission bound to THIS session only — never the newest mission, and
-    // never a delegated parent's (a child's turn stop is not the parent's
-    // stage completion).
+    // The mission bound to THIS session only — never the newest mission, and never a delegated parent's (a child's turn stop is not the parent's stage completion).
     const mission = store.active(sessionId)
     if (mission === undefined) return
     if (mission.status === 'blocked') return

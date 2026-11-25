@@ -35,6 +35,7 @@ import type { OrchestratorConfig } from './config.js'
 import { blockedRefusal, entryGateRefusal } from './advance-guards.js'
 import { dispatchStageEntry } from './split-stage-dispatch.js'
 import { shouldDispatch, type DispatchDeps, type DispatchOutcome } from './dispatch.js'
+import { scopedDeps } from './effective-split.js'
 import type { GateFacts, GateOutcome } from './gate-facts.js'
 import { evaluateGate, type Verdict } from './gates.js'
 import { MAX_MAX_IN_FLIGHT, MAX_METRICS_WINDOW_DAYS, collectMetrics, renderMetrics } from './metrics.js'
@@ -50,7 +51,7 @@ import {
 } from './pipeline.js'
 import { readLedger, renderHistory } from './retrospective.js'
 import { renderRetrospectiveTail, retroAction, safeRetrospective } from './retro-report.js'
-import type { StageConfig } from './pipeline.js'
+import type { Pipeline, StageConfig } from './pipeline.js'
 import { describeMount, refusalForMissingPlugins, requiredPluginStates, type PluginProbe } from './probes.js'
 import { laneAfterPass } from './split-advance.js'
 import { splitReviewGateRefusal } from './split-approval.js'
@@ -156,14 +157,14 @@ export interface SequenceDeps {
     /** Diagnostics sink for the split-review policy read (AC-002): log only, never a refusal. */
     log?: (message: string) => void
     /**
-     * The clock for wall-clock-derived numbers (delivery metrics).
-     *
-     * Injected rather than read from `Date.now()` at the call site because the
-     * report contains rounded durations: two calls a few milliseconds apart agree
-     * only until one of them crosses a rounding boundary, which is exactly how
-     * "two runs on the same tree are byte-identical" became a flaky assertion
-     * under load. A caller that wants determinism passes a fixed clock; the
-     * default keeps the tool's behaviour unchanged.
+     * The stage pipeline of ONE workspace (`effective-split.ts`): the project's
+     * `models.json` decides whether the split segment exists. `scopedDeps`
+     * applies it before any stage list is read.
+     */
+    stagesFor: (cwd: string) => Pipeline
+    /**
+     * The clock for wall-clock-derived numbers (delivery metrics). Injected so
+     * two runs on the same tree are byte-identical; absent = wall clock.
      * @returns milliseconds since the epoch.
      */
     now?: () => number
@@ -177,11 +178,10 @@ interface CallContext {
     sessionId: string | undefined
     mission: MissionRecord | undefined
     /**
-     * The caller's cancellation signal (BUG-3).
-     *
-     * Without it an auto-dispatched child cannot be cancelled: the orchestrator
-     * used to hand the provider a fresh `AbortController`, so a cancelled turn
-     * kept a child running (and spending tokens) to completion.
+     * The caller's cancellation signal (BUG-3). Without it an auto-dispatched
+     * child cannot be cancelled: the orchestrator used to hand the provider a
+     * fresh `AbortController`, so a cancelled turn kept a child running to
+     * completion (and spending tokens).
      */
     signal?: AbortSignal
 }
@@ -195,12 +195,10 @@ function agentOf(exec: unknown): AgentLike | undefined {
 }
 
 /**
- * Resolve the mission a call applies to.
- *
- * `explicitId` wins, then the session (or delegating parent) binding. There is
- * deliberately no "newest mission in the workspace" fallback: driving another
- * session's mission from here would be a silent cross-session action, so an
- * unbound session is told to pass `missionId` (or start its own mission).
+ * Resolve the mission a call applies to. `explicitId` wins, then the session
+ * (or delegating parent) binding; there is deliberately no "newest mission in
+ * the workspace" fallback (driving another session's mission would be a silent
+ * cross-session action, so an unbound session is told to pass `missionId`).
  */
 function callContext(deps: SequenceDeps, exec: unknown, explicitId?: string): CallContext {
     const agent = agentOf(exec)
@@ -1440,6 +1438,8 @@ export async function runOrchestrate(deps: SequenceDeps, args: OrchestrateArgs, 
         ].join('\n')
     }
     const ctx = callContext(deps, exec, args.missionId)
+    // The stage list is the PROJECT's decision (`models.json`), not the profile's.
+    deps = scopedDeps(deps, ctx.cwd)
     const probes = deps.probesFor(ctx.agent)
     switch (action) {
         case 'stages':
