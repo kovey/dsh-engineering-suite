@@ -9,6 +9,7 @@ profile**（`.dsh/**` 与 profile 都在信任根里，Agent 写不了）。
 目录：
 
 1. [打开 `split.enabled`（profile 侧）](#1-打开-splitenabledprofile-侧)
+   - [1.1 `team_delegate` 的准入检查：派单不能绕过 split](#11-team_delegate-的准入检查派单不能绕过-split)
 2. [项目侧 `models.json`（含重试上限 `maxAttempts`）](#2-项目侧-modelsjson含重试上限-maxattempts)
 3. [真机接入：`DSH_SMOKE_REAL=1` 的步骤与判据](#3-真机接入dsh_smoke_real1-的步骤与判据)
 4. [本机没有 `dsh` 时的 SKIP 边界](#4-本机没有-dsh-时的-skip-边界)
@@ -75,6 +76,48 @@ spec-clarify → test-design-review → spec-approve → split → split-review 
 的摘要；未审核 / 摘要已变 / 依赖有环都会**拒绝派发**并写 `split/run.json`（`state=refused`），不会建
 worktree、不会派 worker。
 
+### 1.1 `team_delegate` 的准入检查：派单不能绕过 split
+
+开了拆分之后，"谁能派单、什么时候能派"也由流程决定：`team_delegate` 会先做一次**准入检查**
+（`packages/dsh-role-guard/src/split-gate.ts`），通过了才创建子会话。拒绝是**拒绝**（工具报错、不创建
+子会话、不写委派台账），不是"警告后继续"。
+
+生效的开关是**项目** `models.json` 的 `split.enabled`（见 §2）；它与这里 profile 的
+`orchestrator.config.split.enabled` 说的是同一件事，必须**一起打开**——前者决定本检查是否生效，后者决定
+流水线里是否真的有 `split` / `split-review` 两个阶段。只开 profile 的一半，检查会按"未开启"放行（已知边界，
+见 §7）。
+
+| 当前事实 | 结果 |
+|----------|------|
+| `split.enabled !== true`（没写 / `false`） | 不检查，派发行为与以前一字不差 |
+| 开了拆分，但调用方**没有绑定 mission** | 不拦截；`role-guard` 日志留一句"按未绑定处理" |
+| 开了拆分，绑定还在但 mission 记录读不出来（损坏/丢失） | **拒绝**（fail closed）：读不到不等于没开拆分 |
+| 阶段不是 `implement`（`spec-clarify` / `test-design-review` / `spec-approve` / `split` / `split-review` …） | **拒绝**：先 advance 到 split 完成拆分与审核 |
+| `implement` + 磁盘上**没有** `split/plan.json` | 放行（"不值得拆"/轮数超限降级就是这条合法路径） |
+| `implement` + 有 plan，但 `split/review.json` 缺失 / `rejected` / 摘要与当前 plan 不一致 | **拒绝**：要求重新送审（文案给出两个短摘要） |
+| `implement` + 有 plan 且 `approved`、`planDigest` 与当前 plan 摘要一致 | 放行 |
+
+阶段不对时的拒绝文案（节选）：
+
+```
+team_delegate 拒绝：本仓库开启了拆分（models.json 的 split.enabled=true），派发前必须先经过 split 的拆分与 split-review 的审核；当前阶段 spec-approve 不允许派单。
+- 当前阶段：spec-approve（mission <id>）—— 只有 implement 阶段才允许派单
+- 缺少的步骤：先走 split 阶段产出 split/plan.json（planner 拆分 + 四道自动校验），需要审核时再由人完成 split-review，然后才能进入 implement
+- 下一步：开启拆分后必须先 advance 到 split 完成拆分与审核（orchestrate({ action: "advance" }) 按流水线推进），再重试本次 team_delegate
+- 合法路径：拆分被判定"不值得拆"/轮数超限降级 plain implement 也是合法路径，但必须先经过 split 阶段的判定，不能跳过——跳过 split 直接派单就是这里拒绝的行为
+```
+
+审核过期时，文案会同时给出**当前 plan 摘要**与**审核记录引用的摘要**，并明确"必须重新审核"：
+
+```
+team_delegate 拒绝：split/plan.json 还没有通过审核（stale），未审核的计划不能派发。
+- 当前 plan 摘要：3f9c0a1b2c3d（split/plan.json；审核记录引用的是 51ad2f6c7e90）
+- 下一步：把当前 plan 重新送审（进入 split-review 完成人工审核，或重新拆一次），让审核记录引用摘要 3f9c0a1b2c3d，再重试本次派发
+```
+
+遇到这三种情况先看这几处：`orchestrate({ action: "status" })` 的当前阶段、`split/plan.json` 是否存在、
+`split/review.json` 的 `decision` 与 `planDigest`（`docs/ARCHITECTURE.md` §5.38.5）。
+
 ## 2. 项目侧 `models.json`（含重试上限 `maxAttempts` 与每任务 AC 上限）
 
 放在布局根（`<repo>/.dsh/engineering-suite/models.json`；没有命名空间目录的老仓库是
@@ -85,6 +128,7 @@ worktree、不会派 worker。
   "planner": { "model": "deepseek/deepseek-reasoner", "reasoningEffort": "high" },
   "worker": { "model": "deepseek/deepseek-chat", "reasoningEffort": "low" },
   "split": {
+    "enabled": true,
     "reviewRequired": true,
     "maxTasks": 8,
     "maxParallel": 2,
@@ -99,11 +143,17 @@ worktree、不会派 worker。
 
 | 字段 | 含义 | 缺省 / 边界 |
 |------|------|-------------|
+| `split.enabled` | 本仓库声明"跑拆分"：`team_delegate` 的准入检查据此拦截"跳过 split 直接派单"（§1.1） | 缺省 `false`（不写 = 不检查、行为不变）；非布尔值点名后按未开启处理 |
 | `split.maxParallel` | 一组内同时跑几个 worker（上限，不是日程表） | 默认 3；`1` = 退化串行 |
 | `split.taskTimeoutMs` | 单个 worker 的截止时间 | 缺省跟随宿主 `autoDispatch.timeoutMs`，再缺省 600000 |
 | `split.maxAttempts` | 一个子任务允许的**派发尝试次数** | 缺省 1（不重试），允许 1..3，非法值点名后回退 1 |
 | `split.maxAcceptancePerTask` | 一个子任务**最多**映射几条验收标准；超出即 plan 不合格 | 缺省 3，允许 1..10，非法值点名后回退 3 |
 | `quality.maxReworkRatio` | 返工率超过它就**把后续**子任务升级到 `planner` 模型（不中止） | 默认 0.3 |
+
+`split.enabled` 与 profile 的 `orchestrator.config.split.enabled`（§1）是**同一件事的两处声明**：profile 决定
+流水线里是否有 `split` / `split-review` 两个阶段，项目侧这份决定 `dsh-role-guard` 的派单准入检查是否生效
+（它读不到另一个插件的配置）。**两处一起打开**——只开 profile 的一半时，`team_delegate` 仍会放行"跳过 split
+直接派单"（§1.1、§7）。
 
 `maxAttempts` 的语义（AC-002）：
 
@@ -432,3 +482,10 @@ git -C <主树> log -1 --format=%s <tasks[].commit>
 - **AC 预算是"每任务上限"，不是"拆得好"**：它不阻止 `maxTasks` 个任务各自 3 条 AC 的宽计划，也不评价
   切分质量（那是审核人的问题）；`plan.md` 第 2 行写的是本次校验实际使用的上限，不是重新读配置得来的。
   门槛（`decideSplit`）本身没有预算概念——只有"先校验、后门槛"的组合顺序才是权威。
+- **派单准入检查读的是项目声明，不是宿主开关**：`team_delegate` 的准入检查（§1.1）只能读项目
+  `models.json` 的 `split.enabled`；profile 的 `orchestrator.config.split.enabled` 对它是不可见的。所以
+  "只开了 profile、没写项目声明"的部署里，`team_delegate` 仍会放行跳过 split 的派单——这不是"检查通过了"，
+  是检查没有生效。两处一起打开，并在升级 profile 时一起检查。
+- **没有 plan 就是放行**：`not-worth-splitting` / 降级 plain implement 的产物就是"没有可用 plan"，所以
+  删掉 `split/plan.json` 在准入层面与这两个合法结果等价；拦截的是"跳过整个 split 阶段"，不是"没有 plan"
+  这一状态。真正的防篡改在摘要绑定（派发与导入只认 `review.json` 引用的摘要）。

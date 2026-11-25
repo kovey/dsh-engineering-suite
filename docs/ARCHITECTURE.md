@@ -2430,6 +2430,111 @@ implement——正是要关掉的静默路径。
 - 门槛（`decideSplit`）本身**没有**预算概念：绕过 `validateSplitPlan` 直接调用它的地方，看到的仍是
   旧的"单任务不值得拆"结论。门禁与工具的组合顺序才是权威。
 
+### 5.38.5 派单也不能绕过拆分：`team_delegate` 的准入检查
+
+§5.38 让"已审核的 plan"真的会派发，但对**派单这个动作本身**没有任何检查：`team_delegate` 接受任何阶段
+的调用，于是一句工具调用就能把 `developer` 直接启动在 `spec-approve` 或 `split` 阶段——`split` 与
+`split-review` 一次都没跑，而下游每个门禁仍然报绿。这一节补的是**准入**（admission）：开启拆分的仓库里，
+"先拆、再审核、最后派单"是流程而不是建议。
+
+**A. 检查落点与配置来源**
+
+| 事实 | 来源 | 位置 |
+|------|------|------|
+| 本仓库是否跑拆分 | **生效**的 `models.json` 的 `split.enabled`（`dsh-eng-core/split` 解析，缺省 false） | `packages/dsh-role-guard/src/split-gate.ts` |
+| 当前阶段 / 当前 mission | mission store（`resolveForAgent`，与写守卫、`advance` 同一规则） | 同上 |
+| 拆分计划的摘要与审核状态 | `split/plan.json` + `split/review.json`（`readSplitPlan` / `splitReviewStatus`） | 同上 |
+| 调用点 | `team_delegate` 的 `execute`，在**任何子会话存在之前** | `packages/dsh-role-guard/src/tools.ts` |
+
+`split.enabled` 是 `SplitSettings` 的可选字段（没有内建缺省）：不写 = `false` = 检查完全不做，既有行为
+一字不变；写成非布尔值（`"true"`）由解析器**点名**并按未开启处理——"也许他想开"不是一种安全的读法。
+
+**B. 三种结果（只有第三种是新行为）**
+
+| 条件 | 结果 |
+|------|------|
+| `split.enabled !== true`（缺省 / `false` / 读不到） | 不检查、不拦截；读不到时结果里带 `warning:` 一行 |
+| 开启拆分、调用方**没有绑定 mission** | 不拦截（非 mission 的派发没有 split 阶段可跳），日志留一句 |
+| 开启拆分、绑定还在但 mission 记录读不出来（损坏/丢失） | **拒绝**（fail closed）：读不到不等于没开拆分 |
+| 开启拆分、绑定了可读的 mission | 见 C 的两道判断 |
+
+**C. 两道判断：阶段，然后审核**
+
+1. `mission.stage !== 'implement'` → **拒绝**。文案含当前阶段、当前 plan 摘要（若有）、缺哪一步，并明确
+   写出合法路径不止一条：「拆分被判定"不值得拆"/轮数超限降级 plain implement 也是合法路径，但必须先经过
+   split 阶段的判定，不能跳过」——跳过的正是这里要拒绝的。
+2. `stage === 'implement'` 且磁盘上**有** `split/plan.json` → 要求 `split/review.json` 为 `approved`
+   且 `planDigest` 等于当前 plan 摘要；`missing-review` / `stale`（plan 改过）/ `rejected` 一律拒绝，
+   文案给出两个短摘要（当前 plan 与审核记录引用的那个）并要求重审。
+3. `stage === 'implement'` 且磁盘上**没有** plan → 放行。这是 `not-worth-splitting` 与返工预算用尽的
+   降级路径：两者都由 `split` 阶段判定并记录，所以"没有 plan"本身就是一个**已经过判定**的结果。
+
+**D. 拒绝是拒绝，不是警告**
+
+`team_delegate` 在拒绝路径上 `throw`：没有 `StartActivation`、没有 `run.run.result`、没有委派台账行、
+没有角色绑定。用例断言 `activationSpecs.length === 0`——"文案说拒绝但其实启动了子会话"是实现缺陷，不是
+配置问题。唯一的 `warning:` 行属于"降级但放行"（读不到 `models.json`、`split.enabled` 写错类型、无
+mission 时的日志），与"开启拆分后直接派发"无关。
+
+**E. 三句拒绝文案（原文）**
+
+阶段不对（`stage !== 'implement'`）：
+
+```
+team_delegate 拒绝：本仓库开启了拆分（models.json 的 split.enabled=true），派发前必须先经过 split 的拆分与 split-review 的审核；当前阶段 spec-approve 不允许派单。
+- 当前阶段：spec-approve（mission <id>）—— 只有 implement 阶段才允许派单
+- 当前 plan 摘要：(还没有 split/plan.json)
+- 缺少的步骤：先走 split 阶段产出 split/plan.json（planner 拆分 + 四道自动校验），需要审核时再由人完成 split-review，然后才能进入 implement
+- 下一步：开启拆分后必须先 advance 到 split 完成拆分与审核（orchestrate({ action: "advance" }) 按流水线推进），再重试本次 team_delegate
+- 合法路径：拆分被判定"不值得拆"/轮数超限降级 plain implement 也是合法路径，但必须先经过 split 阶段的判定，不能跳过——跳过 split 直接派单就是这里拒绝的行为
+```
+
+审核缺失 / 过期 / 被拒（`stage === 'implement'` 且有 plan）：
+
+```
+team_delegate 拒绝：split/plan.json 还没有通过审核（stale），未审核的计划不能派发。
+- 当前阶段：implement（mission <id>）
+- 当前 plan 摘要：3f9c0a1b2c3d（split/plan.json；审核记录引用的是 51ad2f6c7e90）
+- 缺少的步骤：split/review.json 必须 decision=approved 且 planDigest 等于当前 plan 摘要；当前：审核针对的是 plan 摘要 51ad2f6c7e90，当前 plan 摘要 3f9c0a1b2c3d：plan 已改动，必须重新审核
+- 下一步：把当前 plan 重新送审（进入 split-review 完成人工审核，或重新拆一次），让审核记录引用摘要 3f9c0a1b2c3d，再重试本次派发
+- 合法路径：拆分被判定"不值得拆"/轮数超限降级 plain implement 也是合法路径，但必须先经过 split 阶段的判定（并由 split-review 记录），不能跳过；带着未审核或已过期的 plan 派单同样被拒绝
+```
+
+读不出 mission（fail closed；`<id>` 是会话仍绑定的那个 mission）：
+
+```
+team_delegate 拒绝：本仓库开启了拆分（models.json 的 split.enabled=true），但会话绑定的 mission <id> 读不出来，无法证明这次派发经过了 split 与 split-review。
+- 问题：<布局根>/state/sessions/ 的绑定指向了一个读不出的 mission 记录（mission.json 缺失或损坏）
+- 下一步：修好 <布局根>/missions/ 下该 mission 的记录（或解绑会话）后重试；读不到不等于没开拆分。
+```
+
+（`mission store` 读取抛错时是同一类拒绝，`- 问题：` 后面是异常原文。）
+
+**F. 测试**
+
+`packages/dsh-role-guard/test/split-gate.test.ts`（10 例）：`spec-approve` / `split` / `split-review` 三个
+代表阶段拒绝（其中 `spec-approve` 与 `split` 断言 `activationSpecs.length === 0` 且文案含"先走 split"、
+当前阶段、缺少的步骤、"不值得拆…但必须先经过 split 阶段"）；`implement` + 无 plan 放行；`implement` +
+approved 且摘要一致放行（且不含拒绝文案）；plan 改动后 `stale` 拒绝（文案含两个短摘要与"重新送审"）；
+`split.enabled` 未配置时任何阶段都照常派发（结果不含"拆分"字样）；无 mission 不阻断但日志留痕；绑定的
+mission 记录损坏时 fail closed（零子会话）；`split.enabled: "true"` 按未开启处理并在结果里报 `warning:`。
+
+**诚实边界（§5.38.5）**
+
+- **宿主开关不可见**：决定流水线是否插 `split` / `split-review` 的是宿主 profile 的
+  `orchestrator.config.split.enabled`；`dsh-role-guard` 拿不到另一个插件的配置，读的是**项目**在
+  `models.json` 里对同一件事的声明。两者由人一起打开（`docs/SPLIT-RUNBOOK.md` §1.1、§2）。只开宿主
+  开关不写项目声明的部署，本检查按"未开启"放行——这是**已知边界**，不是"检查通过了"。
+- **没有 plan 就放行**：`not-worth-splitting` 与"降级 plain implement"是合法结果，而它们的产物就是
+  "没有可用 plan"。所以删掉 `split/plan.json` 在准入层面等价于这两个结果；被拦住的仍然是"跳过整个
+  split 阶段"。真正的防篡改在别处：`plan.md` 是投影，派发与导入只认摘要。
+- **只回答"能不能开始派发"**：它不是写守卫（`dsh-spec-gate` 的阶段规则）也不是 `advance` 的委派门禁；
+  三者读同一批事实，但各管一段，不能互相替代。
+- **不证明子代理做了拆分**：检查证明的是"这次派发之前 split 与 split-review 的状态成立"，不是"子代理
+  按 plan 干活"。后者由 plan 的摘要绑定与 `split/run.json` 回答。
+- **读不到 `models.json` 时按未开启处理**并留 `warning:`：信任根（`.dsh/**`）由人维护，磁盘异常导致的
+  读失败不阻断派发；但这也意味着"把文件弄坏"不会触发拦截。
+
 ## 6. 为什么这样切分
 
 - **一个关注点一个插件**：门禁可以单独失效（例如先只上 quality-gate），不影响其它环节。

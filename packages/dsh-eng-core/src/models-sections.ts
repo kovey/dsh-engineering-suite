@@ -16,6 +16,19 @@
 
 /** Splitting granularity and the review requirement (`models.json`'s `split` section). */
 export interface SplitSettings {
+    /**
+     * Whether THIS REPOSITORY runs the split workflow (`models.json`'s
+     * `split.enabled`), read by `dsh-role-guard`'s delegation admission check.
+     *
+     * Optional and WITHOUT a built-in default on purpose: absent means `false`,
+     * so a project that never heard of this key keeps its behaviour byte for
+     * byte (no fallback line, no changed verdict). The host's own pipeline
+     * switch (`dsh-orchestrator`'s `config.split.enabled`) decides whether the
+     * `split` / `split-review` stages exist; this project-level declaration is
+     * what a plugin that cannot see the host's config can read — the two are
+     * meant to be set together (see docs/SPLIT-RUNBOOK.md §1 and §2).
+     */
+    enabled?: boolean
     /** A human must review the plan before any worker is dispatched. */
     reviewRequired: boolean
     /** Upper bound on tasks in one plan; more than this is "split into missions". */
@@ -166,6 +179,13 @@ export function parseSplitSection(value: unknown, where: string, problems: strin
     if (reviewRequired !== undefined && typeof reviewRequired !== 'boolean') {
         problems.push(`${where}.reviewRequired 必须是布尔值（收到 ${JSON.stringify(reviewRequired)}），已忽略`)
     }
+    // `enabled` is a switch, not a number: a typo is REPORTED and left out
+    // (absent = false), never guessed into `true` — the same rule the
+    // orchestrator's own `split.enabled` parser follows.
+    const enabled = raw['enabled']
+    if (enabled !== undefined && typeof enabled !== 'boolean') {
+        problems.push(`${where}.enabled 必须是布尔值（收到 ${JSON.stringify(enabled)}），已忽略（按未开启处理）`)
+    }
     const maxTasks = positiveInt(raw['maxTasks'], `${where}.maxTasks`, 2, problems)
     const maxParallel = positiveInt(raw['maxParallel'], `${where}.maxParallel`, 1, problems)
     const maxReworkRounds = positiveInt(raw['maxReworkRounds'], `${where}.maxReworkRounds`, 0, problems)
@@ -173,6 +193,7 @@ export function parseSplitSection(value: unknown, where: string, problems: strin
     const maxAttempts = boundedInt(raw['maxAttempts'], `${where}.maxAttempts`, 1, MAX_SPLIT_ATTEMPTS, problems)
     const maxAcceptancePerTask = boundedInt(raw['maxAcceptancePerTask'], `${where}.maxAcceptancePerTask`, 1, MAX_ACCEPTANCE_PER_TASK, problems)
     return {
+        ...(typeof enabled === 'boolean' ? { enabled } : {}),
         ...(typeof reviewRequired === 'boolean' ? { reviewRequired } : {}),
         ...(maxTasks === undefined ? {} : { maxTasks }),
         ...(maxParallel === undefined ? {} : { maxParallel }),

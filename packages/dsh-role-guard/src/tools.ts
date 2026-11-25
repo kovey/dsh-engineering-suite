@@ -53,6 +53,7 @@ import { renderRoleDetail } from './role-detail.js'
 import { resolveRoute, routeLine } from './route.js'
 import type { Role } from './roles.js'
 import { recordStageDelegation } from './stage-delegations.js'
+import { splitAdmission } from './split-gate.js'
 
 const TEXT_OUTPUT = { type: 'string' } as const
 
@@ -388,12 +389,11 @@ export function registerTools(
                 // An unconfigured class is a logged fallback, never a warning.
                 logModelClassFallback(role, deps.logger, 'team_delegate')
                 if (agent === undefined) throw new Error('team_delegate 需要调用方 agent。')
+                // Split admission (§5.38.5): a refusal starts NO child (see split-gate.ts).
+                const admission = splitAdmission({ layout, agent, stores: deps.stores, ...(deps.logger === undefined ? {} : { logger: deps.logger }) })
+                if (admission.refusal !== undefined) throw new Error(admission.refusal)
                 const subagents = deps.subagents()
-                if (subagents === undefined) {
-                    throw new Error(
-                        '宿主没有装配子代理服务（ctx.subagents）：请挂载 @deepseek-ai/dsh-subagent 与具体的 provider（如 @deepseek-ai/dsh-subagent-spawn-in-process）。',
-                    )
-                }
+                if (subagents === undefined) throw new Error('宿主没有装配子代理服务（ctx.subagents）：请挂载 @deepseek-ai/dsh-subagent 与具体的 provider（如 @deepseek-ai/dsh-subagent-spawn-in-process）。')
                 const plan = planToolFilter(role, deps.config, (name) => deps.visibleTool(name, agent))
                 const refusal = filterRefusal(role, plan)
                 if (refusal !== undefined) throw new Error(refusal)
@@ -502,7 +502,7 @@ export function registerTools(
                         // disposal failures must not mask the child's result
                     }
                 }
-                const warnings = delegationWarnings({
+                const warnings = [...(admission.warning === undefined ? [] : [admission.warning]), ...delegationWarnings({
                     route,
                     dispatchProblems,
                     droppedTools: plan.dropped,
@@ -512,7 +512,7 @@ export function registerTools(
                     registryProblems: registry.problems(),
                     presetProblems: deps.presets.problems(),
                     ...(delegationWarning === undefined ? {} : { delegationWarning }),
-                })
+                })]
                 const header = [
                     `role: ${role.id}（${role.name}，mode=${role.mode}）`,
                     `child session: ${run.id}`,

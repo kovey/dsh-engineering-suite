@@ -1,5 +1,34 @@
 ## [未发布]
 
+### 功能 · 开启拆分后派单不能绕过 split：`team_delegate` 的准入检查
+
+真实落差：`split.enabled=true` 之后，`team_delegate` 仍然接受**任何阶段**的调用。一句工具调用就能把
+`developer` 启动在 `spec-approve` 或 `split` 阶段——`split` 与 `split-review` 一次都没跑，下游的每个门禁
+却仍然报绿。"先拆、再审核、最后派单"因此只是文档里的建议，不是流程。
+
+- **检查落点（AC-001）**：新增 `packages/dsh-role-guard/src/split-gate.ts`，由 `team_delegate` 的
+  `execute` 在**任何子会话存在之前**调用。拒绝路径直接 `throw`：不建 activation、不写角色绑定、不写委派
+  台账；用例断言 `activationSpecs.length === 0`（拒绝不是警告）。
+- **开关来源**：读生效 `models.json` 的 `split.enabled`（`dsh-eng-core/split` 解析，`SplitSettings` 新增
+  可选 `enabled`，缺省 `false`；非布尔值点名后按未开启处理，不信猜测）。未开启时检查完全不做，既有
+  `team_delegate` 行为与输出一字不变（AC-004）。
+- **两道判断（AC-001/AC-002）**：`mission.stage !== 'implement'` → 拒绝（文案含当前阶段、当前 plan 摘要、
+  "先走 split"缺哪一步，以及"判定不值得拆/轮数超限降级也是合法路径，但必须先经过 split 阶段"）；
+  `implement` + 磁盘上有 `split/plan.json` → 要求 `split/review.json` 为 `approved` 且 `planDigest` 等于
+  当前 plan 摘要，`missing-review` / `stale` / `rejected` 一律拒绝并给出两个短摘要、要求重审。**没有 plan
+  则放行**：那正是"不值得拆"/降级的合法产物。
+- **不阻断非 mission 场景**：开了拆分但调用方没有绑定 mission 时按"未开启拆分"处理，只记一条 `role-guard`
+  日志（避免把非 mission 的派发卡死）；**绑定还在但 mission 记录读不出来**（`mission.json` 损坏/丢失、
+  mission store 抛错）则 fail closed 拒绝，并点名"读不到不等于没开拆分"。
+- **测试（AC-004）**：`packages/dsh-role-guard/test/split-gate.test.ts`（10 例）覆盖 `spec-approve` /
+  `split` / `split-review` 三个代表阶段拒绝（含零子会话断言与文案断言）、`implement` + 无 plan 放行、
+  `implement` + approved 且摘要一致放行、plan 改动后 `stale` 拒绝、split 未配置时任何阶段行为不变、
+  无 mission 不阻断但日志留痕、绑定的 mission 记录损坏时 fail closed、
+  `enabled: "true"` 降级为未开启并在结果里报 `warning:`。
+- **文档**：`docs/ARCHITECTURE.md` 新增 §5.38.5（含三句拒绝文案原文与诚实边界），
+  `docs/SPLIT-RUNBOOK.md` 新增 §1.1、在 §2 的 `models.json` 样例与字段表里补 `split.enabled`，并在 §7
+  写明"项目声明 ≠ 宿主开关"的已知边界。
+
 ### 功能 · worker 必须提交；它忘了时 runner 代提交一次，并在 `run.json` 记 `autocommit`
 
 真实故障（golang/im 的 `mission-20261120-165139`）：T-001 的 `base=13be61ce`、`commit` 为空，problem 写
