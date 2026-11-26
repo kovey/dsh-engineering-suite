@@ -1,4 +1,4 @@
-## [未发布]
+## [0.9.1] — 2026-11-26
 
 ### 功能 · `suite init` 读取仓库里的**每一个**生态，而不只是第一个：供应链 manifests 取并集，审计命令按生态给出
 
@@ -25,6 +25,9 @@ TS 仓库里的 `Cargo.toml` 都不进 `supply-chain-gate.json` 的 `deps.manife
   既有 133 例全部通过、无需改动断言（没有既有用例断言 `auditCommands: []` 或供应链 manifests）。
 - **文档**：`docs/ARCHITECTURE.md` §5.30 与 §5.30.1 写明"两个答案、共用同一个匹配器"、审计命令表与跳过规则；
   `packages/dsh-suite-doctor/README.md` 同步。`bash scripts/verify.sh --quiet` 与 `bash scripts/standards-check.sh --quiet` 全绿。
+- **使用者影响**：`suite init` 现在会为每个检测到的生态写出对应的审计命令——这些 CLI **不会被自动安装**，
+  **需自行安装审计 CLI**（各生态对应的命令见上）；java/kotlin/swift 不生成命令，报告写明"该生态无标准审计器，
+  需人工补充"。
 
 ## [0.9.0] — 2026-11-25
 
