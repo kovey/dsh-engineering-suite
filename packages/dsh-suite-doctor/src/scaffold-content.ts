@@ -11,10 +11,19 @@
  * ecosystems have no coverage command) lives in `scaffold-languages.ts`; this
  * module only renders it into the JSON documents.
  *
+ * ONE document is not single-ecosystem: `supply-chain-gate.json` watches
+ * manifests and audits dependencies, so it is generated for EVERY detected
+ * ecosystem — the manifests are the union and the audit commands come from
+ * `scaffold-audit.ts`'s table. The other nine documents stay keyed to the
+ * PRIMARY ecosystem (the first detection hit): a repository has one way it runs
+ * its tests and one structural threshold set, and inventing a merge of them
+ * would describe a repository nobody has.
+ *
  * @module dsh-suite-doctor/scaffold-content
  */
 
-import { defaultsOf, STANDARDS_LANGUAGES, THRESHOLDS, type SuiteLanguage } from './scaffold-languages.js'
+import { auditCommandsFor, skippedAuditors, type SkippedAuditor } from './scaffold-audit.js'
+import { defaultsOf, manifestsFor, STANDARDS_LANGUAGES, THRESHOLDS, type SuiteLanguage } from './scaffold-languages.js'
 
 export type { SuiteLanguage }
 
@@ -68,10 +77,64 @@ export function impactGateContent(language: SuiteLanguage): Record<string, unkno
     return { testCommandTemplate: defaultsOf(language).impactTemplate, defaultBase: 'HEAD' }
 }
 
-/** Manifests for the declared ecosystem; audit commands stay empty (no invented auditor). */
-export function supplyChainGateContent(language: SuiteLanguage): Record<string, unknown> {
+/**
+ * The ecosystems a scaffold run generates for.
+ *
+ * Every detected one, or the PRIMARY alone when detection found nothing: on an
+ * empty repository the documents still need a language, and the documented `ts`
+ * default fills that role. Returning a copy (not the caller's array) keeps the
+ * plan's field from aliasing detection's.
+ * @param language - the primary ecosystem (the first detection hit).
+ * @param languages - every detected ecosystem (empty when the default applied).
+ * @returns the list the generated documents are keyed to.
+ */
+export function generatedLanguages(language: SuiteLanguage, languages: readonly SuiteLanguage[]): SuiteLanguage[] {
+    return languages.length === 0 ? [language] : [...languages]
+}
+
+/** The dependency section the supply-chain gate is stocked with for one scaffold run. */
+export interface SupplyChainDeps {
+    /** Union of every generated ecosystem's manifests, deduplicated, detection order. */
+    manifests: string[]
+    /** Standard audit commands of those ecosystems, deduplicated, detection order. */
+    auditCommands: string[]
+    /** Ecosystems left without a command, with the reason the report prints. */
+    skipped: SkippedAuditor[]
+}
+
+/**
+ * Build the supply-chain dependency section for the generated ecosystems.
+ *
+ * This is the ONE place the section is computed: the file written by
+ * `suite_init` and the `语言与供应链` block of its report are both projections of
+ * this function's result, so the report cannot describe a watch list the file
+ * does not have.
+ * @param language - the primary ecosystem (used when nothing was detected).
+ * @param languages - every detected ecosystem.
+ * @returns the manifests union, the audit commands and the skipped ecosystems.
+ */
+export function supplyChainDeps(language: SuiteLanguage, languages: readonly SuiteLanguage[]): SupplyChainDeps {
+    const generated = generatedLanguages(language, languages)
+    return { manifests: manifestsFor(generated), auditCommands: auditCommandsFor(generated), skipped: skippedAuditors(generated) }
+}
+
+/**
+ * Manifests + audit commands of EVERY generated ecosystem.
+ *
+ * Multi-ecosystem is the point: a Go repository that also carries
+ * `requirements.txt` gets `go.mod`/`go.sum` AND `requirements.txt`/
+ * `pyproject.toml`, plus `govulncheck ./...` and `pip-audit -f json`.
+ * Ecosystems with no standard auditor (java/kotlin/swift) contribute no command —
+ * the caller's report names them via {@link SupplyChainDeps.skipped}; nothing is
+ * invented.
+ * @param language - the primary ecosystem.
+ * @param languages - every detected ecosystem (default: just the primary).
+ * @returns the `supply-chain-gate.json` document body.
+ */
+export function supplyChainGateContent(language: SuiteLanguage, languages: readonly SuiteLanguage[] = [language]): Record<string, unknown> {
+    const deps = supplyChainDeps(language, languages)
     return {
-        deps: { manifests: [...defaultsOf(language).manifests], auditCommands: [] },
+        deps: { manifests: deps.manifests, auditCommands: deps.auditCommands },
         secretScan: { scanWholeTree: false },
     }
 }

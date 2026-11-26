@@ -1327,8 +1327,10 @@ IM 面如何被发现：`dsh-interaction-gate` 导出 `imApprovalSurface(ctx, cw
 
 **十份里为什么有 `standards.json`**：它不是插件配置，而是仓库自己的结构规范。没有它 `standards_check` 会
 拒绝运行（插件不替仓库猜阈值），所以只写九份插件配置的脚手架会得到一个"什么都不能门禁"的套件。
-`deploy-gate.environments` 与 `supply-chain-gate.deps.auditCommands` 则**故意留空**：部署命令与审计器只有
-仓库自己知道，编一个不存在的命令只会让门禁在第一次运行时失败。默认值因此是"保守且可评审的起点"，不是断言。
+`deploy-gate.environments` 则**故意留空**：部署命令只有仓库自己知道，编一个不存在的命令只会让门禁在第一次
+运行时失败。`supply-chain-gate.deps.auditCommands` 不同：它按检测到的生态填入**有既定 CLI** 的审计命令（见
+5.30.1 的审计表）；java/kotlin/swift 没有这样的 CLI，于是留空并在报告里写明"该生态无标准审计器，需人工补充"——
+留空的目的是不编造，不是不说。默认值因此是"保守且可评审的起点"，不是断言。
 
 **为什么模型不能自己写 `.dsh/**`**：`.dsh/` 在信任根里，`dsh-spec-gate` 的写守卫把 `write`/`edit` 关在外面——
 否则一个模型可以通过改阈值让自己通过门禁。`suite_init` 是**插件自己的写入口**（工具或命令），它的 dry-run、
@@ -1389,9 +1391,17 @@ feed 里只剩一条长行。修法不是再写一份短报告，而是把**同�
 #### 5.30.1 支持的生态与检测优先级（11 种）
 
 `suite_init` 的默认命令、`standards.json` 的阈值、`supply-chain-gate` 的 manifest 清单，都按**检测到的生态**生成。
-检测只做一件事：按下面这张**固定顺序**查仓库根目录的 manifest，**第一个命中**的胜出；同时把"命中哪个文件"作为
-检测依据打印出来（`suite_init` 的 `语言判定：检测依据：命中 Cargo.toml`）——"检测为 rust"没有依据，就是一句无法核对
-的断言，而多生态仓库正是静默选错的地方。
+检测回答两个问题，二者共用同一张规则表与同一个匹配函数（`scaffold-detect.ts` 的 `matchesRule()`；单语言答案与
+多生态列表各抄一份迟早会分叉，报告就会引用生成内容没有用到的依据）：
+
+1. **主生态**——按下面这张**固定顺序**查仓库根目录的 manifest，**第一个命中**的胜出。它决定 `quality-gate`、
+   `coverage-gate`、`impact-gate`、`standards` 这九份**单生态**文档：一个仓库只有一种跑测试的方式，合并出来的
+   命令表描述的是一个不存在的仓库。
+2. **仓库里实际有哪些生态**——同一顺序下**全部命中**、去重保序。它们共同决定 `supply-chain-gate` 的 manifests
+   并集与审计命令。
+
+两个答案都把"命中哪个文件"作为检测依据打印出来（`suite_init` 的 `语言判定：检测依据：命中 Cargo.toml`）——
+"检测为 rust"没有依据，就是一句无法核对的断言，而多生态仓库正是静默选错的地方。
 
 | 优先级 | 生态（`SuiteLanguage`） | 命中依据（根目录） | 覆盖率报告格式 | shell 脚手架：`kind` / `test` / `lint`（`scripts/project-config.sh`） |
 |---|---|---|---|---|
@@ -1412,6 +1422,32 @@ feed 里只剩一条长行。修法不是再写一份短报告，而是把**同�
 并存必须得到 `rust`；`pom.xml` 与 `build.gradle.kts` 并存得到 `java`（Java 在 Kotlin 之前），只带
 `build.gradle.kts` 才是 Kotlin。`*.sln`/`*.csproj`/`*.gemspec` 用扩展名匹配（目录项按名字排序，两次运行同一答案），
 目录同名的不算命中。全部没有命中时返回 `ts`，并明确写"没有找到任何已知 manifest，按约定默认 ts"——默认值不等于检测结果。
+`detectLanguageInfo()` 因此返回三样东西：`language`（主生态，语义与多生态支持之前一致）、`languages`（全部命中，
+去重保序；**一个都没命中时是空数组**——默认值是默认值，不是检测证据）、`matches`（每个命中的生态及其 manifest）。
+
+**供应链门禁按全部生态生成（`scaffold-audit.ts` + `scaffold-content.ts` 的 `supplyChainDeps()`）**：
+`supply-chain-gate.json` 的 `deps.manifests` 是**已检测全部生态**的 manifest 并集（按上表顺序、按名字去重；
+单生态仓库因此与改动前逐字一致），`deps.auditCommands` 是各生态**既定**的审计 CLI（同一字符串只写一次，
+`ts`+`js` 共用 `npm audit --json`）。`suite_init` 的 dry-run 与 apply 输出都带一段 `语言与供应链：`，逐条列出
+检测到的生态（含命中文件与它贡献的 manifests）、manifests 并集、生成的审计命令（标注由哪个生态贡献）以及被
+跳过的生态与原因——**不静默省略**：
+
+| 生态 | 生成的 `deps.auditCommands` | 说明 |
+|---|---|---|
+| `ts` / `js` | `npm audit --json` | 两个生态共用，一条命令只写一次 |
+| `go` | `govulncheck ./...` | |
+| `py` | `pip-audit -f json` | |
+| `rust` | `cargo audit --json` | |
+| `ruby` | `bundler-audit check` | |
+| `php` | `composer audit --format=json` | |
+| `csharp` | `dotnet list package --vulnerable --include-transitive` | |
+| `java` / `kotlin` / `swift` | **不生成** | 没有既定审计 CLI：报告写明"该生态无标准审计器，需人工补充"，由人按仓库实际工具填 `deps.auditCommands` |
+
+**不为不存在的 CLI 编造命令**与覆盖率格式是同一条规则：空着并说明理由，比写一条第一次运行就必然失败的命令好
+（空列表在供应链门禁里意味着依赖漏洞最多 WARN，所以报告必须让人看见并知道怎么补——这是"不编造"和"不说"的区别）。
+审计命令是**生态约定的调用方式**，不是本仓库的事实：与其余默认值一样，装好工具、按仓库实际情况复核后再当门禁用。
+一组固定的期望值（11 种生态各自的 manifests/命令、`go`+`py` 与 `ts`+`rust` 的并集、`ts`+`js` 的去重、空仓库的
+默认、java/kotlin/swift 的跳过原因）由 `packages/dsh-suite-doctor/test/suite-init-supply-chain.test.ts` 逐字钉住。
 
 **shell 脚手架（`scripts/project-config.sh --print`）是第二份清单，优先级与上表不同**：它按 `composer.json` →
 `Gemfile` → `mix.exs` → `Package.swift` → `build.gradle(.kts)` → `pom.xml` → `Cargo.toml` → `go.mod` →

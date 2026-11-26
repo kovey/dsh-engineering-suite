@@ -198,6 +198,27 @@ export function defaultsOf(language: SuiteLanguage): LanguageDefaults {
     return LANGUAGE_DEFAULTS[language]
 }
 
+/**
+ * The union of the given ecosystems' manifests, in the order given, deduplicated.
+ *
+ * The supply-chain gate watches MANIFESTS, and a repository that carries two
+ * ecosystems needs both lists: a Go repository with `requirements.txt` must not
+ * stop watching `go.mod`. Deduplication is by manifest NAME, so `ts` + `js`
+ * (which share `package.json`) writes it once — the file is a watch list, not a
+ * log of which ecosystem contributed it.
+ * @param languages - the detected ecosystems, in detection order.
+ * @returns the pooled manifest list (empty only for an empty input).
+ */
+export function manifestsFor(languages: readonly SuiteLanguage[]): string[] {
+    const manifests: string[] = []
+    for (const language of languages) {
+        for (const manifest of LANGUAGE_DEFAULTS[language].manifests) {
+            if (!manifests.includes(manifest)) manifests.push(manifest)
+        }
+    }
+    return manifests
+}
+
 /** Why an ecosystem's coverage command is empty, or `undefined` when it is not. */
 export function coverageNoteOf(language: SuiteLanguage): string | undefined {
     return LANGUAGE_DEFAULTS[language].coverageNote

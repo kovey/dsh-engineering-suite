@@ -52,7 +52,7 @@
 | 工具 | 作用 |
 |---|---|
 | `suite_status({ missionId?, json? })` | 跑离线自检 → 合并运行时事实（`withRuntime`）→ 按"需要我 / 健康 / 一致性 / 历史"的顺序输出中文报告（见下「操作者视图」）；`json: true` 给机器读（同一份判定）。`missionId` 不存在时**拒绝**（fail closed），而不是换一个任务报告。 |
-| `suite_init({ apply?, force?, only? })` | 给**当前仓库**脚手架十份门禁配置（spec / test-design / quality / standards / evidence / coverage / impact / supply-chain / interaction / deploy）。**默认 dry-run**：逐份输出 `path / action(write\|skip\|overwrite) / bytes`，不写盘；只有 `apply: true` 才写。已存在的文件默认 `skip`（这些文件是信任根，脚手架不能撤销已评审的阈值），`force: true` 才覆盖。内容按检测到的生态生成且确定性，第二次 apply 一个字节都不改（幂等）。`only` 过滤，未知/空过滤在写任何文件之前就拒绝。 |
+| `suite_init({ apply?, force?, only? })` | 给**当前仓库**脚手架十份门禁配置（spec / test-design / quality / standards / evidence / coverage / impact / supply-chain / interaction / deploy）。**默认 dry-run**：逐份输出 `path / action(write\|skip\|overwrite) / bytes`，不写盘；只有 `apply: true` 才写。已存在的文件默认 `skip`（这些文件是信任根，脚手架不能撤销已评审的阈值），`force: true` 才覆盖。内容按检测到的**全部**生态生成（供应链门禁的 manifests/审计命令取并集，见下）且确定性，第二次 apply 一个字节都不改（幂等）。`only` 过滤，未知/空过滤在写任何文件之前就拒绝。 |
 
 **支持的生态（11 种）与检测依据**：`ts / js / go / py / rust / java / kotlin / csharp / php / ruby / swift`。
 检测按**固定优先级**查仓库根的 manifest，第一个命中者胜出：`tsconfig(.base).json` → ts、`go.mod` → go、
@@ -60,6 +60,17 @@
 `composer.json` → php、`Gemfile`/`*.gemspec` → ruby、`Package.swift` → swift、`pyproject/setup.py/requirements` → py、
 `package.json` → js，都没有 → ts（并明确写"这是默认值，不是检测结果"）。计划里打印**检测依据**
 （`语言判定：检测依据：命中 Cargo.toml`）：多生态仓库正是静默选错的地方，一句"检测为 rust"没有依据就无法核对。
+
+**多生态不是"选一个"**：同一个优先级顺序下**全部命中**的生态都会被记录下来（去重保序），因为一个 Go 仓库同时
+带着 `requirements.txt` 时，供应链门禁不该停止盯 `go.mod`。九份单生态文档（quality/coverage/impact/standards…）仍按
+**主生态**（第一个命中）生成——一个仓库只有一种跑测试的方式；`supply-chain-gate.json` 的 `deps.manifests` 则是
+**已检测全部生态**的并集（按优先级顺序、按名字去重），`deps.auditCommands` 给出各生态的标准审计命令
+（`npm audit --json` / `govulncheck ./...` / `pip-audit -f json` / `cargo audit --json` / `bundler-audit check` /
+`composer audit --format=json` / `dotnet list package --vulnerable --include-transitive`；ts 与 js 共用一条只写一次）。
+**java / kotlin / swift 没有既定的审计 CLI，所以不生成命令**——报告会逐条写明"该生态无标准审计器，需人工补充"
+（不编造命令，也不静默省略）。`suite_init` 的 dry-run 与 apply 输出都带一段 `语言与供应链：`：检测到的生态（含
+命中文件与它贡献的 manifests）、manifests 并集、生成的审计命令（标注由哪个生态贡献）、被跳过的生态与原因。
+完整规则与审计表见 `docs/ARCHITECTURE.md` §5.30.1。
 
 **覆盖率只给能读的格式**：覆盖率门禁只解析 lcov / cobertura / go-cover / istanbul-json。Java/Kotlin（jacoco）与
 PHP（clover）的 `coverageCommand`/`reportFile` **写成空字符串**（空值 = 未配置，门禁拒绝执行），并在 `suite_init`

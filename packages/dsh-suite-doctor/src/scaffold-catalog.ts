@@ -22,7 +22,6 @@
  * @module dsh-suite-doctor/scaffold-catalog
  */
 
-import fs from 'node:fs'
 import path from 'node:path'
 import {
     coverageGateContent,
@@ -51,8 +50,15 @@ export interface SuiteConfigDescriptor {
     overridableKeys: readonly string[]
     /** `true` when the file is repository-owned (no host ceiling). */
     projectOwned?: boolean
-    /** The default document, by ecosystem. */
-    content: (language: SuiteLanguage) => Record<string, unknown>
+    /**
+     * The default document, by ecosystem.
+     *
+     * `language` is the PRIMARY ecosystem (the one the single-ecosystem
+     * documents are keyed to); `languages` is every ecosystem detected in the
+     * repository. Only the supply-chain gate uses the list — it pools manifests
+     * and audit commands — while the other nine documents use `language` alone.
+     */
+    content: (language: SuiteLanguage, languages: readonly SuiteLanguage[]) => Record<string, unknown>
 }
 
 /**
@@ -147,98 +153,6 @@ export const SUITE_CONFIGS: readonly SuiteConfigDescriptor[] = [
 /** The id of this plugin's own project config row (shown by `suite_config`). */
 export const SUITE_DOCTOR_ID = 'suite-doctor'
 
-/** One detection rule: a language plus the manifests that name it. */
-interface DetectionRule {
-    language: SuiteLanguage
-    /** Root files matched by exact name. */
-    manifests?: readonly string[]
-    /** Root files matched by extension (`*.sln`, `*.gemspec`). */
-    suffixes?: readonly string[]
-}
-
-/**
- * The ONE detection order: highest priority first, and the answer is decided by
- * the first hit.
- *
- * The order is the specification, not an accident: a repository can carry
- * several ecosystems at once, and `tsconfig.json` next to `go.mod` must resolve
- * to TS no matter what a directory listing returns. `build.gradle` (Groovy) is
- * Java's while `build.gradle.kts` is Kotlin's, which is why Java is
- * `pom.xml`/`build.gradle` and Kotlin follows it — a Kotlin file alone still
- * resolves to Kotlin, and a repository with both resolves to Java, in the
- * documented order.
- */
-const DETECTION_ORDER: readonly DetectionRule[] = [
-    { language: 'ts', manifests: ['tsconfig.json', 'tsconfig.base.json'] },
-    { language: 'go', manifests: ['go.mod'] },
-    { language: 'rust', manifests: ['Cargo.toml'] },
-    { language: 'java', manifests: ['pom.xml', 'build.gradle'] },
-    { language: 'kotlin', manifests: ['build.gradle.kts'] },
-    { language: 'csharp', suffixes: ['.sln', '.csproj'] },
-    { language: 'php', manifests: ['composer.json'] },
-    { language: 'ruby', manifests: ['Gemfile'], suffixes: ['.gemspec'] },
-    { language: 'swift', manifests: ['Package.swift'] },
-    { language: 'py', manifests: ['pyproject.toml', 'setup.py', 'requirements.txt'] },
-    { language: 'js', manifests: ['package.json'] },
-]
-
-/** What detection observed: the ecosystem, and the file that decided it. */
-export interface LanguageDetection {
-    language: SuiteLanguage
-    /** The manifest that decided it; absent when nothing matched and the default applied. */
-    manifest?: string
-    /** One line a person can check against the directory. */
-    reason: string
-}
-
-/** Whether a root entry of that exact name is a file. */
-function hasFile(cwd: string, name: string): boolean {
-    try {
-        return fs.statSync(path.join(cwd, name)).isFile()
-    } catch {
-        return false
-    }
-}
-
-/** First root file whose name ends with `suffix` (sorted, so two runs agree). */
-function rootFileWithSuffix(cwd: string, suffix: string): string | undefined {
-    try {
-        return fs
-            .readdirSync(cwd, { withFileTypes: true })
-            .filter((entry) => entry.isFile() && entry.name.toLowerCase().endsWith(suffix))
-            .map((entry) => entry.name)
-            .sort()[0]
-    } catch {
-        return undefined
-    }
-}
-
-/**
- * Detect the repository's primary ecosystem, naming the evidence.
- *
- * `suite_init` prints `reason`, because "detected rust" without "because of
- * Cargo.toml" is a claim a person cannot check — and a repository that carries
- * several ecosystems is exactly where a silent pick goes wrong.
- * @param cwd - the workspace root.
- */
-export function detectLanguageInfo(cwd: string): LanguageDetection {
-    for (const rule of DETECTION_ORDER) {
-        for (const name of rule.manifests ?? []) {
-            if (hasFile(cwd, name)) return { language: rule.language, manifest: name, reason: `检测依据：命中 ${name}` }
-        }
-        for (const suffix of rule.suffixes ?? []) {
-            const name = rootFileWithSuffix(cwd, suffix)
-            if (name !== undefined) return { language: rule.language, manifest: name, reason: `检测依据：命中 ${name}（*${suffix}）` }
-        }
-    }
-    return { language: 'ts', reason: '检测依据：没有找到任何已知 manifest，按约定默认 ts' }
-}
-
-/** Detect the repository's primary ecosystem from its manifests. */
-export function detectLanguage(cwd: string): SuiteLanguage {
-    return detectLanguageInfo(cwd).language
-}
-
 /** Normalise a spelling to the id form (`quality-gate.json` → `quality-gate`). */
 function normalise(name: string): string {
     const base = path.basename(name.trim()).toLowerCase()
@@ -288,8 +202,10 @@ export function selectDescriptors(only?: readonly string[]): SuiteConfigDescript
  * The exact bytes a scaffold writes for one file.
  *
  * Deterministic (two-space JSON, trailing newline) so "apply twice" can be
- * compared byte for byte.
+ * compared byte for byte. `languages` defaults to the primary alone, which is
+ * what a single-ecosystem caller means and what the supply-chain document needs
+ * on an empty repository.
  */
-export function configText(descriptor: SuiteConfigDescriptor, language: SuiteLanguage): string {
-    return `${JSON.stringify(descriptor.content(language), null, 2)}\n`
+export function configText(descriptor: SuiteConfigDescriptor, language: SuiteLanguage, languages: readonly SuiteLanguage[] = [language]): string {
+    return `${JSON.stringify(descriptor.content(language, languages), null, 2)}\n`
 }

@@ -18,8 +18,9 @@
  *    prints both.
  *
  * Idempotency falls out of determinism: the generated text depends only on the
- * descriptor and the detected language, so a second `apply` writes nothing (all
- * entries are `skip`) and the layout root stays byte-identical.
+ * descriptor and the detected ecosystems (the primary one for nine documents,
+ * every one of them for the supply-chain gate), so a second `apply` writes
+ * nothing (all entries are `skip`) and the layout root stays byte-identical.
  *
  * @module dsh-suite-doctor/scaffold
  */
@@ -28,8 +29,11 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { scaffoldConfigDir, type ScaffoldLayout } from 'dsh-eng-core/scaffold'
 import type { LayoutOptions } from 'dsh-eng-core'
-import { configText, detectLanguageInfo, SUITE_CONFIGS, SUITE_DOCTOR_ID, selectDescriptors, type SuiteConfigDescriptor, type SuiteLanguage } from './scaffold-catalog.js'
-import { coverageNoteOf } from './scaffold-languages.js'
+import { AUDIT_COMMAND_BY_LANGUAGE } from './scaffold-audit.js'
+import { configText, SUITE_CONFIGS, SUITE_DOCTOR_ID, selectDescriptors, type SuiteConfigDescriptor, type SuiteLanguage } from './scaffold-catalog.js'
+import { generatedLanguages, supplyChainDeps, type SupplyChainDeps } from './scaffold-content.js'
+import { detectLanguageInfo, type LanguageMatch } from './scaffold-detect.js'
+import { coverageNoteOf, defaultsOf } from './scaffold-languages.js'
 
 /** What happened (or would happen) to one file. */
 export type InitAction = 'write' | 'skip' | 'overwrite'
@@ -54,11 +58,24 @@ export interface InitPlan {
     layout: ScaffoldLayout
     /** Why that root was chosen (printed verbatim; the legacy branch says "沿用遗留位置"). */
     reason: string
+    /** Primary ecosystem: the one the single-ecosystem documents are generated for. */
     language: SuiteLanguage
-    /** The manifest that decided the language, or why the default applied (printed verbatim). */
+    /**
+     * Every ecosystem the documents are generated for, in detection order.
+     *
+     * Equals the detected list, EXCEPT on an empty repository where it is the
+     * documented `ts` default (a default is not a detection, so {@link matches}
+     * stays empty and the report says so).
+     */
+    languages: SuiteLanguage[]
+    /** Which root file evidenced each detected ecosystem; empty when the default applied. */
+    matches: LanguageMatch[]
+    /** The manifest that decided the primary ecosystem, or why the default applied (printed verbatim). */
     languageReason: string
     /** Why the coverage command is empty, for the ecosystems whose report format is unsupported. */
     coverageNote?: string
+    /** What the supply-chain gate was stocked with (manifests union, audit commands, skipped). */
+    supplyChain: SupplyChainDeps
     dryRun: boolean
     entries: InitEntry[]
     /** Non-fatal notes (currently: none — kept so the shape can grow honestly). */
@@ -134,16 +151,17 @@ function writeText(target: string, text: string): void {
  * @param input - the caller's workspace and flags.
  * @param rootDir - absolute directory the file belongs to (already decided).
  * @param descriptor - the file to plan.
- * @param language - the bytes to generate.
+ * @param language - the PRIMARY ecosystem (the nine single-ecosystem documents).
+ * @param languages - every generated ecosystem (the supply-chain gate pools these).
  * @returns the entry the report prints.
  */
-function planEntry(input: InitInput, rootDir: string, descriptor: SuiteConfigDescriptor, language: SuiteLanguage): InitEntry {
+function planEntry(input: InitInput, rootDir: string, descriptor: SuiteConfigDescriptor, language: SuiteLanguage, languages: readonly SuiteLanguage[]): InitEntry {
     const target = path.join(rootDir, descriptor.file)
     const relative = relativeTo(input.cwd, target)
     const exists = fs.existsSync(target)
     const action: InitAction = exists ? (input.force === true ? 'overwrite' : 'skip') : 'write'
     if (action === 'skip') return { path: target, relative, action, bytes: sizeOf(target) }
-    const text = configText(descriptor, language)
+    const text = configText(descriptor, language, languages)
     if (input.apply === true) writeText(target, text)
     return { path: target, relative, action, bytes: Buffer.byteLength(text) }
 }
@@ -160,6 +178,11 @@ function planEntry(input: InitInput, rootDir: string, descriptor: SuiteConfigDes
  * `only` is validated up front by {@link selectDescriptors}: an unknown name
  * throws before anything is written, so a typo cannot produce a half-applied
  * scaffold that looks intentional.
+ *
+ * Detection is computed ONCE: the nine single-ecosystem documents read the
+ * primary language, the supply-chain gate reads every detected one, and the
+ * plan's `supplyChain` field is the same projection the written file is built
+ * from.
  * @param input - workspace, explicit root override (if any) and the three flags.
  * @returns every file, its action, its byte count and the chosen layout root.
  */
@@ -170,7 +193,8 @@ export function planSuiteInit(input: InitInput): InitPlan {
         legacyFiles: [...SUITE_CONFIGS.map((descriptor) => descriptor.file), 'standards-baseline.json', `${SUITE_DOCTOR_ID}.json`],
     })
     const detection = detectLanguageInfo(input.cwd)
-    const entries = descriptors.map((descriptor) => planEntry(input, target.dir, descriptor, detection.language))
+    const languages = generatedLanguages(detection.language, detection.languages)
+    const entries = descriptors.map((descriptor) => planEntry(input, target.dir, descriptor, detection.language, languages))
     const coverageNote = coverageNoteOf(detection.language)
     return {
         cwd: input.cwd,
@@ -178,8 +202,11 @@ export function planSuiteInit(input: InitInput): InitPlan {
         layout: target.layout,
         reason: target.reason,
         language: detection.language,
+        languages,
+        matches: detection.matches,
         languageReason: detection.reason,
         ...(coverageNote === undefined ? {} : { coverageNote }),
+        supplyChain: supplyChainDeps(detection.language, detection.languages),
         dryRun: input.apply !== true,
         entries,
         problems: [],
@@ -191,6 +218,58 @@ const ACTION_ICON: Record<InitAction, string> = { write: '➕', skip: '⏭️', 
 /** `(namespace)` / `(legacy)` / `(explicit)` — the branch that chose the root. */
 function layoutLabel(layout: ScaffoldLayout): string {
     return `（${layout}）`
+}
+
+/** `go（命中 go.mod；manifests go.mod、go.sum）` — one ecosystem, its evidence, its watch list. */
+function ecosystemLine(match: LanguageMatch): string {
+    return `${match.language}（命中 ${match.manifest}；manifests ${defaultsOf(match.language).manifests.join('、')}）`
+}
+
+/**
+ * The `审计命令` cell: each command annotated with the ecosystem(s) that named it.
+ *
+ * Read from `plan.supplyChain.auditCommands` (the value the file gets) rather
+ * than recomputed, so the report cannot list a command that was not written —
+ * only the OWNER labels come from the table.
+ */
+function auditCommandSummary(plan: InitPlan): string {
+    if (plan.supplyChain.auditCommands.length === 0) return '无（检测到的生态都没有标准审计器，见"跳过"）'
+    const owners = new Map<string, SuiteLanguage[]>()
+    for (const language of plan.languages) {
+        const command = AUDIT_COMMAND_BY_LANGUAGE[language]
+        if (command === undefined) continue
+        owners.set(command, [...(owners.get(command) ?? []), language])
+    }
+    return plan.supplyChain.auditCommands.map((command) => `${command}（${(owners.get(command) ?? []).join('、')}）`).join('、')
+}
+
+/**
+ * The `语言与供应链` block: every detected ecosystem with its evidence and watch
+ * list, the manifests union, the audit commands, and what was skipped WHY.
+ *
+ * Nothing is collapsed into a count-only line: a repository with two ecosystems
+ * is exactly where "which one did it pick" must be readable, and an ecosystem
+ * left without an auditor must name the way out instead of going silent.
+ * @param plan - the plan to describe.
+ * @returns the section's lines (heading included).
+ */
+function supplyChainLines(plan: InitPlan): string[] {
+    const detected =
+        plan.matches.length === 0
+            ? `无（没有找到任何已知 manifest，按约定默认 ${plan.language}）`
+            : plan.matches.map(ecosystemLine).join('、')
+    const ledger = plan.supplyChain
+    const skipped =
+        ledger.skipped.length === 0
+            ? '- 跳过：无（生成所用的生态都有标准审计器）'
+            : `- 跳过（${ledger.skipped.length}）：${ledger.skipped.map((entry) => `${entry.language} —— ${entry.note}`).join('；')}`
+    return [
+        '语言与供应链：',
+        `- 检测到的生态（${plan.matches.length}）：${detected}`,
+        `- manifests 并集（${ledger.manifests.length}）：${ledger.manifests.join('、')}`,
+        `- 审计命令（${ledger.auditCommands.length}）：${auditCommandSummary(plan)}`,
+        skipped,
+    ]
 }
 
 /**
@@ -212,6 +291,7 @@ export function renderInitPlan(plan: InitPlan): string {
     // An empty coverage command is a decision, not an omission: say why, where a
     // person reading the plan can act on it.
     if (plan.coverageNote !== undefined) lines.push(`覆盖率：${plan.language} 的命令留空 —— ${plan.coverageNote}`)
+    lines.push(...supplyChainLines(plan))
     for (const entry of plan.entries) lines.push(`${ACTION_ICON[entry.action]} ${entry.action.padEnd(9)} ${entry.relative}  (${entry.bytes} B)`)
     lines.push(`合计：写入 ${written}、覆盖 ${overwritten}、跳过（已存在）${skipped}；共 ${plan.entries.length} 份`)
     if (plan.dryRun) lines.push('下一步：suite_init({ apply: true })（已存在的文件默认跳过；force:true 才覆盖）')

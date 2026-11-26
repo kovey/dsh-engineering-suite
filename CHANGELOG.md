@@ -1,3 +1,31 @@
+## [未发布]
+
+### 功能 · `suite init` 读取仓库里的**每一个**生态，而不只是第一个：供应链 manifests 取并集，审计命令按生态给出
+
+真实缺口：`detectLanguageInfo()` 只返回**第一个**命中的语言，于是 Go 仓库里同时存在的 `requirements.txt`、
+TS 仓库里的 `Cargo.toml` 都不进 `supply-chain-gate.json` 的 `deps.manifests`——供应链门禁盯的是一份漏了清单的
+清单；`deps.auditCommands` 又恒为 `[]`，依赖漏洞从脚手架生成的第一天起就只能是"最多 WARN"。
+
+- **检测（AC-001，`src/scaffold-detect.ts`，规则表与命中判定从 `scaffold-catalog.ts` 拆出）**：命中判定只有一个来源
+  ——`matchesRule(cwd, rule)`，单语言答案与多生态列表共用它；`detectLanguageInfo()` 按同一固定顺序收集**全部**命中，
+  新增 `languages`（去重保序；一个都没命中时是 `[]`——默认值不是检测证据）与 `matches`（每个生态及其 manifest），
+  原有 `language`（第一个命中，未知时 `ts`）与 `reason` 语义不变，既有调用方不受影响。
+- **供应链文档（AC-002 / AC-003，`src/scaffold-content.ts` 的 `supplyChainDeps()` + 新模块 `src/scaffold-audit.ts`）**：
+  `deps.manifests` 是已检测全部生态的 manifest 并集（按检测顺序、按名字去重；单生态仓库结果与改动前逐字一致）；
+  `deps.auditCommands` 按 `AUDIT_COMMAND_BY_LANGUAGE` 生成：ts/js → `npm audit --json`、go → `govulncheck ./...`、
+  py → `pip-audit -f json`、rust → `cargo audit --json`、ruby → `bundler-audit check`、php → `composer audit --format=json`、
+  csharp → `dotnet list package --vulnerable --include-transitive`（同一条命令只写一次，ts+js 共用）。java/kotlin/swift
+  **不生成命令**：`NO_STANDARD_AUDITOR` 给出"该生态无标准审计器，需人工补充"的原因文案——不编造不存在的 CLI。
+- **报告（AC-004）**：`/suite init` 与 `suite_init` 的 dry-run 与 apply 输出都新增 `语言与供应链：` 段，逐条列出
+  检测到的生态（含命中文件与它贡献的 manifests）、manifests 并集、生成的审计命令（标注由哪个生态贡献）、以及被
+  跳过的生态与原因，不静默省略。`/suite init` 没有 `--json` 选项，因此不存在需要同步的机器输出。
+- **测试（AC-005，`test/suite-init-supply-chain.test.ts`，9 例）**：11 种生态的单仓库各自断言 manifests 与命令
+  （java/kotlin/swift 无命令且报告写明原因）、go+py 与 ts+rust 的并集、ts+js 的 manifest 与命令去重、空仓库按 ts、
+  命中顺序/后缀匹配/目录不算命中、审计表覆盖集合，以及"写出的文件 == 报告承诺的内容，报告独有的 skipped 不落盘"。
+  既有 133 例全部通过、无需改动断言（没有既有用例断言 `auditCommands: []` 或供应链 manifests）。
+- **文档**：`docs/ARCHITECTURE.md` §5.30 与 §5.30.1 写明"两个答案、共用同一个匹配器"、审计命令表与跳过规则；
+  `packages/dsh-suite-doctor/README.md` 同步。`bash scripts/verify.sh --quiet` 与 `bash scripts/standards-check.sh --quiet` 全绿。
+
 ## [0.9.0] — 2026-11-25
 
 ### 修复 · 任务 worktree 是运行时状态，不是信任根策略：建/删不再让在飞 mandate 过期
